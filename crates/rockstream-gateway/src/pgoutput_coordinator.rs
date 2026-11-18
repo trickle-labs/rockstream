@@ -291,13 +291,47 @@ impl SpillKey for EnvelopeKey {
     }
 }
 
+/// An explicit discriminator prevents a malformed old row object from being
+/// mistaken for a TRUNCATE marker by the untagged compatibility decoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PgOutputTruncateTag {
+    Truncate,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EncodedChange {
-    pub relation_id: u32,
-    pub operation: CdcOperation,
-    pub old_values: Option<Vec<Option<String>>>,
-    pub new_values: Option<Vec<Option<String>>>,
-    pub schema_version: u64,
+#[serde(untagged)] // Keep preexisting spilled row JSON readable after an upgrade.
+pub enum EncodedChange {
+    Row {
+        relation_id: u32,
+        operation: CdcOperation,
+        old_values: Option<Vec<Option<String>>>,
+        new_values: Option<Vec<Option<String>>>,
+        schema_version: u64,
+    },
+    /// A truncate marker remains ordered among row changes in the spilled
+    /// transaction. Row images are recovered from local durable table state
+    /// at commit time, never from the already-truncated upstream table.
+    Truncate {
+        relation_id: u32,
+        schema_version: u64,
+        tag: PgOutputTruncateTag,
+    },
+}
+
+impl EncodedChange {
+    pub fn relation_id(&self) -> u32 {
+        match self {
+            Self::Row { relation_id, .. } | Self::Truncate { relation_id, .. } => *relation_id,
+        }
+    }
+
+    pub fn schema_version(&self) -> u64 {
+        match self {
+            Self::Row { schema_version, .. } | Self::Truncate { schema_version, .. } => {
+                *schema_version
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -482,6 +516,44 @@ impl SharedPgOutputCoordinator {
         old_values: Option<Vec<Option<String>>>,
         new_values: Option<Vec<Option<String>>>,
     ) -> Result<(), GatewayError> {
+        self.push_encoded_change(xid, relation_id, |schema_version| EncodedChange::Row {
+            relation_id,
+            operation,
+            old_values,
+            new_values,
+            schema_version,
+        })
+    }
+
+    pub fn push_truncate(&mut self, xid: u32, relation_ids: &[u32]) -> Result<(), GatewayError> {
+        self.require_xid(xid)?;
+        if relation_ids.is_empty() {
+            return Err(protocol_error("TRUNCATE has no relations"));
+        }
+        // Validate the whole message before staging any marker.
+        let mut seen = BTreeSet::new();
+        if relation_ids
+            .iter()
+            .any(|&relation_id| !seen.insert(relation_id))
+        {
+            return Err(protocol_error("duplicate TRUNCATE relation ID"));
+        }
+        for &relation_id in relation_ids {
+            self.push_encoded_change(xid, relation_id, |schema_version| EncodedChange::Truncate {
+                relation_id,
+                schema_version,
+                tag: PgOutputTruncateTag::Truncate,
+            })?;
+        }
+        Ok(())
+    }
+
+    fn push_encoded_change(
+        &mut self,
+        xid: u32,
+        relation_id: u32,
+        make_change: impl FnOnce(u64) -> EncodedChange,
+    ) -> Result<(), GatewayError> {
         self.require_xid(xid)?;
         if self.is_relation_blocked(relation_id) {
             return Ok(());
@@ -504,13 +576,7 @@ impl SharedPgOutputCoordinator {
                 "row for relation {relation_id} has no durable route or preceding Relation message"
             )));
         };
-        let change = EncodedChange {
-            relation_id,
-            operation,
-            old_values,
-            new_values,
-            schema_version,
-        };
+        let change = make_change(schema_version);
         let encoded_bytes = serde_json::to_vec(&change)
             .map_err(|error| coordinator_error(&format!("encode pgoutput change: {error}")))?
             .len();
@@ -1011,6 +1077,96 @@ mod tests {
         );
     }
 
+    #[test]
+    fn truncated_marker_json_cannot_misread_legacy_row_or_corruption() {
+        let legacy = r#"{
+            "relation_id": 7,
+            "operation": "Insert",
+            "old_values": null,
+            "new_values": ["1"],
+            "schema_version": 1
+        }"#;
+        assert!(matches!(
+            serde_json::from_str::<EncodedChange>(legacy).unwrap(),
+            EncodedChange::Row {
+                operation: CdcOperation::Insert,
+                ..
+            }
+        ));
+        let corrupt = r#"{"relation_id":7,"operation":"BOGUS","schema_version":1}"#;
+        assert!(serde_json::from_str::<EncodedChange>(corrupt).is_err());
+        let marker = EncodedChange::Truncate {
+            relation_id: 7,
+            schema_version: 1,
+            tag: PgOutputTruncateTag::Truncate,
+        };
+        assert_eq!(
+            serde_json::from_str::<EncodedChange>(&serde_json::to_string(&marker).unwrap())
+                .unwrap(),
+            marker
+        );
+    }
+
+    // Synchronous spill I/O uses block_in_place on the runtime. A single-thread
+    // test reactor can deadlock when a storage background task needs to run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn truncate_markers_preserve_order_in_a_spilled_envelope() {
+        let mut coordinator = coordinator().await;
+        coordinator
+            .relation_routes
+            .insert(7, route(vec![column("id", 25)]));
+        coordinator.envelope_buffer.set_memory_limit(64);
+        coordinator.begin(57).unwrap();
+        coordinator
+            .push_change(
+                57,
+                7,
+                CdcOperation::Insert,
+                None,
+                Some(vec![Some("1".to_string())]),
+            )
+            .unwrap();
+        coordinator.push_truncate(57, &[7]).unwrap();
+        coordinator
+            .push_change(
+                57,
+                7,
+                CdcOperation::Insert,
+                None,
+                Some(vec![Some("2".to_string())]),
+            )
+            .unwrap();
+        let envelope = coordinator.finish_envelope(57, PgLsn(0x57)).unwrap();
+        assert!(coordinator.spill_bytes() > 0);
+        assert!(matches!(
+            &envelope.changes[0],
+            EncodedChange::Row {
+                operation: CdcOperation::Insert,
+                ..
+            }
+        ));
+        assert_eq!(
+            envelope.changes[1],
+            EncodedChange::Truncate {
+                relation_id: 7,
+                schema_version: 1,
+                tag: PgOutputTruncateTag::Truncate,
+            }
+        );
+        assert!(matches!(
+            &envelope.changes[2],
+            EncodedChange::Row {
+                operation: CdcOperation::Insert,
+                ..
+            }
+        ));
+        let error = coordinator.push_truncate(57, &[7, 7]).unwrap_err();
+        assert!(
+            error.to_string().contains("duplicate TRUNCATE relation ID"),
+            "{error}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cdc_tx_spilled_two_tables_exact_atomic_batch_oracle() {
         let mut coordinator = coordinator().await;
@@ -1050,12 +1206,21 @@ mod tests {
                 envelope
                     .changes
                     .iter()
-                    .map(|change| (change.relation_id, change.new_values.clone()))
+                    .map(|change| match change {
+                        EncodedChange::Row {
+                            relation_id,
+                            new_values,
+                            ..
+                        } => (*relation_id, new_values.clone()),
+                        EncodedChange::Truncate { .. } => {
+                            panic!("row-only spill oracle unexpectedly contained TRUNCATE")
+                        }
+                    })
                     .collect::<Vec<_>>(),
             ),
             (
                 true,
-                serde_json::to_vec(&EncodedChange {
+                serde_json::to_vec(&EncodedChange::Row {
                     relation_id: 7,
                     operation: CdcOperation::Insert,
                     old_values: None,

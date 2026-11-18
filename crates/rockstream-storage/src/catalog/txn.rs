@@ -66,6 +66,11 @@ pub enum CatalogMutation {
         operation_id: String,
         audit: SecurityAuditRecord,
     },
+    RecoverAdministratorCredentials {
+        principal: SecurityPrincipal,
+        expected_revision: u64,
+        audit: SecurityAuditRecord,
+    },
     DeleteSecurityPrincipal {
         principal_id: PrincipalId,
         expected_revision: u64,
@@ -115,6 +120,7 @@ impl CatalogTxn {
             matches!(
                 mutation,
                 CatalogMutation::PutSecurityPrincipalForOperation { .. }
+                    | CatalogMutation::RecoverAdministratorCredentials { .. }
             )
         }) {
             3
@@ -166,11 +172,12 @@ impl CatalogTxn {
                 matches!(
                     mutation,
                     CatalogMutation::PutSecurityPrincipalForOperation { .. }
+                        | CatalogMutation::RecoverAdministratorCredentials { .. }
                 )
             })
         {
             return Err(CatalogError::IncompatibleVersion(
-                "[RS-1002] operation-correlated security mutations require transaction format version 3; next_steps: upgrade RockStream binary".to_string(),
+                "[RS-1002] operation-correlated and offline-recovery security mutations require transaction format version 3; next_steps: upgrade RockStream binary".to_string(),
             ));
         }
 
@@ -208,6 +215,7 @@ fn is_security_mutation(mutation: &CatalogMutation) -> bool {
         mutation,
         CatalogMutation::PutSecurityPrincipal { .. }
             | CatalogMutation::PutSecurityPrincipalForOperation { .. }
+            | CatalogMutation::RecoverAdministratorCredentials { .. }
             | CatalogMutation::DeleteSecurityPrincipal { .. }
             | CatalogMutation::AppendSecurityAudit(_)
     )

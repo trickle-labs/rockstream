@@ -25,10 +25,11 @@ pub mod shard_actor;
 pub mod tls;
 pub use client::{
     execute_frame, setup_test_deployment, start_worker_client,
-    start_worker_client_with_compaction_config, start_worker_client_with_metadata,
-    start_worker_client_with_tls, start_worker_client_with_tls_and_metadata,
+    start_worker_client_with_compaction_config, start_worker_client_with_exchange_endpoint,
+    start_worker_client_with_metadata, start_worker_client_with_tls,
+    start_worker_client_with_tls_and_metadata,
     start_worker_client_with_tls_metadata_and_compaction, ShardState, WorkerClientHandle,
-    WorkerDeployment, WorkerDeployments,
+    WorkerDeployment, WorkerDeployments, WorkerExchangeEndpoint,
 };
 pub use compaction::{CompactionBudget, CompactionPermit, CompactionWorker};
 pub use data_plane::DataPlaneClient;

@@ -123,11 +123,11 @@ async fn postgres_cdc_snapshot_stream_fence_has_exact_transcript() {
 }
 
 #[tokio::test]
-async fn postgres_cdc_all_mutation_types_have_exact_transcript() {
+async fn postgres_cdc_insert_update_delete_have_exact_transcript() {
     let fixture = common::connector_fixture("mutations").await;
     fixture
         .postgres
-        .batch_execute("INSERT INTO orders VALUES (1); UPDATE orders SET id = 2 WHERE id = 1; DELETE FROM orders WHERE id = 2; TRUNCATE orders")
+        .batch_execute("INSERT INTO orders VALUES (1); UPDATE orders SET id = 2 WHERE id = 1; DELETE FROM orders WHERE id = 2")
         .await
         .unwrap();
     let mut source = source();
@@ -149,6 +149,53 @@ async fn postgres_cdc_all_mutation_types_have_exact_transcript() {
         .await
         .unwrap()
         .is_empty());
+}
+
+#[tokio::test]
+async fn postgres_cdc_row_only_truncate_retries_same_frame_without_ack() {
+    let fixture = common::connector_fixture("row_only_truncate").await;
+    let mut source = PostgresCdcSource::connect_pgoutput(
+        ConnectorId(5_259),
+        schema(),
+        config(&fixture, "row_only_truncate"),
+        false,
+    )
+    .await
+    .unwrap();
+    let fence = source.capture_snapshot_delta_fence(None).await.unwrap();
+    fixture
+        .postgres
+        .batch_execute("BEGIN; INSERT INTO orders VALUES (1); TRUNCATE orders; COMMIT")
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match source
+            .poll_delta(fence.live.clone(), 8 * 1024 * 1024, 4_096, None)
+            .await
+        {
+            Err(error) => {
+                assert!(error.to_string().contains("TRUNCATE"), "{error}");
+                break;
+            }
+            Ok(result) => {
+                assert!(
+                    result.batches.is_empty(),
+                    "must not emit a partial transaction"
+                );
+                assert!(Instant::now() < deadline, "TRUNCATE did not reach decoder");
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+    for _ in 0..2 {
+        let error = source
+            .poll_delta(fence.live.clone(), 8 * 1024 * 1024, 4_096, None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("TRUNCATE"), "{error}");
+    }
+    assert_eq!(source.last_committed_lsn(), None);
 }
 
 #[tokio::test]

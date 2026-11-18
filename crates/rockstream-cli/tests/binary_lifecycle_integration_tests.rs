@@ -59,7 +59,7 @@ async fn test_binary_lifecycle_gateway_worker_control_roles() {
     let metrics_addr = format!("127.0.0.1:{metrics_port}");
     let listen_addr = format!("127.0.0.1:{pg_port}");
     let mut node_config = rockstream_types::config::NodeConfig::default();
-    node_config.control.management_addr = Some("127.0.0.1:0".to_string());
+    node_config.control.management_addr = None;
 
     let opts = StartOptions {
         storage: storage_dir.clone(),
@@ -101,6 +101,12 @@ async fn test_binary_lifecycle_gateway_worker_control_roles() {
             }
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    if !server_ready && server_task.is_finished() {
+        panic!(
+            "server exited before readiness: {:?}",
+            server_task.join().unwrap()
+        );
     }
     assert!(server_ready, "Server must transition to ready (HTTP 200)");
 
@@ -433,7 +439,7 @@ async fn test_server_roles_remain_alive_until_explicit_signal() {
     let metrics_addr = format!("127.0.0.1:{metrics_port}");
     let listen_addr = format!("127.0.0.1:{pg_port}");
     let mut node_config = rockstream_types::config::NodeConfig::default();
-    node_config.control.management_addr = Some("127.0.0.1:0".to_string());
+    node_config.control.management_addr = None;
 
     let opts = StartOptions {
         storage: storage_dir.clone(),
@@ -474,6 +480,12 @@ async fn test_server_roles_remain_alive_until_explicit_signal() {
             }
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    if !reached_ready && server_thread.is_finished() {
+        panic!(
+            "server exited before readiness: {:?}",
+            server_thread.join().unwrap()
+        );
     }
     assert!(reached_ready, "Server must reach Ready (HTTP 200)");
 

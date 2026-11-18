@@ -59,6 +59,13 @@ does not cancel its commit. Success waits for durable storage before retiring
 the store's old provider. A provider or decode failure during staging leaves
 every stored envelope unchanged.
 
+With durable storage, rotation also requires the durable security audit
+catalog. The rewrap batch carries a structured audit outbox record, and success
+waits for that record to reach the catalog. The method's actor label is recorded
+as unverified because this internal API does not establish authentication; it
+has no client request identity, and its operation identity is recorded as
+unknown. Pending outbox records are flushed before gateway listeners open.
+
 Keep both KEKs available until rotation has returned success and the replacement
 provider has been configured for restart. After an interruption or storage error,
 the durable batch may contain either generation. Reopen the catalog using
@@ -119,13 +126,37 @@ The control-worker TCP listener used for registration, heartbeats, and shard lea
 
 For local development only, `--allow-insecure-internal-dev` explicitly permits plaintext control traffic when the control listener or worker target uses a literal loopback socket address. The option rejects non-loopback addresses and must not be used for production or release qualification.
 
+Worker-to-worker shuffle uses separate `[worker].exchange_bind_addr` and
+`[worker].exchange_advertise_addr` settings. A `worker` process requires both;
+the listener binds before registration, and control receives only the advertised
+address. Bind may use a wildcard socket, while the advertised address must be a
+reachable non-wildcard `host:port`. Without internal mTLS, both addresses must
+be numeric loopback addresses and startup also requires
+`--allow-insecure-internal-dev`. Workers without a shuffle endpoint do not
+advertise `shuffle_codec_v1`; embedded `all` may omit the endpoint for its
+single local worker.
+
+Authenticated worker registration requires protocol v3, which carries the current
+shard-lease snapshot and durable audit acknowledgments. The shuffle listener
+accepts only CA-verified worker certificates matching a currently healthy
+registered worker. Before processing a frame, it also verifies that the
+authenticated worker currently owns `src_shard` and that the target shard is
+active locally. A frame for an unregistered exchange target is rejected instead
+of acknowledged. Application-level identity and source-ownership denials are
+correlated and durably audited through the authenticated worker-control stream;
+the shuffle stream fails closed if that append is unavailable. TLS handshake
+failures such as an expired certificate or wrong CA are not covered by this
+application-level audit path. The CLI worker also does not yet wire exchange
+inlets into its application data path. These gaps and the release
+negative-case/rollover matrix keep #303 open.
+
 When a gateway connects to `--control`, its cross-process SQL data-plane client uses internal mTLS and presents a CA-verified `Gateway` node identity. For authenticated gateway configurations, each deploy, source-delta, workload-read, and operator-stats request carries a short-lived RS256 actor assertion. Version 2 claims include explicit `SecretUse` scopes for secret-backed sources in a deployment, limited to scopes the actor is authorized to use when the assertion is issued. Control retains those scopes with the workload; each worker secret refresh must match the retained allowance and the actor's current scoped policy. A later grant applies to a workload only after a fresh authorized deployment assertion includes that scope. The gateway signs assertions with the dedicated deployment-managed private key at `auth.actor_assertion_signing_key_path`; control verifies them with the matching RSA public JWK at `auth.actor_assertion_public_key_path`. Both nodes require the same `node.deployment_id`. The assertion audience is exactly `rockstream-control:<deployment_id>`, and its lifetime is 60 seconds. Control verifies the gateway certificate role, signature, deployment, request digest, action and scope, then checks the actor's current durable grants. Effective authority is the intersection of the asserted allowance and those current grants. Version 1 assertions remain valid for their original action and scope and carry no delegated secret-use scopes. Missing keys, invalid assertions, disabled actors, and revoked grants are rejected and audited before the data-plane request is dispatched. The signing key pair must be distinct from both gateway and internal TLS key pairs.
 
 The explicit loopback plaintext development mode continues to permit bare data-plane messages for local development. It does not establish a verified node identity and cannot carry actor assertions; signed delegation requires internal mTLS. Worker secret-token requests name an active workload. Control verifies that the mTLS worker is assigned to it, derives the reference and namespace from durable source metadata, and rechecks both the source consumer's and delegated actor's current scoped `SecretUse` grants. Name-only legacy requests are rejected and audited. Versioned tokens are encrypted and cached per worker and workload; unsupported token formats are rejected. Tokens expire within 60 seconds and are reauthorized every 30 seconds while the workload is active. A denied refresh removes the cached token. Secret-rotation refreshes target only workloads that reference that secret; replacement tokens remain pending until the workload enters a later epoch. The worker secret-token path still needs real-process release qualification, including revocation and refresh behavior.
 
 Configure the values in the node configuration file or with `ROCKSTREAM_NODE_DEPLOYMENT_ID`, `ROCKSTREAM_AUTH_ACTOR_ASSERTION_SIGNING_KEY_PATH` on the gateway, and `ROCKSTREAM_AUTH_ACTOR_ASSERTION_PUBLIC_KEY_PATH` on control. The public JWK must contain one RSA signing key with `kty=RSA`, `alg=RS256`, and `use=sig`; distribute it through the deployment's trusted configuration channel.
 
-Worker shuffle and native management APIs are separate transport boundaries. A configured worker shuffle endpoint requires certificate, key, CA roots, and mutual TLS; plaintext requires the explicit `ExchangeService::with_insecure_internal_dev` opt-in and a literal loopback address. Shuffle clients verify the advertised worker ID against the peer certificate's `worker-<id>` DNS name, and the server rejects RPCs from CA-verified certificates whose parsed node role is not `Worker` before reading frames. This is partial enforcement: the server does not yet bind the peer certificate to a registered worker ID or shard assignment, role denials are only transiently logged, and the rejected RPC does not close its underlying HTTP/2 connection. Keep worker shuffle qualification blocked until durable denial audit, connection rejection, and assignment binding are demonstrated.
+Worker shuffle and native management APIs are separate transport boundaries. A configured worker shuffle endpoint requires certificate, key, CA roots, and mutual TLS; plaintext requires the explicit `ExchangeService::with_insecure_internal_dev` opt-in and a literal loopback address. Shuffle clients verify the advertised worker ID against the peer certificate's `worker-<id>` DNS name. The server rejects non-worker and unregistered identities before reading frames, and rechecks current worker health, lifecycle state, and source-shard ownership for each authenticated frame. Application denials are durably audited through control. A denied gRPC call ends its RPC stream but does not close the underlying HTTP/2 connection; a wrong-node peer therefore remains unauthenticated and every call is rejected. Keep worker shuffle qualification blocked until release-process identity, audit-failure, connection, assignment, and rollover cases are demonstrated.
 
 The native management API requires mTLS and a durable security catalog. Only certificates with a parsed `Cli` node identity are eligible for principal mapping; worker and control-node certificates are rejected and audited even when their fingerprints are listed as login methods. A verified CLI certificate is mapped by SHA-256 fingerprint to an enabled principal; the node role, CLI role flag, and headers do not grant application authority. Each RPC evaluates the principal's current persisted grants for the requested action and scope. A failed handshake, wrong-role certificate, or unmapped certificate establishes no management session. An authorization denial is audited and rejects that operation while preserving the authenticated session. Startup fails when the security catalog is unavailable or has no enabled administrator and mTLS principal. This implementation and its component tests do not constitute the assembled v0.73 qualification sign-off; missing release evidence remains blocking.
 
@@ -179,12 +210,11 @@ RockStream features **zero-downtime in-flight certificate rotation** via `TlsCer
    Concatenate old and new CA certificates into `cluster-ca-bundle.pem` and distribute across the cluster.
 
 3. **Reload Certificates In-Flight**:
-   On Unix, send `SIGHUP` to a control process after replacing its configured
-   certificate, key, and dual-CA bundle. The process reloads listener
-   credentials without restarting; existing connections remain open. Embedded
-   services can use `ControlServiceHandle::reload_tls`. Control nodes and
-   workers may also detect updated certificate files on disk or reload
-   credentials through the control API.
+   On Unix, send `SIGHUP` to a control process or a worker with a configured
+   shuffle listener after replacing its certificate, key, and dual-CA bundle.
+   The process reloads listener credentials without restarting; existing
+   connections remain open. Embedded services can use
+   `ControlServiceHandle::reload_tls`.
 
 4. **Retire Old CA (Post-Grace Window)**:
    Once all nodes have transitioned to Generation 2 leaf certificates, remove Generation 1 CA from the trust bundle.
@@ -224,6 +254,12 @@ degraded health. Stop admitting new authenticated sessions when their
 authentication event cannot be stored, and close an existing session when its
 required denial event cannot be stored.
 
+Prometheus exports `security_audit_retained_records`,
+`security_audit_retained_bytes`, and `security_audit_capacity_bytes` to show
+retention fill. `security_audit_degraded` is 1 while required writes are
+failing; health reports audit storage degradation without marking a ready
+process unhealthy.
+
 Authenticated PGWire clients with the current `security.audit.read` permission
 can read retained security records with `SHOW SECURITY AUDIT [FROM
 <timestamp_ms>] [TO <timestamp_ms>] [AFTER <cursor>] [LIMIT <rows>]`. Time bounds
@@ -244,3 +280,9 @@ retryable conflict without disclosing records.
 Run trusted offline tooling while all RockStream processes for the deployment are stopped. Invoke `rockstream security preprovision-admin --storage <root> --layout <all|gateway> --principal-file <path> --operation-id <id> [--yes]`. The command accepts a JSON `SecurityPrincipal` with an enabled interactive cluster administrator; provide only verifier or public certificate identity material, never a plaintext password or private key. Select `--layout all` for an `all` role deployment, or `--layout gateway` for a `gateway` or `control` deployment. `--storage` must match the deployment's `start --storage` value, and `--operation-id` must be unique for the catalog and reused on retry. The command requires `--yes` in non-interactive use.
 
 The principal and its grant-change audit event commit together; the audit actor is `unknown` because bootstrap has no authenticated application session. The operation rejects a nonempty security catalog, and a retry verifies the committed principal and audit record. It is not a public network operation. Catalog mutations also reject removal, disablement, or downgrade of the last active administrator.
+
+### Offline administrator credential recovery
+
+If an existing administrator loses access to its login credentials, run trusted offline tooling with direct operator access to the durable deployment catalog while all RockStream processes are stopped. The current CLI accepts `rockstream security recover-admin --storage <root> --layout <all|gateway> --principal-id <id> --login-methods-file <path> --operation-id <id> [--yes]`. The file is a JSON array of replacement `LoginMethod` records; it contains verifier or public identity material, never a plaintext password. Reuse the same unique operation ID on retry. The CLI calls `DurableCatalogStore::recover_administrator_credentials`; the catalog increments the principal revision and commits the replacement login methods with an `AdminOperationCompletion` audit record in one transaction. Because this route runs offline, the audit actor is `unknown` and correlation is `not_applicable`.
+
+Recovery only replaces login methods for an enabled principal that already has an interactive cluster Administrator grant. It preserves the principal identity and all grants; it cannot create a principal, promote a role, or self-grant authority. The caller must not expose or log credential material. If the administrator record is absent or the durable catalog cannot be recovered, this method fails closed; restore the trusted deployment state through the documented backup recovery process rather than creating an administrator through an online request.
