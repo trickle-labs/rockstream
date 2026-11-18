@@ -774,6 +774,13 @@ ACK is not attempted, and observes the new owner commit through frontier 5.
 The token-only model does not represent the numeric report value, Kafka group
 behavior, or the wire response; those details remain in the real-cluster evidence.
 
+PR #367 preserves the empty-snapshot lease-token initialization boundary:
+`ShardManagerSnapshot::default()` starts `next_token` at 1, and the first lease
+after restoring that snapshot must be nonzero. The Rust regression
+`restoring_empty_snapshot_keeps_first_lease_token_nonzero` checks it. M4 models
+token equality and authorization, not numeric token allocation, so this fix does
+not add a coordination transition.
+
 Issue #202 preserves secret readability across failed or interrupted KEK
 rotation in `crates/rockstream-control`. Rotation excludes secret reads and
 mutations, stages every rewrapped envelope, and publishes one atomic SlateDB
