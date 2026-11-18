@@ -197,15 +197,6 @@ impl ConfigContributor {
                 source_origin: "rockstream-runtime::server".to_string(),
             },
             ConfigOptionDescriptor {
-                key: "node.deployment_id".to_string(),
-                data_type: "Option<String>".to_string(),
-                default_value: "None".to_string(),
-                description: "Shared deployment identifier required by gateway actor assertions; configure the same value on gateway and control".to_string(),
-                deprecated: false,
-                env_var: Some("ROCKSTREAM_NODE_DEPLOYMENT_ID".to_string()),
-                source_origin: "rockstream-types::config::NodeSection".to_string(),
-            },
-            ConfigOptionDescriptor {
                 key: "skew_split.enabled".to_string(),
                 data_type: "bool".to_string(),
                 default_value: "true".to_string(),

@@ -131,10 +131,12 @@ fn sasl_secret_rotation_updates_native_client_and_version_without_restart() {
         .unwrap());
     let stale_version_error = source
         .rotate_sasl_plain_credentials("kafka_auth", 1, "stale-user", "stale-password")
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
     let wrong_binding_error = source
         .rotate_sasl_plain_credentials("another_secret", 3, "user", "password")
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
 
     assert_eq!(
         (
@@ -151,8 +153,9 @@ fn sasl_secret_rotation_updates_native_client_and_version_without_restart() {
             1,
             0,
             0,
-            "Kafka source secret version moved backwards".to_string(),
-            "rotated secret does not match the Kafka source binding".to_string(),
+            "RS-4001: source I/O error: Kafka source secret version moved backwards".to_string(),
+            "RS-4001: source I/O error: rotated secret does not match the Kafka source binding"
+                .to_string(),
             "RS-4001: source I/O error: Kafka secret sources require security.protocol SASL_SSL or SASL_PLAINTEXT".to_string(),
         )
     );

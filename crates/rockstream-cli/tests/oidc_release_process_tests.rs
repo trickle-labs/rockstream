@@ -2763,7 +2763,18 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
         .batch_execute("BEGIN; INSERT INTO public.orders VALUES (3, 30), (3, 30), (4, NULL);")
         .await
         .unwrap();
-    upstream
+    let (rotation_admin, rotation_admin_connection) = tokio_postgres::connect(
+        &format!(
+            "host={postgres_host} port={postgres_port} user=postgres password=rotation-fixture-value dbname=postgres"
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = rotation_admin_connection.await;
+    });
+    rotation_admin
         .simple_query("ALTER ROLE postgres PASSWORD 'rotated-fixture-value'")
         .await
         .unwrap();
@@ -2916,6 +2927,25 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
     connection_task.abort();
     process.0.kill().unwrap();
     process.0.wait().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let slot_active = upstream
+            .query_opt(
+                "SELECT active FROM pg_replication_slots WHERE slot_name = $1",
+                &[&slot_name],
+            )
+            .await
+            .unwrap()
+            .is_some_and(|row| row.get::<_, bool>(0));
+        if !slot_active {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PostgreSQL replication slot remained active after gateway process destruction"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 
     let store =
         rockstream_storage::build_runtime_object_store(&shard_dir, "gateway-shard").unwrap();

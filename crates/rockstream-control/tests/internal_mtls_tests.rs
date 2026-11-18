@@ -570,6 +570,7 @@ async fn worker_secret_tokens_are_workload_bound_and_recheck_current_grants() {
         .unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
+            auth.catalog.refresh().await.unwrap();
             let records = auth.catalog.list_security_audit_records().await.unwrap();
             if records.iter().any(|record| {
                 record.action == SecurityAuditClass::AuthorizationDenial
