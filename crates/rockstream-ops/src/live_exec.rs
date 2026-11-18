@@ -2429,6 +2429,8 @@ mod tests {
         use std::collections::HashMap;
         let mut net: HashMap<(i64, i64), i64> = HashMap::new();
         for out in [&out1, &out2] {
+            out.validate()
+                .expect("pipeline output must have aligned row weights");
             let k0 = out
                 .data
                 .column(0)
@@ -2441,8 +2443,8 @@ mod tests {
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .unwrap();
-            for i in 0..out.num_rows() {
-                *net.entry((k0.value(i), k1.value(i))).or_insert(0) += out.weights[i];
+            for (i, &weight) in out.weights.iter().enumerate() {
+                *net.entry((k0.value(i), k1.value(i))).or_insert(0) += weight;
             }
         }
         let mut live: Vec<(i64, i64)> = net
