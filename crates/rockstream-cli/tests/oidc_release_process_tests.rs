@@ -240,6 +240,28 @@ async fn oidc_authentication_error(
     }
 }
 
+async fn assert_scram_login_rejected(port: u16, username: &str) {
+    let error = match tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={port} user={username} password=unused dbname=test sslmode=disable"
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("the release SCRAM process accepted service-only principal '{username}'"),
+    };
+    let database_error = error.as_db_error().unwrap();
+    assert_eq!(database_error.code().code(), "28P01");
+    assert_eq!(
+        database_error.message(),
+        format!(
+            "[RS-2401] auth.invalid_password: password authentication failed for user '{username}'. next_steps: Check password and retry"
+        )
+    );
+}
+
 fn oidc_principal() -> SecurityPrincipal {
     SecurityPrincipal {
         format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
@@ -2191,7 +2213,7 @@ async fn release_process_rejects_scram_with_empty_durable_credentials_before_lis
 }
 
 #[tokio::test]
-async fn scram_failures_run_in_release_process_and_audit_after_restart() {
+async fn scram_failures_and_service_only_login_rejection_run_in_release_process() {
     let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let temp = tempfile::tempdir().unwrap();
@@ -2199,12 +2221,74 @@ async fn scram_failures_run_in_release_process_and_audit_after_restart() {
     let shard_dir = storage.join("gateway-shard");
     std::fs::create_dir_all(&shard_dir).unwrap();
     let principal = scram_principal();
+    let service_scope = PolicyScope::Secret {
+        namespace: "public".to_owned(),
+        name: "kafka".to_owned(),
+        consumer: Some(PrincipalId(2)),
+    };
+    let service_principal = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(2),
+        display_name: "Release service-only consumer".to_owned(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::Service {
+            service_id: "release-service-only".to_owned(),
+        }],
+        preset_grants: vec![],
+        scoped_grants: vec![ScopedActionGrant {
+            action: SecurityAction::SecretUse,
+            scope: service_scope,
+        }],
+    };
     let store =
         rockstream_storage::build_runtime_object_store(&shard_dir, "gateway-shard").unwrap();
-    DurableCatalogStore::new(store, "gateway")
+    let catalog = DurableCatalogStore::new(store, "gateway");
+    catalog
         .preprovision_first_administrator(principal.clone(), 1)
         .await
         .unwrap();
+    let service_policy = serde_json::to_string(&(
+        service_principal.enabled,
+        &service_principal.preset_grants,
+        &service_principal.scoped_grants,
+    ))
+    .unwrap();
+    let grant_audit = SecurityAuditRecord {
+        format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: "release-service-only-grant".to_owned(),
+        timestamp_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64,
+        actor: AuditIdentity::Verified("principal:1".to_owned()),
+        target: AuditField::Known("principal:2".to_owned()),
+        scope: AuditField::Known("cluster".to_owned()),
+        action: SecurityAuditClass::GrantChange,
+        outcome: SecurityAuditOutcome::Success,
+        correlation: AuditCorrelation::Unknown,
+        operation_id: AuditField::Known("2".to_owned()),
+        policy_revision: AuditField::Known(1),
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::Known(format!("revision=1;policy={service_policy}")),
+    };
+    catalog
+        .commit_txn(
+            CatalogTxn::new(
+                2,
+                2,
+                vec![CatalogMutation::PutSecurityPrincipal {
+                    principal: service_principal.clone(),
+                    expected_revision: None,
+                    grantor_revision: Some((PrincipalId(1), 1)),
+                    audit: grant_audit.clone(),
+                }],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    drop(catalog);
 
     let tls_key = rcgen::KeyPair::generate().unwrap();
     let tls_cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
@@ -2268,6 +2352,7 @@ async fn scram_failures_run_in_release_process_and_audit_after_restart() {
         wrong_password.as_db_error().unwrap().message(),
         "[RS-2401] auth.invalid_password: password authentication failed for user 'alice'. next_steps: Check password and retry"
     );
+    assert_scram_login_rejected(address.port(), "release-service-only").await;
 
     let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
     let mut startup = Vec::new();
@@ -2317,24 +2402,123 @@ async fn scram_failures_run_in_release_process_and_audit_after_restart() {
     let recovered = DurableCatalogStore::recover(store, "gateway")
         .await
         .unwrap();
+    assert_eq!(recovered.list_security_principals().await.unwrap().len(), 2);
     assert_eq!(
-        recovered.list_security_principals().await.unwrap(),
-        vec![principal]
+        recovered
+            .get_security_principal(principal.id)
+            .await
+            .unwrap(),
+        Some(principal.clone())
+    );
+    assert_eq!(
+        recovered
+            .get_security_principal(service_principal.id)
+            .await
+            .unwrap(),
+        Some(service_principal.clone())
     );
     let records = recovered.list_security_audit_records().await.unwrap();
-    assert_eq!(records.len(), 4);
-    assert_eq!(records[0].action, SecurityAuditClass::GrantChange);
-    assert_eq!(records[0].outcome, SecurityAuditOutcome::Success);
-    assert_eq!(records[1].action, SecurityAuditClass::AuthenticationSuccess);
-    for record in &records[2..] {
+    assert_eq!(records.len(), 6);
+    assert_eq!(
+        records[0],
+        expected_bootstrap_audit(&principal, 1, records[0].timestamp_ms)
+    );
+    assert_eq!(records[1], grant_audit);
+    assert_eq!(records[2].action, SecurityAuditClass::AuthenticationSuccess);
+    assert_eq!(records[2].outcome, SecurityAuditOutcome::Success);
+    assert_eq!(
+        records[2].actor,
+        AuditIdentity::Verified("scram:alice".to_owned())
+    );
+    assert_eq!(
+        records[2].target,
+        AuditField::Known("principal:1".to_owned())
+    );
+    assert_eq!(records[2].policy_revision, AuditField::Known(1));
+    for record in &records[3..] {
         assert_eq!(record.action, SecurityAuditClass::AuthenticationFailure);
         assert_eq!(record.outcome, SecurityAuditOutcome::Failure);
+        assert_eq!(record.scope, AuditField::NotApplicable);
+        assert!(matches!(
+            &record.correlation,
+            AuditCorrelation::Observed(id)
+                if id.len() == 32 && id.chars().all(|character| character.is_ascii_hexdigit())
+        ));
+        assert_eq!(record.operation_id, AuditField::NotApplicable);
+        assert_eq!(record.before_state, AuditField::NotApplicable);
+        assert_eq!(record.after_state, AuditField::NotApplicable);
+        assert!(record.event_id.starts_with("gateway-authn-"));
+        assert_eq!(record.event_id.len(), "gateway-authn-".len() + 32);
+        assert!(record.timestamp_ms > 0);
+    }
+    for record in [&records[3], &records[5]] {
         assert_eq!(
             record.actor,
-            AuditIdentity::Unverified("scram:alice".to_string())
+            AuditIdentity::Unverified("scram:alice".to_owned())
         );
-        assert_eq!(record.target, AuditField::Known("principal:1".to_string()));
+        assert_eq!(record.target, AuditField::Known("principal:1".to_owned()));
+        assert_eq!(record.policy_revision, AuditField::Known(1));
     }
+    assert_eq!(
+        records[4].actor,
+        AuditIdentity::Unverified("scram:release-service-only".to_owned())
+    );
+    assert_eq!(records[4].target, AuditField::Unknown);
+    assert_eq!(records[4].policy_revision, AuditField::Unknown);
+
+    let records_before_restart = records;
+    let restarted_address: std::net::SocketAddr =
+        format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut restarted_process = start_gateway_process(
+        temp.path(),
+        &storage,
+        restarted_address,
+        &cert_path,
+        &key_path,
+        "scram",
+        None,
+        "",
+        "",
+        "",
+    );
+    wait_for_gateway(&mut restarted_process.0, restarted_address).await;
+    assert_scram_login_rejected(restarted_address.port(), "release-service-only").await;
+    restarted_process.0.kill().unwrap();
+    restarted_process.0.wait().unwrap();
+
+    let store =
+        rockstream_storage::build_runtime_object_store(&shard_dir, "gateway-shard").unwrap();
+    let recovered = DurableCatalogStore::recover(store, "gateway")
+        .await
+        .unwrap();
+    assert_eq!(
+        recovered
+            .get_security_principal(service_principal.id)
+            .await
+            .unwrap(),
+        Some(service_principal)
+    );
+    let records = recovered.list_security_audit_records().await.unwrap();
+    assert_eq!(records.len(), 7);
+    assert_eq!(&records[..6], records_before_restart.as_slice());
+    let failure = &records[6];
+    assert_eq!(failure.action, SecurityAuditClass::AuthenticationFailure);
+    assert_eq!(failure.outcome, SecurityAuditOutcome::Failure);
+    assert_eq!(
+        failure.actor,
+        AuditIdentity::Unverified("scram:release-service-only".to_owned())
+    );
+    assert_eq!(failure.target, AuditField::Unknown);
+    assert_eq!(failure.policy_revision, AuditField::Unknown);
+    assert_eq!(failure.scope, AuditField::NotApplicable);
+    assert_eq!(failure.operation_id, AuditField::NotApplicable);
+    assert_eq!(failure.before_state, AuditField::NotApplicable);
+    assert_eq!(failure.after_state, AuditField::NotApplicable);
+    assert!(matches!(
+        &failure.correlation,
+        AuditCorrelation::Observed(id)
+            if id.len() == 32 && id.chars().all(|character| character.is_ascii_hexdigit())
+    ));
     assert!(!serde_json::to_string(&records).unwrap().contains("pencil"));
 }
 
