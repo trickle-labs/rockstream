@@ -1,6 +1,12 @@
 # RockStream Metrics Reference
  
 RockStream exports OpenMetrics / Prometheus metrics over HTTP via the `--metrics-addr` endpoint or gateway `/metrics` handler.
+
+## Authentication Cache Metrics
+
+| Metric | Type | Unit | Description |
+|---|---|---|---|
+| `jwks_cache_size` | Gauge | keys | Number of usable RS256 signing keys in the configured gateway issuer cache; zero after cache expiry or verifier shutdown. Maximum: 100 keys. |
  
 ## Freshness Lag & Attributable Stage Lag Metrics
  

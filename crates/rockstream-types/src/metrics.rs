@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
@@ -456,6 +456,8 @@ struct MetricRegistry {
     exchange_pool_clients_size: AtomicU64,
     webhook_pending_size: AtomicU64,
     mtls_cn_cache_size: AtomicU64,
+    jwks_cache_size: AtomicU64,
+    jwks_cache_expires_at: Option<Instant>,
 
     // Stage lag & Barrier flight metrics
     view_stage_lags: HashMap<String, StageLagBreakdown>,
@@ -610,6 +612,8 @@ impl MetricRegistry {
             exchange_pool_clients_size: AtomicU64::new(0),
             webhook_pending_size: AtomicU64::new(0),
             mtls_cn_cache_size: AtomicU64::new(0),
+            jwks_cache_size: AtomicU64::new(0),
+            jwks_cache_expires_at: None,
             view_stage_lags: HashMap::new(),
             stage_timestamps: HashMap::new(),
             barrier_flight_samples: Vec::new(),
@@ -1322,6 +1326,8 @@ pub fn reset_all() {
         reg.exchange_pool_clients_size.store(0, Ordering::Relaxed);
         reg.webhook_pending_size.store(0, Ordering::Relaxed);
         reg.mtls_cn_cache_size.store(0, Ordering::Relaxed);
+        reg.jwks_cache_size.store(0, Ordering::Relaxed);
+        reg.jwks_cache_expires_at = None;
         reg.view_stage_lags.clear();
         reg.stage_timestamps.clear();
         reg.barrier_flight_samples.clear();
@@ -2310,6 +2316,28 @@ pub fn read_mtls_cn_cache_size() -> u64 {
     with_registry(|reg| reg.mtls_cn_cache_size.load(Ordering::Relaxed))
 }
 
+pub fn set_jwks_cache_size(size: u64, expires_at: Option<Instant>) {
+    with_registry(|reg| {
+        reg.jwks_cache_size.store(size, Ordering::Relaxed);
+        reg.jwks_cache_expires_at = expires_at;
+    });
+}
+
+fn current_jwks_cache_size(reg: &MetricRegistry) -> u64 {
+    if reg
+        .jwks_cache_expires_at
+        .is_some_and(|expires_at| Instant::now() >= expires_at)
+    {
+        0
+    } else {
+        reg.jwks_cache_size.load(Ordering::Relaxed)
+    }
+}
+
+pub fn read_jwks_cache_size() -> u64 {
+    with_registry(|reg| current_jwks_cache_size(reg))
+}
+
 pub fn inc_shuffle_compression_disabled_total() {
     with_registry(|reg| {
         reg.shuffle_compression_disabled_total
@@ -2997,6 +3025,13 @@ pub fn generate_prometheus_metrics() -> String {
             reg.mtls_cn_cache_size.load(Ordering::Relaxed)
         ));
 
+        out.push_str("# HELP jwks_cache_size Gauge showing usable cached OIDC signing keys.\n");
+        out.push_str("# TYPE jwks_cache_size gauge\n");
+        out.push_str(&format!(
+            "jwks_cache_size {}\n\n",
+            current_jwks_cache_size(reg)
+        ));
+
         out.push_str("# HELP checkpoint_export_objects_in_flight Gauge showing checkpoint export copies in flight.\n");
         out.push_str("# TYPE checkpoint_export_objects_in_flight gauge\n");
         out.push_str(&format!(
@@ -3614,6 +3649,51 @@ mod tests {
     /// concurrent test threads don't corrupt each other's `reset_all` / `inc`
     /// sequences.
     static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    #[test]
+    fn jwks_cache_size_metric_exports_only_unexpired_keys() {
+        let _g = TEST_LOCK.lock().unwrap();
+        reset_all();
+        set_jwks_cache_size(2, Some(Instant::now() + Duration::from_secs(1)));
+        let active: Vec<_> = generate_prometheus_metrics()
+            .lines()
+            .filter(|line| {
+                line.starts_with("# HELP jwks_cache_size")
+                    || line.starts_with("# TYPE jwks_cache_size")
+                    || line.starts_with("jwks_cache_size ")
+            })
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            active,
+            [
+                "# HELP jwks_cache_size Gauge showing usable cached OIDC signing keys.",
+                "# TYPE jwks_cache_size gauge",
+                "jwks_cache_size 2",
+            ]
+        );
+
+        set_jwks_cache_size(2, Some(Instant::now() - Duration::from_secs(1)));
+        assert_eq!(read_jwks_cache_size(), 0);
+        let expired: Vec<_> = generate_prometheus_metrics()
+            .lines()
+            .filter(|line| {
+                line.starts_with("# HELP jwks_cache_size")
+                    || line.starts_with("# TYPE jwks_cache_size")
+                    || line.starts_with("jwks_cache_size ")
+            })
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            expired,
+            [
+                "# HELP jwks_cache_size Gauge showing usable cached OIDC signing keys.",
+                "# TYPE jwks_cache_size gauge",
+                "jwks_cache_size 0",
+            ]
+        );
+        reset_all();
+    }
 
     #[test]
     fn operator_runtime_stats_filter_ids_and_expire_after_sixty_seconds() {
