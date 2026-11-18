@@ -4402,7 +4402,7 @@ async fn operator_only_management_access_keeps_artifacts_and_denies_backup_creat
     .await;
     wait_for_gateway(&mut process.0, control_address).await;
 
-    let _admin = wait_for_management_client(management_address, &pki).await;
+    let mut admin = wait_for_management_client(management_address, &pki).await;
     let mut client = management_client_with_identity(
         management_address,
         &pki,
@@ -4444,6 +4444,23 @@ async fn operator_only_management_access_keeps_artifacts_and_denies_backup_creat
     assert_eq!(String::from_utf8(content).unwrap(), expected_content);
     assert_eq!(expires_at_ms, artifact.expires_at_ms);
 
+    let principal_request = rockstream_management_proto::v1::ListSecurityPrincipalsRequest {
+        protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+        page_size: 100,
+        page_token: String::new(),
+    };
+    let before_principals = admin
+        .list_security_principals(principal_request.clone())
+        .await
+        .unwrap()
+        .into_inner()
+        .principals;
+    let operator_before = before_principals
+        .iter()
+        .find(|principal| principal.principal_id == 2)
+        .unwrap()
+        .clone();
+
     let operations_request = ListOperationsRequest {
         protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
         page_size: 100,
@@ -4454,6 +4471,33 @@ async fn operator_only_management_access_keeps_artifacts_and_denies_backup_creat
         .await
         .unwrap()
         .into_inner();
+    let denied_grant_key = uuid::Uuid::new_v4().to_string();
+    let grant_denial = client
+        .set_security_principal_grants(SetSecurityPrincipalGrantsRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            principal_id: 2,
+            expected_revision: 1,
+            expected_grantor_revision: 1,
+            idempotency_key: denied_grant_key.clone(),
+            preset_grants: ["data_reader", "administrator"]
+                .into_iter()
+                .map(
+                    |preset| rockstream_management_proto::v1::SecurityPresetGrant {
+                        preset: preset.to_owned(),
+                        scope_json: serde_json::to_string(&PolicyScope::Cluster).unwrap(),
+                    },
+                )
+                .collect(),
+            scoped_grants: Vec::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(grant_denial.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        grant_denial.message(),
+        "management action is not authorized"
+    );
+
     let backup_destination = temp.path().join("operator-only-backup");
     let denied_key = uuid::Uuid::new_v4().to_string();
     let denial = client
@@ -4476,8 +4520,23 @@ async fn operator_only_management_access_keeps_artifacts_and_denies_backup_creat
     assert!(!after_denial
         .operations
         .iter()
+        .any(|operation| operation.operation_id == denied_grant_key));
+    assert!(!after_denial
+        .operations
+        .iter()
         .any(|operation| operation.operation_id == denied_key));
     assert!(!backup_destination.exists());
+    let after_principals = admin
+        .list_security_principals(principal_request)
+        .await
+        .unwrap()
+        .into_inner()
+        .principals;
+    let operator_after = after_principals
+        .iter()
+        .find(|principal| principal.principal_id == 2)
+        .unwrap();
+    assert_eq!(operator_after, &operator_before);
 
     process.0.kill().unwrap();
     process.0.wait().unwrap();
@@ -4492,32 +4551,46 @@ async fn operator_only_management_access_keeps_artifacts_and_denies_backup_creat
     let audits = catalog.list_security_audit_records().await.unwrap();
     let denials = audits
         .iter()
-        .filter(|record| {
-            record.action == SecurityAuditClass::AuthorizationDenial
-                && record.target == AuditField::Known("BackupCreate".to_owned())
-        })
+        .filter(|record| record.action == SecurityAuditClass::AuthorizationDenial)
         .collect::<Vec<_>>();
-    assert_eq!(denials.len(), 1);
-    let denial = denials[0];
-    assert_eq!(
-        denial.actor,
-        AuditIdentity::Verified("principal:2".to_owned())
-    );
-    assert_eq!(
-        denial.scope,
-        AuditField::Known(
-            serde_json::to_string(&PolicyScope::BackupDestination {
+    assert_eq!(denials.len(), 2);
+    for (target, scope) in [
+        ("GrantManage", PolicyScope::Cluster),
+        (
+            "BackupCreate",
+            PolicyScope::BackupDestination {
                 destination: backup_destination.to_string_lossy().into_owned(),
-            })
-            .unwrap()
-        )
-    );
-    assert_eq!(denial.outcome, SecurityAuditOutcome::Denied);
-    assert_eq!(denial.correlation, AuditCorrelation::Unknown);
-    assert_eq!(denial.operation_id, AuditField::NotApplicable);
-    assert_eq!(denial.policy_revision, AuditField::Known(1));
-    assert_eq!(denial.before_state, AuditField::NotApplicable);
-    assert_eq!(denial.after_state, AuditField::NotApplicable);
+            },
+        ),
+    ] {
+        let matching = denials
+            .iter()
+            .copied()
+            .filter(|record| record.target == AuditField::Known(target.to_owned()))
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1);
+        let denial = matching[0];
+        assert!(denial.event_id.starts_with("management-denial-"));
+        assert!(denial.timestamp_ms > 0);
+        assert_eq!(
+            denial,
+            &SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: denial.event_id.clone(),
+                timestamp_ms: denial.timestamp_ms,
+                actor: AuditIdentity::Verified("principal:2".to_owned()),
+                target: AuditField::Known(target.to_owned()),
+                scope: AuditField::Known(serde_json::to_string(&scope).unwrap()),
+                action: SecurityAuditClass::AuthorizationDenial,
+                outcome: SecurityAuditOutcome::Denied,
+                correlation: AuditCorrelation::Unknown,
+                operation_id: AuditField::NotApplicable,
+                policy_revision: AuditField::Known(1),
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::NotApplicable,
+            }
+        );
+    }
 }
 
 #[tokio::test]
