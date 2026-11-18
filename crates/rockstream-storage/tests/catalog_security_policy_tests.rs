@@ -5,8 +5,9 @@ use object_store::{ObjectStore, ObjectStoreExt};
 use rockstream_storage::catalog::*;
 use rockstream_types::authorization::{
     AuditCorrelation, AuditField, AuditIdentity, LoginMethod, PermissionPreset, PolicyScope,
-    ScopedPresetGrant, SecurityAuditClass, SecurityAuditOutcome, SecurityAuditRecord,
-    SecurityPrincipal, SECURITY_AUDIT_FORMAT_VERSION, SECURITY_PRINCIPAL_FORMAT_VERSION,
+    ScopedActionGrant, ScopedPresetGrant, SecurityAction, SecurityAuditClass, SecurityAuditOutcome,
+    SecurityAuditRecord, SecurityPrincipal, SECURITY_AUDIT_FORMAT_VERSION,
+    SECURITY_PRINCIPAL_FORMAT_VERSION,
 };
 use rockstream_types::ids::PrincipalId;
 use std::collections::BTreeSet;
@@ -314,6 +315,163 @@ async fn first_administrator_preprovision_is_atomic_audited_and_one_time() {
     assert_eq!(
         recovered.list_security_audit_records().await.unwrap(),
         vec![expected_audit]
+    );
+}
+
+#[tokio::test]
+async fn offline_administrator_recovery_replaces_login_and_reconciles_after_store_recovery() {
+    let object_store = Arc::new(InMemory::new());
+    let catalog = DurableCatalogStore::new(object_store.clone(), "admin-recovery");
+    let mut administrator = admin(79, 1);
+    administrator.scoped_grants.push(ScopedActionGrant {
+        action: SecurityAction::BackupInspect,
+        scope: PolicyScope::BackupDestination {
+            destination: "backup-a".into(),
+        },
+    });
+    catalog
+        .preprovision_first_administrator(administrator.clone(), 903)
+        .await
+        .unwrap();
+
+    let replacement_login = vec![LoginMethod::ScramSha256 {
+        username: "recovered-admin".into(),
+        salt: vec![4; 16],
+        iterations: 4096,
+        stored_key: vec![5; 32],
+        server_key: vec![6; 32],
+    }];
+    assert_eq!(
+        catalog
+            .recover_administrator_credentials(administrator.id, replacement_login.clone(), 904,)
+            .await
+            .unwrap(),
+        2
+    );
+    let mut recovered_admin = administrator.clone();
+    recovered_admin.revision = 2;
+    recovered_admin.login_methods = replacement_login.clone();
+    assert_eq!(
+        catalog
+            .get_security_principal(administrator.id)
+            .await
+            .unwrap(),
+        Some(recovered_admin.clone())
+    );
+    let audits = catalog.list_security_audit_records().await.unwrap();
+    assert_eq!(audits.len(), 2);
+    let recovery_audit = audits.last().unwrap();
+    assert_eq!(
+        recovery_audit,
+        &SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: "offline-admin-recovery:904".into(),
+            timestamp_ms: recovery_audit.timestamp_ms,
+            actor: AuditIdentity::Unknown,
+            target: AuditField::Known("principal:79".into()),
+            scope: AuditField::Known("cluster".into()),
+            action: SecurityAuditClass::AdminOperationCompletion,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::NotApplicable,
+            operation_id: AuditField::Known("904".into()),
+            policy_revision: AuditField::Known(2),
+            before_state: AuditField::Known(policy_state(&administrator)),
+            after_state: AuditField::Known(policy_state(&recovered_admin)),
+        }
+    );
+
+    assert_eq!(
+        catalog
+            .recover_administrator_credentials(administrator.id, replacement_login.clone(), 904,)
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(catalog.list_security_audit_records().await.unwrap(), audits);
+    assert!(matches!(
+        catalog
+            .recover_administrator_credentials(
+                administrator.id,
+                vec![LoginMethod::Oidc {
+                    issuer: "https://issuer.invalid".into(),
+                    subject: "other-admin".into(),
+                }],
+                904,
+            )
+            .await,
+        Err(CatalogError::InvalidSecurityPolicy(message))
+            if message == "offline recovery operation ID is already committed to a different change"
+    ));
+
+    let mut forged_recovery = recovered_admin.clone();
+    forged_recovery.revision = 3;
+    forged_recovery.scoped_grants.clear();
+    forged_recovery.login_methods = vec![LoginMethod::ScramSha256 {
+        username: "third-admin".into(),
+        salt: vec![7; 16],
+        iterations: 4096,
+        stored_key: vec![8; 32],
+        server_key: vec![9; 32],
+    }];
+    let forged_audit = SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: "offline-admin-recovery:905".into(),
+        timestamp_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64,
+        actor: AuditIdentity::Unknown,
+        target: AuditField::Known("principal:79".into()),
+        scope: AuditField::Known("cluster".into()),
+        action: SecurityAuditClass::AdminOperationCompletion,
+        outcome: SecurityAuditOutcome::Success,
+        correlation: AuditCorrelation::NotApplicable,
+        operation_id: AuditField::Known("905".into()),
+        policy_revision: AuditField::Known(3),
+        before_state: AuditField::Known(policy_state(&recovered_admin)),
+        after_state: AuditField::Known(policy_state(&forged_recovery)),
+    };
+    assert!(matches!(
+        catalog
+            .commit_txn(
+                CatalogTxn::new(
+                    3,
+                    905,
+                    vec![CatalogMutation::RecoverAdministratorCredentials {
+                        principal: forged_recovery,
+                        expected_revision: 2,
+                        audit: forged_audit,
+                    }],
+                )
+                .unwrap(),
+            )
+            .await,
+        Err(CatalogError::InvalidSecurityPolicy(message))
+            if message == "offline recovery may only replace login methods for an existing active administrator"
+    ));
+    assert_eq!(catalog.get_revision().await, 2);
+    assert_eq!(catalog.list_security_audit_records().await.unwrap(), audits);
+
+    let recovered = DurableCatalogStore::recover(object_store, "admin-recovery")
+        .await
+        .unwrap();
+    assert_eq!(
+        recovered
+            .recover_administrator_credentials(administrator.id, replacement_login, 904,)
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        recovered
+            .get_security_principal(administrator.id)
+            .await
+            .unwrap(),
+        Some(recovered_admin)
+    );
+    assert_eq!(
+        recovered.list_security_audit_records().await.unwrap(),
+        audits
     );
 }
 

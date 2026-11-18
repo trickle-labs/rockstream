@@ -59,7 +59,7 @@ async fn register_worker(
     assert!(matches!(
         serde_json::from_str::<rockstream_types::topology::ControlMessage>(response.trim())
             .unwrap(),
-        rockstream_types::topology::ControlMessage::Registered { worker_id } if worker_id == WorkerId(id)
+        rockstream_types::topology::ControlMessage::Registered { worker_id, .. } if worker_id == WorkerId(id)
     ));
     reader
 }

@@ -1475,6 +1475,11 @@ impl ManagementMigrationRuntime {
         if let Some(store) = &self.shard_store {
             store.save(&self.shard_manager.snapshot()).await;
         }
+        broadcast_message(
+            &self.worker_senders,
+            topology_changed_message(&self.catalog, &self.shard_manager),
+        )
+        .await;
         if self
             .operations
             .transition(
@@ -1603,6 +1608,11 @@ impl ManagementMigrationRuntime {
         if let Some(store) = &self.shard_store {
             store.save(&self.shard_manager.snapshot()).await;
         }
+        broadcast_message(
+            &self.worker_senders,
+            topology_changed_message(&self.catalog, &self.shard_manager),
+        )
+        .await;
         let sender = self
             .worker_senders
             .lock()
@@ -2255,6 +2265,12 @@ async fn deploy_workload(
         );
     }
 
+    broadcast_message(
+        worker_senders,
+        topology_changed_message(catalog, shard_manager),
+    )
+    .await;
+
     data_plane.lock().await.deployments.insert(
         workload_id,
         DeploymentState {
@@ -2762,6 +2778,11 @@ async fn process_drain_queue(
         } else {
             current_lease
         };
+        broadcast_message(
+            worker_senders,
+            topology_changed_message(catalog, shard_manager),
+        )
+        .await;
         if donor_sender
             .send(ControlMessage::ShardRevoked {
                 shard_id: task.shard_id,
@@ -2988,6 +3009,33 @@ async fn append_node_identity_rejection(
     };
     if let Err(error) = crate::management::append_security_audit(catalog.as_ref(), record).await {
         tracing::error!(code = %RS_0003, %error, "required node identity audit append failed");
+        return false;
+    }
+    true
+}
+
+async fn append_validated_security_audit(
+    catalog: Option<&Arc<dyn CatalogStore>>,
+    request_id: &str,
+    record: SecurityAuditRecord,
+) -> bool {
+    if request_id != record.event_id
+        || record.validate().is_err()
+        || !matches!(
+            record.action,
+            SecurityAuditClass::AuthorizationDenial | SecurityAuditClass::NodeIdentityRejection
+        )
+        || record.outcome != SecurityAuditOutcome::Denied
+    {
+        tracing::error!(code = %RS_0003, "worker reported an invalid security audit record");
+        return false;
+    }
+    let Some(catalog) = catalog else {
+        tracing::error!(code = %RS_0003, "required worker security audit catalog is unavailable");
+        return false;
+    };
+    if let Err(error) = crate::management::append_security_audit(catalog.as_ref(), record).await {
+        tracing::error!(code = %RS_0003, %error, "required worker security audit append failed");
         return false;
     }
     true
@@ -4177,6 +4225,68 @@ async fn handle_connection_stream<R, W>(
                         send_message(&sender, &reply).await;
                         return;
                     }
+                    if !reg
+                        .protocol_range
+                        .contains(rockstream_types::compatibility::ProtocolVersion::V3)
+                    {
+                        let record = SecurityAuditRecord {
+                            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                            event_id: format!("worker-protocol-denial:{}", uuid::Uuid::new_v4()),
+                            timestamp_ms: now_ms().max(1),
+                            actor: AuditIdentity::Verified(id.to_cn()),
+                            target: AuditField::Known(reg.worker_id.to_string()),
+                            scope: AuditField::Known("worker_control".to_owned()),
+                            action: SecurityAuditClass::AuthorizationDenial,
+                            outcome: SecurityAuditOutcome::Denied,
+                            correlation: AuditCorrelation::Unknown,
+                            operation_id: AuditField::NotApplicable,
+                            policy_revision: AuditField::NotApplicable,
+                            before_state: AuditField::NotApplicable,
+                            after_state: AuditField::NotApplicable,
+                        };
+                        let request_id = record.event_id.clone();
+                        if !append_validated_security_audit(
+                            security_catalog.as_ref(),
+                            &request_id,
+                            record,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        let event = AuditEvent::now(
+                            id.to_cn(),
+                            "security.internal_mtls_denied",
+                            format!("worker_id={}, peer={peer}", reg.worker_id),
+                        )
+                        .with_error_code(rockstream_types::error_code::RS_5021.to_string())
+                        .with_detail(format!(
+                            "worker protocol range {:?} does not include v3 required for audited authenticated shard ownership",
+                            reg.protocol_range
+                        ));
+                        if !append_required_security_audit(
+                            audit.as_ref(),
+                            &event,
+                            "worker protocol version rejection",
+                        ) {
+                            return;
+                        }
+                        send_message(
+                            &sender,
+                            &ControlMessage::OperationFailed {
+                                code: rockstream_types::error_code::RS_5021.to_string(),
+                                message:
+                                    "RS-5021: authenticated worker shuffle requires protocol v3"
+                                        .to_owned(),
+                                next_steps: rockstream_types::error_code::next_steps(
+                                    rockstream_types::error_code::RS_5021,
+                                )
+                                .to_string(),
+                            },
+                        )
+                        .await;
+                        return;
+                    }
                 }
                 let worker_id = catalog.register(&reg);
                 connected_worker_id = Some(worker_id);
@@ -4212,13 +4322,14 @@ async fn handle_connection_stream<R, W>(
                 if let Some(worker) = catalog.get(worker_id) {
                     persist_worker_if_needed(topology_store.as_ref(), &worker).await;
                 }
-                let reply = ControlMessage::Registered { worker_id };
+                let reply = ControlMessage::Registered {
+                    worker_id,
+                    protocol_version: rockstream_types::compatibility::ProtocolVersion::V3,
+                };
                 send_message(&sender, &reply).await;
                 broadcast_message(
                     &worker_senders,
-                    ControlMessage::TopologyChanged {
-                        workers: catalog.healthy_workers(),
-                    },
+                    topology_changed_message(&catalog, &shard_manager),
                 )
                 .await;
                 let acked = drain_state
@@ -4243,6 +4354,28 @@ async fn handle_connection_stream<R, W>(
                     )
                     .await;
                 }
+            }
+            WorkerMessage::ReportSecurityAudit { request_id, record } => {
+                let authenticated_reporter = peer_identity.as_ref().is_some_and(|identity| {
+                    connected_worker_id.is_some_and(|worker_id| {
+                        identity.role == NodeRole::Worker && identity.matches_worker_id(worker_id.0)
+                    })
+                });
+                let persisted = authenticated_reporter
+                    && append_validated_security_audit(
+                        security_catalog.as_ref(),
+                        &request_id,
+                        record,
+                    )
+                    .await;
+                send_message(
+                    &sender,
+                    &ControlMessage::SecurityAuditRecorded {
+                        request_id,
+                        persisted,
+                    },
+                )
+                .await;
             }
             WorkerMessage::DeployWorkload(request) => {
                 deploy_workload(
@@ -4558,8 +4691,7 @@ async fn handle_connection_stream<R, W>(
                     }
                 }
                 // Notify remaining workers about topology change.
-                let workers = catalog.healthy_workers();
-                let notify = ControlMessage::TopologyChanged { workers };
+                let notify = topology_changed_message(&catalog, &shard_manager);
                 broadcast_message(&worker_senders, notify).await;
             }
             WorkerMessage::RequestShard {
@@ -4684,6 +4816,11 @@ async fn handle_connection_stream<R, W>(
                         if let Some(store) = &shard_store {
                             persist_shard_state(&shard_manager, store).await;
                         }
+                        broadcast_message(
+                            &worker_senders,
+                            topology_changed_message(&catalog, &shard_manager),
+                        )
+                        .await;
                         let reply = ControlMessage::ShardAssigned {
                             lease,
                             operation_id: None,
@@ -5377,6 +5514,7 @@ async fn handle_connection_stream<R, W>(
                             }
                         }
                         Err(error) => tracing::error!(
+                            code = %rockstream_types::error_code::RS_2425,
                             worker_id = %worker_id,
                             secret_name = %rotation.secret_name,
                             ?error,
@@ -5457,9 +5595,7 @@ async fn handle_connection_stream<R, W>(
         }
         broadcast_message(
             &worker_senders,
-            ControlMessage::TopologyChanged {
-                workers: catalog.healthy_workers(),
-            },
+            topology_changed_message(&catalog, &shard_manager),
         )
         .await;
     }
@@ -5472,6 +5608,16 @@ async fn handle_connection_stream<R, W>(
 async fn send_message(sender: &mpsc::Sender<ControlMessage>, msg: &ControlMessage) {
     if sender.send(msg.clone()).await.is_err() {
         tracing::warn!("control: connection writer closed");
+    }
+}
+
+fn topology_changed_message(
+    catalog: &TopologyCatalog,
+    shard_manager: &ShardManager,
+) -> ControlMessage {
+    ControlMessage::TopologyChanged {
+        workers: catalog.healthy_workers(),
+        shard_leases: shard_manager.leases(),
     }
 }
 
@@ -5751,7 +5897,7 @@ mod tests {
         let resp = send_and_recv(&mut stream, &WorkerMessage::Register(reg)).await;
         let reply: ControlMessage = serde_json::from_str(resp.trim()).unwrap();
         match reply {
-            ControlMessage::Registered { worker_id } => {
+            ControlMessage::Registered { worker_id, .. } => {
                 assert_eq!(worker_id, WorkerId(1));
             }
             _ => panic!("expected Registered reply"),

@@ -5205,6 +5205,29 @@ impl GatewayHandler {
         shard_db: &Arc<rockstream_storage::ShardDb>,
     ) -> Result<(), GatewayError> {
         let mut coordinator = coordinator.lock().await;
+        // A newly attached alias may point to a different PostgreSQL table
+        // than the first source using this shared slot. Check its partition
+        // publication before reading or publishing a view from it.
+        let imported = self.catalog.source_table(&source.name).ok_or_else(|| {
+            GatewayError::QueryTimeExecutionFailed {
+                detail: format!("source '{}' is not bound to a table", source.name),
+            }
+        })?;
+        let upstream_table = source
+            .options
+            .get("table")
+            .map(String::as_str)
+            .unwrap_or(&imported.name);
+        let lease = coordinator.owner_lease.clone().ok_or_else(|| {
+            GatewayError::QueryTimeExecutionFailed {
+                detail: "RS-4013: pgoutput coordinator owner is fenced".to_string(),
+            }
+        })?;
+        coordinator
+            .runtime
+            .validate_pgoutput_table(&lease, upstream_table)
+            .await
+            .map_err(source_backfill_error)?;
         let _guard = self.shard_commit_lock.lock().await;
         self.recover_pending_views_locked().await?;
         self.validate_pgoutput_lifecycles(&coordinator).await?;
@@ -5590,6 +5613,32 @@ impl GatewayHandler {
                     .open_pgoutput(&lease)
                     .await
                     .map_err(|_| ())?;
+                // Revalidate all existing imported aliases on restart. One
+                // shared slot can contain multiple independently imported
+                // tables, including a partitioned root not used by the first
+                // alias that opened the physical connection.
+                let restored_aliases = handler.pgoutput_source_aliases(connector_id);
+                for alias in &restored_aliases {
+                    let upstream_table = alias.options.get("table").cloned().or_else(|| {
+                        handler
+                            .catalog
+                            .source_table(&alias.name)
+                            .map(|table| table.name)
+                    });
+                    if let Some(upstream_table) = upstream_table {
+                        if let Err(error) = coordinator
+                            .runtime
+                            .validate_pgoutput_table(&lease, &upstream_table)
+                            .await
+                        {
+                            handler.block_pgoutput_aliases(
+                                &restored_aliases,
+                                format!("pgoutput publication validation failed: {error}"),
+                            );
+                            return Err(());
+                        }
+                    }
+                }
                 let durable_lsn = rockstream_connectors::PgLsn::from_offset_token(
                     coordinator.runtime.committed_offset(),
                 )
@@ -5747,6 +5796,9 @@ impl GatewayHandler {
                     Some(old_values),
                     None,
                 ),
+                PgOutputEvent::Truncate {
+                    xid, relation_ids, ..
+                } => coordinator.push_truncate(xid, &relation_ids),
                 PgOutputEvent::Commit { xid, commit_lsn } => {
                     match coordinator.finish_envelope(xid, commit_lsn) {
                         Ok(envelope) => {
@@ -6128,28 +6180,19 @@ impl GatewayHandler {
                 )
             })
             .collect::<HashMap<_, _>>();
-        let mut ops = Vec::new();
-        for change in &envelope.changes {
-            let route = staged_routes
-                .get(&change.relation_id)
-                .copied()
-                .or_else(|| coordinator.relation_routes.get(&change.relation_id))
-                .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
-                    detail: format!(
-                        "RS-4013: pgoutput relation {} has no durable route",
-                        change.relation_id
-                    ),
-                })?;
-            if route.schema_version != change.schema_version {
-                return Err(GatewayError::QueryTimeExecutionFailed {
-                    detail: format!(
-                        "RS-1002: pgoutput relation {} change used schema version {}, expected {}",
-                        change.relation_id, change.schema_version, route.schema_version
-                    ),
-                });
-            }
-            ops.push(pgoutput_change_to_dml(route, change)?);
-        }
+        let mut resolved_routes = coordinator
+            .relation_routes
+            .iter()
+            .map(|(&id, route)| (id, route))
+            .collect::<HashMap<_, _>>();
+        resolved_routes.extend(staged_routes.iter().map(|(&id, &route)| (id, route)));
+        // Read the pre-TRUNCATE table images under the shard commit lock, then
+        // expand ordered markers into row retractions before the M3 write.
+        // A failed/incomplete scan must never advance the PostgreSQL LSN.
+        let truncate_images =
+            load_pgoutput_truncate_images(shard_db, &envelope.changes, &resolved_routes).await?;
+        let ops =
+            pgoutput_envelope_to_dml_ops(&envelope.changes, &resolved_routes, truncate_images)?;
         let changed_relations = ops
             .iter()
             .map(dml_table_name)
@@ -6282,9 +6325,7 @@ impl GatewayHandler {
                 .unwrap_or_else(|| SnapshotDeltaFence::new(offset.clone(), offset.clone()));
             let estimated_rows = previous
                 .as_ref()
-                .map_or(envelope.changes.len() as u64, |lifecycle| {
-                    lifecycle.estimated_rows
-                });
+                .map_or(ops.len() as u64, |lifecycle| lifecycle.estimated_rows);
             lifecycles.push(BackfillLifecycle::new(
                 BackfillPhase::Running,
                 BackfillCursor::new(view_name, 0, offset.as_bytes().to_vec(), fence, epoch),
@@ -19563,6 +19604,17 @@ fn pgoutput_change_to_dml(
     route: &RelationRoute,
     change: &EncodedChange,
 ) -> Result<DmlOp, GatewayError> {
+    let EncodedChange::Row {
+        operation,
+        old_values,
+        new_values,
+        ..
+    } = change
+    else {
+        return Err(pgoutput_truncate_error(
+            "TRUNCATE marker must be expanded before row conversion",
+        ));
+    };
     let names = route
         .columns
         .iter()
@@ -19589,9 +19641,9 @@ fn pgoutput_change_to_dml(
             .collect::<Vec<_>>();
         Ok((values.join("\t"), build_row_key(&names, &values)))
     };
-    match change.operation {
+    match operation {
         CdcOperation::Insert => {
-            let (values_tsv, row_key) = row(&change.new_values, "INSERT")?;
+            let (values_tsv, row_key) = row(new_values, "INSERT")?;
             Ok(DmlOp::Insert {
                 table: route.imported_table_name.clone(),
                 cols: names,
@@ -19600,8 +19652,8 @@ fn pgoutput_change_to_dml(
             })
         }
         CdcOperation::Update => {
-            let (old_tsv, old_row_key) = row(&change.old_values, "UPDATE old")?;
-            let (new_tsv, new_row_key) = row(&change.new_values, "UPDATE new")?;
+            let (old_tsv, old_row_key) = row(old_values, "UPDATE old")?;
+            let (new_tsv, new_row_key) = row(new_values, "UPDATE new")?;
             Ok(DmlOp::Update {
                 table: route.imported_table_name.clone(),
                 old_row_key,
@@ -19611,13 +19663,381 @@ fn pgoutput_change_to_dml(
             })
         }
         CdcOperation::Delete => {
-            let (returning_tsv, row_key) = row(&change.old_values, "DELETE")?;
+            let (returning_tsv, row_key) = row(old_values, "DELETE")?;
             Ok(DmlOp::Delete {
                 table: route.imported_table_name.clone(),
                 row_key,
                 returning_tsv: Some(returning_tsv),
             })
         }
+    }
+}
+
+/// A native TRUNCATE has no per-row preimages. Bound retraction expansion and
+/// fail closed when a table is too large for one atomic CDC epoch. Do not
+/// acknowledge the upstream LSN on incomplete state reconstruction.
+const MAX_PGOUTPUT_TRUNCATE_ROWS: usize = 65_536;
+
+fn pgoutput_truncate_error(detail: &str) -> GatewayError {
+    GatewayError::QueryTimeExecutionFailed {
+        detail: format!(
+            "RS-4014: pgoutput TRUNCATE cannot commit atomically: {detail}; source remains blocked and its slot must not advance"
+        ),
+    }
+}
+
+async fn load_pgoutput_truncate_images(
+    shard_db: &rockstream_storage::ShardDb,
+    changes: &[EncodedChange],
+    routes: &HashMap<u32, &RelationRoute>,
+) -> Result<HashMap<String, BTreeMap<String, String>>, GatewayError> {
+    let mut images = HashMap::new();
+    let mut total_rows = 0_usize;
+    let mut total_bytes = 0_usize;
+    for change in changes {
+        let EncodedChange::Truncate { relation_id, .. } = change else {
+            continue;
+        };
+        let route = routes.get(relation_id).ok_or_else(|| {
+            pgoutput_truncate_error(&format!("relation {relation_id} has no durable route"))
+        })?;
+        let table = &route.imported_table_name;
+        if images.contains_key(table) {
+            continue;
+        }
+        let prefix = format!("view_output/{table}/");
+        let (rows, incomplete) = shard_db
+            .scan_prefix_bounded(
+                prefix.as_bytes(),
+                rockstream_connectors::POSTGRES_CDC_MAX_TRANSACTION_BYTES,
+            )
+            .await?;
+        if incomplete {
+            return Err(pgoutput_truncate_error(&format!(
+                "incomplete scan of '{table}' (8 MiB transaction limit)"
+            )));
+        }
+        let mut table_images = BTreeMap::new();
+        for (key, value) in rows {
+            total_rows = total_rows.saturating_add(1);
+            total_bytes = total_bytes
+                .saturating_add(key.len())
+                .saturating_add(value.len());
+            if total_rows > MAX_PGOUTPUT_TRUNCATE_ROWS
+                || total_bytes > rockstream_connectors::POSTGRES_CDC_MAX_TRANSACTION_BYTES
+            {
+                return Err(pgoutput_truncate_error(
+                    "retractions exceed the 65,536-row / 8 MiB atomic epoch limit",
+                ));
+            }
+            let key = std::str::from_utf8(&key)
+                .map_err(|_| pgoutput_truncate_error("non-UTF8 stored row key"))?;
+            let row_key = key.strip_prefix(prefix.as_str()).ok_or_else(|| {
+                pgoutput_truncate_error("stored row key is outside its relation prefix")
+            })?;
+            let image = std::str::from_utf8(&value)
+                .map_err(|_| pgoutput_truncate_error("non-UTF8 stored row image"))?;
+            table_images.insert(row_key.to_string(), image.to_string());
+        }
+        images.insert(table.clone(), table_images);
+    }
+    Ok(images)
+}
+
+/// Expand pgoutput's ordered row and TRUNCATE events to ordinary weighted DML.
+/// Staged changes before a TRUNCATE update the in-memory row images first:
+/// INSERT; TRUNCATE; INSERT therefore retracts the first INSERT and preserves
+/// only the second. All effects reach views and source LSN in one M3 epoch.
+fn pgoutput_envelope_to_dml_ops(
+    changes: &[EncodedChange],
+    routes: &HashMap<u32, &RelationRoute>,
+    mut truncate_images: HashMap<String, BTreeMap<String, String>>,
+) -> Result<Vec<DmlOp>, GatewayError> {
+    let has_truncate = changes
+        .iter()
+        .any(|change| matches!(change, EncodedChange::Truncate { .. }));
+    let mut ops = Vec::new();
+    let mut bytes = 0_usize;
+    for change in changes {
+        let relation_id = change.relation_id();
+        let route =
+            routes
+                .get(&relation_id)
+                .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                    detail: format!(
+                        "RS-4013: pgoutput relation {relation_id} has no durable route"
+                    ),
+                })?;
+        if route.schema_version != change.schema_version() {
+            return Err(GatewayError::QueryTimeExecutionFailed {
+                detail: format!(
+                    "RS-1002: pgoutput relation {relation_id} change used schema version {}, expected {}",
+                    change.schema_version(), route.schema_version
+                ),
+            });
+        }
+        let table = &route.imported_table_name;
+        match change {
+            EncodedChange::Row { .. } => {
+                let op = pgoutput_change_to_dml(route, change)?;
+                if let Some(images) = truncate_images.get_mut(table) {
+                    match &op {
+                        DmlOp::Insert {
+                            row_key,
+                            values_tsv,
+                            ..
+                        } => {
+                            images.insert(row_key.clone(), values_tsv.clone());
+                        }
+                        DmlOp::Update {
+                            old_row_key,
+                            new_row_key,
+                            new_tsv,
+                            ..
+                        } => {
+                            images.remove(old_row_key);
+                            images.insert(new_row_key.clone(), new_tsv.clone());
+                        }
+                        DmlOp::Delete { row_key, .. } => {
+                            images.remove(row_key);
+                        }
+                    }
+                }
+                if has_truncate {
+                    bytes = bytes.saturating_add(pgoutput_dml_op_size(&op));
+                }
+                ops.push(op);
+            }
+            EncodedChange::Truncate { .. } => {
+                let images = truncate_images
+                    .get_mut(table)
+                    .ok_or_else(|| pgoutput_truncate_error("missing imported table images"))?;
+                for (row_key, returning_tsv) in std::mem::take(images) {
+                    let op = DmlOp::Delete {
+                        table: table.clone(),
+                        row_key,
+                        returning_tsv: Some(returning_tsv),
+                    };
+                    bytes = bytes.saturating_add(pgoutput_dml_op_size(&op));
+                    ops.push(op);
+                }
+            }
+        }
+        if has_truncate
+            && (ops.len() > MAX_PGOUTPUT_TRUNCATE_ROWS
+                || bytes > rockstream_connectors::POSTGRES_CDC_MAX_TRANSACTION_BYTES)
+        {
+            return Err(pgoutput_truncate_error(
+                "expanded changes exceed the 65,536-row / 8 MiB atomic epoch limit",
+            ));
+        }
+    }
+    Ok(ops)
+}
+
+fn pgoutput_dml_op_size(op: &DmlOp) -> usize {
+    match op {
+        DmlOp::Insert {
+            row_key,
+            values_tsv,
+            ..
+        } => row_key.len().saturating_add(values_tsv.len()),
+        DmlOp::Update {
+            old_row_key,
+            new_row_key,
+            old_tsv,
+            new_tsv,
+            ..
+        } => old_row_key
+            .len()
+            .saturating_add(new_row_key.len())
+            .saturating_add(old_tsv.len())
+            .saturating_add(new_tsv.len()),
+        DmlOp::Delete {
+            row_key,
+            returning_tsv,
+            ..
+        } => row_key
+            .len()
+            .saturating_add(returning_tsv.as_ref().map_or(0, String::len)),
+    }
+}
+
+#[cfg(test)]
+// These regression tests use unwrap/expect only for fixture construction and assertions.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod pgoutput_truncate_unit_tests {
+    use super::*;
+    use crate::pgoutput_coordinator::PgOutputTruncateTag;
+
+    fn route(id: u32, table: &str) -> RelationRoute {
+        RelationRoute {
+            version: 1,
+            relation_id: id,
+            upstream_namespace: "public".to_string(),
+            upstream_relation: table.to_string(),
+            imported_table_id: u64::from(id),
+            imported_table_name: table.to_string(),
+            columns: vec![ColumnRoute {
+                upstream_name: "id".to_string(),
+                imported_name: "id".to_string(),
+                type_oid: 20,
+                type_modifier: -1,
+                nullable: false,
+                has_default: false,
+                key: true,
+            }],
+            replica_identity: ReplicaIdentity::Full,
+            schema_version: 1,
+        }
+    }
+
+    fn insert(relation_id: u32, id: &str) -> EncodedChange {
+        EncodedChange::Row {
+            relation_id,
+            operation: CdcOperation::Insert,
+            old_values: None,
+            new_values: Some(vec![Some(id.to_string())]),
+            schema_version: 1,
+        }
+    }
+
+    #[test]
+    fn truncate_expansion_retracts_preexisting_and_pending_rows_in_wire_order() {
+        let a = route(7, "a");
+        let b = route(8, "b");
+        let routes = HashMap::from([(7, &a), (8, &b)]);
+        let images = HashMap::from([
+            (
+                "a".to_string(),
+                BTreeMap::from([
+                    ("id=1".to_string(), "1".to_string()),
+                    ("id=2".to_string(), "2".to_string()),
+                ]),
+            ),
+            (
+                "b".to_string(),
+                BTreeMap::from([("id=9".to_string(), "9".to_string())]),
+            ),
+        ]);
+        let ops = pgoutput_envelope_to_dml_ops(
+            &[
+                insert(7, "3"),
+                EncodedChange::Truncate {
+                    relation_id: 7,
+                    schema_version: 1,
+                    tag: PgOutputTruncateTag::Truncate,
+                },
+                insert(7, "4"),
+                EncodedChange::Truncate {
+                    relation_id: 8,
+                    schema_version: 1,
+                    tag: PgOutputTruncateTag::Truncate,
+                },
+                EncodedChange::Truncate {
+                    relation_id: 8,
+                    schema_version: 1,
+                    tag: PgOutputTruncateTag::Truncate,
+                },
+            ],
+            &routes,
+            images,
+        )
+        .unwrap();
+        assert_eq!(ops.len(), 6); // INSERT(3), DELETE(1,2,3), INSERT(4), DELETE(9)
+        assert!(matches!(
+            &ops[0],
+            DmlOp::Insert { row_key, .. } if row_key == "id=3"
+        ));
+        assert!(matches!(
+            &ops[1],
+            DmlOp::Delete {
+                row_key,
+                returning_tsv: Some(tsv),
+                ..
+            } if row_key == "id=1" && tsv == "1"
+        ));
+        assert!(matches!(
+            &ops[2],
+            DmlOp::Delete { row_key, .. } if row_key == "id=2"
+        ));
+        assert!(matches!(
+            &ops[3],
+            DmlOp::Delete { row_key, .. } if row_key == "id=3"
+        ));
+        assert!(matches!(
+            &ops[4],
+            DmlOp::Insert { row_key, .. } if row_key == "id=4"
+        ));
+        assert!(matches!(
+            &ops[5],
+            DmlOp::Delete { table, row_key, .. } if table == "b" && row_key == "id=9"
+        ));
+    }
+
+    #[test]
+    fn truncate_expansion_rejects_missing_route_or_schema_mismatch() {
+        let a = route(7, "a");
+        let routes = HashMap::from([(7, &a)]);
+        let bad_route = EncodedChange::Truncate {
+            relation_id: 8,
+            schema_version: 1,
+            tag: PgOutputTruncateTag::Truncate,
+        };
+        let bad_schema = EncodedChange::Truncate {
+            relation_id: 7,
+            schema_version: 2,
+            tag: PgOutputTruncateTag::Truncate,
+        };
+        for change in [bad_route, bad_schema] {
+            assert!(pgoutput_envelope_to_dml_ops(
+                &[change],
+                &routes,
+                HashMap::from([("a".to_string(), BTreeMap::new())]),
+            )
+            .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn truncate_preimage_scan_refuses_oversized_state_without_partial_rows() {
+        let db = rockstream_storage::ShardDb::builder(
+            "pgoutput-truncate-bounded",
+            Arc::new(object_store::memory::InMemory::new()),
+        )
+        .build()
+        .await
+        .unwrap();
+        // Exceed the aggregate scan budget with bounded individual writes.
+        // A single oversized WAL entry can stall before the scan is exercised.
+        let row_image = vec![b'9'; 512 * 1024];
+        for id in 0..17 {
+            let key = format!("view_output/a/id={id}");
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                db.put(key.as_bytes(), &row_image),
+            )
+            .await
+            .expect("bounded fixture write timed out")
+            .unwrap();
+        }
+        let a = route(7, "a");
+        let routes = HashMap::from([(7, &a)]);
+        let changes = [EncodedChange::Truncate {
+            relation_id: 7,
+            schema_version: 1,
+            tag: PgOutputTruncateTag::Truncate,
+        }];
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            load_pgoutput_truncate_images(&db, &changes, &routes),
+        )
+        .await
+        .expect("bounded preimage scan timed out")
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("RS-4014"), "{error}");
+        assert!(db.get(b"view_output/a/id=0").await.unwrap().is_some());
     }
 }
 

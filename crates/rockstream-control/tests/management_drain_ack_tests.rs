@@ -38,7 +38,7 @@ async fn register_worker(addr: std::net::SocketAddr, worker_id: u64) -> TcpStrea
     reader.read_line(&mut response).await.unwrap();
     assert!(matches!(
         serde_json::from_str::<ControlMessage>(response.trim()).unwrap(),
-        ControlMessage::Registered { worker_id: registered } if registered == WorkerId(worker_id)
+        ControlMessage::Registered { worker_id: registered, .. } if registered == WorkerId(worker_id)
     ));
     drop(reader);
     stream

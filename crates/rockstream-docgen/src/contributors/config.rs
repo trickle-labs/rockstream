@@ -63,6 +63,15 @@ impl ConfigContributor {
                 source_origin: "rockstream-types::config::AuthSection".to_string(),
             },
             ConfigOptionDescriptor {
+                key: "node.deployment_id".to_string(),
+                data_type: "Option<String>".to_string(),
+                default_value: "None".to_string(),
+                description: "Shared deployment identifier required by gateway actor assertions; configure the same value on gateway and control".to_string(),
+                deprecated: false,
+                env_var: Some("ROCKSTREAM_NODE_DEPLOYMENT_ID".to_string()),
+                source_origin: "rockstream-types::config::NodeSection".to_string(),
+            },
+            ConfigOptionDescriptor {
                 key: "autotuner.compression_disable_hysteresis_windows".to_string(),
                 data_type: "usize".to_string(),
                 default_value: "2".to_string(),
@@ -241,6 +250,24 @@ impl ConfigContributor {
                 deprecated: false,
                 env_var: Some("ROCKSTREAM_OBJECT_STORE_URL".to_string()),
                 source_origin: "rockstream-storage".to_string(),
+            },
+            ConfigOptionDescriptor {
+                key: "worker.exchange_bind_addr".to_string(),
+                data_type: "Option<String>".to_string(),
+                default_value: "None".to_string(),
+                description: "Local socket address for the worker-to-worker shuffle listener; configure with worker.exchange_advertise_addr".to_string(),
+                deprecated: false,
+                env_var: None,
+                source_origin: "rockstream-types::config::WorkerSection".to_string(),
+            },
+            ConfigOptionDescriptor {
+                key: "worker.exchange_advertise_addr".to_string(),
+                data_type: "Option<String>".to_string(),
+                default_value: "None".to_string(),
+                description: "Reachable host:port registered for worker-to-worker shuffle; must not be a wildcard or use port 0".to_string(),
+                deprecated: false,
+                env_var: None,
+                source_origin: "rockstream-types::config::WorkerSection".to_string(),
             },
         ];
 
