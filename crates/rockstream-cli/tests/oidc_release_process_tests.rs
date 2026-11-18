@@ -2955,6 +2955,25 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
         .simple_query("ALTER ROLE postgres PASSWORD 'rotated-fixture-value'")
         .await
         .unwrap();
+    let old_credential_error = match tokio_postgres::connect(
+        &format!(
+            "host={postgres_host} port={postgres_port} user=postgres password=rotation-fixture-value dbname=postgres"
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("PostgreSQL accepted the old credential after rotation"),
+    };
+    assert_eq!(
+        old_credential_error.as_db_error().unwrap().code().code(),
+        "28P01"
+    );
+    assert_eq!(
+        old_credential_error.as_db_error().unwrap().message(),
+        "password authentication failed for user \"postgres\""
+    );
     let rotation_id = "d931137e-9e28-4a29-96f2-0cb10e5acb21";
     let rotation_query = "ALTER SECRET pg_auth SET (PASSWORD = 'rotated-fixture-value')";
     let missing_key = client.simple_query(rotation_query).await.unwrap_err();
@@ -3156,6 +3175,56 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    let (rotated_upstream, rotated_upstream_connection) = tokio_postgres::connect(
+        &format!(
+            "host={postgres_host} port={postgres_port} user=postgres password=rotated-fixture-value dbname=postgres"
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("the rotated credential should authenticate after gateway restart");
+    let rotated_upstream_connection_task = tokio::spawn(rotated_upstream_connection);
+    rotated_upstream
+        .batch_execute("INSERT INTO public.orders VALUES (6, 60)")
+        .await
+        .unwrap();
+    let committed_wal_lsn: String = rotated_upstream
+        .query_one("SELECT pg_current_wal_lsn()::text", &[])
+        .await
+        .unwrap()
+        .get(0);
+    expected_rows.push(row("6", Some("60")));
+    expected_rows.sort();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let observed = client
+            .simple_query("SELECT * FROM order_rows")
+            .await
+            .ok()
+            .map(|messages| {
+                let mut rows = simple_query_rows(&messages);
+                rows.sort();
+                rows
+            });
+        let slot_checkpointed = upstream
+            .query_opt(
+                "SELECT COALESCE(confirmed_flush_lsn >= ($2::text)::pg_lsn, false) FROM pg_replication_slots WHERE slot_name = $1",
+                &[&slot_name, &committed_wal_lsn],
+            )
+            .await
+            .unwrap()
+            .is_some_and(|row| row.get::<_, bool>(0));
+        if observed.as_ref() == Some(&expected_rows) && slot_checkpointed {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "release PostgreSQL source did not consume the post-restart row with the rotated credential; observed: {observed:?}, slot_checkpointed: {slot_checkpointed}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    drop(rotated_upstream);
+    rotated_upstream_connection_task.abort();
     drop(client);
     connection_task.abort();
     recovered.0.kill().unwrap();
