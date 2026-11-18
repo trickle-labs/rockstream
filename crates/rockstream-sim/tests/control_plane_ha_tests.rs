@@ -372,10 +372,11 @@ async fn leader_crash_composed_with_shard_fence_no_split_brain() {
 // gracefully (rather than failing, and rather than `#[ignore]`, which has
 // no precedent anywhere in this codebase) when Docker is not present.
 mod tc {
-    use super::management_security::preprovision_management_catalog;
     use std::net::SocketAddr;
+    use std::path::Path;
     use std::time::{Duration, Instant};
 
+    use sha2::Digest;
     use testcontainers::core::{ContainerPort, Mount, WaitFor};
     use testcontainers::runners::AsyncRunner;
     use testcontainers::{ContainerAsync, GenericImage, ImageExt};
@@ -384,7 +385,11 @@ mod tc {
     use tokio_rustls::client::TlsStream;
 
     use rockstream_test_support::pki::TestPki;
-    use rockstream_types::ids::{ShardId, WorkerId};
+    use rockstream_types::authorization::{
+        LoginMethod, PermissionPreset, PolicyScope, ScopedPresetGrant, SecurityPrincipal,
+        SECURITY_PRINCIPAL_FORMAT_VERSION,
+    };
+    use rockstream_types::ids::{PrincipalId, ShardId, WorkerId};
     use rockstream_types::topology::{
         CapacityHeadroom, ControlMessage, NodeRole, RaftRoleWire, WorkerMessage, WorkerRegistration,
     };
@@ -426,6 +431,47 @@ mod tc {
         pub shared_dir: tempfile::TempDir,
     }
 
+    fn certificate_sha256(path: &Path) -> [u8; 32] {
+        let mut reader = std::io::BufReader::new(std::fs::File::open(path).unwrap());
+        let certificate = rustls_pemfile::certs(&mut reader)
+            .next()
+            .expect("test PKI must include an administrator certificate")
+            .unwrap();
+        sha2::Sha256::digest(certificate.as_ref()).into()
+    }
+
+    fn preprovision_admin(storage_dir: &Path, shared_dir: &Path, operation_id: u64) {
+        let storage_mount = format!("{}:/data", storage_dir.display());
+        let shared_mount = format!("{}:/shared", shared_dir.display());
+        let output = std::process::Command::new("docker")
+            .args(["run", "--rm", "--volume"])
+            .arg(storage_mount)
+            .args(["--volume"])
+            .arg(shared_mount)
+            .arg(format!("{IMAGE_NAME}:{IMAGE_TAG}"))
+            .args([
+                "security",
+                "preprovision-admin",
+                "--layout",
+                "gateway",
+                "--storage",
+                "/data",
+                "--principal-file",
+                "/shared/ha-administrator.json",
+                "--operation-id",
+            ])
+            .arg(operation_id.to_string())
+            .arg("--yes")
+            .output()
+            .expect("failed to invoke the supported administrator preprovisioning CLI");
+        assert!(
+            output.status.success(),
+            "administrator preprovisioning failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     impl TcCluster {
         pub async fn boot(test_id: &str) -> Self {
             let network = format!("rs-net-{test_id}");
@@ -439,26 +485,6 @@ mod tc {
                 std::fs::copy(source, shared_dir.path().join(name))
                     .unwrap_or_else(|error| panic!("copy test TLS file {name}: {error}"));
             }
-            for i in 0..3 {
-                let node_storage = shared_dir.path().join(format!("node-storage-{i}"));
-                preprovision_management_catalog(&node_storage, &pki).await;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-
-                    let catalog_root = node_storage.join("gateway-shard");
-                    for path in [
-                        node_storage.clone(),
-                        catalog_root.clone(),
-                        catalog_root.join("gateway"),
-                        catalog_root.join("gateway/catalog"),
-                        catalog_root.join("gateway/catalog/log"),
-                    ] {
-                        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777))
-                            .unwrap();
-                    }
-                }
-            }
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -467,11 +493,42 @@ mod tc {
                     std::fs::Permissions::from_mode(0o777),
                 );
             }
+            let principal = SecurityPrincipal {
+                format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+                id: PrincipalId(1),
+                display_name: "HA smoke administrator".to_owned(),
+                enabled: true,
+                revision: 1,
+                login_methods: vec![LoginMethod::Mtls {
+                    certificate_sha256: certificate_sha256(&pki.cli_cert_path),
+                }],
+                preset_grants: vec![ScopedPresetGrant {
+                    preset: PermissionPreset::Administrator,
+                    scope: PolicyScope::Cluster,
+                }],
+                scoped_grants: Vec::new(),
+            };
+            std::fs::write(
+                shared_dir.path().join("ha-administrator.json"),
+                serde_json::to_vec(&principal).unwrap(),
+            )
+            .expect("write HA smoke administrator preprovisioning record");
             let names: Vec<String> = (0..3).map(|i| format!("rs-ctl-{test_id}-{i}")).collect();
 
             let mut nodes = Vec::new();
             for i in 0..3u64 {
-                let node_storage = shared_dir.path().join(format!("node-storage-{i}"));
+                let storage_dir = shared_dir.path().join(format!("node-{i}-data"));
+                std::fs::create_dir_all(&storage_dir)
+                    .expect("create per-node durable catalog directory");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&storage_dir, std::fs::Permissions::from_mode(0o777))
+                        .expect(
+                            "make per-node durable catalog directory writable in the container",
+                        );
+                }
+                preprovision_admin(&storage_dir, shared_dir.path(), i + 1);
                 let peers: Vec<String> = (0..3u64)
                     .filter(|&j| j != i)
                     .map(|j| format!("{j}@{}:7000", names[j as usize]))
@@ -500,7 +557,7 @@ mod tc {
                     .with_container_name(names[i as usize].clone())
                     .with_network(network.clone())
                     .with_mount(Mount::bind_mount(
-                        node_storage.to_str().unwrap().to_string(),
+                        storage_dir.to_str().unwrap().to_string(),
                         "/data".to_string(),
                     ))
                     .with_mount(Mount::bind_mount(
@@ -756,7 +813,7 @@ mod tc {
         assert!(
             matches!(
                 serde_json::from_str::<ControlMessage>(response.trim()),
-                Ok(ControlMessage::Registered { worker_id: registered })
+                Ok(ControlMessage::Registered { worker_id: registered, .. })
                     if registered == WorkerId(worker_id)
             ),
             "worker registration was rejected; response: {response:?}"
@@ -934,9 +991,6 @@ mod tc {
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 }
-
-#[path = "common/management_security.rs"]
-mod management_security;
 
 /// **S1 (closing the item deferred from Phase 3a) / S4 precondition** —
 /// `three_node_tc_cluster_boots_and_elects_leader`: a real 3-container

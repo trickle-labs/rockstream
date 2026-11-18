@@ -638,6 +638,10 @@ impl Default for ControlSection {
 pub struct WorkerSection {
     #[serde(default)]
     pub worker_id: Option<u64>,
+    #[serde(default)]
+    pub exchange_bind_addr: Option<String>,
+    #[serde(default)]
+    pub exchange_advertise_addr: Option<String>,
     #[serde(default = "default_worker_execution_threads")]
     pub execution_threads: usize,
     #[serde(default = "default_worker_segment_cache_bytes")]
@@ -702,6 +706,8 @@ impl Default for WorkerSection {
     fn default() -> Self {
         Self {
             worker_id: None,
+            exchange_bind_addr: None,
+            exchange_advertise_addr: None,
             execution_threads: default_worker_execution_threads(),
             segment_cache_bytes: default_worker_segment_cache_bytes(),
             max_rows_per_quantum: default_worker_max_rows_per_quantum(),
@@ -986,6 +992,8 @@ impl NodeConfig {
             || s.contains("[control]")
             || s.contains("[storage]")
             || s.contains("[runtime]")
+            || s.contains("exchange_bind_addr")
+            || s.contains("exchange_advertise_addr")
         {
             if let Ok(cfg) = toml::from_str::<NodeConfig>(s) {
                 return Ok(cfg);
@@ -1042,6 +1050,22 @@ mod tests {
         assert_eq!(
             roundtrip.control.management_addr.as_deref(),
             Some("0.0.0.0:9201")
+        );
+    }
+
+    #[test]
+    fn worker_shuffle_addresses_load_from_legacy_worker_only_config() {
+        let config = NodeConfig::load_from_str(
+            "[worker]\nexchange_bind_addr = '0.0.0.0:9100'\nexchange_advertise_addr = 'worker-a.internal:9100'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.worker.exchange_bind_addr.as_deref(),
+            Some("0.0.0.0:9100")
+        );
+        assert_eq!(
+            config.worker.exchange_advertise_addr.as_deref(),
+            Some("worker-a.internal:9100")
         );
     }
 

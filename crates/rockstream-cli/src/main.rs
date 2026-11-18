@@ -22,12 +22,12 @@ use rockstream_cli::{
     run_interactive_shell, run_manifest_validate, run_project_apply, run_project_verify,
     run_qualify, run_resource_cluster, run_resource_usage, run_schema_create, run_schema_drop,
     run_schema_evolution_history, run_schema_evolution_status, run_schema_list, run_schema_show,
-    run_security_preprovision, run_source_drop, run_source_list, run_source_pause,
-    run_source_resume, run_source_show, run_sql_compile, run_start_with_dev_transport,
-    run_support_bundle, run_view_list, run_view_pause, run_view_query, run_view_resume,
-    run_view_show, run_view_status, run_view_subscribe, run_workload_alter, run_workload_create,
-    run_workload_drop, run_workload_list, run_workload_show, DemoOptions, DoctorOptions,
-    InitOptions, StartOptions,
+    run_security_preprovision, run_security_recover_admin, run_source_drop, run_source_list,
+    run_source_pause, run_source_resume, run_source_show, run_sql_compile,
+    run_start_with_dev_transport, run_support_bundle, run_view_list, run_view_pause,
+    run_view_query, run_view_resume, run_view_show, run_view_status, run_view_subscribe,
+    run_workload_alter, run_workload_create, run_workload_drop, run_workload_list,
+    run_workload_show, DemoOptions, DoctorOptions, InitOptions, StartOptions,
 };
 use rockstream_types::acl::Role as AclRole;
 use rockstream_types::config_resolver::CliConfigOverrides;
@@ -394,6 +394,8 @@ fn main() -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 };
+            let worker_shuffle_enabled = node_config.worker.exchange_bind_addr.is_some()
+                && node_config.worker.exchange_advertise_addr.is_some();
 
             let opts = StartOptions {
                 storage,
@@ -410,7 +412,7 @@ fn main() -> ExitCode {
                 ),
                 worker_capabilities: WorkerCapabilities {
                     same_host_arrow_shm_v1: true,
-                    shuffle_codec_v1: true,
+                    shuffle_codec_v1: worker_shuffle_enabled,
                     checkpoint_manifest_codec_v1: true,
                     shared_shard_store_id: None,
                 },
@@ -716,6 +718,28 @@ fn main() -> ExitCode {
                         &storage,
                         layout,
                         &principal_file,
+                        operation_id,
+                        yes,
+                    )),
+                    format,
+                )
+            }
+            SecurityCommand::RecoverAdministratorCredentials {
+                layout,
+                storage,
+                principal_id,
+                login_methods_file,
+                operation_id,
+                yes,
+            } => {
+                let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+                handle_result(
+                    runtime.block_on(run_security_recover_admin(
+                        format,
+                        &storage,
+                        layout,
+                        principal_id,
+                        &login_methods_file,
                         operation_id,
                         yes,
                     )),

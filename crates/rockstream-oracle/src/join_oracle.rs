@@ -121,6 +121,9 @@ pub fn batch_reference_join(
 // ─── Incremental output accumulator ─────────────────────────────────────────
 
 fn accumulate_join_output(output: &ArrowZSet, output_acc: &mut BTreeMap<(i64, i64, i64), i64>) {
+    output
+        .validate()
+        .expect("join output must have aligned row weights");
     if output.is_empty() {
         return;
     }
@@ -142,10 +145,10 @@ fn accumulate_join_output(output: &ArrowZSet, output_acc: &mut BTreeMap<(i64, i6
         .as_any()
         .downcast_ref::<Int64Array>()
         .unwrap();
-    for i in 0..output.num_rows() {
+    for (i, &weight) in output.weights.iter().enumerate() {
         let key = (lk_col.value(i), lv_col.value(i), rw_col.value(i));
         let entry = output_acc.entry(key).or_insert(0);
-        *entry += output.weights[i];
+        *entry += weight;
         if *entry == 0 {
             output_acc.remove(&key);
         }
@@ -271,6 +274,9 @@ fn accumulate_3way_join_output(
     output: &ArrowZSet,
     output_acc: &mut BTreeMap<(i64, i64, i64, i64), i64>,
 ) {
+    output
+        .validate()
+        .expect("3-way join output must have aligned row weights");
     if output.is_empty() {
         return;
     }
@@ -298,10 +304,10 @@ fn accumulate_3way_join_output(
         .as_any()
         .downcast_ref::<Int64Array>()
         .unwrap();
-    for i in 0..output.num_rows() {
+    for (i, &weight) in output.weights.iter().enumerate() {
         let key = (col0.value(i), col1.value(i), col3.value(i), col5.value(i));
         let entry = output_acc.entry(key).or_insert(0);
-        *entry += output.weights[i];
+        *entry += weight;
         if *entry == 0 {
             output_acc.remove(&key);
         }

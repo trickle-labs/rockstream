@@ -1000,6 +1000,28 @@ pub enum SecurityCommand {
         #[arg(long)]
         yes: bool,
     },
+    /// Replace login methods for an existing administrator while the deployment is stopped.
+    #[command(name = "recover-admin")]
+    RecoverAdministratorCredentials {
+        /// Select `all` for `--role all`, or `gateway` for `--role gateway`/`control`.
+        #[arg(long, value_enum)]
+        layout: SecurityCatalogLayout,
+        /// Node storage directory used by `start --storage` for this deployment.
+        #[arg(long)]
+        storage: PathBuf,
+        /// ID of the existing active cluster administrator to recover.
+        #[arg(long)]
+        principal_id: u64,
+        /// JSON array of replacement `LoginMethod` entries; contains no plaintext password.
+        #[arg(long)]
+        login_methods_file: PathBuf,
+        /// Stable catalog operation ID to reuse if this command must be retried.
+        #[arg(long)]
+        operation_id: u64,
+        /// Confirm the deployment is stopped and the selected durable store is correct.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]

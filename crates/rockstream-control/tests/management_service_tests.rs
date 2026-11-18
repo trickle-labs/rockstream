@@ -51,7 +51,7 @@ async fn register_worker(addr: std::net::SocketAddr, worker_id: u64) -> TcpStrea
     reader.read_line(&mut response).await.unwrap();
     assert!(matches!(
         serde_json::from_str::<ControlMessage>(response.trim()).unwrap(),
-        ControlMessage::Registered { worker_id: registered } if registered == WorkerId(worker_id)
+        ControlMessage::Registered { worker_id: registered, .. } if registered == WorkerId(worker_id)
     ));
     drop(reader);
     stream
@@ -920,7 +920,7 @@ async fn management_grant_mutation_rejects_last_management_administrator_removal
         serde_json::from_str::<serde_json::Value>(&operation.result_json).unwrap(),
         serde_json::json!({
             "status": "failed",
-            "reason": "grant mutation would remove the last mTLS management administrator"
+            "reason": "RS-2401: grant mutation would remove the last mTLS management administrator"
         })
     );
     assert_eq!(

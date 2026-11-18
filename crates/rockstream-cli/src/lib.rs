@@ -145,8 +145,8 @@ fn validate_internal_transport(
     opts: &StartOptions,
     allow_insecure_internal_dev: bool,
 ) -> Result<(), CliError> {
-    if !matches!(opts.role.as_str(), "all" | "control" | "worker")
-        && !(opts.role == "gateway" && opts.control.is_some())
+    if !(matches!(opts.role.as_str(), "all" | "control" | "worker")
+        || opts.role == "gateway" && opts.control.is_some())
     {
         return Ok(());
     }
@@ -210,6 +210,82 @@ fn validate_internal_transport(
         ));
     }
     Ok(())
+}
+
+fn validate_worker_exchange_endpoint(
+    node_config: &rockstream_types::config::NodeConfig,
+    role: &str,
+    internal_tls_enabled: bool,
+    allow_insecure_internal_dev: bool,
+) -> Result<Option<rockstream_runtime::WorkerExchangeEndpoint>, CliError> {
+    if !matches!(role, "worker" | "all") {
+        return Ok(None);
+    }
+    let bind = node_config.worker.exchange_bind_addr.as_deref();
+    let advertise = node_config.worker.exchange_advertise_addr.as_deref();
+    let (Some(bind), Some(advertise)) = (bind, advertise) else {
+        if bind.is_some() || advertise.is_some() || role == "worker" {
+            return Err(CliError::new(
+                RS_0002,
+                "worker shuffle requires both exchange_bind_addr and exchange_advertise_addr",
+                "Set both fields under [worker] in the node configuration.",
+            ));
+        }
+        return Ok(None);
+    };
+    let bind_addr = bind.parse::<std::net::SocketAddr>().map_err(|error| {
+        CliError::new(
+            RS_0002,
+            format!("invalid worker.exchange_bind_addr `{bind}`: {error}"),
+            "Set worker.exchange_bind_addr to a socket address with a nonzero port.",
+        )
+    })?;
+    if bind_addr.port() == 0 {
+        return Err(CliError::new(
+            RS_0002,
+            "worker.exchange_bind_addr must use a nonzero port",
+            "Set a fixed listener port so the advertised endpoint can reach it.",
+        ));
+    }
+    let advertise_valid = if let Ok(address) = advertise.parse::<std::net::SocketAddr>() {
+        address.port() != 0 && !address.ip().is_unspecified()
+    } else {
+        let Some((host, port)) = advertise.rsplit_once(':') else {
+            return Err(CliError::new(
+                RS_0002,
+                format!("invalid worker.exchange_advertise_addr `{advertise}`"),
+                "Set worker.exchange_advertise_addr to a reachable host:port address.",
+            ));
+        };
+        !host.is_empty()
+            && !host.contains(':')
+            && port.parse::<u16>().is_ok_and(|port| port != 0)
+            && tonic::transport::Endpoint::from_shared(format!("http://{advertise}")).is_ok()
+    };
+    if !advertise_valid {
+        return Err(CliError::new(
+            RS_0002,
+            format!("invalid worker.exchange_advertise_addr `{advertise}`"),
+            "Set worker.exchange_advertise_addr to a reachable, non-wildcard host:port address.",
+        ));
+    }
+    if !internal_tls_enabled {
+        let loopback = bind_addr.ip().is_loopback()
+            && advertise
+                .parse::<std::net::SocketAddr>()
+                .is_ok_and(|address| address.ip().is_loopback());
+        if !allow_insecure_internal_dev || !loopback {
+            return Err(CliError::new(
+                rockstream_types::error_code::RS_2405,
+                "worker shuffle requires internal mTLS outside explicit loopback development",
+                "Configure internal mTLS or use numeric loopback addresses with --allow-insecure-internal-dev for local development.",
+            ));
+        }
+    }
+    Ok(Some(rockstream_runtime::WorkerExchangeEndpoint {
+        bind_addr,
+        advertise_addr: advertise.to_owned(),
+    }))
 }
 
 fn load_actor_assertion_signer(
@@ -287,9 +363,10 @@ fn load_actor_assertion_verifier(
     rockstream_control::delegation::ActorAssertionVerifier::from_jwk_file(key_path, deployment_id)
         .map(Some)
         .map_err(|error| {
+            let detail = error.strip_prefix("RS-2400: ").unwrap_or(error.as_str());
             CliError::new(
                 rockstream_types::error_code::RS_2400,
-                format!("control actor assertion verification key is invalid: {error}"),
+                format!("control actor assertion verification key is invalid: {detail}"),
                 "Configure the matching RSA RS256 public JWK and deployment ID.",
             )
         })
@@ -586,6 +663,21 @@ impl output::Formattable for SecurityPreprovisionResult {
     }
 }
 
+#[derive(Serialize)]
+struct SecurityRecoveryResult {
+    principal_id: u64,
+    catalog_revision: u64,
+}
+
+impl output::Formattable for SecurityRecoveryResult {
+    fn to_text(&self) -> String {
+        format!(
+            "Recovered administrator principal {} at catalog revision {}",
+            self.principal_id, self.catalog_revision
+        )
+    }
+}
+
 pub async fn run_security_preprovision(
     format: output::OutputFormat,
     storage_root: &Path,
@@ -627,6 +719,58 @@ pub async fn run_security_preprovision(
     Ok(output::render_output(
         &SecurityPreprovisionResult {
             principal_id: principal.id.0,
+            catalog_revision: revision,
+        },
+        format,
+    ))
+}
+
+pub async fn run_security_recover_admin(
+    format: output::OutputFormat,
+    storage_root: &Path,
+    layout: SecurityCatalogLayout,
+    principal_id: u64,
+    login_methods_file: &Path,
+    operation_id: u64,
+    yes: bool,
+) -> Result<String, CliError> {
+    prompt_confirmation(
+        "Confirm RockStream processes are stopped and this is the intended deployment store",
+        yes,
+    )?;
+    let login_methods: Vec<rockstream_types::authorization::LoginMethod> =
+        serde_json::from_reader(fs::File::open(login_methods_file).map_err(|error| {
+            CliError::new(
+                RS_0002,
+                format!("could not open administrator login-method file: {error}"),
+                "Check the selected login-method file and its permissions.",
+            )
+        })?)
+        .map_err(|error| {
+            CliError::new(
+                RS_0002,
+                format!("could not parse administrator login-method file: {error}"),
+                "Provide a JSON array of valid LoginMethod entries without plaintext passwords.",
+            )
+        })?;
+    let catalog = open_security_catalog(storage_root, layout).await?;
+    let revision = catalog
+        .recover_administrator_credentials(
+            rockstream_types::ids::PrincipalId(principal_id),
+            login_methods,
+            operation_id,
+        )
+        .await
+        .map_err(|error| {
+            CliError::new(
+                RS_0003,
+                format!("offline administrator credential recovery failed: {error}"),
+                "Use a stopped deployment and an existing active administrator principal with valid replacement login methods.",
+            )
+        })?;
+    Ok(output::render_output(
+        &SecurityRecoveryResult {
+            principal_id,
             catalog_revision: revision,
         },
         format,
@@ -1175,20 +1319,39 @@ type InternalTlsReloadSignal = ();
 async fn wait_for_signal_or_tls_reload(
     coordinator: &ShutdownCoordinator,
     control: Option<&rockstream_control::ControlServiceHandle>,
+    worker: Option<&rockstream_runtime::WorkerClientHandle>,
     tls: &rockstream_types::identity::InternalTlsConfig,
     mut reload_signal: Option<&mut InternalTlsReloadSignal>,
 ) {
     #[cfg(unix)]
     if tls.reload_enabled {
-        if let (Some(signal), Some(control)) = (reload_signal.take(), control) {
+        if let Some(signal) = reload_signal.take() {
             let shutdown = coordinator.wait_for_signal_or_trigger();
             tokio::pin!(shutdown);
             loop {
                 tokio::select! {
                     _ = &mut shutdown => break,
-                    _ = signal.recv() => match control.reload_tls(tls.clone()) {
-                        Ok(()) => tracing::info!("internal TLS credentials reloaded after SIGHUP"),
-                        Err(error) => tracing::error!(%error, "internal TLS reload after SIGHUP failed"),
+                    _ = signal.recv() => {
+                        if let Some(control) = control {
+                            match control.reload_tls(tls.clone()) {
+                                Ok(()) => tracing::info!("control internal TLS credentials reloaded after SIGHUP"),
+                                Err(error) => tracing::error!(
+                                    code = %rockstream_types::error_code::RS_2413,
+                                    %error,
+                                    "control internal TLS reload after SIGHUP failed"
+                                ),
+                            }
+                        }
+                        if let Some(worker) = worker {
+                            match worker.reload_tls(tls.clone()) {
+                                Ok(()) => tracing::info!("worker internal TLS credentials reloaded after SIGHUP"),
+                                Err(error) => tracing::error!(
+                                    code = %rockstream_types::error_code::RS_2413,
+                                    %error,
+                                    "worker internal TLS reload after SIGHUP failed"
+                                ),
+                            }
+                        }
                     }
                 }
             }
@@ -1197,7 +1360,7 @@ async fn wait_for_signal_or_tls_reload(
     }
 
     #[cfg(not(unix))]
-    let _ = (control, tls, reload_signal);
+    let _ = (control, worker, tls, reload_signal);
 
     coordinator.wait_for_signal_or_trigger().await;
 }
@@ -1294,6 +1457,12 @@ pub fn run_start_with_dev_transport(
     }
 
     validate_internal_transport(opts, allow_insecure_internal_dev)?;
+    let worker_exchange_endpoint = validate_worker_exchange_endpoint(
+        &node_config,
+        &opts.role,
+        opts.config.internal_tls.is_enabled(),
+        allow_insecure_internal_dev,
+    )?;
 
     fs::create_dir_all(&opts.storage).map_err(|e| {
         CliError::new(
@@ -1355,7 +1524,8 @@ pub fn run_start_with_dev_transport(
         let coordinator = ShutdownCoordinator::new(tracker.clone(), Duration::from_secs(timeout_secs));
 
         #[cfg(unix)]
-        let mut tls_reload_signal = if matches!(opts.role.as_str(), "control" | "all")
+        let mut tls_reload_signal = if (matches!(opts.role.as_str(), "control" | "all")
+            || (opts.role == "worker" && worker_exchange_endpoint.is_some()))
             && opts.config.internal_tls.is_enabled()
             && opts.config.internal_tls.reload_enabled
         {
@@ -1394,6 +1564,7 @@ pub fn run_start_with_dev_transport(
 
         let mut control_handle = None;
         let mut worker_handle = None;
+        let mut worker_client = None;
         let mut control_url = opts.control.clone();
         let mut raft_node_guard: Option<rockstream_control::raft::RaftNodeHandleFull> = None;
         // `--role all` opens exactly one shared shard (id 0) via the
@@ -1695,7 +1866,20 @@ pub fn run_start_with_dev_transport(
             let mut worker = None;
             let mut last_error = None;
             for _ in 0..20 {
-                let connection = if opts.config.internal_tls.is_enabled() {
+                let connection = if let Some(endpoint) = worker_exchange_endpoint.clone() {
+                    rockstream_runtime::start_worker_client_with_exchange_endpoint(
+                        proposed_worker_id,
+                        url,
+                        &opts.storage,
+                        opts.worker_location.clone(),
+                        opts.worker_capabilities,
+                        opts.config.internal_tls.clone(),
+                        opts.config.exchange.clone(),
+                        endpoint,
+                        allow_insecure_internal_dev,
+                    )
+                    .await
+                } else if opts.config.internal_tls.is_enabled() {
                     rockstream_runtime::start_worker_client_with_tls_and_metadata(
                         proposed_worker_id,
                         url,
@@ -1780,6 +1964,9 @@ pub fn run_start_with_dev_transport(
                     shared_gateway_shard = Some((Arc::new(db), store));
                 }
             }
+            if worker_exchange_endpoint.is_some() && opts.config.internal_tls.is_enabled() {
+                worker_client = Some(client);
+            }
             worker_handle = Some(handle);
         }
 
@@ -1841,6 +2028,7 @@ pub fn run_start_with_dev_transport(
                         wait_for_signal_or_tls_reload(
                             &coordinator,
                             control_handle.as_ref(),
+                            worker_client.as_ref(),
                             &opts.config.internal_tls,
                             tls_reload_signal.as_mut(),
                         )
@@ -1892,6 +2080,7 @@ pub fn run_start_with_dev_transport(
                     wait_for_signal_or_tls_reload(
                         &coordinator,
                         control_handle.as_ref(),
+                        worker_client.as_ref(),
                         &opts.config.internal_tls,
                         tls_reload_signal.as_mut(),
                     )
@@ -3442,7 +3631,52 @@ mod tests {
         let err = super::run_start(&opts).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "RS-2405 control and worker roles require internal mTLS\n  next steps: Configure internal TLS, or pass --allow-insecure-internal-dev only for loopback development."
+            "RS-2405 control, worker, and connected gateway roles require internal mTLS\n  next steps: Configure internal TLS, or pass --allow-insecure-internal-dev only for loopback development."
+        );
+        assert!(!storage.exists());
+    }
+
+    #[test]
+    fn worker_shuffle_config_keeps_bind_and_advertise_addresses_distinct() {
+        let mut config = rockstream_types::config::NodeConfig::default();
+        config.worker.exchange_bind_addr = Some("0.0.0.0:9100".to_owned());
+        config.worker.exchange_advertise_addr = Some("worker-a.internal:9100".to_owned());
+
+        let endpoint = validate_worker_exchange_endpoint(&config, "worker", true, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(endpoint.bind_addr, "0.0.0.0:9100".parse().unwrap());
+        assert_eq!(endpoint.advertise_addr, "worker-a.internal:9100");
+
+        config.worker.exchange_advertise_addr = None;
+        let error = validate_worker_exchange_endpoint(&config, "worker", true, false).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "RS-0002 worker shuffle requires both exchange_bind_addr and exchange_advertise_addr\n  next steps: Set both fields under [worker] in the node configuration."
+        );
+    }
+
+    #[test]
+    fn worker_role_without_shuffle_endpoint_fails_before_storage_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().join("worker");
+        let pki = TestPki::generate();
+        let config = RockstreamConfig {
+            internal_tls: pki.worker_tls_config(1),
+            ..RockstreamConfig::default()
+        };
+        let opts = StartOptions {
+            storage: storage.clone(),
+            role: "worker".to_owned(),
+            control: Some("127.0.0.1:8000".to_owned()),
+            config,
+            ..StartOptions::default()
+        };
+
+        let error = run_start(&opts).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "RS-0002 worker shuffle requires both exchange_bind_addr and exchange_advertise_addr\n  next steps: Set both fields under [worker] in the node configuration."
         );
         assert!(!storage.exists());
     }
@@ -3665,6 +3899,30 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(reused.to_string(), "RS-2400 gateway actor assertion signing key must not reuse a TLS key pair\n  next steps: Configure a dedicated deployment-managed RS256 private key.");
+    }
+
+    #[test]
+    fn invalid_actor_assertion_verification_key_uses_one_registered_code() {
+        let directory = tempfile::tempdir().unwrap();
+        let key_path = directory.path().join("invalid-actor-assertion.jwk");
+        std::fs::write(
+            &key_path,
+            r#"{"kty":"RSA","alg":"RS384","use":"sig","n":"AQ","e":"AQAB"}"#,
+        )
+        .unwrap();
+        let mut node_config = rockstream_types::config::NodeConfig::default();
+        node_config.node.deployment_id = Some("deployment-a".to_owned());
+        node_config.auth.actor_assertion_public_key_path = Some(key_path);
+
+        let error = match load_actor_assertion_verifier(&node_config) {
+            Ok(_) => panic!("invalid actor assertion verification key was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code.to_string(), "RS-2400");
+        assert_eq!(
+            error.message,
+            "control actor assertion verification key is invalid: actor assertion verification key must be RSA RS256"
+        );
     }
 
     #[test]

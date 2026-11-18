@@ -894,19 +894,17 @@ impl AggregateOp {
         };
         let v_col = &v_col_owned;
 
-        let n = delta.num_rows();
-
         let max_groups = self.max_groups.load(Ordering::Relaxed);
         let max_bytes = self.max_bytes.load(Ordering::Relaxed);
         let mut staged = StagedEpochAggregator::with_limits(max_groups, max_bytes);
+        let n = delta.num_rows();
 
-        for row in 0..n {
+        for (row, &w) in delta.weights.iter().enumerate() {
             if k_col.is_null(row) || v_col.is_null(row) || v_raw.is_null(row) {
                 continue;
             }
             let k = k_col.value(row);
             let v = v_col.value(row);
-            let w = delta.weights[row];
             if w == 0 {
                 continue;
             }
@@ -1418,6 +1416,7 @@ impl Operator for BucketedAggregateOp {
     }
 
     fn process_delta(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
+        delta.validate()?;
         let started_at = Instant::now();
         if delta.is_empty() {
             return Ok(ArrowZSet::empty(output_schema()));
@@ -1442,10 +1441,9 @@ impl Operator for BucketedAggregateOp {
         let mut consolidated: std::collections::HashMap<(i64, i64), i64> =
             std::collections::HashMap::new();
         let mut order: Vec<(i64, i64)> = Vec::new();
-        for row in 0..delta.num_rows() {
+        for (row, &w) in delta.weights.iter().enumerate() {
             let k = k_col.value(row);
             let v = v_col.value(row);
-            let w = delta.weights[row];
             let entry = consolidated.entry((k, v)).or_insert_with(|| {
                 order.push((k, v));
                 0
@@ -2040,6 +2038,18 @@ mod tests {
         op2.restore(&entries).unwrap();
         assert_eq!(op2.live_groups(), 2);
         assert_eq!(op2.live_partials(), 1);
+    }
+
+    #[test]
+    fn bucketed_aggregate_rejects_misaligned_weights_before_processing() {
+        let op = BucketedAggregateOp::new(OperatorId(10), 2, 4);
+        let mut delta = make_batch(&[(1, 10, 1)]);
+        delta.weights.clear();
+
+        assert_eq!(
+            op.process_delta(delta).unwrap_err().to_string(),
+            "[RS-1013] Invalid literal: Z-set row/weight length mismatch: 1 rows, 0 weights; next_steps: Z-set row/weight length mismatch: 1 rows, 0 weights"
+        );
     }
 
     #[test]

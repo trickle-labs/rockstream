@@ -68,6 +68,12 @@ SlateDB `WriteBatch`) and the CALM invariant
 contributing shard's persisted frontier satisfies `frontier ≥ N`, verifiable by
 any reader of the object store with no coordinator).
 
+The durable shuffle catch-up helper currently persists its inbox marker before
+the inlet handoff, outside the operator's epoch commit. The closed-inlet retry
+test covers explicit rejection and retry; it does not establish atomicity with
+operator state or recovery of a marker left before delivery. Concurrent
+catch-up and owning-epoch recovery remain unqualified (issue #321).
+
 Verification targets:
 - `WriteBatch` is **all-or-nothing**: a crash mid-commit leaves the shard at
   epoch `N-1`, never a torn state where the frontier advanced but state did not
@@ -725,12 +731,31 @@ exact denial audit event. `identity.rs::tests::node_identity_worker_matching`
 checks worker-ID matching, and
 `cli/src/lib.rs::tests::default_start_requires_internal_mtls_before_storage_creation`
 checks that default startup rejects plaintext before creating storage. The
-control, runtime, and CLI lifecycle fixtures explicitly opt into loopback
-development transport and do not qualify production mTLS. This slice refines
-M4's registration boundary, but its abstract model contains no certificates,
-trust roots, or TLS-handshake state. Gateway authentication, worker-to-worker
-mTLS, management authentication, delegated actor assertions, and release-process
-qualification remain outside this PR and are not qualified by these tests.
+#359 integration also adds versioned RS256 gateway actor assertions bound to a
+60-second expiry, deployment and audience, action and scope, request digest,
+persisted principal revision, and scoped secret-use allowance. Control verifies
+the assertion and rereads the durable principal policy before applying the
+operation. `oidc_release_process_tests.rs` covers policy recheck, delegated SQL,
+and delegated secret use in release processes; `internal_mtls_tests.rs` covers
+current-policy intersection and scoped grants. These authorization transitions
+are not represented by M1–M7, so the concrete tests are not formal proof.
+
+Issue #305 exposes durable security-audit record count, encoded bytes, capacity,
+and write degradation as operational metrics. These are observations of the
+existing audit commit and recovery outcomes; they add no M1–M7 transition or
+authorization rule. `security_audit_metrics_tests.rs::durable_audit_metrics_follow_commit_and_restart`
+and `security_audit_health_tests.rs::audit_storage_degradation_is_visible_without_failing_ready_health`
+check the metric and health surfaces.
+
+`runtime/src/exchange` now provides a worker mTLS listener and client pool.
+`shuffle_mtls_tests.rs` covers invalid peer credentials, worker identity and
+source-shard authorization, audited denial without inlet delivery, and active
+stream continuity while both certificate generations are trusted. Worker
+startup starts the listener, but production does not register `ExchangeInlet`s
+or connect them to compiled pipelines; application result delivery remains
+incomplete. The release-process test covers worker-stream continuity for this
+path. M1–M7 do not model this protocol, so these tests are implementation
+evidence, not formal proof.
 
 Issue #203 replaces the public `aws_kms` provider's ARN/region-derived local
 encryption with signed KMS `Encrypt` and `Decrypt` requests. Both operations
@@ -889,6 +914,39 @@ state remains an external source boundary outside M1–M7, so this adds real
 cluster evidence without a new abstract invariant or a general CDC guarantee
 (`docs/testing/postgres-cdc-kafka-minio-v1.md`). The adjacent spill-governor
 atomic compatibility annotation changes no coordination transition.
+
+Issue #338's partitioned `postgres_cdc` retention contract refines M3's
+external source admission and ACK boundary, not M3's abstract record-level
+transition. A partitioned source published without
+`publish_via_partition_root = true` is rejected with `RS-4013` before the
+gateway accepts child-relation changes as parent-table data. A `pgoutput`
+TRUNCATE frame lacks row images, so the legacy row-only decoder fails closed
+with `RS-4015` before acknowledging the containing transaction. The
+relation-aware gateway instead reconstructs bounded row retractions from local
+committed images, applying them atomically with the slot checkpoint (issue #339).
+Neither path may silently advance the slot LSN or leave stale aggregates
+presented as correct.
+The M3 abstraction still requires durable input/output/checkpoint coupling
+before source acknowledgement, but does not model PostgreSQL relation OIDs,
+publication modes, partition DDL, or historical window state. Source-side
+DETACH/DROP PARTITION emits no row-level retractions, and a fresh snapshot of
+retained partitions cannot reconstruct already-pruned historical aggregates.
+These limitations must remain explicit instead of asserting a new abstract
+exactly-once or historical-resnapshot property.
+
+Concrete evidence: `postgres_cdc::tests::pgoutput_truncate_row_only_paths_fail_closed_and_event_decodes`
+checks row-only rejection and relation-aware frame decoding;
+`postgres_cdc::tests::pgoutput_truncate_decodes_relations_flags_and_rejects_malformed_frames`
+checks strict relation and flag validation;
+`postgres_cdc::tests::partitioned_sources_require_root_publication_identity`
+checks the admission guard; and the real PostgreSQL 16
+`postgres_cdc_partition_retention_tests::partitioned_pgoutput_requires_root_identity_and_truncate_fails_closed`
+checks parent publication identity, exact initial and post-pruning snapshot
+transcripts, the child INSERT delta, unchanged slot acknowledgement on rejected
+TRUNCATE, and missing-slot recovery refusal. It does **not** test preserving
+closed TUMBLE aggregates through resnapshot, reconstructing missing WAL, or
+publication-level DDL replay. Those require a separate durable-state model
+and end-to-end recovery proof before being claimed.
 
 Issue #122 adds a bounded production view-log adapter to Kafka. The M3 model
 still abstracts epochs, not row contents. The adapter persists the full pending
@@ -1169,6 +1227,40 @@ coordination and acknowledgment barrier protocols adhere to the end-to-end
 guarantee matrix covered by
 `crates/rockstream-connectors/tests/postgres_cdc_guarantee_matrix_tests.rs` and
 `crates/rockstream-gateway/tests/source_ddl_postgres_kafka_tests.rs`.
+
+Issue #339 extends that **external PostgreSQL pgoutput boundary** with
+transactional `TRUNCATE` semantics. A decoded `T` message retains the enclosing
+XID, relation IDs, and CASCADE / RESTART IDENTITY flags; the source-wide gateway
+stages an ordered marker among INSERT / UPDATE / DELETE records, including when
+the transaction spills. Under the shard commit lock, it expands each affected
+relation's locally committed row images into negative deltas, first overlaying
+earlier changes in the same upstream transaction. Thus `INSERT; TRUNCATE;
+INSERT` retracts the preexisting and first inserted rows, while retaining the
+last INSERT. A multi-relation `T` must retract each imported relation and every
+reachable compiled materialized view in the **same M3 durable epoch** as the
+source checkpoint and frontier advancement; no reader may observe a partial
+truncate. An empty relation contributes no retractions.
+
+**Safety / failure boundary:** if a relation route, row image, or complete
+bounded scan is unavailable, or the expanded transaction exceeds the 65,536
+DML-op / 8 MiB bound, the gateway blocks without advancing PostgreSQL's
+confirmed slot LSN. The legacy row-only decoder cannot obtain these preimages,
+so it rejects `T` and retains the failed frame on retry rather than silently
+acknowledging its COMMIT. This is an implementation-level refinement of M1's
+atomic-WriteBatch and M3's checkpoint-coupled epoch assumptions; the abstract
+M1–M7 FizzBee models do **not** model PostgreSQL relation contents, `T` frames,
+or source-slot state, and therefore do not establish this CDC correctness claim.
+Concrete proof obligations are exercised by
+`pgoutput_truncate_decodes_relations_flags_and_rejects_malformed_frames`,
+`truncate_markers_preserve_order_in_a_spilled_envelope`,
+`truncate_expansion_retracts_preexisting_and_pending_rows_in_wire_order`,
+`truncate_preimage_scan_refuses_oversized_state_without_partial_rows`,
+`postgres_cdc_row_only_truncate_retries_same_frame_without_ack`, and the real
+PostgreSQL gateway test
+`pgoutput_truncate_retracts_nonempty_views_and_survives_gateway_restart`.
+The last test covers nonempty tables, flags, same-transaction ordering,
+multi-relation changes, dependent views, later writes and restart replay; see
+`docs/connectors.md` for the documented operating bounds.
 
 The v0.70 Kafka golden connector provides external streaming ingestion with
 partition offset watermark coordination, bounded buffer consumer groups,

@@ -3,6 +3,7 @@
 use rockstream_control::audit::FileAuditLog;
 use rockstream_control::kek::EnvKekProvider;
 use rockstream_control::secret_store::SecretStore;
+use rockstream_storage::catalog::DurableCatalogStore;
 use rockstream_types::secret::SecretType;
 use slatedb::Db;
 use std::collections::HashMap;
@@ -155,7 +156,12 @@ async fn test_secrets_lifecycle_slatedb_persistence() {
     let db = open_test_slatedb(&dir).await;
 
     let kek_provider = Arc::new(EnvKekProvider::from_passphrase("slatedb-kek-v1"));
-    let store = SecretStore::new(Some(db.clone()), kek_provider.clone());
+    let audit_catalog = Arc::new(DurableCatalogStore::new(
+        Arc::new(object_store::memory::InMemory::new()),
+        "secret-lifecycle-test",
+    ));
+    let store = SecretStore::new(Some(db.clone()), kek_provider.clone())
+        .with_security_audit_catalog(audit_catalog);
 
     let ns = 42u128;
     let mut payload1 = HashMap::new();

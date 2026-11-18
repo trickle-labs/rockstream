@@ -3356,6 +3356,84 @@
               "RS-0003",
               "RS-0005"
             ]
+          },
+          {
+            "name": "recover-admin",
+            "about": "Replace login methods for an existing administrator while the deployment is stopped",
+            "options": [
+              {
+                "name": "layout",
+                "long": "layout",
+                "help": "Select `all` for `--role all`, or `gateway` for `--role gateway`/`control`",
+                "required": true,
+                "value_name": "LAYOUT",
+                "possible_values": [
+                  "all",
+                  "gateway"
+                ]
+              },
+              {
+                "name": "login_methods_file",
+                "long": "login-methods-file",
+                "help": "JSON array of replacement `LoginMethod` entries; contains no plaintext password",
+                "required": true,
+                "value_name": "LOGIN_METHODS_FILE"
+              },
+              {
+                "name": "operation_id",
+                "long": "operation-id",
+                "help": "Stable catalog operation ID to reuse if this command must be retried",
+                "required": true,
+                "value_name": "OPERATION_ID"
+              },
+              {
+                "name": "principal_id",
+                "long": "principal-id",
+                "help": "ID of the existing active cluster administrator to recover",
+                "required": true,
+                "value_name": "PRINCIPAL_ID"
+              },
+              {
+                "name": "storage",
+                "long": "storage",
+                "help": "Node storage directory used by `start --storage` for this deployment",
+                "required": true,
+                "value_name": "STORAGE"
+              },
+              {
+                "name": "yes",
+                "long": "yes",
+                "help": "Confirm the deployment is stopped and the selected durable store is correct",
+                "required": false,
+                "value_name": "YES",
+                "possible_values": [
+                  "true",
+                  "false"
+                ]
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0002",
+              "RS-0003",
+              "RS-0005"
+            ]
           }
         ],
         "exit_codes": [
@@ -4995,6 +5073,24 @@
   "config_surface": {
     "options": [
       {
+        "key": "auth.actor_assertion_public_key_path",
+        "data_type": "Option<PathBuf>",
+        "default_value": "None",
+        "description": "Matching single-key RSA RS256 public JWK used by control to verify gateway actor assertions",
+        "deprecated": false,
+        "env_var": "ROCKSTREAM_AUTH_ACTOR_ASSERTION_PUBLIC_KEY_PATH",
+        "source_origin": "rockstream-types::config::AuthSection"
+      },
+      {
+        "key": "auth.actor_assertion_signing_key_path",
+        "data_type": "Option<PathBuf>",
+        "default_value": "None",
+        "description": "Dedicated RSA private key used by an authenticated gateway connected to control; use a distinct key pair from gateway and internal TLS",
+        "deprecated": false,
+        "env_var": "ROCKSTREAM_AUTH_ACTOR_ASSERTION_SIGNING_KEY_PATH",
+        "source_origin": "rockstream-types::config::AuthSection"
+      },
+      {
         "key": "auth.mode",
         "data_type": "String",
         "default_value": "off",
@@ -5112,6 +5208,15 @@
         "source_origin": "rockstream-types::config::AutotunerConfig"
       },
       {
+        "key": "node.deployment_id",
+        "data_type": "Option<String>",
+        "default_value": "None",
+        "description": "Shared deployment identifier required by gateway actor assertions; configure the same value on gateway and control",
+        "deprecated": false,
+        "env_var": "ROCKSTREAM_NODE_DEPLOYMENT_ID",
+        "source_origin": "rockstream-types::config::NodeSection"
+      },
+      {
         "key": "scatter_pruning.shard_bloom_budget_bytes",
         "data_type": "usize",
         "default_value": "65536",
@@ -5191,6 +5296,22 @@
         "deprecated": false,
         "env_var": "ROCKSTREAM_OBJECT_STORE_URL",
         "source_origin": "rockstream-storage"
+      },
+      {
+        "key": "worker.exchange_advertise_addr",
+        "data_type": "Option<String>",
+        "default_value": "None",
+        "description": "Reachable host:port registered for worker-to-worker shuffle; must not be a wildcard or use port 0",
+        "deprecated": false,
+        "source_origin": "rockstream-types::config::WorkerSection"
+      },
+      {
+        "key": "worker.exchange_bind_addr",
+        "data_type": "Option<String>",
+        "default_value": "None",
+        "description": "Local socket address for the worker-to-worker shuffle listener; configure with worker.exchange_advertise_addr",
+        "deprecated": false,
+        "source_origin": "rockstream-types::config::WorkerSection"
       }
     ]
   },
@@ -6438,6 +6559,38 @@
         ],
         "stability": "stable",
         "description": "Duration of pgwire queries in milliseconds"
+      },
+      {
+        "name": "security_audit_capacity_bytes",
+        "metric_type": "gauge",
+        "unit": "bytes",
+        "labels": [],
+        "stability": "stable",
+        "description": "Configured deployment-wide security audit retention limit"
+      },
+      {
+        "name": "security_audit_degraded",
+        "metric_type": "gauge",
+        "unit": "boolean",
+        "labels": [],
+        "stability": "stable",
+        "description": "Whether required security audit writes are failing"
+      },
+      {
+        "name": "security_audit_retained_bytes",
+        "metric_type": "gauge",
+        "unit": "bytes",
+        "labels": [],
+        "stability": "stable",
+        "description": "JSON-encoded size of retained security audit records"
+      },
+      {
+        "name": "security_audit_retained_records",
+        "metric_type": "gauge",
+        "unit": "count",
+        "labels": [],
+        "stability": "stable",
+        "description": "Number of retained security audit records"
       },
       {
         "name": "storage_flush_latency_ms",
