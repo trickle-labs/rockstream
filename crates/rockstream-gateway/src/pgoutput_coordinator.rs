@@ -1107,7 +1107,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    // Synchronous spill I/O uses block_in_place on the runtime. A single-thread
+    // test reactor can deadlock when a storage background task needs to run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn truncate_markers_preserve_order_in_a_spilled_envelope() {
         let mut coordinator = coordinator().await;
         coordinator
