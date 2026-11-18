@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use rockstream_control::audit::FileAuditLog;
 use rockstream_control::{ControlService, ShardManager, TopologyCatalog};
-use rockstream_runtime::client::{start_worker_client, start_worker_client_with_tls};
+use rockstream_runtime::client::start_worker_client_with_tls;
 use rockstream_storage::catalog::{CatalogStore, DurableCatalogStore};
 use rockstream_test_support::pki::TestPki;
 use rockstream_types::authorization::{
