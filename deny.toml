@@ -15,9 +15,6 @@ ignore = [
     "RUSTSEC-2026-0555", # chrono-tz - upstream maintenance wind-down; reviewed in DEPENDENCY_POLICY.md
     "RUSTSEC-2026-0542", # humantime - follows chrono's maintenance status; reviewed in DEPENDENCY_POLICY.md
     "RUSTSEC-2024-0449", # unsafe-libyaml - pre-existing serde_yaml dependency; unmaintained, no reported vulnerability
-    "RUSTSEC-2026-0542", # humantime - object_store transitive dependency; no patched version
-    "RUSTSEC-2026-0543", # chrono - direct and Arrow/DataFusion dependency; no patched version
-    "RUSTSEC-2026-0555", # chrono-tz - Arrow/DataFusion dependency; no patched version
 ]
 
 [licenses]
