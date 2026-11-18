@@ -335,27 +335,37 @@ impl SecretStore {
         record: &SecurityAuditRecord,
     ) -> Result<(), SecretStoreError> {
         for attempt in 0..rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS {
-            let revision =
-                catalog.get_revision().await.checked_add(1).ok_or_else(|| {
-                    SecretStoreError::storage("durable catalog revision exhausted")
-                })?;
+            let revision = catalog.get_revision().await.checked_add(1).ok_or_else(|| {
+                rockstream_types::metrics::set_security_audit_degraded(true);
+                SecretStoreError::storage("durable catalog revision exhausted")
+            })?;
             let transaction = CatalogTxn::new(
                 revision,
                 rand::random::<u64>().max(1),
                 vec![CatalogMutation::AppendSecurityAudit(record.clone())],
             )
-            .map_err(|error| SecretStoreError::storage(error.to_string()))?;
+            .map_err(|error| {
+                rockstream_types::metrics::set_security_audit_degraded(true);
+                SecretStoreError::storage(error.to_string())
+            })?;
             match catalog.commit_txn(transaction).await {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    rockstream_types::metrics::set_security_audit_degraded(false);
+                    return Ok(());
+                }
                 Err(rockstream_storage::catalog::CatalogError::OptimisticConflict(_))
                     if attempt + 1
                         < rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS =>
                 {
                     continue;
                 }
-                Err(error) => return Err(SecretStoreError::storage(error.to_string())),
+                Err(error) => {
+                    rockstream_types::metrics::set_security_audit_degraded(true);
+                    return Err(SecretStoreError::storage(error.to_string()));
+                }
             }
         }
+        rockstream_types::metrics::set_security_audit_degraded(true);
         Err(SecretStoreError::storage(
             "durable security audit retry was exhausted",
         ))
