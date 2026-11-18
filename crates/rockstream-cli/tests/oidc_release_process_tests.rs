@@ -6853,6 +6853,9 @@ async fn worker_shuffle_mtls_rollover_preserves_release_process_stream() {
     assert!(server.0.try_wait().unwrap().is_none());
     assert!(client_worker.0.try_wait().unwrap().is_none());
 
+    let expected_correlation = AuditCorrelation::Observed(
+        "exchange:100:source:10:target:20:epoch:1:sequence:1".to_owned(),
+    );
     let deadline = Instant::now() + Duration::from_secs(5);
     let audit_after = loop {
         security_catalog.refresh().await.unwrap();
@@ -6860,14 +6863,28 @@ async fn worker_shuffle_mtls_rollover_preserves_release_process_stream() {
             .list_security_audit_records()
             .await
             .unwrap();
-        if records.len() == audit_before.len() + 1 {
+        if records.iter().any(|record| {
+            record.event_id.starts_with("shuffle-authorization:")
+                && record.correlation.eq(&expected_correlation)
+        }) {
             break records;
         }
         assert!(Instant::now() < deadline, "shuffle denial was not audited");
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
-    let rejection = audit_after.last().unwrap();
-    assert!(rejection.event_id.starts_with("shuffle-authorization:"));
+    assert!(!audit_before.iter().any(|record| {
+        record.event_id.starts_with("shuffle-authorization:")
+            && record.correlation.eq(&expected_correlation)
+    }));
+    let rejections = audit_after
+        .iter()
+        .filter(|record| {
+            record.event_id.starts_with("shuffle-authorization:")
+                && record.correlation.eq(&expected_correlation)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rejections.len(), 1);
+    let rejection = rejections[0];
     assert_eq!(
         rejection,
         &SecurityAuditRecord {
@@ -6879,9 +6896,7 @@ async fn worker_shuffle_mtls_rollover_preserves_release_process_stream() {
             scope: AuditField::Known("worker_shuffle".to_owned()),
             action: SecurityAuditClass::AuthorizationDenial,
             outcome: SecurityAuditOutcome::Denied,
-            correlation: AuditCorrelation::Observed(
-                "exchange:100:source:10:target:20:epoch:1:sequence:1".to_owned(),
-            ),
+            correlation: expected_correlation,
             operation_id: AuditField::NotApplicable,
             policy_revision: AuditField::NotApplicable,
             before_state: AuditField::NotApplicable,
