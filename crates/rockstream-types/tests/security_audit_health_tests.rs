@@ -27,5 +27,27 @@ fn audit_storage_degradation_is_visible_without_failing_ready_health() {
         report.dimensions.unwrap().degradation.status,
         HealthDimensionStatus::Pass
     );
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    tracker.set_degradation_status(
+        HealthDimensionStatus::Fail,
+        Some("catalog write failed".to_owned()),
+        now_secs,
+    );
+    metrics::set_security_audit_degraded(true);
+
+    let (status_code, report) = tracker.generate_health_report();
+    assert_eq!(status_code, 503);
+    assert_eq!(report.status, "unhealthy");
+    let degradation = report.dimensions.unwrap().degradation;
+    assert_eq!(degradation.status, HealthDimensionStatus::Fail);
+    assert_eq!(
+        degradation.reason.as_deref(),
+        Some("catalog write failed; security audit storage is degraded")
+    );
+    assert_eq!(degradation.producer, "control:diagnostic");
     metrics::reset_all();
 }

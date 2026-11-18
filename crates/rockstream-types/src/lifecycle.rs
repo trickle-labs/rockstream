@@ -815,12 +815,26 @@ impl LifecycleTracker {
 
         let audit_degraded = metrics::is_security_audit_degraded();
         if audit_degraded {
-            dimensions.degradation = HealthDimensionObservation::new(
-                HealthDimensionStatus::Warn,
-                format!("{}:security-audit", self.role),
-                now_secs,
-            )
-            .with_reason("security audit storage is degraded");
+            const AUDIT_REASON: &str = "security audit storage is degraded";
+            if dimensions.degradation.status == HealthDimensionStatus::Pass {
+                dimensions.degradation = HealthDimensionObservation::new(
+                    HealthDimensionStatus::Warn,
+                    format!("{}:security-audit", self.role),
+                    now_secs,
+                )
+                .with_reason(AUDIT_REASON);
+            } else {
+                let reason = dimensions.degradation.reason.take();
+                dimensions.degradation.reason = Some(match reason {
+                    Some(reason) if !reason.contains(AUDIT_REASON) => {
+                        format!("{reason}; {AUDIT_REASON}")
+                    }
+                    Some(reason) => reason,
+                    None => AUDIT_REASON.to_owned(),
+                });
+                dimensions.degradation.sampled_at = now_secs;
+                dimensions.degradation.is_stale = false;
+            }
         }
 
         // Apply stale observation policy (15s threshold)
@@ -828,8 +842,11 @@ impl LifecycleTracker {
 
         // Grounding Rule: A live process with unavailable storage MUST remain live while reporting durability: FAIL and availability: FAIL.
         // Liveness alone NEVER produces workload health.
+        let audit_degradation_failed =
+            audit_degraded && dimensions.degradation.status == HealthDimensionStatus::Fail;
         if (dimensions.durability.status == HealthDimensionStatus::Fail
-            || dimensions.availability.status == HealthDimensionStatus::Fail)
+            || dimensions.availability.status == HealthDimensionStatus::Fail
+            || audit_degradation_failed)
             && code == 200
         {
             code = 503;
@@ -837,6 +854,7 @@ impl LifecycleTracker {
 
         let report_status = if dimensions.durability.status == HealthDimensionStatus::Fail
             || dimensions.availability.status == HealthDimensionStatus::Fail
+            || audit_degradation_failed
         {
             "unhealthy".to_string()
         } else if audit_degraded && state.is_ready() {
