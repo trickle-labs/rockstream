@@ -242,6 +242,24 @@ impl ConfigContributor {
                 env_var: Some("ROCKSTREAM_OBJECT_STORE_URL".to_string()),
                 source_origin: "rockstream-storage".to_string(),
             },
+            ConfigOptionDescriptor {
+                key: "worker.exchange_bind_addr".to_string(),
+                data_type: "Option<String>".to_string(),
+                default_value: "None".to_string(),
+                description: "Local socket address for the worker-to-worker shuffle listener; configure with worker.exchange_advertise_addr".to_string(),
+                deprecated: false,
+                env_var: None,
+                source_origin: "rockstream-types::config::WorkerSection".to_string(),
+            },
+            ConfigOptionDescriptor {
+                key: "worker.exchange_advertise_addr".to_string(),
+                data_type: "Option<String>".to_string(),
+                default_value: "None".to_string(),
+                description: "Reachable host:port registered for worker-to-worker shuffle; must not be a wildcard or use port 0".to_string(),
+                deprecated: false,
+                env_var: None,
+                source_origin: "rockstream-types::config::WorkerSection".to_string(),
+            },
         ];
 
         options.sort_by(|a, b| a.key.cmp(&b.key));

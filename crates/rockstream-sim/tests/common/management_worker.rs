@@ -220,7 +220,7 @@ impl WorkerPeer {
         Self::send_on(&mut reader, &WorkerMessage::Register(registration)).await;
         let worker_id = WorkerId(worker_id);
         loop {
-            if matches!(Self::next_from(&mut reader).await, ControlMessage::Registered { worker_id: id } if id == worker_id)
+            if matches!(Self::next_from(&mut reader).await, ControlMessage::Registered { worker_id: id, .. } if id == worker_id)
             {
                 return Self { reader, worker_id };
             }
