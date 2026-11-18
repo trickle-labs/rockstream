@@ -146,6 +146,9 @@ fn batch_oracle(
 
 /// Accumulate an ArrowZSet (schema: k, v) into a BTreeMap<(k,v), weight>.
 fn accumulate_kv(acc: &mut BTreeMap<(i64, i64), i64>, batch: &ArrowZSet) {
+    batch
+        .validate()
+        .expect("query output must have aligned row weights");
     if batch.is_empty() {
         return;
     }
@@ -181,6 +184,9 @@ fn accumulate_kv(acc: &mut BTreeMap<(i64, i64), i64>, batch: &ArrowZSet) {
 /// apply insertions (set new state).  This correctly handles both updates
 /// and deletions within a single output batch.
 fn collect_agg_output(acc: &mut BTreeMap<i64, i64>, batch: &ArrowZSet) {
+    batch
+        .validate()
+        .expect("aggregate output must have aligned row weights");
     if batch.is_empty() {
         return;
     }
@@ -533,6 +539,8 @@ async fn sql_engine_window_row_number_over_view() {
     let mut output_state: HashMap<(i64, i64, i64), i64> = HashMap::new();
 
     fn acc_out(state: &mut HashMap<(i64, i64, i64), i64>, zset: &ArrowZSet) {
+        zset.validate()
+            .expect("window output must have aligned row weights");
         if zset.is_empty() {
             return;
         }

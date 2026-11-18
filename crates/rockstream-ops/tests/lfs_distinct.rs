@@ -54,6 +54,8 @@ fn make_batch(rows: &[(i64, i64, i64)]) -> ArrowZSet {
 /// Collect all live (positive-weight) rows from a DistinctOp output accumulation.
 fn collect_positive_kv(zset: &ArrowZSet) -> BTreeMap<(i64, i64), i64> {
     let mut out = BTreeMap::new();
+    zset.validate()
+        .expect("distinct output must have aligned row weights");
     if zset.is_empty() {
         return out;
     }
@@ -69,7 +71,7 @@ fn collect_positive_kv(zset: &ArrowZSet) -> BTreeMap<(i64, i64), i64> {
         .as_any()
         .downcast_ref::<Int64Array>()
         .unwrap();
-    for (i, &weight) in zset.weights.iter().enumerate().take(zset.num_rows()) {
+    for (i, &weight) in zset.weights.iter().enumerate() {
         if weight > 0 {
             out.insert((k_col.value(i), v_col.value(i)), weight);
         }

@@ -118,6 +118,9 @@ fn run_q1_incremental(op: &AggregateOp, lineitem: &ArrowZSet) -> Vec<(i64, i64)>
     let kv_zset = ArrowZSet::new(data, lineitem.weights.clone());
 
     let output = op.process_delta(kv_zset).expect("AggregateOp Q1 failed");
+    output
+        .validate()
+        .expect("Q1 aggregate output must have aligned row weights");
     if output.is_empty() {
         return vec![];
     }
@@ -137,12 +140,12 @@ fn run_q1_incremental(op: &AggregateOp, lineitem: &ArrowZSet) -> Vec<(i64, i64)>
         .downcast_ref::<Int64Array>()
         .unwrap();
     let mut acc: BTreeMap<i64, i64> = BTreeMap::new();
-    for (i, &w) in output.weights.iter().enumerate().take(output.num_rows()) {
+    for (i, &weight) in output.weights.iter().enumerate() {
         let k = k_out.value(i);
         let s = s_out.value(i);
-        if w > 0 {
+        if weight > 0 {
             acc.insert(k, s);
-        } else if w < 0 {
+        } else if weight < 0 {
             acc.remove(&k);
         }
     }
@@ -156,6 +159,9 @@ fn run_q1_incremental(op: &AggregateOp, lineitem: &ArrowZSet) -> Vec<(i64, i64)>
 /// The output delta contains (k, sum_v, count_v, avg_v) rows with weights
 /// +1 (insert) or -1 (retract). We only track (k → sum_v) for Q1.
 fn apply_agg_delta(state: &mut BTreeMap<i64, i64>, output: &ArrowZSet) {
+    output
+        .validate()
+        .expect("aggregate output must have aligned row weights");
     if output.is_empty() {
         return;
     }
@@ -171,12 +177,12 @@ fn apply_agg_delta(state: &mut BTreeMap<i64, i64>, output: &ArrowZSet) {
         .as_any()
         .downcast_ref::<Int64Array>()
         .unwrap();
-    for (i, &w) in output.weights.iter().enumerate().take(output.num_rows()) {
+    for (i, &weight) in output.weights.iter().enumerate() {
         let k = k_col.value(i);
         let s = s_col.value(i);
-        if w > 0 {
+        if weight > 0 {
             state.insert(k, s);
-        } else if w < 0 {
+        } else if weight < 0 {
             state.remove(&k);
         }
     }
@@ -606,6 +612,9 @@ async fn tpch_q11_lfs_join_aggregate() {
     let agg_out = agg_op
         .process_delta(agg_input)
         .expect("AggregateOp Q11 failed");
+    agg_out
+        .validate()
+        .expect("Q11 aggregate output must have aligned row weights");
     let agg_time = t_agg.elapsed();
 
     assert!(
@@ -629,12 +638,12 @@ async fn tpch_q11_lfs_join_aggregate() {
         .downcast_ref::<Int64Array>()
         .unwrap();
     let mut acc_state: std::collections::BTreeMap<i64, i64> = std::collections::BTreeMap::new();
-    for (i, &w) in agg_out.weights.iter().enumerate().take(agg_out.num_rows()) {
+    for (i, &weight) in agg_out.weights.iter().enumerate() {
         let k = k_col.value(i);
         let s = s_col.value(i);
-        if w > 0 {
+        if weight > 0 {
             acc_state.insert(k, s);
-        } else if w < 0 {
+        } else if weight < 0 {
             acc_state.remove(&k);
         }
     }

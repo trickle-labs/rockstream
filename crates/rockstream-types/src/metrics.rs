@@ -409,6 +409,10 @@ struct MetricRegistry {
     rmw_required: HashMap<LawMetricKey, Counter>,
     /// Total manifest writes (global, not per-law).
     manifest_writes: AtomicU64,
+    security_audit_retained_records: u64,
+    security_audit_retained_bytes: u64,
+    security_audit_capacity_bytes: u64,
+    security_audit_degraded: bool,
 
     // SRE Observability metrics
     compaction_bytes_reclaimed: HashMap<u16, Counter>,
@@ -559,6 +563,10 @@ impl MetricRegistry {
             rmw_avoided: HashMap::new(),
             rmw_required: HashMap::new(),
             manifest_writes: AtomicU64::new(0),
+            security_audit_retained_records: 0,
+            security_audit_retained_bytes: 0,
+            security_audit_capacity_bytes: 0,
+            security_audit_degraded: false,
             compaction_bytes_reclaimed: HashMap::new(),
             duplicate_dropped_total: HashMap::new(),
             tombstone_bytes: HashMap::new(),
@@ -1259,6 +1267,10 @@ pub fn reset_all() {
         reg.rmw_avoided.clear();
         reg.rmw_required.clear();
         reg.manifest_writes.store(0, Ordering::Relaxed);
+        reg.security_audit_retained_records = 0;
+        reg.security_audit_retained_bytes = 0;
+        reg.security_audit_capacity_bytes = 0;
+        reg.security_audit_degraded = false;
         reg.compaction_bytes_reclaimed.clear();
         reg.duplicate_dropped_total.clear();
         reg.tombstone_bytes.clear();
@@ -2500,6 +2512,26 @@ pub fn prometheus_text() -> String {
     generate_prometheus_metrics()
 }
 
+pub fn set_security_audit_storage_metrics(
+    retained_records: u64,
+    retained_bytes: u64,
+    capacity_bytes: u64,
+) {
+    with_registry(|reg| {
+        reg.security_audit_retained_records = retained_records;
+        reg.security_audit_retained_bytes = retained_bytes;
+        reg.security_audit_capacity_bytes = capacity_bytes;
+    });
+}
+
+pub fn set_security_audit_degraded(degraded: bool) {
+    with_registry(|reg| reg.security_audit_degraded = degraded);
+}
+
+pub fn is_security_audit_degraded() -> bool {
+    with_registry(|reg| reg.security_audit_degraded)
+}
+
 pub fn generate_prometheus_metrics() -> String {
     let mut out = String::new();
     with_registry(|reg| {
@@ -2515,6 +2547,35 @@ pub fn generate_prometheus_metrics() -> String {
             id.compiler_version,
             id.lockfile_digest,
             id.enabled_features.join(",")
+        ));
+
+        out.push_str(
+            "# HELP security_audit_retained_records Number of retained security audit records.\n",
+        );
+        out.push_str("# TYPE security_audit_retained_records gauge\n");
+        out.push_str(&format!(
+            "security_audit_retained_records {}\n",
+            reg.security_audit_retained_records
+        ));
+        out.push_str("# HELP security_audit_retained_bytes JSON-encoded size of retained security audit records.\n");
+        out.push_str("# TYPE security_audit_retained_bytes gauge\n");
+        out.push_str(&format!(
+            "security_audit_retained_bytes {}\n",
+            reg.security_audit_retained_bytes
+        ));
+        out.push_str("# HELP security_audit_capacity_bytes Configured security audit retention byte limit.\n");
+        out.push_str("# TYPE security_audit_capacity_bytes gauge\n");
+        out.push_str(&format!(
+            "security_audit_capacity_bytes {}\n",
+            reg.security_audit_capacity_bytes
+        ));
+        out.push_str(
+            "# HELP security_audit_degraded Whether required security audit writes are failing.\n",
+        );
+        out.push_str("# TYPE security_audit_degraded gauge\n");
+        out.push_str(&format!(
+            "security_audit_degraded {}\n\n",
+            u8::from(reg.security_audit_degraded)
         ));
 
         // 1. merge_law_applied_total
@@ -3979,6 +4040,45 @@ mod tests {
         assert!(metrics.contains("write_amplification_ratio"));
         assert!(metrics.contains("segment_cache_hit_ratio"));
         assert!(metrics.contains("segment_cache_bytes_used"));
+    }
+
+    #[test]
+    fn security_audit_storage_metrics_are_exported_exactly() {
+        let _g = TEST_LOCK.lock().unwrap();
+        reset_all();
+
+        set_security_audit_storage_metrics(7, 2048, 4096);
+        set_security_audit_degraded(true);
+        let prometheus = generate_prometheus_metrics();
+        let lines: Vec<_> = prometheus
+            .lines()
+            .filter(|line| {
+                line.starts_with("# HELP security_audit_")
+                    || line.starts_with("# TYPE security_audit_")
+                    || line.starts_with("security_audit_")
+            })
+            .collect();
+
+        assert_eq!(
+            lines,
+            vec![
+                "# HELP security_audit_retained_records Number of retained security audit records.",
+                "# TYPE security_audit_retained_records gauge",
+                "security_audit_retained_records 7",
+                "# HELP security_audit_retained_bytes JSON-encoded size of retained security audit records.",
+                "# TYPE security_audit_retained_bytes gauge",
+                "security_audit_retained_bytes 2048",
+                "# HELP security_audit_capacity_bytes Configured security audit retention byte limit.",
+                "# TYPE security_audit_capacity_bytes gauge",
+                "security_audit_capacity_bytes 4096",
+                "# HELP security_audit_degraded Whether required security audit writes are failing.",
+                "# TYPE security_audit_degraded gauge",
+                "security_audit_degraded 1",
+            ]
+        );
+        assert!(is_security_audit_degraded());
+
+        reset_all();
     }
 
     #[test]

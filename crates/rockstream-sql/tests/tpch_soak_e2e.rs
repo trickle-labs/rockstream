@@ -621,6 +621,8 @@ fn make_df_ctx(dataset: &HashMap<String, ArrowZSet>) -> SessionContext {
 
 /// Accumulate Z-set output rows into `acc` (row → net weight).
 fn accumulate_zset_output(out: &ArrowZSet, acc: &mut BTreeMap<Vec<i64>, i64>) {
+    out.validate()
+        .expect("query output must have aligned row weights");
     if out.is_empty() {
         return;
     }
@@ -634,7 +636,7 @@ fn accumulate_zset_output(out: &ArrowZSet, acc: &mut BTreeMap<Vec<i64>, i64>) {
                 .unwrap()
         })
         .collect();
-    for (i, &weight) in out.weights.iter().enumerate().take(out.num_rows()) {
+    for (i, &weight) in out.weights.iter().enumerate() {
         let row: Vec<i64> = col_arrays.iter().map(|c| c.value(i)).collect();
         *acc.entry(row).or_insert(0) += weight;
     }
@@ -785,29 +787,7 @@ async fn test_tpch_queries_incremental_vs_batch() {
         let out_0 = exec_tree.evaluate(&initial_dataset);
         total_bootstrap_inc_time += t_start.elapsed();
 
-        // Accumulate incremental output
-        if !out_0.is_empty() {
-            let num_cols = out_0.data.num_columns();
-            let mut col_arrays = Vec::new();
-            for j in 0..num_cols {
-                col_arrays.push(
-                    out_0
-                        .data
-                        .column(j)
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .unwrap(),
-                );
-            }
-            for (i, &weight) in out_0.weights.iter().enumerate().take(out_0.num_rows()) {
-                let mut row = Vec::with_capacity(col_arrays.len());
-                for col in &col_arrays {
-                    row.push(col.value(i));
-                }
-                *inc_acc.entry(row).or_insert(0) += weight;
-            }
-        }
-        inc_acc.retain(|_, &mut w| w != 0);
+        accumulate_zset_output(&out_0, &mut inc_acc);
 
         // Run DataFusion batch execution
         let t_df_start = Instant::now();
@@ -844,29 +824,7 @@ async fn test_tpch_queries_incremental_vs_batch() {
         let out_1 = exec_tree.evaluate(&delta_1);
         total_inc_time += t_start_1.elapsed();
 
-        // Accumulate incremental output
-        if !out_1.is_empty() {
-            let num_cols = out_1.data.num_columns();
-            let mut col_arrays = Vec::new();
-            for j in 0..num_cols {
-                col_arrays.push(
-                    out_1
-                        .data
-                        .column(j)
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .unwrap(),
-                );
-            }
-            for (i, &weight) in out_1.weights.iter().enumerate().take(out_1.num_rows()) {
-                let mut row = Vec::with_capacity(col_arrays.len());
-                for col in &col_arrays {
-                    row.push(col.value(i));
-                }
-                *inc_acc.entry(row).or_insert(0) += weight;
-            }
-        }
-        inc_acc.retain(|_, &mut w| w != 0);
+        accumulate_zset_output(&out_1, &mut inc_acc);
 
         // Run DataFusion batch execution
         let t_df_start_1 = Instant::now();
@@ -903,29 +861,7 @@ async fn test_tpch_queries_incremental_vs_batch() {
         let out_2 = exec_tree.evaluate(&delta_2);
         total_inc_time += t_start_2.elapsed();
 
-        // Accumulate incremental output
-        if !out_2.is_empty() {
-            let num_cols = out_2.data.num_columns();
-            let mut col_arrays = Vec::new();
-            for j in 0..num_cols {
-                col_arrays.push(
-                    out_2
-                        .data
-                        .column(j)
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .unwrap(),
-                );
-            }
-            for (i, &weight) in out_2.weights.iter().enumerate().take(out_2.num_rows()) {
-                let mut row = Vec::with_capacity(col_arrays.len());
-                for col in &col_arrays {
-                    row.push(col.value(i));
-                }
-                *inc_acc.entry(row).or_insert(0) += weight;
-            }
-        }
-        inc_acc.retain(|_, &mut w| w != 0);
+        accumulate_zset_output(&out_2, &mut inc_acc);
 
         // Run DataFusion batch execution
         let t_df_start_2 = Instant::now();

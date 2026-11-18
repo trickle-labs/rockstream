@@ -59,6 +59,9 @@ fn step_plan() -> PlanNode {
 }
 
 fn accumulate(state: &mut BTreeMap<(i64, i64), i64>, batch: &ArrowZSet) {
+    batch
+        .validate()
+        .expect("recursion output must have aligned row weights");
     if batch.is_empty() {
         return;
     }
@@ -74,7 +77,7 @@ fn accumulate(state: &mut BTreeMap<(i64, i64), i64>, batch: &ArrowZSet) {
         .as_any()
         .downcast_ref::<Int64Array>()
         .unwrap();
-    for (row_idx, &weight) in batch.weights.iter().enumerate().take(batch.num_rows()) {
+    for (row_idx, &weight) in batch.weights.iter().enumerate() {
         *state
             .entry((src.value(row_idx), dst.value(row_idx)))
             .or_insert(0) += weight;

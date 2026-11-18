@@ -111,6 +111,9 @@ pub fn incremental_output(epochs: &[Vec<(i64, i64, i64)>], kind: MinMaxKind) -> 
         }
         let batch = make_kv_batch(epoch);
         let output = op.process_delta(batch).expect("MinMaxOp failed");
+        output
+            .validate()
+            .expect("MinMaxOp output must have aligned row weights");
 
         // After every batch: verify cache consistency.
         for &(k, _, _) in epoch {
@@ -136,7 +139,7 @@ pub fn incremental_output(epochs: &[Vec<(i64, i64, i64)>], kind: MinMaxKind) -> 
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        for (i, &w) in output.weights.iter().enumerate().take(output.num_rows()) {
+        for (i, &w) in output.weights.iter().enumerate() {
             let k = k_col.value(i);
             let e = e_col.value(i);
             if w > 0 {

@@ -58,6 +58,9 @@ mod proptest_oracle {
 
     /// Accumulate (pk, v, id) → net_weight into the given map.
     fn accumulate_state(acc: &mut BTreeMap<(i64, i64, i64), i64>, batch: &ArrowZSet) {
+        batch
+            .validate()
+            .expect("top-k input must have aligned row weights");
         if batch.is_empty() {
             return;
         }
@@ -79,7 +82,7 @@ mod proptest_oracle {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        for (i, &weight) in batch.weights.iter().enumerate().take(batch.num_rows()) {
+        for (i, &weight) in batch.weights.iter().enumerate() {
             *acc.entry((pk_col.value(i), v_col.value(i), id_col.value(i)))
                 .or_insert(0) += weight;
         }
@@ -129,6 +132,9 @@ mod proptest_oracle {
 
     /// Accumulate incremental output into a running top-K state map.
     fn accumulate_output(out: &mut BTreeMap<(i64, i64, i64), i64>, batch: &ArrowZSet) {
+        batch
+            .validate()
+            .expect("top-k output must have aligned row weights");
         if batch.is_empty() {
             return;
         }
@@ -150,7 +156,7 @@ mod proptest_oracle {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        for (i, &weight) in batch.weights.iter().enumerate().take(batch.num_rows()) {
+        for (i, &weight) in batch.weights.iter().enumerate() {
             *out.entry((pk_col.value(i), v_col.value(i), id_col.value(i)))
                 .or_insert(0) += weight;
         }

@@ -66,6 +66,9 @@ fn accumulate_agg_output(output: &ArrowZSet) -> Vec<(i64, i64)> {
 /// Apply an AggregateOp output Z-set to an accumulated group state map.
 /// Retract (w < 0) removes the key; insert (w > 0) sets the new sum.
 fn apply_agg_output(state: &mut BTreeMap<i64, i64>, output: &ArrowZSet) {
+    output
+        .validate()
+        .expect("aggregate output must have aligned row weights");
     if output.is_empty() {
         return;
     }
@@ -81,7 +84,7 @@ fn apply_agg_output(state: &mut BTreeMap<i64, i64>, output: &ArrowZSet) {
         .as_any()
         .downcast_ref::<Int64Array>()
         .unwrap();
-    for (i, &weight) in output.weights.iter().enumerate().take(output.num_rows()) {
+    for (i, &weight) in output.weights.iter().enumerate() {
         let k = k_col.value(i);
         let s = s_col.value(i);
         match weight {

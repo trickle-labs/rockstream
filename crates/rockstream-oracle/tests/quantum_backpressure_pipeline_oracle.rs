@@ -185,6 +185,8 @@ fn join_left_only(join: &JoinOp, left_delta: ArrowZSet) -> ArrowZSet {
 /// each), preserving row order. This models the sender-side rechunking that
 /// keeps every shuffle frame within `worker.max_rows_per_quantum`.
 fn rechunk(zset: &ArrowZSet, max_rows: usize) -> Vec<ArrowZSet> {
+    zset.validate()
+        .expect("rechunk input must have aligned row weights");
     if zset.is_empty() {
         return Vec::new();
     }

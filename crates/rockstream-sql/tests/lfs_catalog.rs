@@ -497,6 +497,8 @@ async fn test_5_level_view_chain_convergence() {
 
 fn consolidate_first_two_cols(zset: &ArrowZSet) -> std::collections::BTreeMap<(i64, i64), i64> {
     let mut map = std::collections::BTreeMap::new();
+    zset.validate()
+        .expect("view output must have aligned row weights");
     if zset.is_empty() {
         return map;
     }

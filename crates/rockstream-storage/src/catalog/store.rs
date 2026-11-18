@@ -36,6 +36,7 @@ use rockstream_types::ids::{
     CompiledPlanId, DatabaseId, IndexId, NamespaceId, PrincipalId, SinkId, SourceId, TableId,
     ViewId, WorkloadId,
 };
+use rockstream_types::metrics;
 use rockstream_types::workload::WorkloadDef;
 
 const SECURITY_AUDIT_RETENTION_MS: u64 = 90 * 24 * 60 * 60 * 1000;
@@ -675,15 +676,12 @@ impl DurableCatalogStore {
             }
         }
 
-        *catalog.state.write().await = recovered_state;
-        {
-            let mut state = catalog.state.write().await;
-            prune_expired_security_audit_records(&mut state, audit_cutoff_ms)?;
-            ensure_security_audit_budget_bytes(
-                state.security_audit_bytes,
-                MAX_SECURITY_AUDIT_BYTES,
-            )?;
-        }
+        let mut state = catalog.state.write().await;
+        *state = recovered_state;
+        prune_expired_security_audit_records(&mut state, audit_cutoff_ms)?;
+        update_security_audit_storage_metrics(&state);
+        ensure_security_audit_budget_bytes(state.security_audit_bytes, MAX_SECURITY_AUDIT_BYTES)?;
+        drop(state);
         Ok(catalog)
     }
 
@@ -802,8 +800,17 @@ fn encoded_security_audit_record_bytes(record: &SecurityAuditRecord) -> Result<u
     Ok(counter.0)
 }
 
+fn update_security_audit_storage_metrics(state: &CatalogInnerState) {
+    metrics::set_security_audit_storage_metrics(
+        state.security_audit_records.len() as u64,
+        state.security_audit_bytes,
+        MAX_SECURITY_AUDIT_BYTES,
+    );
+}
+
 fn ensure_security_audit_budget_bytes(bytes: u64, max_bytes: u64) -> Result<(), CatalogError> {
     if bytes > max_bytes {
+        metrics::set_security_audit_degraded(true);
         return Err(CatalogError::Storage(
             "security audit retention budget is full (1 GiB); required security operation was not committed".into(),
         ));
@@ -874,6 +881,11 @@ fn append_security_audit_record_to_state(
     };
     state.security_audit_bytes = state
         .security_audit_bytes
+        .saturating_sub(if state.security_audit_records.is_empty() {
+            2
+        } else {
+            0
+        })
         .saturating_add(separator_bytes)
         .saturating_add(encoded_security_audit_record_bytes(record)?);
     state.security_audit_oldest_timestamp_ms = Some(
@@ -1421,7 +1433,13 @@ impl CatalogStore for DurableCatalogStore {
     }
 
     async fn refresh(&self) -> Result<(), CatalogError> {
-        let recovered = Self::recover(self.store.clone(), self.prefix.clone()).await?;
+        let recovered = match Self::recover(self.store.clone(), self.prefix.clone()).await {
+            Ok(recovered) => recovered,
+            Err(error) => {
+                metrics::set_security_audit_degraded(true);
+                return Err(error);
+            }
+        };
         let recovered_state = recovered.state.read().await.clone();
         self.id_allocator
             .observe(recovered.id_allocator.high_water_mark());
@@ -1429,6 +1447,7 @@ impl CatalogStore for DurableCatalogStore {
         if recovered_state.revision >= state.revision {
             *state = recovered_state;
         }
+        update_security_audit_storage_metrics(&state);
         Ok(())
     }
 
@@ -1582,22 +1601,48 @@ impl CatalogStore for DurableCatalogStore {
         let txn = CatalogTxn::new(txn.revision, txn.operation_id, resolved)?;
 
         // 3. Durably persist transaction log
-        let bytes = txn.encode()?;
+        let bytes = txn.encode().inspect_err(|_| {
+            if audit_cutoff_ms > 0 {
+                metrics::set_security_audit_degraded(true);
+            }
+        })?;
         let revision_path = self.revision_log_path(txn.revision);
-        persist_catalog_log(self.store.as_ref(), &revision_path, &bytes).await?;
+        if let Err(error) = persist_catalog_log(self.store.as_ref(), &revision_path, &bytes).await {
+            if audit_cutoff_ms > 0 {
+                metrics::set_security_audit_degraded(true);
+            }
+            return Err(error);
+        }
         let path = self.log_path(txn.revision, txn.operation_id);
-        persist_catalog_log(self.store.as_ref(), &path, &bytes).await?;
+        if let Err(error) = persist_catalog_log(self.store.as_ref(), &path, &bytes).await {
+            if audit_cutoff_ms > 0 {
+                metrics::set_security_audit_degraded(true);
+            }
+            return Err(error);
+        }
 
         // 4. Apply all mutations to in-memory state
         if audit_cutoff_ms > 0 {
-            prune_expired_security_audit_records(&mut state, audit_cutoff_ms)?;
+            if let Err(error) = prune_expired_security_audit_records(&mut state, audit_cutoff_ms) {
+                metrics::set_security_audit_degraded(true);
+                return Err(error);
+            }
         }
         for m in &txn.mutations {
-            apply_mutation_to_state(&mut state, &self.id_allocator, m)?;
+            if let Err(error) = apply_mutation_to_state(&mut state, &self.id_allocator, m) {
+                if audit_cutoff_ms > 0 {
+                    metrics::set_security_audit_degraded(true);
+                }
+                return Err(error);
+            }
         }
 
         state.committed_operations.insert(txn.operation_id);
         state.revision = txn.revision;
+        if audit_cutoff_ms > 0 {
+            update_security_audit_storage_metrics(&state);
+            metrics::set_security_audit_degraded(false);
+        }
 
         Ok(state.revision)
     }

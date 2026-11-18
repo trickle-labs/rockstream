@@ -134,6 +134,9 @@ mod proptest_oracle {
                 batch: &ArrowZSet,
                 watermark_ms: &mut i64,
             ) {
+                batch
+                    .validate()
+                    .expect("session input must have aligned row weights");
                 if batch.is_empty() {
                     return;
                 }
@@ -164,6 +167,9 @@ mod proptest_oracle {
                 state: &mut BTreeMap<(i64, i64, i64, i64), i64>,
                 batch: &ArrowZSet,
             ) {
+                batch
+                    .validate()
+                    .expect("session output must have aligned row weights");
                 if batch.is_empty() {
                     return;
                 }
@@ -300,6 +306,9 @@ mod proptest_oracle {
             window_size_ms: i64,
             slide_ms: i64,
         ) {
+            batch
+                .validate()
+                .expect("hop-window input must have aligned row weights");
             if batch.is_empty() {
                 return;
             }
@@ -339,6 +348,9 @@ mod proptest_oracle {
         }
 
         fn accumulate_output(state: &mut BTreeMap<(i64, i64, i64), i64>, batch: &ArrowZSet) {
+            batch
+                .validate()
+                .expect("hop-window output must have aligned row weights");
             if batch.is_empty() {
                 return;
             }
@@ -478,6 +490,9 @@ mod proptest_oracle {
     // ─── Input accumulation ───────────────────────────────────────────────────
 
     fn accumulate_input(acc: &mut BTreeMap<(i64, i64), i64>, batch: &ArrowZSet) {
+        batch
+            .validate()
+            .expect("window input must have aligned row weights");
         if batch.is_empty() {
             return;
         }
@@ -507,6 +522,9 @@ mod proptest_oracle {
 
     /// Accumulate output ZSet deltas into net state.
     fn accumulate_output(state: &mut BTreeMap<(i64, i64, i64), i64>, batch: &ArrowZSet) {
+        batch
+            .validate()
+            .expect("window output must have aligned row weights");
         if batch.is_empty() {
             return;
         }

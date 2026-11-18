@@ -41,6 +41,9 @@ fn make_batch(rows: &[(i64, i64, i64)]) -> rockstream_ops::ArrowZSet {
 }
 
 fn extract_rows(batch: &rockstream_ops::ArrowZSet) -> Vec<(i64, i64, i64, f64, i64)> {
+    batch
+        .validate()
+        .expect("bucket output must have aligned row weights");
     let k = batch
         .data
         .column(0)
@@ -66,7 +69,7 @@ fn extract_rows(batch: &rockstream_ops::ArrowZSet) -> Vec<(i64, i64, i64, f64, i
         .downcast_ref::<Float64Array>()
         .unwrap();
     let mut rows = Vec::new();
-    for (index, &weight) in batch.weights.iter().enumerate().take(batch.num_rows()) {
+    for (index, &weight) in batch.weights.iter().enumerate() {
         rows.push((
             k.value(index),
             sum.value(index),

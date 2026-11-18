@@ -740,6 +740,13 @@ and delegated secret use in release processes; `internal_mtls_tests.rs` covers
 current-policy intersection and scoped grants. These authorization transitions
 are not represented by M1–M7, so the concrete tests are not formal proof.
 
+Issue #305 exposes durable security-audit record count, encoded bytes, capacity,
+and write degradation as operational metrics. These are observations of the
+existing audit commit and recovery outcomes; they add no M1–M7 transition or
+authorization rule. `security_audit_metrics_tests.rs::durable_audit_metrics_follow_commit_and_restart`
+and `security_audit_health_tests.rs::audit_storage_degradation_is_visible_without_failing_ready_health`
+check the metric and health surfaces.
+
 `runtime/src/exchange` has worker mTLS service and client-pool code covered by
 `shuffle_mtls_tests.rs`, but no production worker startup caller wires those
 components. Worker-to-worker application wiring, release-process coverage, and

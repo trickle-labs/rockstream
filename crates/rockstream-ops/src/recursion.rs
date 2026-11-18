@@ -932,6 +932,9 @@ mod tests {
 
     fn closure_rows(batch: &ArrowZSet) -> BTreeMap<(i64, i64), i64> {
         let mut out = BTreeMap::new();
+        batch
+            .validate()
+            .expect("recursion output must have aligned row weights");
         if batch.is_empty() {
             return out;
         }
@@ -947,7 +950,7 @@ mod tests {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        for (row_idx, &weight) in batch.weights.iter().enumerate().take(batch.num_rows()) {
+        for (row_idx, &weight) in batch.weights.iter().enumerate() {
             *out.entry((src.value(row_idx), dst.value(row_idx)))
                 .or_insert(0) += weight;
         }

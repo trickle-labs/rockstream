@@ -34,6 +34,9 @@ fn make_kv_batch(rows: &[(i64, i64, i64)]) -> ArrowZSet {
 fn apply_output(state: &mut BTreeMap<i64, (i64, i64, f64)>, output: &ArrowZSet) {
     use arrow::array::{Float64Array, Int64Array};
 
+    output
+        .validate()
+        .expect("aggregate output must have aligned row weights");
     if output.is_empty() {
         return;
     }
@@ -64,7 +67,7 @@ fn apply_output(state: &mut BTreeMap<i64, (i64, i64, f64)>, output: &ArrowZSet) 
         .as_any()
         .downcast_ref::<Float64Array>()
         .unwrap();
-    for (i, &weight) in output.weights.iter().enumerate().take(output.num_rows()) {
+    for (i, &weight) in output.weights.iter().enumerate() {
         let row = (s_col.value(i), c_col.value(i), a_col.value(i));
         if weight > 0 {
             state.insert(k_col.value(i), row);
