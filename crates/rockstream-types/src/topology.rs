@@ -6,12 +6,17 @@
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::authorization::SecurityAuditRecord;
 use crate::compatibility::{
     ProtocolVersion, StorageFormatVersion, SupportedStorageFormatRange, SupportedVersionRange,
 };
 use crate::frontier::MembershipFrontierReport;
 use crate::ids::{ShardId, WorkerId};
 use crate::lease::{ShardLease, ShardRevokeReason};
+
+fn legacy_protocol_version() -> ProtocolVersion {
+    ProtocolVersion::V1
+}
 
 /// The role a node is running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -176,7 +181,7 @@ impl WorkerRegistration {
             capacity_headroom,
             location: WorkerLocation::default(),
             capabilities: WorkerCapabilities::default(),
-            protocol_range: SupportedVersionRange::default(),
+            protocol_range: SupportedVersionRange::v3_only(),
             storage_format_range: SupportedStorageFormatRange::default(),
             registered_at_ms,
         }
@@ -280,6 +285,9 @@ pub enum ControlMessage {
     Registered {
         /// The canonical worker ID assigned by the control plane.
         worker_id: WorkerId,
+        /// Control's protocol level; v1 is assumed for legacy responses.
+        #[serde(default = "legacy_protocol_version")]
+        protocol_version: ProtocolVersion,
     },
     Deploy {
         descriptor: crate::data_plane::DeploymentDescriptor,
@@ -312,7 +320,12 @@ pub enum ControlMessage {
     TopologyChanged {
         /// Current list of healthy workers.
         workers: Vec<WorkerInfo>,
+        /// Current shard leases used to authorize shuffle source identities.
+        #[serde(default)]
+        shard_leases: Vec<ShardLease>,
     },
+    /// Acknowledge a worker-reported security audit append.
+    SecurityAuditRecorded { request_id: String, persisted: bool },
     /// Instructs the worker to stop gracefully.
     Shutdown,
     /// The control plane has assigned a shard lease to this worker.
@@ -861,6 +874,11 @@ pub enum WorkerMessage {
     Deregister {
         worker_id: WorkerId,
     },
+    /// Report a security event observed by this authenticated worker.
+    ReportSecurityAudit {
+        request_id: String,
+        record: SecurityAuditRecord,
+    },
     /// Request the control plane to acquire a shard lease on behalf of this
     /// worker. The control plane responds with [`ControlMessage::ShardAssigned`]
     /// or an error (connection close).
@@ -1022,15 +1040,33 @@ mod tests {
     fn control_message_registered_roundtrip() {
         let msg = ControlMessage::Registered {
             worker_id: WorkerId(3),
+            protocol_version: ProtocolVersion::V3,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let decoded: ControlMessage = serde_json::from_str(&json).unwrap();
         match decoded {
-            ControlMessage::Registered { worker_id } => {
-                assert_eq!(worker_id, WorkerId(3))
+            ControlMessage::Registered {
+                worker_id,
+                protocol_version,
+            } => {
+                assert_eq!(worker_id, WorkerId(3));
+                assert_eq!(protocol_version, ProtocolVersion::V3);
             }
             _ => panic!("unexpected message variant"),
         }
+    }
+
+    #[test]
+    fn legacy_registration_ack_defaults_to_v1() {
+        let legacy = serde_json::json!({ "type": "registered", "worker_id": 3 });
+        let decoded: ControlMessage = serde_json::from_value(legacy).unwrap();
+        assert!(matches!(
+            decoded,
+            ControlMessage::Registered {
+                protocol_version: ProtocolVersion::V1,
+                ..
+            }
+        ));
     }
 
     #[test]

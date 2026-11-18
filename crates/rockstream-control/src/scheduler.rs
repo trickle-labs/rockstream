@@ -387,7 +387,17 @@ mod tests {
     #[test]
     fn mixed_versions_choose_a_compatible_worker() {
         let sched = make_scheduler();
-        register(&sched, 1, 0.3);
+        let v1_worker = WorkerRegistration::new(
+            WorkerId(1),
+            NodeRole::Worker,
+            "127.0.0.1:8001",
+            CapacityHeadroom::new(0.3),
+        )
+        .with_compatibility(
+            SupportedVersionRange::v1_only(),
+            SupportedStorageFormatRange::v1_only(),
+        );
+        sched.catalog.register(&v1_worker);
         let v2_worker = WorkerRegistration::new(
             WorkerId(2),
             NodeRole::Worker,

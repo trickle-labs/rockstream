@@ -51,6 +51,7 @@ pub mod sink;
 pub mod state_budget;
 pub mod state_mutation;
 pub mod tiering;
+pub mod tls;
 pub mod topology;
 pub mod view_lifecycle;
 pub mod workload;
