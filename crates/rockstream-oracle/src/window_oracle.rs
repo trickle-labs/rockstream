@@ -134,6 +134,9 @@ mod proptest_oracle {
                 batch: &ArrowZSet,
                 watermark_ms: &mut i64,
             ) {
+                batch
+                    .validate()
+                    .expect("session input must have aligned row weights");
                 if batch.is_empty() {
                     return;
                 }
@@ -149,11 +152,11 @@ mod proptest_oracle {
                     .as_any()
                     .downcast_ref::<Int64Array>()
                     .unwrap();
-                for i in 0..batch.num_rows() {
+                for (i, &weight) in batch.weights.iter().enumerate() {
                     *watermark_ms = (*watermark_ms).max(t.value(i));
                     let key = (k.value(i), t.value(i));
                     let entry = state.entry(key).or_insert(0);
-                    *entry += batch.weights[i];
+                    *entry += weight;
                     if *entry == 0 {
                         state.remove(&key);
                     }
@@ -164,6 +167,9 @@ mod proptest_oracle {
                 state: &mut BTreeMap<(i64, i64, i64, i64), i64>,
                 batch: &ArrowZSet,
             ) {
+                batch
+                    .validate()
+                    .expect("session output must have aligned row weights");
                 if batch.is_empty() {
                     return;
                 }
@@ -191,10 +197,10 @@ mod proptest_oracle {
                     .as_any()
                     .downcast_ref::<Int64Array>()
                     .unwrap();
-                for i in 0..batch.num_rows() {
+                for (i, &weight) in batch.weights.iter().enumerate() {
                     let key = (start.value(i), end.value(i), k.value(i), t.value(i));
                     let entry = state.entry(key).or_insert(0);
-                    *entry += batch.weights[i];
+                    *entry += weight;
                     if *entry == 0 {
                         state.remove(&key);
                     }
@@ -300,6 +306,9 @@ mod proptest_oracle {
             window_size_ms: i64,
             slide_ms: i64,
         ) {
+            batch
+                .validate()
+                .expect("hop-window input must have aligned row weights");
             if batch.is_empty() {
                 return;
             }
@@ -317,20 +326,20 @@ mod proptest_oracle {
                 .unwrap();
             let epoch_start_watermark = *watermark_ms;
             let mut reopened_this_epoch = HashSet::new();
-            for i in 0..batch.num_rows() {
+            for (i, &weight) in batch.weights.iter().enumerate() {
                 *watermark_ms = (*watermark_ms).max(t.value(i));
                 for window_id in hop_window_ids(t.value(i), window_size_ms, slide_ms) {
                     let window_closed = epoch_start_watermark > window_id + window_size_ms
                         && !reopened_this_epoch.contains(&window_id);
-                    if window_closed && batch.weights[i] > 0 {
+                    if window_closed && weight > 0 {
                         continue;
                     }
-                    if window_closed && batch.weights[i] <= 0 {
+                    if window_closed && weight <= 0 {
                         reopened_this_epoch.insert(window_id);
                     }
                     let key = (window_id, t.value(i), v.value(i));
                     let entry = state.entry(key).or_insert(0);
-                    *entry += batch.weights[i];
+                    *entry += weight;
                     if *entry == 0 {
                         state.remove(&key);
                     }
@@ -339,6 +348,9 @@ mod proptest_oracle {
         }
 
         fn accumulate_output(state: &mut BTreeMap<(i64, i64, i64), i64>, batch: &ArrowZSet) {
+            batch
+                .validate()
+                .expect("hop-window output must have aligned row weights");
             if batch.is_empty() {
                 return;
             }
@@ -360,10 +372,10 @@ mod proptest_oracle {
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .unwrap();
-            for i in 0..batch.num_rows() {
+            for (i, &weight) in batch.weights.iter().enumerate() {
                 let key = (wid.value(i), t.value(i), v.value(i));
                 let entry = state.entry(key).or_insert(0);
-                *entry += batch.weights[i];
+                *entry += weight;
                 if *entry == 0 {
                     state.remove(&key);
                 }
@@ -478,6 +490,9 @@ mod proptest_oracle {
     // ─── Input accumulation ───────────────────────────────────────────────────
 
     fn accumulate_input(acc: &mut BTreeMap<(i64, i64), i64>, batch: &ArrowZSet) {
+        batch
+            .validate()
+            .expect("window input must have aligned row weights");
         if batch.is_empty() {
             return;
         }
@@ -493,10 +508,10 @@ mod proptest_oracle {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        for i in 0..batch.num_rows() {
+        for (i, &weight) in batch.weights.iter().enumerate() {
             let key = (k_col.value(i), v_col.value(i));
             let entry = acc.entry(key).or_insert(0);
-            *entry += batch.weights[i];
+            *entry += weight;
             if *entry == 0 {
                 acc.remove(&key);
             }
@@ -507,6 +522,9 @@ mod proptest_oracle {
 
     /// Accumulate output ZSet deltas into net state.
     fn accumulate_output(state: &mut BTreeMap<(i64, i64, i64), i64>, batch: &ArrowZSet) {
+        batch
+            .validate()
+            .expect("window output must have aligned row weights");
         if batch.is_empty() {
             return;
         }
@@ -528,10 +546,10 @@ mod proptest_oracle {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        for i in 0..batch.num_rows() {
+        for (i, &weight) in batch.weights.iter().enumerate() {
             let key = (k_col.value(i), v_col.value(i), r_col.value(i));
             let entry = state.entry(key).or_insert(0);
-            *entry += batch.weights[i];
+            *entry += weight;
             if *entry == 0 {
                 state.remove(&key);
             }
