@@ -1766,6 +1766,8 @@ mod tests {
     }
 
     fn accumulate(state: &mut HashMap<(i64, i64, i64), i64>, zset: &ArrowZSet) {
+        zset.validate()
+            .expect("window output must have aligned row weights");
         if zset.is_empty() {
             return;
         }
@@ -1787,10 +1789,10 @@ mod tests {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        for i in 0..zset.num_rows() {
+        for (i, &weight) in zset.weights.iter().enumerate() {
             *state
                 .entry((wid_col.value(i), t_col.value(i), v_col.value(i)))
-                .or_insert(0) += zset.weights[i];
+                .or_insert(0) += weight;
         }
     }
 
@@ -1846,6 +1848,8 @@ mod tests {
     }
 
     fn accumulate_session(state: &mut HashMap<(i64, i64, i64, i64), i64>, zset: &ArrowZSet) {
+        zset.validate()
+            .expect("session output must have aligned row weights");
         if zset.is_empty() {
             return;
         }
@@ -1873,7 +1877,7 @@ mod tests {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        for i in 0..zset.num_rows() {
+        for (i, &weight) in zset.weights.iter().enumerate() {
             *state
                 .entry((
                     session_start.value(i),
@@ -1881,7 +1885,7 @@ mod tests {
                     t_col.value(i),
                     v_col.value(i),
                 ))
-                .or_insert(0) += zset.weights[i];
+                .or_insert(0) += weight;
         }
     }
 
@@ -1896,6 +1900,8 @@ mod tests {
     }
 
     fn session_rows(zset: &ArrowZSet) -> Vec<(i64, i64, i64, i64, i64)> {
+        zset.validate()
+            .expect("session output must have aligned row weights");
         if zset.is_empty() {
             return Vec::new();
         }
@@ -1924,13 +1930,13 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         let mut rows = Vec::new();
-        for i in 0..zset.num_rows() {
+        for (i, &weight) in zset.weights.iter().enumerate() {
             rows.push((
                 session_start.value(i),
                 session_end.value(i),
                 t_col.value(i),
                 v_col.value(i),
-                zset.weights[i],
+                weight,
             ));
         }
         rows.sort();

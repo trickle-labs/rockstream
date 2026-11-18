@@ -6366,6 +6366,38 @@
         "description": "Duration of pgwire queries in milliseconds"
       },
       {
+        "name": "security_audit_capacity_bytes",
+        "metric_type": "gauge",
+        "unit": "bytes",
+        "labels": [],
+        "stability": "stable",
+        "description": "Configured deployment-wide security audit retention limit"
+      },
+      {
+        "name": "security_audit_degraded",
+        "metric_type": "gauge",
+        "unit": "boolean",
+        "labels": [],
+        "stability": "stable",
+        "description": "Whether required security audit writes are failing"
+      },
+      {
+        "name": "security_audit_retained_bytes",
+        "metric_type": "gauge",
+        "unit": "bytes",
+        "labels": [],
+        "stability": "stable",
+        "description": "JSON-encoded size of retained security audit records"
+      },
+      {
+        "name": "security_audit_retained_records",
+        "metric_type": "gauge",
+        "unit": "count",
+        "labels": [],
+        "stability": "stable",
+        "description": "Number of retained security audit records"
+      },
+      {
         "name": "storage_flush_latency_ms",
         "metric_type": "histogram",
         "unit": "ms",

@@ -254,6 +254,12 @@ degraded health. Stop admitting new authenticated sessions when their
 authentication event cannot be stored, and close an existing session when its
 required denial event cannot be stored.
 
+Prometheus exports `security_audit_retained_records`,
+`security_audit_retained_bytes`, and `security_audit_capacity_bytes` to show
+retention fill. `security_audit_degraded` is 1 while required writes are
+failing; health reports audit storage degradation without marking a ready
+process unhealthy.
+
 Authenticated PGWire clients with the current `security.audit.read` permission
 can read retained security records with `SHOW SECURITY AUDIT [FROM
 <timestamp_ms>] [TO <timestamp_ms>] [AFTER <cursor>] [LIMIT <rows>]`. Time bounds
