@@ -80,6 +80,9 @@ mod tests {
     }
 
     fn accumulate(state: &mut BTreeMap<(i64, i64), i64>, batch: &ArrowZSet) {
+        batch
+            .validate()
+            .expect("recursion output must have aligned row weights");
         if batch.is_empty() {
             return;
         }
@@ -95,10 +98,10 @@ mod tests {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        for row_idx in 0..batch.num_rows() {
+        for (row_idx, &weight) in batch.weights.iter().enumerate() {
             *state
                 .entry((src.value(row_idx), dst.value(row_idx)))
-                .or_insert(0) += batch.weights[row_idx];
+                .or_insert(0) += weight;
         }
         state.retain(|_, weight| *weight > 0);
     }

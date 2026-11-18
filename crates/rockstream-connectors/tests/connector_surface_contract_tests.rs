@@ -239,7 +239,7 @@ fn connector_guarantee_document_is_exact_and_all_matrix_tests_exist() {
             "crates/rockstream-connectors/tests/postgres_cdc_guarantee_matrix_tests.rs",
             &[
                 "postgres_cdc_snapshot_stream_fence_has_exact_transcript",
-                "postgres_cdc_all_mutation_types_have_exact_transcript",
+                "postgres_cdc_insert_update_delete_have_exact_transcript",
                 "postgres_cdc_each_commit_boundary_recovers_exactly_once",
                 "postgres_cdc_wal_lag_pauses_at_bound_and_recovers_within_slo",
                 "postgres_cdc_malformed_replication_record_fails_closed_then_recovers_exactly",

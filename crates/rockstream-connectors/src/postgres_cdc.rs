@@ -180,6 +180,14 @@ pub enum PgOutputEvent {
         relation_id: u32,
         old_values: Vec<Option<String>>,
     },
+    /// PostgreSQL pgoutput Truncate (T). Relation IDs and options are scoped
+    /// to the enclosing transaction and must be applied in wire order.
+    Truncate {
+        xid: u32,
+        relation_ids: Vec<u32>,
+        cascade: bool,
+        restart_identity: bool,
+    },
     Commit {
         xid: u32,
         commit_lsn: PgLsn,
@@ -564,6 +572,15 @@ impl PostgresCdcSource {
             let _ = connection_task.await;
             return Err(SourceError::Io(error));
         }
+        let table = &config.table;
+        let publication = &config.publication;
+        let validation = Self::validate_partitioned_publication(&client, table, publication).await;
+        if let Err(error) = validation {
+            drop(client);
+            connection_task.abort();
+            let _ = connection_task.await;
+            return Err(error);
+        }
         self.pgoutput = Some(PgOutputConnection {
             client,
             slot: config.slot,
@@ -574,6 +591,56 @@ impl PostgresCdcSource {
             connection_task,
         });
         Ok(())
+    }
+
+    /// Partitioned parents must publish changes under the imported root identity,
+    /// not under individual child relation IDs which are not routed to the view.
+    async fn validate_partitioned_publication(
+        client: &Client,
+        table: &str,
+        publication: &str,
+    ) -> Result<(), SourceError> {
+        let row = client
+            .query_opt(
+                "SELECT c.relkind::text FROM pg_class c WHERE c.oid = to_regclass($1)",
+                &[&table],
+            )
+            .await
+            .map_err(|error| SourceError::DiscoverSchemaFailed {
+                reason: format!("RS-4013: inspect PostgreSQL source table '{table}': {error}"),
+            })?
+            .ok_or_else(|| SourceError::DiscoverSchemaFailed {
+                reason: format!("RS-4013: PostgreSQL source table '{table}' does not exist"),
+            })?;
+        let relation_kind: String = row.get(0);
+        if relation_kind != "p" {
+            return Ok(());
+        }
+        let publication = client
+            .query_opt(
+                "SELECT pubviaroot FROM pg_publication WHERE pubname = $1",
+                &[&publication],
+            )
+            .await
+            .map_err(|error| SourceError::DiscoverSchemaFailed {
+                reason: format!("RS-4013: inspect partitioned publication for '{table}': {error}"),
+            })?
+            .ok_or_else(|| SourceError::DiscoverSchemaFailed {
+                reason: format!(
+                    "RS-4013: publication for partitioned table '{table}' does not exist"
+                ),
+            })?;
+        require_partition_root_identity(table, publication.get(0))
+    }
+
+    /// Validate additional imported aliases that share the same pgoutput slot.
+    /// Checking only the primary table would leave newly attached partitioned
+    /// sources vulnerable to silently unrouted child-table changes.
+    pub async fn validate_pgoutput_table(&self, table: &str) -> Result<(), SourceError> {
+        let pgoutput = self.pgoutput.as_ref().ok_or_else(|| {
+            SourceError::Io("native pgoutput connection is unavailable".to_string())
+        })?;
+        Self::validate_partitioned_publication(&pgoutput.client, table, &pgoutput.publication).await
     }
 
     pub fn set_snapshot_batches(&mut self, batches: Vec<RecordBatch>) {
@@ -651,6 +718,10 @@ impl PostgresCdcSource {
                 .map_err(|error| SourceError::StartSnapshotFailed {
                     reason: format!("create pgoutput slot '{}': {error}", pgoutput.slot),
                 })?;
+        }
+        for (table, _) in relations {
+            Self::validate_partitioned_publication(&pgoutput.client, table, &pgoutput.publication)
+                .await?;
         }
         pgoutput
             .client
@@ -1410,12 +1481,22 @@ impl PostgresCdcSource {
                 }
                 _ => {}
             }
-            if let Some(change) = decode_native_pgoutput_text_message(
+            let change = match decode_native_pgoutput_text_message(
                 &mut pgoutput.relations,
                 self.schema.fields().len(),
                 lsn,
                 &payload,
-            )? {
+            ) {
+                Ok(change) => change,
+                Err(error) => {
+                    // The row-only caller may retry after a poll error. Do not
+                    // skip an unsupported TRUNCATE (or other malformed frame)
+                    // on retry and accidentally acknowledge its COMMIT.
+                    self.native_seen_messages = self.native_seen_messages.saturating_sub(1);
+                    return Err(error);
+                }
+            };
+            if let Some(change) = change {
                 let Some((_, changes, bytes)) = &mut self.native_transaction else {
                     return Err(SourceError::PollDeltaFailed {
                         reason: "pgoutput row frame without BEGIN is invalid".to_string(),
@@ -1471,7 +1552,13 @@ impl PostgresCdcSource {
         };
         let payload = message.get::<_, Vec<u8>>(1);
         self.native_seen_messages = self.native_seen_messages.saturating_add(1);
-        let event = decode_pgoutput_event(&mut self.native_xid, &payload)?;
+        let event = match decode_pgoutput_event(&mut self.native_xid, &payload) {
+            Ok(event) => event,
+            Err(error) => {
+                self.native_seen_messages = self.native_seen_messages.saturating_sub(1);
+                return Err(error);
+            }
+        };
         if matches!(event, PgOutputEvent::Commit { .. }) {
             self.native_seen_messages = 0;
         }
@@ -1721,7 +1808,8 @@ fn decode_native_pgoutput_message(
         });
     };
     match tag {
-        b'B' | b'C' | b'O' | b'Y' | b'T' => Ok(None),
+        b'B' | b'C' | b'O' | b'Y' => Ok(None),
+        b'T' => Err(pgoutput_truncate_unsupported()),
         b'R' => {
             let relation_id = take_u32(&mut data)?;
             take_cstring(&mut data)?;
@@ -1810,7 +1898,8 @@ fn decode_native_pgoutput_text_message(
         });
     };
     match tag {
-        b'B' | b'C' | b'O' | b'Y' | b'T' => Ok(None),
+        b'B' | b'C' | b'O' | b'Y' => Ok(None),
+        b'T' => Err(pgoutput_truncate_unsupported()),
         b'R' => {
             let relation_id = take_u32(&mut data)?;
             take_cstring(&mut data)?;
@@ -1966,6 +2055,33 @@ pub fn decode_pgoutput_event(
                 old_values,
             })
         }
+        b'T' => {
+            // Protocol v1: count (u32), option flags (u8), then count
+            // relation OIDs (u32). Bound count by the actual frame before
+            // allocating so a malformed count cannot exhaust memory.
+            let count = usize::try_from(take_u32(&mut data)?)
+                .map_err(|_| pgoutput_protocol_error("TRUNCATE relation count overflow"))?;
+            let flags = take_byte(&mut data)?;
+            if flags & !0x03 != 0 || count == 0 || count > data.len() / 4 {
+                return Err(pgoutput_protocol_error("malformed TRUNCATE count or flags"));
+            }
+            let mut relation_ids = Vec::with_capacity(count);
+            let mut seen = std::collections::HashSet::with_capacity(count);
+            for _ in 0..count {
+                let relation_id = take_u32(&mut data)?;
+                if !seen.insert(relation_id) {
+                    return Err(pgoutput_protocol_error("duplicate TRUNCATE relation ID"));
+                }
+                relation_ids.push(relation_id);
+            }
+            ensure_consumed(data, "Truncate")?;
+            Ok(PgOutputEvent::Truncate {
+                xid,
+                relation_ids,
+                cascade: flags & 0x01 != 0,
+                restart_identity: flags & 0x02 != 0,
+            })
+        }
         _ => Err(pgoutput_protocol_error(&format!(
             "unsupported message tag 0x{tag:02x}"
         ))),
@@ -2007,6 +2123,28 @@ fn ensure_consumed(data: &[u8], frame: &str) -> Result<(), SourceError> {
         Ok(())
     } else {
         Err(pgoutput_protocol_error(&format!("malformed {frame} frame")))
+    }
+}
+
+/// pgoutput TRUNCATE has no row images with which to retract old aggregates.
+fn pgoutput_truncate_unsupported() -> SourceError {
+    SourceError::PollDeltaFailed {
+        reason: "RS-4015: pgoutput TRUNCATE cannot be applied to retained materialized views without row retractions; source blocked before LSN acknowledgment. Next steps: use row-level DELETE, or rebuild from a complete historical source and verify view totals".to_string(),
+    }
+}
+
+fn require_partition_root_identity(
+    table: &str,
+    publish_via_partition_root: bool,
+) -> Result<(), SourceError> {
+    if publish_via_partition_root {
+        Ok(())
+    } else {
+        Err(SourceError::DiscoverSchemaFailed {
+            reason: format!(
+                "RS-4013: partitioned PostgreSQL source '{table}' requires its publication to use publish_via_partition_root = true; child partition relation IDs are not routed to the parent import"
+            ),
+        })
     }
 }
 
@@ -2511,6 +2649,94 @@ mod tests {
             }
         );
         assert_eq!(xid, None);
+    }
+
+    #[test]
+    fn pgoutput_truncate_row_only_paths_fail_closed_and_event_decodes() {
+        // pgoutput TRUNCATE: relation count, option flags, then relation OIDs.
+        let mut truncate = vec![b'T'];
+        truncate.extend_from_slice(&1_u32.to_be_bytes());
+        truncate.push(0);
+        truncate.extend_from_slice(&7_u32.to_be_bytes());
+
+        let mut relations = std::collections::HashMap::new();
+        let legacy = decode_native_pgoutput_message(&mut relations, 1, PgLsn(10), &truncate);
+        assert!(legacy.unwrap_err().to_string().contains("RS-4015"));
+        let text = decode_native_pgoutput_text_message(&mut relations, 1, PgLsn(10), &truncate);
+        assert!(text.unwrap_err().to_string().contains("RS-4015"));
+
+        let mut xid = None;
+        let mut begin = vec![b'B'];
+        begin.extend_from_slice(&100_u64.to_be_bytes());
+        begin.extend_from_slice(&0_u64.to_be_bytes());
+        begin.extend_from_slice(&52_u32.to_be_bytes());
+        decode_pgoutput_event(&mut xid, &begin).unwrap();
+        assert_eq!(
+            decode_pgoutput_event(&mut xid, &truncate).unwrap(),
+            PgOutputEvent::Truncate {
+                xid: 52,
+                relation_ids: vec![7],
+                cascade: false,
+                restart_identity: false,
+            }
+        );
+        // A TRUNCATE frame never commits the transaction by itself.
+        assert_eq!(xid, Some(52));
+    }
+
+    #[test]
+    fn partitioned_sources_require_root_publication_identity() {
+        assert!(require_partition_root_identity("public.events", true).is_ok());
+        let failure = require_partition_root_identity("public.events", false)
+            .unwrap_err()
+            .to_string();
+        assert!(failure.contains("RS-4013"));
+        assert!(failure.contains("publish_via_partition_root"));
+    }
+
+    #[test]
+    fn pgoutput_truncate_decodes_relations_flags_and_rejects_malformed_frames() {
+        let mut xid = None;
+        let mut begin = vec![b'B'];
+        begin.extend_from_slice(&100_u64.to_be_bytes());
+        begin.extend_from_slice(&0_u64.to_be_bytes());
+        begin.extend_from_slice(&52_u32.to_be_bytes());
+        assert_eq!(
+            decode_pgoutput_event(&mut xid, &begin).unwrap(),
+            PgOutputEvent::Begin { xid: 52 }
+        );
+
+        let mut truncate = vec![b'T'];
+        truncate.extend_from_slice(&2_u32.to_be_bytes());
+        truncate.push(0x03); // CASCADE and RESTART IDENTITY
+        truncate.extend_from_slice(&7_u32.to_be_bytes());
+        truncate.extend_from_slice(&8_u32.to_be_bytes());
+        assert_eq!(
+            decode_pgoutput_event(&mut xid, &truncate).unwrap(),
+            PgOutputEvent::Truncate {
+                xid: 52,
+                relation_ids: vec![7, 8],
+                cascade: true,
+                restart_identity: true,
+            }
+        );
+        assert_eq!(xid, Some(52));
+        for malformed in [
+            vec![b'T', 0, 0, 0, 2, 0, 0, 0, 0, 7],
+            vec![b'T', 0, 0, 0, 0, 0],
+            vec![b'T', 0, 0, 0, 1, 4, 0, 0, 0, 7],
+            vec![b'T', 0, 0, 0, 1, 0, 0, 0, 0, 7, 0],
+            vec![b'T', 0, 0, 0, 2, 0, 0, 0, 0, 7, 0, 0, 0, 7],
+            vec![b'T', 255, 255, 255, 255, 0],
+        ] {
+            assert!(decode_pgoutput_event(&mut xid, &malformed).is_err());
+            assert_eq!(xid, Some(52)); // Never advance the transaction.
+        }
+        let mut relations = std::collections::HashMap::new();
+        assert!(decode_native_pgoutput_message(&mut relations, 1, PgLsn(1), &truncate).is_err());
+        assert!(
+            decode_native_pgoutput_text_message(&mut relations, 1, PgLsn(1), &truncate).is_err()
+        );
     }
 
     #[test]

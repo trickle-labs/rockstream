@@ -11,7 +11,10 @@ use crate::management_store::{
 };
 use parking_lot::RwLock;
 use rockstream_storage::catalog::{CatalogMutation, CatalogStore, CatalogTxn};
-use rockstream_types::authorization::SecurityAuditRecord;
+use rockstream_types::authorization::{
+    AuditCorrelation, AuditField, AuditIdentity, SecurityAuditClass, SecurityAuditOutcome,
+    SecurityAuditRecord, SECURITY_AUDIT_FORMAT_VERSION,
+};
 use rockstream_types::error_code::{
     ErrorCode, RS_2420, RS_2421, RS_2422, RS_2423, RS_2424, RS_2425, RS_2426, RS_3601,
 };
@@ -359,27 +362,37 @@ impl SecretStore {
         record: &SecurityAuditRecord,
     ) -> Result<(), SecretStoreError> {
         for attempt in 0..rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS {
-            let revision =
-                catalog.get_revision().await.checked_add(1).ok_or_else(|| {
-                    SecretStoreError::storage("durable catalog revision exhausted")
-                })?;
+            let revision = catalog.get_revision().await.checked_add(1).ok_or_else(|| {
+                rockstream_types::metrics::set_security_audit_degraded(true);
+                SecretStoreError::storage("durable catalog revision exhausted")
+            })?;
             let transaction = CatalogTxn::new(
                 revision,
                 rand::random::<u64>().max(1),
                 vec![CatalogMutation::AppendSecurityAudit(record.clone())],
             )
-            .map_err(|error| SecretStoreError::storage(error.to_string()))?;
+            .map_err(|error| {
+                rockstream_types::metrics::set_security_audit_degraded(true);
+                SecretStoreError::storage(error.to_string())
+            })?;
             match catalog.commit_txn(transaction).await {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    rockstream_types::metrics::set_security_audit_degraded(false);
+                    return Ok(());
+                }
                 Err(rockstream_storage::catalog::CatalogError::OptimisticConflict(_))
                     if attempt + 1
                         < rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS =>
                 {
                     continue;
                 }
-                Err(error) => return Err(SecretStoreError::storage(error.to_string())),
+                Err(error) => {
+                    rockstream_types::metrics::set_security_audit_degraded(true);
+                    return Err(SecretStoreError::storage(error.to_string()));
+                }
             }
         }
+        rockstream_types::metrics::set_security_audit_degraded(true);
         Err(SecretStoreError::storage(
             "durable security audit retry was exhausted",
         ))
@@ -1246,6 +1259,9 @@ impl SecretStore {
         actor: &str,
     ) -> Result<usize, SecretStoreError> {
         let rotation = self.rotation_lock.clone().write_owned().await;
+        if self.db.is_some() {
+            self.flush_pending_security_audit_outbox_locked().await?;
+        }
         let old_kek = self.kek_provider();
         let mut rotated_count = 0;
 
@@ -1274,33 +1290,70 @@ impl SecretStore {
                     .secret_scan_fill_level
                     .store(rotated_count, Ordering::Relaxed);
             }
-            if rotated_count > 0 {
-                let db = db.clone();
-                let provider = self.kek_provider.clone();
-                let audit_log = self.audit_log.clone();
-                let event = AuditEvent::now(actor, "secret.rotated", "cluster_kek");
-                // Cancellation must not separate a submitted batch from its provider switch.
-                return tokio::spawn(async move {
-                    let _rotation = rotation;
-                    *provider.write() =
-                        Arc::new(RetainedKekProvider::new(old_kek, new_kek_provider.clone()));
-                    let write = db
-                        .write(batch)
-                        .await
-                        .map_err(|e| SecretStoreError::storage(e.to_string()))?;
-                    write
-                        .await_durable()
-                        .await
-                        .map_err(|e| SecretStoreError::storage(e.to_string()))?;
-                    *provider.write() = new_kek_provider;
-                    if let Some(log) = audit_log {
-                        let _ = log.append(&event);
-                    }
-                    Ok(rotated_count)
-                })
-                .await
-                .map_err(|e| SecretStoreError::rotation_failed(e.to_string()))?;
-            }
+            let audit_catalog = self.security_audit_catalog.clone().ok_or_else(|| {
+                SecretStoreError::storage("durable security audit catalog is unavailable")
+            })?;
+            let timestamp_ms = chrono::Utc::now()
+                .timestamp_millis()
+                .try_into()
+                .map_err(|_| SecretStoreError::storage("system clock is before the Unix epoch"))?;
+            let audit_record = SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: uuid::Uuid::new_v4().to_string(),
+                timestamp_ms,
+                actor: AuditIdentity::Unverified(actor.to_owned()),
+                target: AuditField::Known("cluster_kek".to_owned()),
+                scope: AuditField::Known("cluster".to_owned()),
+                action: SecurityAuditClass::SecretRotation,
+                outcome: SecurityAuditOutcome::Success,
+                correlation: AuditCorrelation::NotApplicable,
+                operation_id: AuditField::Unknown,
+                policy_revision: AuditField::Unknown,
+                before_state: AuditField::Unknown,
+                after_state: AuditField::Known(format!("rewrapped_envelopes={rotated_count}")),
+            };
+            audit_record.validate().map_err(|error| {
+                SecretStoreError::storage(format!("invalid KEK rotation audit: {error:?}"))
+            })?;
+            let audit_key = security_audit_outbox_key(&audit_record.event_id);
+            let audit_bytes = serde_json::to_vec(&audit_record)
+                .map_err(|error| SecretStoreError::storage(error.to_string()))?;
+            batch.put(&audit_key, &audit_bytes);
+
+            let db = db.clone();
+            let provider = self.kek_provider.clone();
+            let audit_log = self.audit_log.clone();
+            let event = AuditEvent::now(actor, "secret.rotated", "cluster_kek");
+            // Cancellation must not separate rewrapping, provider switch, and audit commit.
+            return tokio::spawn(async move {
+                let _rotation = rotation;
+                *provider.write() =
+                    Arc::new(RetainedKekProvider::new(old_kek, new_kek_provider.clone()));
+                let write = db
+                    .write(batch)
+                    .await
+                    .map_err(|e| SecretStoreError::storage(e.to_string()))?;
+                write
+                    .await_durable()
+                    .await
+                    .map_err(|e| SecretStoreError::storage(e.to_string()))?;
+                Self::append_security_audit(audit_catalog.as_ref(), &audit_record).await?;
+                let write = db
+                    .delete(&audit_key)
+                    .await
+                    .map_err(|e| SecretStoreError::storage(e.to_string()))?;
+                write
+                    .await_durable()
+                    .await
+                    .map_err(|e| SecretStoreError::storage(e.to_string()))?;
+                *provider.write() = new_kek_provider;
+                if let Some(log) = audit_log {
+                    let _ = log.append(&event);
+                }
+                Ok(rotated_count)
+            })
+            .await
+            .map_err(|e| SecretStoreError::rotation_failed(e.to_string()))?;
         } else {
             let mut entries: Vec<_> = {
                 let map = self.in_memory.read();
