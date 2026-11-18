@@ -49,6 +49,8 @@ rockstream-control = { workspace = true, features = ["test-support-artifact-cras
 rockstream-connectors = { workspace = true }
 rockstream-test-support = { workspace = true }
 rockstream-docgen = { workspace = true }
+futures = { workspace = true }
+parking_lot = { workspace = true }
 rcgen.workspace = true
 tokio-postgres-rustls.workspace = true
 rustls-pemfile.workspace = true

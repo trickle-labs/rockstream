@@ -394,6 +394,8 @@ fn main() -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 };
+            let worker_shuffle_enabled = node_config.worker.exchange_bind_addr.is_some()
+                && node_config.worker.exchange_advertise_addr.is_some();
 
             let opts = StartOptions {
                 storage,
@@ -410,7 +412,7 @@ fn main() -> ExitCode {
                 ),
                 worker_capabilities: WorkerCapabilities {
                     same_host_arrow_shm_v1: true,
-                    shuffle_codec_v1: true,
+                    shuffle_codec_v1: worker_shuffle_enabled,
                     checkpoint_manifest_codec_v1: true,
                     shared_shard_store_id: None,
                 },

@@ -1,3 +1,4 @@
+use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
 use rockstream_control::kek::EnvKekProvider;
 use rockstream_control::secret_store::{
     secret_key, SecretRotationOperationContext, SecretStore, SecretStoreError,
@@ -14,6 +15,7 @@ use rockstream_types::authorization::{
     SecurityAuditOutcome, SecurityAuditRecord, SECURITY_AUDIT_FORMAT_VERSION,
 };
 use rockstream_types::secret::{EncryptedSecret, SecretType};
+use sha2::{Digest, Sha256};
 use slatedb::Db;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -21,6 +23,32 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 
 const MINIO_BUCKET: &str = "rockstream-secrets-durability-test";
+
+fn independent_aes_gcm_open(key: &[u8; 32], nonce: &[u8], ciphertext: &[u8]) -> Vec<u8> {
+    let unbound = UnboundKey::new(&AES_256_GCM, key).unwrap();
+    let key = LessSafeKey::new(unbound);
+    let nonce = Nonce::try_assume_unique_for_key(nonce).unwrap();
+    let mut in_out = ciphertext.to_vec();
+    key.open_in_place(nonce, Aad::empty(), &mut in_out)
+        .unwrap()
+        .to_vec()
+}
+
+fn independently_open_secret_envelope(
+    envelope: &EncryptedSecret,
+    passphrase: &str,
+) -> HashMap<String, String> {
+    let kek: [u8; 32] = Sha256::digest(passphrase.as_bytes()).into();
+    assert_eq!(envelope.wrapped_dek.len(), NONCE_LEN + 32 + 16);
+    let dek = independent_aes_gcm_open(
+        &kek,
+        &envelope.wrapped_dek[..NONCE_LEN],
+        &envelope.wrapped_dek[NONCE_LEN..],
+    );
+    let dek: [u8; 32] = dek.try_into().unwrap();
+    let plaintext = independent_aes_gcm_open(&dek, &envelope.nonce, &envelope.ciphertext);
+    serde_json::from_slice(&plaintext).unwrap()
+}
 
 fn assert_rotation_audit(records: &[SecurityAuditRecord], rotated_count: usize) {
     assert_eq!(records.len(), 1);
@@ -64,7 +92,7 @@ async fn secrets_survive_lfs_reopen_and_kek_rotation_uses_point_keys() {
         Arc::new(EnvKekProvider::from_passphrase("before")),
     )
     .with_security_audit_catalog(audit_catalog.clone());
-    store
+    let expected_metadata = store
         .create_secret(
             0,
             "durable",
@@ -122,9 +150,12 @@ async fn secrets_survive_lfs_reopen_and_kek_rotation_uses_point_keys() {
     assert_eq!(envelope.name, "durable");
     assert_eq!(envelope.secret_type, SecretType::SaslPlain);
     assert_eq!(envelope.kek_provider, "env");
-    assert!(!envelope.wrapped_dek.is_empty());
-    assert!(!envelope.ciphertext.is_empty());
     assert_eq!(envelope.nonce.len(), 12);
+    assert_eq!(envelope.metadata, expected_metadata);
+    assert_eq!(
+        independently_open_secret_envelope(&envelope, "after"),
+        HashMap::from([(String::from("password"), String::from("durable-secret"))])
+    );
     let reopened = SecretStore::new(
         Some(reopened_db.clone()),
         Arc::new(EnvKekProvider::from_passphrase("after")),

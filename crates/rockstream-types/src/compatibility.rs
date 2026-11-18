@@ -10,6 +10,7 @@ pub struct ProtocolVersion(pub u32);
 impl ProtocolVersion {
     pub const V1: Self = Self(1);
     pub const V2: Self = Self(2);
+    pub const V3: Self = Self(3);
 }
 
 impl fmt::Display for ProtocolVersion {
@@ -40,6 +41,14 @@ impl SupportedVersionRange {
 
     pub const fn v2_only() -> Self {
         Self::new(ProtocolVersion::V2, ProtocolVersion::V2)
+    }
+
+    pub const fn v3_only() -> Self {
+        Self::new(ProtocolVersion::V3, ProtocolVersion::V3)
+    }
+
+    pub const fn v1_through_v3() -> Self {
+        Self::new(ProtocolVersion::V1, ProtocolVersion::V3)
     }
 
     pub const fn v1_through_v2() -> Self {
