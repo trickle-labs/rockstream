@@ -672,6 +672,8 @@ mod tests {
 
     fn kv_pairs(zset: &ArrowZSet) -> Vec<((i64, i64), i64)> {
         let mut out = Vec::new();
+        zset.validate()
+            .expect("distinct output must have aligned row weights");
         if zset.is_empty() {
             return out;
         }
@@ -687,8 +689,8 @@ mod tests {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        for i in 0..zset.num_rows() {
-            out.push(((k_col.value(i), v_col.value(i)), zset.weights[i]));
+        for (i, &weight) in zset.weights.iter().enumerate() {
+            out.push(((k_col.value(i), v_col.value(i)), weight));
         }
         out.sort_by_key(|(k, _)| *k);
         out
