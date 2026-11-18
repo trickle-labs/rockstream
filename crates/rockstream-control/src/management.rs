@@ -40,7 +40,8 @@ use crate::service::{
 };
 use crate::shard::ShardManager;
 use crate::support_artifact::{
-    ArtifactExpiry, ArtifactStoreError, SupportArtifactStore, ARTIFACT_TTL, MAX_ARTIFACT_BYTES,
+    ArtifactExpiry, ArtifactStoreError, SupportArtifactStore, ARTIFACT_CLEANUP_INTERVAL,
+    ARTIFACT_TTL, MAX_ARTIFACT_BYTES,
 };
 use crate::topology::TopologyCatalog;
 
@@ -576,7 +577,7 @@ impl ManagementService {
             let artifacts = self.support_artifacts.clone();
             let mut artifact_shutdown = shutdown_tx.subscribe();
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(1));
+                let mut interval = tokio::time::interval(ARTIFACT_CLEANUP_INTERVAL);
                 loop {
                     tokio::select! {
                         _ = interval.tick() => if let Err(error) = artifacts.cleanup_expired(Utc::now().timestamp_millis().max(1) as u64).await {

@@ -16,8 +16,9 @@ pub(crate) const MAX_ARTIFACT_BYTES: usize = 10 * 1024 * 1024;
 pub(crate) const MAX_ARTIFACT_STORAGE_BYTES: usize = 100 * 1024 * 1024;
 pub(crate) const MAX_ARTIFACTS_PER_DEPLOYMENT: usize = 2_048;
 pub(crate) const ARTIFACT_TTL: Duration = Duration::from_secs(10 * 60);
-// Reserve one second for the background cleanup tick to observe expiry.
-const ARTIFACT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(59);
+pub(crate) const ARTIFACT_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
+// Two passes plus one cleanup tick must fit inside the 60-second retention bound.
+const ARTIFACT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(29);
 const LEDGER_CAS_RETRIES: usize = 32;
 const LEDGER_FORMAT_VERSION: u16 = 1;
 
@@ -884,6 +885,97 @@ mod tests {
                 Err(ObjectStoreError::NotFound { .. })
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn cleanup_rescans_artifacts_that_expire_during_a_sweep() {
+        let object_store = Arc::new(InMemory::new());
+        let delete_delay = Duration::from_millis(15);
+        let throttled_store = Arc::new(object_store::throttle::ThrottledStore::new(
+            object_store.clone(),
+            object_store::throttle::ThrottleConfig {
+                wait_delete_per_call: delete_delay,
+                ..Default::default()
+            },
+        ));
+        let store = SupportArtifactStore::new(throttled_store);
+        store.initialize().await.unwrap();
+
+        let already_expired = LedgerArtifact {
+            owner: PrincipalId(1),
+            scope: PolicyScope::Cluster,
+            size: 7,
+            expires_at_ms: 1_000,
+        };
+        let expires_during_sweep = LedgerArtifact {
+            owner: PrincipalId(1),
+            scope: PolicyScope::Cluster,
+            size: 7,
+            expires_at_ms: 1_001,
+        };
+        store
+            .mutate_ledger(|ledger| {
+                ledger
+                    .artifacts
+                    .insert("already-expired".to_owned(), already_expired.clone());
+                ledger.artifacts.insert(
+                    "expires-during-sweep".to_owned(),
+                    expires_during_sweep.clone(),
+                );
+                Ok(true)
+            })
+            .await
+            .unwrap();
+        for (id, content) in [
+            ("already-expired", b"expired".as_slice()),
+            ("expires-during-sweep", b"pending".as_slice()),
+        ] {
+            object_store
+                .put(&store.artifact_path(id), content.to_vec().into())
+                .await
+                .unwrap();
+        }
+
+        let started = Instant::now();
+        store.cleanup_expired(1_000).await.unwrap();
+        assert!(started.elapsed() >= delete_delay);
+        assert_eq!(
+            store.read_ledger().await.unwrap().0.artifacts,
+            BTreeMap::from([("expires-during-sweep".to_owned(), expires_during_sweep)])
+        );
+        assert!(matches!(
+            object_store
+                .get(&store.artifact_path("already-expired"))
+                .await,
+            Err(ObjectStoreError::NotFound { .. })
+        ));
+        assert_eq!(
+            object_store
+                .get(&store.artifact_path("expires-during-sweep"))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .as_ref(),
+            b"pending"
+        );
+
+        store.cleanup_expired(1_002).await.unwrap();
+        assert!(store.read_ledger().await.unwrap().0.artifacts.is_empty());
+        for id in ["already-expired", "expires-during-sweep"] {
+            assert!(matches!(
+                object_store.get(&store.artifact_path(id)).await,
+                Err(ObjectStoreError::NotFound { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn cleanup_timeout_accounts_for_an_artifact_expiring_mid_sweep() {
+        assert!(
+            ARTIFACT_CLEANUP_TIMEOUT * 2 + ARTIFACT_CLEANUP_INTERVAL <= Duration::from_secs(60)
+        );
     }
 
     #[tokio::test]
