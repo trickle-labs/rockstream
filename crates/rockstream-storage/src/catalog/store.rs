@@ -1592,11 +1592,10 @@ impl CatalogStore for DurableCatalogStore {
         let txn = CatalogTxn::new(txn.revision, txn.operation_id, resolved)?;
 
         // 3. Durably persist transaction log
-        let bytes = txn.encode().map_err(|error| {
+        let bytes = txn.encode().inspect_err(|_| {
             if audit_cutoff_ms > 0 {
                 metrics::set_security_audit_degraded(true);
             }
-            error
         })?;
         let revision_path = self.revision_log_path(txn.revision);
         if let Err(error) = persist_catalog_log(self.store.as_ref(), &revision_path, &bytes).await {
