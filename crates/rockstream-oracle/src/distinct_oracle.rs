@@ -70,6 +70,9 @@ mod proptest_oracle {
     // ─── Accumulator helpers ──────────────────────────────────────────────────
 
     fn accumulate(acc: &mut BTreeMap<(i64, i64), i64>, batch: &ArrowZSet) {
+        batch
+            .validate()
+            .expect("distinct output must have aligned row weights");
         if batch.is_empty() {
             return;
         }
@@ -85,9 +88,8 @@ mod proptest_oracle {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        for i in 0..batch.num_rows() {
+        for (i, &w) in batch.weights.iter().enumerate() {
             let key = (k_col.value(i), v_col.value(i));
-            let w = batch.weights[i];
             let entry = acc.entry(key).or_insert(0);
             *entry += w;
             if *entry == 0 {

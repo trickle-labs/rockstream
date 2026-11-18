@@ -403,6 +403,7 @@ impl Operator for MinMaxOp {
     }
 
     fn process_delta(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
+        delta.validate()?;
         if delta.is_empty() {
             return Ok(ArrowZSet::empty(output_schema()));
         }
@@ -441,10 +442,9 @@ impl Operator for MinMaxOp {
 
         let mut state = self.state.lock().expect("MinMaxOp mutex poisoned");
 
-        for row in 0..n {
+        for (row, &w) in delta.weights.iter().enumerate() {
             let k = k_col.value(row);
             let v = v_col.value(row);
-            let w = delta.weights[row];
 
             let (old_ext, new_ext) = state.apply_delta(k, v, w)?;
 
@@ -632,6 +632,18 @@ mod tests {
         let rows = extract_rows(&out);
         assert_eq!(rows, vec![(1, 10, 1)]);
         assert_eq!(op.live_groups(), 1);
+    }
+
+    #[test]
+    fn minmax_rejects_misaligned_weights_before_processing() {
+        let op = MinMaxOp::new_min(OperatorId(0));
+        let mut delta = make_kv_batch(&[(1, 10, 1)]);
+        delta.weights.clear();
+
+        assert_eq!(
+            op.process_delta(delta).unwrap_err().to_string(),
+            "[RS-1013] Invalid literal: Z-set row/weight length mismatch: 1 rows, 0 weights; next_steps: Z-set row/weight length mismatch: 1 rows, 0 weights"
+        );
     }
 
     #[test]
