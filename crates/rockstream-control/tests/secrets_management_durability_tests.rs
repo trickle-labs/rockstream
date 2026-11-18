@@ -8,8 +8,8 @@ use rockstream_storage::catalog::{CatalogStore, DurableCatalogStore};
 use rockstream_test_support::docker_available;
 use rockstream_test_support::minio::{minio_object_store, start_minio};
 use rockstream_types::authorization::{
-    AuditCorrelation, AuditField, AuditIdentity, PolicyScope, SecurityAuditClass, SecurityAuditOutcome,
-    SecurityAuditRecord, SECURITY_AUDIT_FORMAT_VERSION,
+    AuditCorrelation, AuditField, AuditIdentity, PolicyScope, SecurityAuditClass,
+    SecurityAuditOutcome, SecurityAuditRecord, SECURITY_AUDIT_FORMAT_VERSION,
 };
 use rockstream_types::secret::{EncryptedSecret, SecretType};
 use slatedb::Db;
