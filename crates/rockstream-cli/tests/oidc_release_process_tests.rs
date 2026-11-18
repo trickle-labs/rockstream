@@ -5618,7 +5618,8 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
     let ledger_path = object_store::path::Path::from("control/support-artifacts/ledger.json");
     let pressure_id = uuid::Uuid::new_v4().to_string();
     let pressure_blob_path = support_artifact_object_path(&pressure_id);
-    let pressure_payload = vec![0u8; 10 * 1024 * 1024];
+    let pressure_size = 10 * 1024 * 1024;
+    let pressure_payload = vec![0u8; pressure_size];
     let ledger_bytes = management_store
         .get(&ledger_path)
         .await
@@ -5665,7 +5666,50 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
         over_limit.message(),
         "support artifact download limit reached"
     );
+    let mut full_stream = open_downloads
+        .pop()
+        .expect("one admitted stream remains open");
     drop(open_downloads);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let recovered_stream = loop {
+        match client.download_support_artifact(download_request()).await {
+            Ok(response) => break response.into_inner(),
+            Err(error)
+                if error.code() == tonic::Code::ResourceExhausted && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => panic!("download capacity did not recover after stream close: {error}"),
+        }
+    };
+    drop(recovered_stream);
+
+    let mut downloaded = Vec::new();
+    let mut expected_offset = 0;
+    let mut expires_at_ms = None;
+    let mut final_chunk = false;
+    while let Some(chunk) = full_stream.message().await.unwrap() {
+        assert_eq!(chunk.offset, expected_offset);
+        expected_offset += chunk.content.len() as u64;
+        expires_at_ms = Some(chunk.expires_at_ms);
+        downloaded.extend_from_slice(&chunk.content);
+        final_chunk = chunk.final_chunk;
+        if final_chunk {
+            break;
+        }
+    }
+    assert!(final_chunk);
+    assert!(full_stream.message().await.unwrap().is_none());
+    assert_eq!(downloaded.len(), pressure_size);
+    assert!(downloaded.iter().all(|byte| *byte == 0));
+    assert_eq!(expires_at_ms, Some(first.expires_at_ms));
+    let completed_stream = client
+        .download_support_artifact(download_request())
+        .await
+        .expect("completed download should release its permit")
+        .into_inner();
+    drop(completed_stream);
+
     management_store.delete(&pressure_blob_path).await.unwrap();
     let ledger_bytes = management_store
         .get(&ledger_path)
@@ -6186,7 +6230,7 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
                 before_state: AuditField::NotApplicable,
                 after_state: AuditField::NotApplicable,
             },
-            8,
+            10,
         ),
     );
     let security_store: Arc<dyn object_store::ObjectStore> =
