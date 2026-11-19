@@ -6,7 +6,7 @@ RockStream exports OpenMetrics / Prometheus metrics over HTTP via the `--metrics
 
 | Metric | Type | Unit | Description |
 |---|---|---|---|
-| `jwks_cache_size` | Gauge | keys | Number of usable RS256 signing keys in the configured gateway issuer cache; zero after cache expiry or verifier shutdown. Maximum: 100 keys. |
+| `jwks_cache_size` | Gauge | keys | Total usable RS256 signing keys across active gateway issuer caches; expired or dropped caches contribute zero. Each issuer cache holds at most 100 keys. |
  
 ## Freshness Lag & Attributable Stage Lag Metrics
  

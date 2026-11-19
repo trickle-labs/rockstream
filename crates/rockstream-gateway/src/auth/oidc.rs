@@ -104,12 +104,7 @@ pub struct OidcVerifier {
     client: Client,
     cache: RwLock<Option<CachedJwks>>,
     refresh: Mutex<()>,
-}
-
-impl Drop for OidcVerifier {
-    fn drop(&mut self) {
-        rockstream_types::metrics::set_jwks_cache_size(0, None);
-    }
+    cache_metric: rockstream_types::metrics::JwksCacheSizeMetric,
 }
 
 impl OidcVerifier {
@@ -124,6 +119,7 @@ impl OidcVerifier {
             client,
             cache: RwLock::new(None),
             refresh: Mutex::new(()),
+            cache_metric: rockstream_types::metrics::JwksCacheSizeMetric::register(),
         };
         let fetched = verifier.fetch_jwks().await?;
         verifier.store_jwks(fetched);
@@ -289,7 +285,7 @@ impl OidcVerifier {
         let ttl = fetched.ttl.min(JWKS_CACHE_TTL);
         if ttl.is_zero() {
             *self.cache.write() = None;
-            rockstream_types::metrics::set_jwks_cache_size(0, None);
+            self.cache_metric.set(0, None);
             return;
         }
         let expires_at = Instant::now() + ttl;
@@ -298,7 +294,7 @@ impl OidcVerifier {
             keys: fetched.keys,
             expires_at,
         });
-        rockstream_types::metrics::set_jwks_cache_size(cache_size, Some(expires_at));
+        self.cache_metric.set(cache_size, Some(expires_at));
     }
 
     async fn fetch_jwks(&self) -> Result<FetchedJwks, AuthError> {
@@ -625,41 +621,6 @@ mod tests {
         let claims = verifier.verify(VALID_TOKEN).await.unwrap();
         assert_eq!(claims.sub, "alice");
         assert_eq!(claims.exp, Some(4_102_444_800));
-    }
-
-    #[tokio::test]
-    async fn jwks_metric_returns_to_zero_when_verifier_is_dropped() {
-        let metric_lines = || {
-            rockstream_types::metrics::generate_prometheus_metrics()
-                .lines()
-                .filter(|line| {
-                    line.starts_with("# HELP jwks_cache_size")
-                        || line.starts_with("# TYPE jwks_cache_size")
-                        || line.starts_with("jwks_cache_size ")
-                })
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        };
-        let verifier = verifier_with_local_jwks().await;
-        assert_eq!(
-            metric_lines(),
-            [
-                "# HELP jwks_cache_size Gauge showing usable cached OIDC signing keys.",
-                "# TYPE jwks_cache_size gauge",
-                "jwks_cache_size 1",
-            ]
-        );
-
-        drop(verifier);
-
-        assert_eq!(
-            metric_lines(),
-            [
-                "# HELP jwks_cache_size Gauge showing usable cached OIDC signing keys.",
-                "# TYPE jwks_cache_size gauge",
-                "jwks_cache_size 0",
-            ]
-        );
     }
 
     #[tokio::test]
