@@ -357,6 +357,10 @@ impl SecretStore {
                     if attempt + 1
                         < rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS =>
                 {
+                    catalog.refresh().await.map_err(|error| {
+                        rockstream_types::metrics::set_security_audit_degraded(true);
+                        SecretStoreError::storage(error.to_string())
+                    })?;
                     continue;
                 }
                 Err(error) => {

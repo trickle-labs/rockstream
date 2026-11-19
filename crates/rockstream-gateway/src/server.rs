@@ -2608,6 +2608,7 @@ impl GatewayHandler {
                     if attempt + 1
                         < rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS =>
                 {
+                    store.refresh().await.map_err(|error| error.to_string())?;
                     continue;
                 }
                 Err(error) => return Err(error.to_string()),
@@ -3306,6 +3307,7 @@ impl GatewayHandler {
                     if attempt + 1
                         < rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS =>
                 {
+                    store.refresh().await.map_err(|error| error.to_string())?;
                     continue;
                 }
                 Err(error) => return Err(error.to_string()),
@@ -23243,6 +23245,144 @@ mod s4_tests {
     }
 
     // ── S5: audit_carries_principal_actor ────────────────────────────────────
+
+    #[tokio::test]
+    async fn gateway_security_audit_writers_refresh_after_catalog_conflicts() {
+        use rockstream_storage::catalog::{
+            CatalogMutation, CatalogStore, CatalogTxn, DurableCatalogStore,
+        };
+        use rockstream_types::authorization::{
+            AuditCorrelation, AuditField, AuditIdentity, SecurityAuditClass, SecurityAuditOutcome,
+            SecurityAuditRecord, SECURITY_AUDIT_FORMAT_VERSION,
+        };
+
+        let object_store = Arc::new(object_store::memory::InMemory::new());
+        let current_catalog = Arc::new(DurableCatalogStore::new(
+            object_store.clone(),
+            "audit-retry",
+        ));
+        let stale_auth_catalog = Arc::new(DurableCatalogStore::new(
+            object_store.clone(),
+            "audit-retry",
+        ));
+        let stale_denial_catalog = Arc::new(DurableCatalogStore::new(object_store, "audit-retry"));
+        let now_ms = current_time_ms().max(1);
+        let seed_records = ["concurrent-1", "concurrent-2"].map(|event_id| SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: event_id.to_owned(),
+            timestamp_ms: now_ms,
+            actor: AuditIdentity::Unknown,
+            target: AuditField::Unknown,
+            scope: AuditField::NotApplicable,
+            action: SecurityAuditClass::AuthenticationFailure,
+            outcome: SecurityAuditOutcome::Failure,
+            correlation: AuditCorrelation::NotApplicable,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::NotApplicable,
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        });
+        for (index, record) in seed_records.iter().cloned().enumerate() {
+            current_catalog
+                .commit_txn(
+                    CatalogTxn::new(
+                        current_catalog.get_revision().await + 1,
+                        index as u64 + 1,
+                        vec![CatalogMutation::AppendSecurityAudit(record)],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let shard_db = Arc::new(
+            rockstream_storage::ShardDb::builder(
+                "audit-retry-shard",
+                Arc::new(object_store::memory::InMemory::new()),
+            )
+            .build()
+            .await
+            .unwrap(),
+        );
+        let catalog = Arc::new(CatalogStubs::default());
+        catalog.set_durable_store(stale_auth_catalog.clone());
+        let handler =
+            GatewayHandler::with_shard_db(catalog.clone(), Arc::new(NoopViewReader), shard_db);
+        handler
+            .append_authentication_audit(
+                AuditIdentity::Unknown,
+                AuditField::Unknown,
+                AuditField::NotApplicable,
+                false,
+            )
+            .await
+            .unwrap();
+        catalog.set_durable_store(stale_denial_catalog.clone());
+        handler
+            .append_authorization_denial(None, None, None, None, None)
+            .await
+            .unwrap();
+
+        current_catalog.refresh().await.unwrap();
+        let records = current_catalog.list_security_audit_records().await.unwrap();
+        for seed_record in seed_records {
+            assert!(records.contains(&seed_record));
+        }
+        assert_eq!(records.len(), 4);
+        let auth = records
+            .iter()
+            .find(|record| {
+                record.action == SecurityAuditClass::AuthenticationFailure
+                    && record.event_id.starts_with("gateway-authn-")
+            })
+            .unwrap();
+        assert!(auth.timestamp_ms > 0);
+        assert_eq!(
+            auth,
+            &SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: auth.event_id.clone(),
+                timestamp_ms: auth.timestamp_ms,
+                actor: AuditIdentity::Unknown,
+                target: AuditField::Unknown,
+                scope: AuditField::NotApplicable,
+                action: SecurityAuditClass::AuthenticationFailure,
+                outcome: SecurityAuditOutcome::Failure,
+                correlation: AuditCorrelation::Unknown,
+                operation_id: AuditField::NotApplicable,
+                policy_revision: AuditField::NotApplicable,
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::NotApplicable,
+            }
+        );
+        let denial = records
+            .iter()
+            .find(|record| record.action == SecurityAuditClass::AuthorizationDenial)
+            .unwrap();
+        assert!(denial.event_id.starts_with("gateway-authz-"));
+        assert!(denial.timestamp_ms > 0);
+        assert_eq!(
+            denial,
+            &SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: denial.event_id.clone(),
+                timestamp_ms: denial.timestamp_ms,
+                actor: AuditIdentity::Unknown,
+                target: AuditField::Unknown,
+                scope: AuditField::Unknown,
+                action: SecurityAuditClass::AuthorizationDenial,
+                outcome: SecurityAuditOutcome::Denied,
+                correlation: AuditCorrelation::Unknown,
+                operation_id: AuditField::NotApplicable,
+                policy_revision: AuditField::Unknown,
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::NotApplicable,
+            }
+        );
+        assert_eq!(stale_auth_catalog.get_revision().await, 3);
+        assert_eq!(stale_denial_catalog.get_revision().await, 4);
+    }
 
     /// S5 green gate: COMMIT with a Jwt principal produces an audit event with actor = "jwt:alice".
     #[tokio::test]
