@@ -13749,17 +13749,13 @@ impl GatewayHandler {
                     }
                 })?;
                 let fields: Vec<String> = val_str.split('\t').map(|s| s.to_string()).collect();
-                let canonical_row_key = build_pk_row_key_typed(
-                    &catalog_table.pk_cols,
-                    &col_names,
-                    &fields,
-                    &col_types,
-                )
-                .map_err(|e| GatewayError::QueryTimeExecutionFailed {
-                    detail: format!(
+                let canonical_row_key =
+                    build_pk_row_key_typed(&catalog_table.pk_cols, &col_names, &fields, &col_types)
+                        .map_err(|e| GatewayError::QueryTimeExecutionFailed {
+                            detail: format!(
                         "[RS-2057] legacy primary key reconciliation failed on table '{table}': {e}"
                     ),
-                })?;
+                        })?;
                 if !seen_canonical.insert(canonical_row_key.clone()) {
                     return Err(GatewayError::QueryTimeExecutionFailed {
                         detail: format!(
@@ -22651,10 +22647,9 @@ fn normalize_typed_value(raw: &str, data_type: &DataType) -> Result<String, Stri
             Ok(v.to_string())
         }
         DataType::Float64 => {
-            let v = raw
-                .trim()
-                .parse::<f64>()
-                .map_err(|e| format!("[RS-2056] invalid DOUBLE PRECISION key value '{raw}': {e}"))?;
+            let v = raw.trim().parse::<f64>().map_err(|e| {
+                format!("[RS-2056] invalid DOUBLE PRECISION key value '{raw}': {e}")
+            })?;
             let v = if v == 0.0 { 0.0 } else { v };
             Ok(v.to_string())
         }
@@ -22665,9 +22660,11 @@ fn normalize_typed_value(raw: &str, data_type: &DataType) -> Result<String, Stri
         },
         DataType::Decimal128(_, _) => {
             use rockstream_sql::dml::{DmlLiteral, DmlScalarExpr};
-            match DmlScalarExpr::Literal(DmlLiteral::String(raw.to_string()))
-                .evaluate_assignment(&HashMap::new(), &HashMap::new(), data_type)
-            {
+            match DmlScalarExpr::Literal(DmlLiteral::String(raw.to_string())).evaluate_assignment(
+                &HashMap::new(),
+                &HashMap::new(),
+                data_type,
+            ) {
                 Ok(Some(formatted)) => Ok(formatted),
                 Ok(None) => Ok(r"\N".to_string()),
                 Err(error) => Err(error.to_string()),
@@ -22688,7 +22685,9 @@ fn normalize_typed_value(raw: &str, data_type: &DataType) -> Result<String, Stri
                 .map_err(|e| format!("[RS-2056] invalid temporal key value '{raw}': {e}"))?;
             let text = parsed
                 .cast_to_with_options(&DataType::Utf8, &opts)
-                .map_err(|e| format!("[RS-2056] failed to format temporal key value '{raw}': {e}"))?;
+                .map_err(|e| {
+                    format!("[RS-2056] failed to format temporal key value '{raw}': {e}")
+                })?;
             Ok(text.to_string())
         }
         _ => Ok(raw.to_string()),
@@ -22714,7 +22713,12 @@ fn encode_key_components<'a>(components: impl IntoIterator<Item = &'a str>) -> S
 fn catalog_column_types(columns: &[CatalogColumn]) -> HashMap<String, DataType> {
     columns
         .iter()
-        .map(|c| (c.name.to_lowercase(), string_to_arrow_datatype(&c.data_type)))
+        .map(|c| {
+            (
+                c.name.to_lowercase(),
+                string_to_arrow_datatype(&c.data_type),
+            )
+        })
         .collect()
 }
 
@@ -22765,9 +22769,7 @@ fn build_pk_row_key_typed(
             .unwrap_or(&DataType::Utf8);
         normalized.push(normalize_typed_value(raw, dt)?);
     }
-    Ok(encode_key_components(
-        normalized.iter().map(String::as_str),
-    ))
+    Ok(encode_key_components(normalized.iter().map(String::as_str)))
 }
 
 fn build_table_row_key_typed(
@@ -22853,9 +22855,7 @@ fn build_row_key_typed(
                 .unwrap_or(&DataType::Utf8);
             normalized.push(normalize_typed_value(v, dt)?);
         }
-        Ok(encode_key_components(
-            normalized.iter().map(String::as_str),
-        ))
+        Ok(encode_key_components(normalized.iter().map(String::as_str)))
     }
 }
 
