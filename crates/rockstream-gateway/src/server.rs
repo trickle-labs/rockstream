@@ -16494,10 +16494,7 @@ impl GatewayServer {
     }
 
     #[doc(hidden)]
-    pub fn with_commit_lock_barrier_for_test(
-        mut self,
-        barrier: Arc<tokio::sync::Barrier>,
-    ) -> Self {
+    pub fn with_commit_lock_barrier_for_test(mut self, barrier: Arc<tokio::sync::Barrier>) -> Self {
         if let Some(h) = Arc::get_mut(&mut self.handler) {
             h.commit_lock_barrier_for_test = Some(barrier);
         }
