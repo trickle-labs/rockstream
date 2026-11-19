@@ -5463,9 +5463,9 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
         "management",
     );
     let ledger_path = object_store::path::Path::from("control/support-artifacts/ledger.json");
-    let pressure_id = uuid::Uuid::new_v4().to_string();
-    let pressure_blob_path = support_artifact_object_path(&pressure_id);
-    let pressure_payload = vec![0u8; 10 * 1024 * 1024];
+    let pressure_blob_path = support_artifact_object_path(&first.opaque_id);
+    let mut pressure_payload = expected_content.as_bytes().to_vec();
+    pressure_payload.resize(10 * 1024 * 1024, b' ');
     let ledger_bytes = management_store
         .get(&ledger_path)
         .await
@@ -5474,12 +5474,7 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
         .await
         .unwrap();
     let mut ledger: serde_json::Value = serde_json::from_slice(&ledger_bytes).unwrap();
-    ledger["artifacts"][&pressure_id] = serde_json::json!({
-        "owner": PrincipalId(1),
-        "scope": PolicyScope::Cluster,
-        "size": pressure_payload.len(),
-        "expires_at_ms": first.expires_at_ms,
-    });
+    ledger["artifacts"][&first.opaque_id]["size"] = serde_json::json!(pressure_payload.len());
     management_store
         .put(&pressure_blob_path, pressure_payload.into())
         .await
@@ -5491,7 +5486,7 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
 
     let download_request = || DownloadSupportArtifactRequest {
         protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
-        opaque_id: pressure_id.clone(),
+        opaque_id: first.opaque_id.clone(),
     };
     let mut open_downloads = Vec::new();
     for _ in 0..8 {
@@ -5513,7 +5508,13 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
         "support artifact download limit reached"
     );
     drop(open_downloads);
-    management_store.delete(&pressure_blob_path).await.unwrap();
+    management_store
+        .put(
+            &pressure_blob_path,
+            expected_content.as_bytes().to_vec().into(),
+        )
+        .await
+        .unwrap();
     let ledger_bytes = management_store
         .get(&ledger_path)
         .await
@@ -5522,10 +5523,7 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
         .await
         .unwrap();
     let mut ledger: serde_json::Value = serde_json::from_slice(&ledger_bytes).unwrap();
-    ledger["artifacts"]
-        .as_object_mut()
-        .unwrap()
-        .remove(&pressure_id);
+    ledger["artifacts"][&first.opaque_id]["size"] = serde_json::json!(expected_content.len());
     management_store
         .put(&ledger_path, serde_json::to_vec(&ledger).unwrap().into())
         .await
@@ -5892,7 +5890,7 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
     })
     .unwrap();
     let pressure_scope = serde_json::to_string(&PolicyScope::Artifact {
-        opaque_id: pressure_id.clone(),
+        opaque_id: idempotency_key.clone(),
     })
     .unwrap();
     let live_expiry_scope = serde_json::to_string(&PolicyScope::Artifact {
@@ -6069,7 +6067,7 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
                 event_id: "support-artifact".to_owned(),
                 timestamp_ms: 0,
                 actor: AuditIdentity::Verified("principal:1".to_owned()),
-                target: AuditField::Known(format!("support-artifact:{pressure_id}")),
+                target: AuditField::Known(format!("support-artifact:{idempotency_key}")),
                 scope: AuditField::Known(pressure_scope),
                 action: SecurityAuditClass::AdminOperationStart,
                 outcome: SecurityAuditOutcome::Success,
@@ -6962,44 +6960,46 @@ async fn support_artifact_download_limit_holds_under_release_process_pressure() 
     let mut client = wait_for_management_client(management_address, &pki).await;
 
     let artifact_id = uuid::Uuid::new_v4().to_string();
-    let expires_at_ms = chrono::Utc::now().timestamp_millis().max(1) as u64 + 600_000;
-    let mut content = serde_json::to_vec(&serde_json::json!({
-        "format_version": 1,
-        "generated_at_ms": 1,
-        "scope": "cluster",
-        "source_version": "test",
-        "topology_revision": 1,
-        "active_operations": 0,
-        "retained_operations": 0,
-        "node": null,
-    }))
-    .unwrap();
-    content.resize(10 * 1024 * 1024, b' ');
+    let generated = client
+        .generate_support_artifact(GenerateSupportArtifactRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            node_id: String::new(),
+            idempotency_key: artifact_id.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(generated.opaque_id, artifact_id);
+    let expires_at_ms = generated.expires_at_ms;
     let management_store = object_store::prefix::PrefixStore::new(
         rockstream_test_support::minio::minio_object_store(minio_port, bucket),
         "management",
     );
     let ledger_path = object_store::path::Path::from("control/support-artifacts/ledger.json");
-    let mut artifacts = serde_json::Map::new();
-    artifacts.insert(
-        artifact_id.clone(),
-        serde_json::json!({
-            "owner": PrincipalId(1),
-            "scope": PolicyScope::Cluster,
-            "size": content.len(),
-            "expires_at_ms": expires_at_ms,
-        }),
-    );
-    let ledger_bytes = serde_json::to_vec(&serde_json::json!({
-        "format_version": 1,
-        "artifacts": artifacts,
-    }))
+    let artifact_path = support_artifact_object_path(&artifact_id);
+    let mut content = management_store
+        .get(&artifact_path)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap()
+        .to_vec();
+    content.resize(10 * 1024 * 1024, b' ');
+    let mut ledger: serde_json::Value = serde_json::from_slice(
+        &management_store
+            .get(&ledger_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+    )
     .unwrap();
+    ledger["artifacts"][&artifact_id]["size"] = serde_json::json!(content.len());
+    let ledger_bytes = serde_json::to_vec(&ledger).unwrap();
     management_store
-        .put(
-            &support_artifact_object_path(&artifact_id),
-            content.clone().into(),
-        )
+        .put(&artifact_path, content.clone().into())
         .await
         .unwrap();
     management_store
@@ -7031,8 +7031,30 @@ async fn support_artifact_download_limit_holds_under_release_process_pressure() 
         operations_before.source_version,
         "management-operation-records:v1"
     );
-    assert!(operations_before.operations.is_empty());
+    assert_eq!(operations_before.operations.len(), 1);
+    let operation = operations_before.operations.first().unwrap();
+    let started_at = operation.started_at.clone();
+    let updated_at = operation.updated_at.clone();
+    assert_eq!(
+        operations_before.operations,
+        vec![rockstream_management_proto::v1::Operation {
+            operation_id: artifact_id.clone(),
+            kind: "generate_support_artifact".to_owned(),
+            state: "succeeded".to_owned(),
+            started_at: started_at.clone(),
+            updated_at: updated_at.clone(),
+            progress: "100%".to_owned(),
+            phase: format!("available_until_ms:{expires_at_ms}"),
+            error_code: String::new(),
+            next_steps: Vec::new(),
+            source_version: "operation-record:1".to_owned(),
+            result_json: String::new(),
+        }]
+    );
+    assert!(chrono::DateTime::parse_from_rfc3339(&started_at).is_ok());
+    assert!(chrono::DateTime::parse_from_rfc3339(&updated_at).is_ok());
     assert!(operations_before.next_page_token.is_empty());
+    catalog.refresh().await.unwrap();
     let audit_before = catalog.list_security_audit_records().await.unwrap();
 
     let mut streams = Vec::new();

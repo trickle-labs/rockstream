@@ -1066,6 +1066,7 @@ impl ManagementService {
         };
         let Some(request) = current.request() else {
             tracing::error!(
+                code = %rockstream_types::error_code::RS_0001,
                 operation_id = current.operation_id(),
                 "support artifact recovery request is missing"
             );
@@ -1077,6 +1078,7 @@ impl ManagementService {
             .map(PrincipalId)
         else {
             tracing::error!(
+                code = %rockstream_types::error_code::RS_0001,
                 operation_id = current.operation_id(),
                 "support artifact recovery actor is missing"
             );
@@ -3075,9 +3077,9 @@ impl v1::management_service_server::ManagementService for ManagementService {
         if newly_completed {
             crate::support_artifact::maybe_crash_after_debug_test_boundary("completion-audit");
         }
-        self.flush_operation_audit(completed).await.map_err(|_| {
-            required_audit_unavailable(&request, "support artifact audit is unavailable")
-        })?;
+        self.flush_operation_audit(completed)
+            .await
+            .map_err(|_| Status::unavailable("support artifact audit is unavailable"))?;
         crate::support_artifact::maybe_crash_after_debug_test_boundary("operation-succeeded");
         Ok(Response::new(v1::GenerateSupportArtifactResponse {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
