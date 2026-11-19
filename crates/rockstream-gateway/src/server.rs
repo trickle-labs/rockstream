@@ -12367,13 +12367,21 @@ impl GatewayHandler {
         // durable flush and subscription publication. Releasing this guard
         // before flushing allowed a later epoch to publish out of order.
         let _commit_guard = self.shard_commit_lock.lock().await;
+        // Reject before view recovery can flush unrelated work for this commit attempt.
+        let (ops, conflicted) = committed_dml_ops(shard_db, ops)
+            .await
+            .map_err(|e| PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e))))?;
+        if conflicted {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "40001".to_owned(),
+                "transaction conflict: a row changed or a primary key became occupied after this transaction staged its writes; no writes were committed. Re-read current rows, resolve any key conflicts, and retry the transaction.".to_owned(),
+            ))));
+        }
         self.recover_pending_views_locked()
             .await
             .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
         let (epoch, ops, changes, distributed_deltas) = {
-            let ops = committed_dml_ops(shard_db, ops).await.map_err(|e| {
-                PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
-            })?;
             if ops.is_empty() {
                 if let Some(conn_id) = conn_id {
                     self.flush_pending_notifies(conn_id);
@@ -18883,7 +18891,7 @@ fn append_dml_ops(batch: &mut rockstream_storage::WriteBatch, ops: &[DmlOp]) {
 async fn committed_dml_ops(
     shard_db: &rockstream_storage::ShardDb,
     ops: Vec<DmlOp>,
-) -> Result<Vec<DmlOp>, rockstream_storage::StorageError> {
+) -> Result<(Vec<DmlOp>, bool), rockstream_storage::StorageError> {
     let mut images = stream::iter(dml_image_tables(&ops))
         .map(|(key, table)| async move {
             let storage_key = format!("view_output/{table}/{}", key.1);
@@ -18899,6 +18907,7 @@ async fn committed_dml_ops(
         .into_iter()
         .collect::<HashMap<_, _>>();
     let mut committed = Vec::with_capacity(ops.len());
+    let mut conflicted = false;
     for op in ops {
         let valid = match &op {
             DmlOp::Insert {
@@ -18926,7 +18935,11 @@ async fn committed_dml_ops(
                 new_tsv,
             } => {
                 let image = cached_row_image(shard_db, &mut images, table, old_row_key).await?;
-                if image.as_deref() == Some(old_tsv) {
+                let destination_available = old_row_key == new_row_key
+                    || cached_row_image(shard_db, &mut images, table, new_row_key)
+                        .await?
+                        .is_none();
+                if image.as_deref() == Some(old_tsv) && destination_available {
                     images.insert((table.to_ascii_lowercase(), old_row_key.clone()), None);
                     images.insert(
                         (table.to_ascii_lowercase(), new_row_key.clone()),
@@ -18953,9 +18966,11 @@ async fn committed_dml_ops(
         };
         if valid {
             committed.push(op);
+        } else {
+            conflicted = true;
         }
     }
-    Ok(committed)
+    Ok((committed, conflicted))
 }
 
 fn dml_image_tables(ops: &[DmlOp]) -> HashMap<(String, String), String> {
