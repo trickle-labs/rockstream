@@ -275,7 +275,8 @@ Pages use live keyset ordering rather than a multi-request snapshot. Records
 committed during pagination may appear when their key sorts after the cursor;
 restart from the first page to include records that sort at or before it. If
 the policy revision changes between authorization and page read, return a
-retryable conflict without disclosing records.
+retryable conflict without disclosing records. A client `CancelRequest` stops
+an audit-page read with RS-2050 and leaves retained history unchanged.
 
 ## First administrator preprovisioning
 
