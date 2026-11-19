@@ -823,19 +823,36 @@ references and rejects deletion with `RS-2426` while a binding remains. The
 gateway pgoutput worker rechecks the durable secret version at transaction
 boundaries, resolves a changed value under the consumer's current grant, and
 reconnects only after the epoch result, source checkpoint, and slot ACK commit.
-The worker process and committed result state remain in place. A Docker-backed
-release-process regression rotates credentials with an upstream transaction
-pending, compares the complete result multiset after the transaction and a
-post-rotation write, then kills and restarts the gateway and compares the
-recovered result multiset. It does not yet verify the corresponding durable
-security-audit sequence or lost-response reconciliation. Kafka source/sink
-runtime rotation remains unqualified; SQL `CREATE SINK` does not configure the
-experimental runtime adapter. The `test_secret_references_survive_store_reopen` regression in
+The worker process and committed result state remain in place. The Docker-backed
+`pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_results`
+release-process test rotates credentials with an upstream transaction pending,
+checks the complete result multiset including duplicate and NULL rows, drops the
+committed rotation response, and retries with the same client-visible
+`rockstream.idempotency_key`; reuse of that key for a different request is
+rejected. It verifies the post-rotation checkpoint, redacted `SHOW SECRETS`,
+and complete results after gateway restart. The control-store
+`secret_rotation_reconciles_a_committed_audit_after_restart` test separately
+checks operation and audit recovery. Kafka source/sink runtime rotation remains
+unqualified and blocked: SQL `CREATE SINK` does not configure the experimental
+runtime adapter, and there is no supported release-process route for the
+multi-view sink case. The `test_secret_references_survive_store_reopen` regression in
 `crates/rockstream-control/tests/secrets_lifecycle_tests.rs` verifies that a
 reopened store retains the reference and continues to reject secret deletion.
 The `sink_secret_reference_blocks_secret_drop_until_sink_drop` regression in
 `crates/rockstream-gateway/src/server.rs` verifies that a sink binding blocks
 deletion until `DROP SINK` removes it.
+
+Issue #306 keeps release support artifacts sanitized and addresses downloads by
+opaque artifact ID bound to the authenticated principal and scope. The release
+tests compare the complete generated JSON, verify operator-only artifact access
+and denied backup creation, and cover same-key recovery across processes,
+durable operation/audit recovery after process exit, cancellation races, and
+expired-artifact denial and cleanup after restart. The enforced profile is
+10 MiB per artifact, 100 MiB and 2,048 retained artifacts per deployment, and
+10 minutes of availability; a full bound rejects new artifacts without
+eviction. MinIO tests cover shared cross-process budget and request contention.
+These are focused implementation and release-process checks; broader sustained
+pressure qualification and assembled #307 evidence remain outstanding.
 
 The v0.73 principal, grant, and audit changes persist reviewed policy revisions
 with their mutation audit records through the durable catalog. The

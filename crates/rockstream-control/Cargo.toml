@@ -8,6 +8,7 @@ description = "Control-plane service for RockStream cluster management"
 
 [features]
 simulation = ["rockstream-sim/simulation"]
+test-support-artifact-crash-injection = []
 
 [[bench]]
 name = "frontier_bench"
