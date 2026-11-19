@@ -37,7 +37,7 @@ pub(crate) struct SupportArtifactStore {
     prefix: Path,
     available: Arc<AtomicBool>,
     #[cfg(test)]
-    artifact_put_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    pub(super) artifact_put_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -284,12 +284,14 @@ impl SupportArtifactStore {
     pub async fn remove(&self, id: &str, owner: PrincipalId) -> Result<(), ArtifactStoreError> {
         self.ensure_available()?;
         let (ledger, _) = self.read_ledger().await?;
-        let Some(artifact) = ledger.artifacts.get(id) else {
-            return Ok(());
-        };
-        if artifact.owner != owner {
+        if ledger
+            .artifacts
+            .get(id)
+            .is_some_and(|artifact| artifact.owner != owner)
+        {
             return Ok(());
         }
+        // A failed generation can remove its ledger reservation before a late retry writes.
         self.delete_artifact(id).await?;
         self.mutate_ledger(|ledger| {
             if ledger

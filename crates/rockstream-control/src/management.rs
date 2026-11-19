@@ -3091,6 +3091,17 @@ impl v1::management_service_server::ManagementService for ManagementService {
                 if completed.status() != OperationStatus::Succeeded
                     || completed.phase() != Some(completion_phase.as_str())
                 {
+                    if matches!(
+                        completed.status(),
+                        OperationStatus::Failed | OperationStatus::Cancelled
+                    ) {
+                        self.support_artifacts
+                            .remove(running.operation_id(), principal_id)
+                            .await
+                            .map_err(|_| {
+                                Status::unavailable("support artifact cleanup is unavailable")
+                            })?;
+                    }
                     return Err(store_error(error));
                 }
             }
@@ -3588,6 +3599,117 @@ mod tests {
             operations.get(&key).await.unwrap().unwrap().status(),
             OperationStatus::Cancelled
         );
+    }
+
+    #[tokio::test]
+    async fn failed_support_artifact_retry_removes_late_object_write() {
+        let security_catalog = test_security_catalog().await;
+        let operations = ManagementOperationStore::new(Arc::new(InMemory::new()));
+        let mut service = ManagementService::new(
+            TopologyCatalog::new(),
+            ShardManager::new(),
+            operations.clone(),
+            NodeConfig::default(),
+        )
+        .with_security_catalog(security_catalog.clone());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        service.support_artifacts.artifact_put_gate =
+            Some((Arc::clone(&started), Arc::clone(&resume)));
+
+        let key = uuid::Uuid::new_v4().to_string();
+        let generation_service = service.clone();
+        let generation_key = key.clone();
+        let generation = tokio::spawn(async move {
+            <ManagementService as v1::management_service_server::ManagementService>::generate_support_artifact(
+                &generation_service,
+                authenticated_request(v1::GenerateSupportArtifactRequest {
+                    protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                    node_id: String::new(),
+                    idempotency_key: generation_key,
+                }),
+            )
+            .await
+        });
+        started.notified().await;
+
+        let running = operations.get(&key).await.unwrap().unwrap();
+        assert_eq!(running.status(), OperationStatus::Running);
+        let scope = PolicyScope::Cluster;
+        let failure_request = authenticated_request(v1::GenerateSupportArtifactRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            node_id: String::new(),
+            idempotency_key: key.clone(),
+        });
+        let (principal_id, policy_revision) = service
+            .authorize(
+                &failure_request,
+                SecurityAction::SupportGenerate,
+                scope.clone(),
+            )
+            .await
+            .unwrap();
+        service
+            .fail_support_artifact_generation(
+                &failure_request,
+                principal_id,
+                policy_revision,
+                (&key, &scope),
+                &running,
+                "injected_failure",
+            )
+            .await
+            .unwrap();
+
+        resume.notify_one();
+        let error = generation.await.unwrap().unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            error.message(),
+            format!("operation {key} changed while the request was processed")
+        );
+        let failed = operations.get(&key).await.unwrap().unwrap();
+        assert_eq!(failed.status(), OperationStatus::Failed);
+        assert_eq!(failed.phase(), Some("injected_failure"));
+
+        let now_ms = Utc::now().timestamp_millis().max(1) as u64;
+        let expiry = ArtifactExpiry {
+            unix_ms: now_ms + ARTIFACT_TTL.as_millis() as u64,
+        };
+        let replacement: Arc<[u8]> = Arc::from(b"replacement".to_vec());
+        service
+            .support_artifacts
+            .insert(
+                key.clone(),
+                principal_id,
+                scope.clone(),
+                replacement.clone(),
+                expiry,
+                now_ms,
+            )
+            .await
+            .unwrap();
+        let (downloaded, _, _) = service
+            .support_artifacts
+            .download(&key, principal_id, now_ms)
+            .await
+            .unwrap();
+        assert_eq!(downloaded.as_ref(), replacement.as_ref());
+
+        let audit = security_catalog
+            .list_security_audit_records()
+            .await
+            .unwrap();
+        assert_eq!(
+            audit.iter().map(|record| record.action).collect::<Vec<_>>(),
+            vec![
+                SecurityAuditClass::GrantChange,
+                SecurityAuditClass::GrantChange,
+                SecurityAuditClass::AdminOperationStart,
+                SecurityAuditClass::AdminOperationCompletion,
+            ]
+        );
+        assert_eq!(audit.last().unwrap().outcome, SecurityAuditOutcome::Failure);
     }
 
     #[tokio::test]
