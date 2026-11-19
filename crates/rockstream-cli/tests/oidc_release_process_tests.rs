@@ -2483,9 +2483,18 @@ async fn management_storage_outage_rejects_grant_change_across_process_restart()
         minio_config,
     );
     wait_for_gateway(&mut recovered_process.0, address).await;
-    let mut recovered_management = try_management_client(management_address, &pki)
-        .await
-        .expect("management endpoint should recover after MinIO returns");
+    let recovery_deadline = Instant::now() + Duration::from_secs(30);
+    let mut recovered_management = loop {
+        match try_management_client(management_address, &pki).await {
+            Ok(client) => break client,
+            Err(_) if Instant::now() < recovery_deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => {
+                panic!("management endpoint did not recover after MinIO returns: {error}")
+            }
+        }
+    };
     let missing = recovered_management
         .get_operation(GetOperationRequest {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
