@@ -32,7 +32,7 @@ use rockstream_types::error_code::RS_0003;
 use rockstream_types::ids::PrincipalId;
 #[path = "common/management_auth.rs"]
 mod management_auth;
-use management_auth::{management_client, preprovision_administrator};
+use management_auth::management_client;
 use sha2::Digest;
 
 struct RunningProcess(Child);
