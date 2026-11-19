@@ -2978,16 +2978,27 @@ impl GatewayHandler {
         let Some(authorized_principal) = matching_principal.as_ref() else {
             return Ok(vec![security_audit_policy_changed_response()]);
         };
-        let records = match store
-            .list_security_audit_page(
+        let mut cancel_token = CANCEL_TOKEN
+            .try_with(|token| token.clone())
+            .unwrap_or_else(|_| CancelToken::new());
+        let page = tokio::select! {
+            biased;
+            _ = cancel_token.cancelled() => {
+                return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "57014".to_string(),
+                    "[RS-2050] query.cancelled: query was cancelled by a client CancelRequest. next_steps: Retry the query or await client timeout settings.".to_string(),
+                )))]);
+            }
+            page = store.list_security_audit_page(
                 (authorized_principal.id, authorized_principal.revision),
                 query.from_ms,
                 query.to_ms,
                 query.after,
                 query.limit,
-            )
-            .await
-        {
+            ) => page,
+        };
+        let records = match page {
             Ok(records) => records,
             Err(rockstream_storage::catalog::CatalogError::OptimisticConflict(_)) => {
                 return Ok(vec![security_audit_policy_changed_response()]);
