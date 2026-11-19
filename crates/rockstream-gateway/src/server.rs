@@ -13983,16 +13983,18 @@ impl GatewayHandler {
         let mut new_keys_in_batch = HashSet::new();
 
         for (old_row_key, existing_fields) in &matched_rows {
-            let mut row_map: HashMap<String, Option<String>> = HashMap::new();
+            let mut original_row: HashMap<String, Option<String>> = HashMap::new();
             for (i, col) in table_columns.iter().enumerate() {
                 let val = existing_fields.get(i).cloned();
                 let val_opt = match val {
                     Some(ref s) if s == r"\N" => None,
                     other => other,
                 };
-                row_map.insert(col.clone(), val_opt);
+                original_row.insert(col.clone(), val_opt);
             }
 
+            let mut staged_assignments: Vec<(String, Option<String>)> =
+                Vec::with_capacity(assignments.len());
             for (col_name, scalar_expr) in &assignments {
                 let Some(target_type) = column_types.get(col_name) else {
                     return Ok(vec![promote_response(Response::Error(Box::new(
@@ -14003,34 +14005,47 @@ impl GatewayHandler {
                         ),
                     )))]);
                 };
-                let new_val =
-                    match scalar_expr.evaluate_assignment(&row_map, &column_types, target_type) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            let err_str = e.to_string();
-                            let sqlstate = if err_str.contains("RS-1016") {
-                                if err_str.contains("division by zero") {
-                                    "22012"
-                                } else {
-                                    "22003"
-                                }
-                            } else if err_str.contains("RS-1013") {
-                                "0A000"
+                let new_val = match scalar_expr.evaluate_assignment(
+                    &original_row,
+                    &column_types,
+                    target_type,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        let sqlstate = if err_str.contains("RS-1016") {
+                            if err_str.contains("division by zero") {
+                                "22012"
                             } else {
-                                "42601"
-                            };
-                            return Ok(vec![promote_response(Response::Error(Box::new(
-                                ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), err_str),
-                            )))]);
-                        }
-                    };
-                row_map.insert(col_name.clone(), new_val);
+                                "22003"
+                            }
+                        } else if err_str.contains("RS-1013") {
+                            "0A000"
+                        } else {
+                            "42601"
+                        };
+                        return Ok(vec![promote_response(Response::Error(Box::new(
+                            ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), err_str),
+                        )))]);
+                    }
+                };
+                staged_assignments.push((col_name.clone(), new_val));
+            }
+
+            let mut updated_row = original_row;
+            for (col_name, new_val) in staged_assignments {
+                let target_col = table_columns
+                    .iter()
+                    .find(|tc| tc.eq_ignore_ascii_case(&col_name))
+                    .cloned()
+                    .unwrap_or(col_name);
+                updated_row.insert(target_col, new_val);
             }
 
             let new_vals: Vec<String> = table_columns
                 .iter()
                 .map(|c| {
-                    row_map
+                    updated_row
                         .get(c)
                         .and_then(|o| o.clone())
                         .unwrap_or_else(|| r"\N".to_string())
