@@ -121,16 +121,18 @@ impl ExchangeRegistry {
         self
     }
 
-    async fn append_security_audit(&self, record: SecurityAuditRecord) -> Result<(), Status> {
+    async fn append_security_audit(&self, record: SecurityAuditRecord) -> Result<(), Box<Status>> {
         let (Some(worker_messages), Some(waiters)) =
             (&self.worker_messages, &self.security_audit_waiters)
         else {
-            return Err(Status::unavailable(format!(
+            return Err(Box::new(Status::unavailable(format!(
                 "{RS_0003}: required security audit transport is unavailable"
-            )));
+            ))));
         };
         record.validate().map_err(|_| {
-            Status::internal(format!("{RS_0003}: invalid required security audit record"))
+            Box::new(Status::internal(format!(
+                "{RS_0003}: invalid required security audit record"
+            )))
         })?;
         let request_id = record.event_id.clone();
         let (ack_tx, ack_rx) = oneshot::channel();
@@ -138,9 +140,9 @@ impl ExchangeRegistry {
             let mut waiters = waiters.lock();
             if waiters.len() >= worker_messages.max_capacity() || waiters.contains_key(&request_id)
             {
-                return Err(Status::unavailable(format!(
+                return Err(Box::new(Status::unavailable(format!(
                     "{RS_0003}: required security audit capacity is unavailable"
-                )));
+                ))));
             }
             waiters.insert(request_id.clone(), ack_tx);
         }
@@ -152,17 +154,17 @@ impl ExchangeRegistry {
             .is_err()
         {
             waiters.lock().remove(&request_id);
-            return Err(Status::unavailable(format!(
+            return Err(Box::new(Status::unavailable(format!(
                 "{RS_0003}: required security audit transport is unavailable"
-            )));
+            ))));
         }
         match tokio::time::timeout(Duration::from_secs(30), ack_rx).await {
             Ok(Ok(true)) => Ok(()),
             _ => {
                 waiters.lock().remove(&request_id);
-                Err(Status::unavailable(format!(
+                Err(Box::new(Status::unavailable(format!(
                     "{RS_0003}: required security audit append failed"
-                )))
+                ))))
             }
         }
     }
@@ -220,7 +222,7 @@ impl ExchangeRegistry {
         &self,
         worker_id: WorkerId,
         frame: &ShuffleFrame,
-    ) -> Result<(), Status> {
+    ) -> Result<(), Box<Status>> {
         let timestamp_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -759,7 +761,10 @@ impl ShuffleService for ShuffleServer {
         let authenticated_worker_id = match self.validate_worker_identity(&request) {
             Ok(worker_id) => worker_id,
             Err((status, record)) => {
-                self.registry.append_security_audit(record).await?;
+                self.registry
+                    .append_security_audit(record)
+                    .await
+                    .map_err(|status| *status)?;
                 return Err(status);
             }
         };
@@ -783,7 +788,7 @@ impl ShuffleService for ShuffleServer {
                                 if let Err(audit_error) =
                                     registry.audit_authorization_denial(worker_id, &frame).await
                                 {
-                                    let _ = tx.send(Err(audit_error)).await;
+                                    let _ = tx.send(Err(*audit_error)).await;
                                     break;
                                 }
                                 let status =
@@ -913,7 +918,10 @@ impl ShuffleService for ShuffleServer {
         request: Request<Streaming<crate::exchange::proto::ExchangeFrame>>,
     ) -> Result<Response<Self::ExchangeStreamStream>, Status> {
         if let Err((status, record)) = self.validate_worker_identity(&request) {
-            self.registry.append_security_audit(record).await?;
+            self.registry
+                .append_security_audit(record)
+                .await
+                .map_err(|status| *status)?;
             return Err(status);
         }
         self.validate_protocol_version(request.metadata())?;
