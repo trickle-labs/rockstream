@@ -18,7 +18,7 @@ use rockstream_ops::sink::{write_view_directory_entry, ViewSinkOp};
 use rockstream_ops::ArrowZSet;
 use rockstream_runtime::exchange::proto::shuffle_service_client::ShuffleServiceClient;
 use rockstream_runtime::exchange::proto::shuffle_service_server::ShuffleServiceServer;
-use rockstream_runtime::exchange::proto::{ExchangeFrame, ShuffleFrame};
+use rockstream_runtime::exchange::proto::ShuffleFrame;
 use rockstream_runtime::exchange::serialization::{build_exchange_frame, serialize_zset};
 use rockstream_runtime::exchange::service::{ExchangeRegistry, ShuffleServer};
 use rockstream_storage::ShardDb;
