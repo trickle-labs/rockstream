@@ -504,6 +504,105 @@ mod tests {
     use object_store::memory::InMemory;
     use tokio::sync::Notify;
 
+    #[derive(Debug)]
+    struct FailingListStore {
+        inner: Arc<InMemory>,
+    }
+
+    impl std::fmt::Display for FailingListStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FailingListStore")
+        }
+    }
+
+    fn listing_failure() -> ObjectStoreError {
+        ObjectStoreError::Generic {
+            store: "support artifact test",
+            source: Box::new(std::io::Error::other("injected list failure")),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for FailingListStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: object_store::PutPayload,
+            options: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            options: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            paths: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(paths)
+        }
+
+        fn list(
+            &self,
+            _prefix: Option<&Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            Box::pin(futures::stream::iter(vec![Err(listing_failure())]))
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+
+        async fn rename_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: object_store::RenameOptions,
+        ) -> object_store::Result<()> {
+            self.inner.rename_opts(from, to, options).await
+        }
+    }
+
+    #[tokio::test]
+    async fn artifact_cleanup_fails_closed_when_prefix_listing_is_unavailable() {
+        let store = SupportArtifactStore::new(Arc::new(FailingListStore {
+            inner: Arc::new(InMemory::new()),
+        }));
+        store.initialize().await.unwrap();
+
+        assert_eq!(
+            store.cleanup_expired(1_000).await,
+            Err(ArtifactStoreError::StorageUnavailable)
+        );
+    }
+
     #[tokio::test]
     async fn reserved_artifact_is_written_when_retried_after_store_restart() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
