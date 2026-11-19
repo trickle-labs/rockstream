@@ -2285,7 +2285,7 @@ async fn management_storage_outage_rejects_grant_change_across_process_restart()
     let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let bucket = "release-audit-outage";
-    let (mut minio_container, minio_port) = rockstream_test_support::minio::start_minio(bucket)
+    let (minio_container, minio_port) = rockstream_test_support::minio::start_minio(bucket)
         .await
         .expect("MinIO is required for release-process audit-storage qualification");
     let minio_config = Some((minio_port, bucket));
@@ -2322,7 +2322,7 @@ async fn management_storage_outage_rejects_grant_change_across_process_restart()
     seed_process.0.kill().unwrap();
     seed_process.0.wait().unwrap();
 
-    let mut catalog =
+    let catalog =
         DurableCatalogStore::recover(minio_runtime_object_store(minio_port, bucket), "gateway")
             .await
             .unwrap();
@@ -2450,7 +2450,7 @@ async fn management_storage_outage_rejects_grant_change_across_process_restart()
     let minio_port = minio_container.get_host_port_ipv4(9000).await.unwrap();
     let minio_config = Some((minio_port, bucket));
     let deadline = Instant::now() + Duration::from_secs(30);
-    let mut recovered = loop {
+    let recovered = loop {
         match DurableCatalogStore::recover(
             minio_runtime_object_store(minio_port, bucket),
             "gateway",
