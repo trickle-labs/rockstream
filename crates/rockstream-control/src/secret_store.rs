@@ -136,6 +136,7 @@ pub struct SecretRotationOperationContext {
     pub operation_id: String,
     pub audit: SecurityAuditRecord,
 }
+
 impl SecretStoreError {
     pub fn not_found(name: impl Into<String>) -> Self {
         Self::NotFound {

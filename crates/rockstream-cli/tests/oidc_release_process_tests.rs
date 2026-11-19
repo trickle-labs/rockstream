@@ -4746,11 +4746,11 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
     let operation = rockstream_control::ManagementOperationStore::new(
         rockstream_storage::build_runtime_object_store(&shard_dir, "gateway-shard").unwrap(),
     )
-    .get(rotation_id)
+    .get(rotation_operation_id)
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(operation.operation_id(), rotation_id);
+    assert_eq!(operation.operation_id(), rotation_operation_id);
     assert_eq!(
         operation.kind(),
         rockstream_control::OperationKind::SecretRotation
