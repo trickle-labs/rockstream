@@ -36,6 +36,8 @@ pub(crate) struct SupportArtifactStore {
     store: Arc<dyn ObjectStore>,
     prefix: Path,
     available: Arc<AtomicBool>,
+    #[cfg(test)]
+    artifact_put_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -80,6 +82,8 @@ impl SupportArtifactStore {
             store,
             prefix: Path::from("control/support-artifacts"),
             available: Arc::new(AtomicBool::new(true)),
+            #[cfg(test)]
+            artifact_put_gate: None,
         }
     }
 
@@ -154,6 +158,12 @@ impl SupportArtifactStore {
             maybe_crash_after_debug_test_boundary("ledger-reserved");
         }
 
+        #[cfg(test)]
+        if let Some((started, resume)) = &self.artifact_put_gate {
+            started.notify_one();
+            resume.notified().await;
+        }
+
         let path = self.artifact_path(&id);
         match self
             .store
@@ -179,6 +189,9 @@ impl SupportArtifactStore {
                     .await
                     .map_err(|_| ArtifactStoreError::StorageUnavailable)?;
                 if existing.as_ref() == content.as_ref() {
+                    Ok(())
+                } else if existing.len() == content.len() {
+                    // The operation key identifies one artifact; the first complete object wins.
                     Ok(())
                 } else {
                     if reserved {
@@ -454,6 +467,7 @@ mod tests {
     use super::*;
     use object_store::local::LocalFileSystem;
     use object_store::memory::InMemory;
+    use tokio::sync::Notify;
 
     #[tokio::test]
     async fn reserved_artifact_is_written_when_retried_after_store_restart() {
@@ -507,6 +521,72 @@ mod tests {
             .unwrap();
         assert_eq!(downloaded.as_ref(), content.as_ref());
         assert_eq!(downloaded_expiry, expires_at_ms);
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_id_writers_preserve_the_first_object() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut first = SupportArtifactStore::new(Arc::clone(&object_store));
+        let second = SupportArtifactStore::new(object_store);
+        first.initialize().await.unwrap();
+        let started = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        first.artifact_put_gate = Some((Arc::clone(&started), Arc::clone(&resume)));
+
+        let id = "concurrent-same-id".to_owned();
+        let owner = PrincipalId(7);
+        let scope = PolicyScope::Cluster;
+        let now_ms = 1_000_000;
+        let expiry = ArtifactExpiry {
+            unix_ms: now_ms + ARTIFACT_TTL.as_millis() as u64,
+        };
+        let first_scope = scope.clone();
+        let reserved_content: Arc<[u8]> = Arc::from(b"first".to_vec());
+        let committed_content: Arc<[u8]> = Arc::from(b"other".to_vec());
+        let first_task = tokio::spawn(async move {
+            first
+                .insert(
+                    id.clone(),
+                    owner,
+                    first_scope,
+                    reserved_content,
+                    expiry,
+                    now_ms,
+                )
+                .await
+        });
+        started.notified().await;
+        second
+            .insert(
+                "concurrent-same-id".to_owned(),
+                owner,
+                scope.clone(),
+                committed_content.clone(),
+                expiry,
+                now_ms,
+            )
+            .await
+            .unwrap();
+        resume.notify_one();
+        first_task.await.unwrap().unwrap();
+
+        let (downloaded, _, _) = second
+            .download("concurrent-same-id", owner, now_ms)
+            .await
+            .unwrap();
+        assert_eq!(downloaded.as_ref(), committed_content.as_ref());
+        assert_eq!(
+            second
+                .read_ledger()
+                .await
+                .unwrap()
+                .0
+                .artifacts
+                .get("concurrent-same-id")
+                .unwrap()
+                .size,
+            committed_content.len()
+        );
     }
 
     #[tokio::test]
