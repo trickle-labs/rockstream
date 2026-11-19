@@ -54,6 +54,13 @@ rockstream --output json --management 127.0.0.1:9201 shard show 0
 rockstream --output json --management 127.0.0.1:9201 config summary
 rockstream --output json --management 127.0.0.1:9201 admin operation list
 rockstream --output json --management 127.0.0.1:9201 admin operation show <operation-id>
+```
+
+## Support artifact examples
+
+These commands require management storage with atomic conditional writes. A backend without that capability disables support-artifact generation and download while leaving other management operations available.
+
+```sh
 rockstream --management 127.0.0.1:9201 support artifact create --idempotency-key <client-generated-uuid>
 rockstream --management 127.0.0.1:9201 support artifact download <opaque-id> --out support.json
 ```
