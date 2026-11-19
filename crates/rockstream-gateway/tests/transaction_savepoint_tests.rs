@@ -315,3 +315,272 @@ async fn test_savepoint_outside_transaction_rejected() {
         "expected error for SAVEPOINT outside BEGIN, got: {result:?}"
     );
 }
+
+// ── Issue #346 — Same-name savepoint shadowing & stack semantics ─────────────
+
+fn extract_i64_column(rows: &[&tokio_postgres::SimpleQueryRow], col: &str) -> Vec<i64> {
+    rows.iter()
+        .map(|r| {
+            r.get(col)
+                .unwrap_or_else(|| panic!("missing column {col}"))
+                .parse::<i64>()
+                .unwrap_or_else(|e| panic!("invalid i64 in column {col}: {e}"))
+        })
+        .collect()
+}
+
+/// Issue #346 regression: releasing a newer same-name savepoint must expose the older one.
+#[tokio::test]
+async fn test_savepoint_same_name_shadowing_regression() {
+    let (port, _handle, shard_db) = start_gateway_with_shard("sp-shadow-346").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query("CREATE TABLE savepoint_rows (id BIGINT)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    client
+        .simple_query("SET rockstream.idempotency_key = 'sp-shadow-346'")
+        .await
+        .expect("SET idempotency_key failed");
+
+    client.simple_query("BEGIN").await.expect("BEGIN failed");
+    client
+        .simple_query("INSERT INTO savepoint_rows VALUES (1)")
+        .await
+        .expect("INSERT 1 failed");
+    client
+        .simple_query("SAVEPOINT s")
+        .await
+        .expect("SAVEPOINT s (1st) failed");
+    client
+        .simple_query("INSERT INTO savepoint_rows VALUES (2)")
+        .await
+        .expect("INSERT 2 failed");
+    client
+        .simple_query("SAVEPOINT s")
+        .await
+        .expect("SAVEPOINT s (2nd) failed");
+    client
+        .simple_query("INSERT INTO savepoint_rows VALUES (3)")
+        .await
+        .expect("INSERT 3 failed");
+    client
+        .simple_query("ROLLBACK TO SAVEPOINT s")
+        .await
+        .expect("ROLLBACK TO SAVEPOINT s (newer) failed");
+    client
+        .simple_query("RELEASE SAVEPOINT s")
+        .await
+        .expect("RELEASE SAVEPOINT s (newer) failed");
+    client
+        .simple_query("ROLLBACK TO SAVEPOINT s")
+        .await
+        .expect("ROLLBACK TO SAVEPOINT s (older) failed");
+    client.simple_query("COMMIT").await.expect("COMMIT failed");
+
+    shard_db.flush().await.unwrap();
+
+    let msgs = client
+        .simple_query("SELECT id FROM savepoint_rows")
+        .await
+        .expect("SELECT failed");
+    let rows = data_rows_from(&msgs);
+    let ids = extract_i64_column(&rows, "id");
+    assert_eq!(ids, vec![1], "expected committed rows [(1)], got {ids:?}");
+}
+
+/// Repeated savepoint names interleaved with distinct names, rollback, and release.
+#[tokio::test]
+async fn test_savepoint_same_name_interleaved_with_distinct_names() {
+    let (port, _handle, shard_db) = start_gateway_with_shard("sp-interleaved-346").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query("CREATE TABLE savepoint_interleaved (id BIGINT)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    client
+        .simple_query("SET rockstream.idempotency_key = 'sp-interleaved-346'")
+        .await
+        .expect("SET idempotency_key failed");
+
+    client.simple_query("BEGIN").await.expect("BEGIN failed");
+    client
+        .simple_query("INSERT INTO savepoint_interleaved VALUES (1)")
+        .await
+        .expect("INSERT 1 failed");
+    client
+        .simple_query("SAVEPOINT s")
+        .await
+        .expect("SAVEPOINT s (1st) failed");
+    client
+        .simple_query("INSERT INTO savepoint_interleaved VALUES (2)")
+        .await
+        .expect("INSERT 2 failed");
+    client
+        .simple_query("SAVEPOINT inner_sp")
+        .await
+        .expect("SAVEPOINT inner_sp failed");
+    client
+        .simple_query("INSERT INTO savepoint_interleaved VALUES (3)")
+        .await
+        .expect("INSERT 3 failed");
+    client
+        .simple_query("SAVEPOINT s")
+        .await
+        .expect("SAVEPOINT s (2nd) failed");
+    client
+        .simple_query("INSERT INTO savepoint_interleaved VALUES (4)")
+        .await
+        .expect("INSERT 4 failed");
+    client
+        .simple_query("SAVEPOINT outer_tail")
+        .await
+        .expect("SAVEPOINT outer_tail failed");
+    client
+        .simple_query("INSERT INTO savepoint_interleaved VALUES (5)")
+        .await
+        .expect("INSERT 5 failed");
+
+    // Roll back to newer 's': discards 4 and 5, drops outer_tail, keeps newer 's'.
+    client
+        .simple_query("ROLLBACK TO SAVEPOINT s")
+        .await
+        .expect("ROLLBACK TO SAVEPOINT s (newer) failed");
+    client
+        .simple_query("INSERT INTO savepoint_interleaved VALUES (6)")
+        .await
+        .expect("INSERT 6 failed");
+
+    // Release newer 's': exposes inner_sp and older 's' while keeping row 6.
+    client
+        .simple_query("RELEASE SAVEPOINT s")
+        .await
+        .expect("RELEASE SAVEPOINT s (newer) failed");
+
+    // Roll back to inner_sp: discards 3 and 6, keeps 1 and 2.
+    client
+        .simple_query("ROLLBACK TO SAVEPOINT inner_sp")
+        .await
+        .expect("ROLLBACK TO SAVEPOINT inner_sp failed");
+    client
+        .simple_query("INSERT INTO savepoint_interleaved VALUES (7)")
+        .await
+        .expect("INSERT 7 failed");
+
+    // Roll back to older 's': discards 2 and 7, drops inner_sp, keeps 1.
+    client
+        .simple_query("ROLLBACK TO SAVEPOINT s")
+        .await
+        .expect("ROLLBACK TO SAVEPOINT s (older) failed");
+    client
+        .simple_query("INSERT INTO savepoint_interleaved VALUES (8)")
+        .await
+        .expect("INSERT 8 failed");
+    client.simple_query("COMMIT").await.expect("COMMIT failed");
+
+    shard_db.flush().await.unwrap();
+
+    let msgs = client
+        .simple_query("SELECT id FROM savepoint_interleaved")
+        .await
+        .expect("SELECT failed");
+    let rows = data_rows_from(&msgs);
+    let mut ids = extract_i64_column(&rows, "id");
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec![1, 8],
+        "expected committed rows [1, 8], got {ids:?}"
+    );
+}
+
+/// Full ROLLBACK discards all buffered writes and clears all shadowed savepoints.
+#[tokio::test]
+async fn test_savepoint_same_name_full_rollback() {
+    let (port, _handle, shard_db) = start_gateway_with_shard("sp-full-rb-346").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query("CREATE TABLE savepoint_full_rb (id BIGINT)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    client
+        .simple_query("SET rockstream.idempotency_key = 'sp-full-rb-init'")
+        .await
+        .expect("SET idempotency_key failed");
+    client
+        .simple_query("INSERT INTO savepoint_full_rb VALUES (10)")
+        .await
+        .expect("initial INSERT failed");
+
+    client
+        .simple_query("SET rockstream.idempotency_key = 'sp-full-rb-tx'")
+        .await
+        .expect("SET idempotency_key failed");
+    client.simple_query("BEGIN").await.expect("BEGIN failed");
+    client
+        .simple_query("INSERT INTO savepoint_full_rb VALUES (20)")
+        .await
+        .expect("INSERT 20 failed");
+    client
+        .simple_query("SAVEPOINT s")
+        .await
+        .expect("SAVEPOINT s (1st) failed");
+    client
+        .simple_query("INSERT INTO savepoint_full_rb VALUES (30)")
+        .await
+        .expect("INSERT 30 failed");
+    client
+        .simple_query("SAVEPOINT s")
+        .await
+        .expect("SAVEPOINT s (2nd) failed");
+    client
+        .simple_query("INSERT INTO savepoint_full_rb VALUES (40)")
+        .await
+        .expect("INSERT 40 failed");
+    client
+        .simple_query("ROLLBACK")
+        .await
+        .expect("ROLLBACK failed");
+
+    shard_db.flush().await.unwrap();
+
+    let msgs = client
+        .simple_query("SELECT id FROM savepoint_full_rb")
+        .await
+        .expect("SELECT failed");
+    let rows = data_rows_from(&msgs);
+    let ids = extract_i64_column(&rows, "id");
+    assert_eq!(
+        ids,
+        vec![10],
+        "expected only pre-transaction row [10] after full ROLLBACK, got {ids:?}"
+    );
+
+    // Shadowed savepoints from the rolled-back transaction must not leak into a new one.
+    client
+        .simple_query("BEGIN")
+        .await
+        .expect("second BEGIN failed");
+    let err = client.simple_query("ROLLBACK TO SAVEPOINT s").await;
+    let has_3b001 = match &err {
+        Err(e) => e
+            .as_db_error()
+            .map(|d| d.code().code() == "3B001")
+            .unwrap_or(false),
+        Ok(msgs) => msgs.iter().any(|m| format!("{m:?}").contains("3B001")),
+    };
+    assert!(
+        has_3b001,
+        "expected SQLSTATE 3B001 for savepoint after full ROLLBACK, got: {err:?}"
+    );
+    client
+        .simple_query("ROLLBACK")
+        .await
+        .expect("cleanup ROLLBACK failed");
+}
