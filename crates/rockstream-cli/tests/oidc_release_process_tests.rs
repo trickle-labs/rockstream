@@ -928,6 +928,7 @@ async fn start_control_process_with_operator(
         provision_first_admin,
         seed_worker_secret,
         None,
+        None,
     )
     .await
 }
@@ -945,6 +946,7 @@ async fn start_control_process_with_operator_and_crash_after(
     provision_first_admin: bool,
     seed_worker_secret: bool,
     crash_after: Option<&str>,
+    fail_audit: Option<&str>,
 ) -> RunningGateway {
     let fingerprint = certificate_sha256(&pki.cli_cert_path);
     let principal = if support_operator {
@@ -1032,6 +1034,7 @@ async fn start_control_process_with_operator_and_crash_after(
         .env("RUST_LOG", "off")
         .env_remove("ROCKSTREAM_CONFIG")
         .env_remove("ROCKSTREAM_TEST_SUPPORT_ARTIFACT_CRASH_AFTER")
+        .env_remove("ROCKSTREAM_TEST_SUPPORT_ARTIFACT_FAIL_AUDIT")
         .args([
             "start",
             "--role",
@@ -1074,6 +1077,9 @@ async fn start_control_process_with_operator_and_crash_after(
     }
     if let Some(boundary) = crash_after {
         command.env("ROCKSTREAM_TEST_SUPPORT_ARTIFACT_CRASH_AFTER", boundary);
+    }
+    if let Some(boundary) = fail_audit {
+        command.env("ROCKSTREAM_TEST_SUPPORT_ARTIFACT_FAIL_AUDIT", boundary);
     }
     let child = command
         .stdout(Stdio::null())
@@ -4286,14 +4292,8 @@ async fn support_artifact_reconciles_durable_boundaries_after_process_exit() {
 
     for (index, boundary) in scenarios.iter().enumerate() {
         let expected_actions = match *boundary {
-            "start-audit" | "ledger-reserved" | "artifact-written" => vec![
+            "operation-running" | "start-audit" | "ledger-reserved" | "artifact-written" => vec![
                 SecurityAuditClass::AdminOperationStart,
-                SecurityAuditClass::AdminOperationStart,
-                SecurityAuditClass::AdminOperationCompletion,
-            ],
-            "completion-audit" => vec![
-                SecurityAuditClass::AdminOperationStart,
-                SecurityAuditClass::AdminOperationCompletion,
                 SecurityAuditClass::AdminOperationStart,
                 SecurityAuditClass::AdminOperationCompletion,
             ],
@@ -4316,6 +4316,7 @@ async fn support_artifact_reconciles_durable_boundaries_after_process_exit() {
             true,
             false,
             Some(*boundary),
+            None,
         )
         .await;
         wait_for_gateway(&mut crashed.0, control_address).await;
@@ -4431,6 +4432,7 @@ async fn support_artifact_reconciles_durable_boundaries_after_process_exit() {
             audit.iter().map(|record| record.action).collect::<Vec<_>>(),
             expected_actions
         );
+        let mut start_count = 0;
         for record in audit {
             let event_id = record
                 .event_id
@@ -4438,10 +4440,18 @@ async fn support_artifact_reconciles_durable_boundaries_after_process_exit() {
                 .expect("support-artifact audit event prefix");
             assert!(uuid::Uuid::parse_str(event_id).is_ok());
             let (before_state, after_state) = match record.action {
-                SecurityAuditClass::AdminOperationStart => (
-                    AuditField::Known("pending".to_owned()),
-                    AuditField::Known("generating".to_owned()),
-                ),
+                SecurityAuditClass::AdminOperationStart => {
+                    let before = if start_count == 0 {
+                        "pending"
+                    } else {
+                        "waiting"
+                    };
+                    start_count += 1;
+                    (
+                        AuditField::Known(before.to_owned()),
+                        AuditField::Known("generating".to_owned()),
+                    )
+                }
                 SecurityAuditClass::AdminOperationCompletion => (
                     AuditField::Known("generating".to_owned()),
                     AuditField::Known(format!("available_until_ms:{}", response.expires_at_ms)),
@@ -4528,6 +4538,7 @@ async fn support_artifact_reconciles_durable_boundaries_after_process_exit() {
         true,
         true,
         Some("cleanup-after-delete"),
+        None,
     )
     .await;
     let exit_status = tokio::time::timeout(Duration::from_secs(10), async {
@@ -4695,6 +4706,159 @@ async fn concurrent_processes_reconcile_same_support_artifact_request() {
     assert_eq!(content_b, expected_content.as_bytes());
     assert_eq!(expiry_a, first.expires_at_ms);
     assert_eq!(expiry_b, first.expires_at_ms);
+
+    process_a.0.kill().unwrap();
+    process_a.0.wait().unwrap();
+    process_b.0.kill().unwrap();
+    process_b.0.wait().unwrap();
+}
+
+#[tokio::test]
+async fn support_artifact_completion_audit_failure_preserves_result_across_processes() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    assert!(rockstream_test_support::docker_available());
+    let bucket = "rockstream-release-support-audit-recovery";
+    let (_minio, minio_port) = rockstream_test_support::minio::start_minio(bucket)
+        .await
+        .expect("MinIO is required for support-artifact audit recovery");
+    let minio_store = rockstream_test_support::minio::minio_object_store(minio_port, bucket);
+    let management_store: Arc<dyn ObjectStore> = Arc::new(object_store::prefix::PrefixStore::new(
+        minio_store.clone(),
+        "management",
+    ));
+    let operations = ManagementOperationStore::new(Arc::clone(&management_store));
+    let security_store: Arc<dyn ObjectStore> = Arc::new(object_store::prefix::PrefixStore::new(
+        minio_store,
+        "gateway-shard",
+    ));
+    let security_catalog = DurableCatalogStore::recover(security_store, "gateway")
+        .await
+        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let pki = rockstream_test_support::pki::TestPki::generate();
+    let control_a = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let management_a = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let control_b = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let management_b = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let idempotency_key = uuid::Uuid::new_v4().to_string();
+    let request = || GenerateSupportArtifactRequest {
+        protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+        node_id: String::new(),
+        idempotency_key: idempotency_key.clone(),
+    };
+
+    let mut process_a = start_control_process_with_operator_and_crash_after(
+        temp.path(),
+        &temp.path().join("control-a"),
+        control_a,
+        management_a,
+        &pki,
+        Some((minio_port, bucket)),
+        true,
+        None,
+        true,
+        false,
+        None,
+        Some("completion"),
+    )
+    .await;
+    wait_for_gateway(&mut process_a.0, control_a).await;
+    let mut client_a = wait_for_management_client(management_a, &pki).await;
+    let unavailable = client_a
+        .generate_support_artifact(request())
+        .await
+        .unwrap_err();
+    assert_eq!(unavailable.code(), tonic::Code::Unavailable);
+    assert_eq!(
+        unavailable.message(),
+        "support artifact audit is unavailable"
+    );
+
+    let committed = operations
+        .get(&idempotency_key)
+        .await
+        .unwrap()
+        .expect("operation was durably committed");
+    assert_eq!(committed.status(), OperationStatus::Succeeded);
+    assert_eq!(
+        committed.pending_audit().map(|audit| audit.action),
+        Some(SecurityAuditClass::AdminOperationCompletion)
+    );
+    assert!(management_store
+        .get(&support_artifact_object_path(&idempotency_key))
+        .await
+        .is_ok());
+
+    let mut client_a = wait_for_management_client(management_a, &pki).await;
+    let unavailable_download = client_a
+        .download_support_artifact(DownloadSupportArtifactRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            opaque_id: idempotency_key.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(unavailable_download.code(), tonic::Code::Unavailable);
+
+    let mut process_b = start_control_process(
+        temp.path(),
+        &temp.path().join("control-b"),
+        control_b,
+        management_b,
+        &pki,
+        Some((minio_port, bucket)),
+        true,
+    )
+    .await;
+    wait_for_gateway(&mut process_b.0, control_b).await;
+    let mut client_b = wait_for_management_client(management_b, &pki).await;
+    let recovered = client_b
+        .generate_support_artifact(request())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(recovered.opaque_id, idempotency_key);
+    assert_eq!(
+        recovered.expires_at_ms,
+        committed.started_at_ms() as u64 + 600_000
+    );
+    let operation = client_b
+        .get_operation(GetOperationRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            operation_id: recovered.opaque_id.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .operation
+        .unwrap();
+    assert_eq!(operation.state, "succeeded");
+    let (content, expires_at_ms) =
+        download_support_artifact(&mut client_b, &recovered.opaque_id).await;
+    assert_eq!(expires_at_ms, recovered.expires_at_ms);
+    assert!(String::from_utf8(content).unwrap().contains(&format!(
+        "\"generated_at_ms\":{}",
+        committed.started_at_ms()
+    )));
+
+    let committed = operations.get(&recovered.opaque_id).await.unwrap().unwrap();
+    assert!(committed.pending_audit().is_none());
+    security_catalog.refresh().await.unwrap();
+    let operation_audit = security_catalog
+        .list_security_audit_records()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|record| record.operation_id == AuditField::Known(recovered.opaque_id.clone()))
+        .map(|record| record.action)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        operation_audit,
+        vec![
+            SecurityAuditClass::AdminOperationStart,
+            SecurityAuditClass::AdminOperationCompletion,
+        ]
+    );
 
     process_a.0.kill().unwrap();
     process_a.0.wait().unwrap();

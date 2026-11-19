@@ -31,6 +31,18 @@ pub(crate) fn maybe_crash_after_debug_test_boundary(boundary: &str) {
     let _ = boundary;
 }
 
+pub(crate) fn maybe_fail_audit_for_debug_test(boundary: &str) -> bool {
+    #[cfg(any(debug_assertions, feature = "test-support-artifact-crash-injection"))]
+    {
+        std::env::var("ROCKSTREAM_TEST_SUPPORT_ARTIFACT_FAIL_AUDIT").as_deref() == Ok(boundary)
+    }
+    #[cfg(not(any(debug_assertions, feature = "test-support-artifact-crash-injection")))]
+    {
+        let _ = boundary;
+        false
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct SupportArtifactStore {
     store: Arc<dyn ObjectStore>,
