@@ -671,6 +671,21 @@ impl output::Formattable for SecurityPreprovisionResult {
     }
 }
 
+#[derive(Serialize)]
+struct SecurityRecoveryResult {
+    principal_id: u64,
+    catalog_revision: u64,
+}
+
+impl output::Formattable for SecurityRecoveryResult {
+    fn to_text(&self) -> String {
+        format!(
+            "Recovered administrator principal {} at catalog revision {}",
+            self.principal_id, self.catalog_revision
+        )
+    }
+}
+
 pub async fn run_security_preprovision(
     format: output::OutputFormat,
     storage_root: &Path,
@@ -712,6 +727,58 @@ pub async fn run_security_preprovision(
     Ok(output::render_output(
         &SecurityPreprovisionResult {
             principal_id: principal.id.0,
+            catalog_revision: revision,
+        },
+        format,
+    ))
+}
+
+pub async fn run_security_recover_admin(
+    format: output::OutputFormat,
+    storage_root: &Path,
+    layout: SecurityCatalogLayout,
+    principal_id: u64,
+    login_methods_file: &Path,
+    operation_id: u64,
+    yes: bool,
+) -> Result<String, CliError> {
+    prompt_confirmation(
+        "Confirm RockStream processes are stopped and this is the intended deployment store",
+        yes,
+    )?;
+    let login_methods: Vec<rockstream_types::authorization::LoginMethod> =
+        serde_json::from_reader(fs::File::open(login_methods_file).map_err(|error| {
+            CliError::new(
+                RS_0002,
+                format!("could not open administrator login-method file: {error}"),
+                "Check the selected login-method file and its permissions.",
+            )
+        })?)
+        .map_err(|error| {
+            CliError::new(
+                RS_0002,
+                format!("could not parse administrator login-method file: {error}"),
+                "Provide a JSON array of valid LoginMethod entries without plaintext passwords.",
+            )
+        })?;
+    let catalog = open_security_catalog(storage_root, layout).await?;
+    let revision = catalog
+        .recover_administrator_credentials(
+            rockstream_types::ids::PrincipalId(principal_id),
+            login_methods,
+            operation_id,
+        )
+        .await
+        .map_err(|error| {
+            CliError::new(
+                RS_0003,
+                format!("offline administrator credential recovery failed: {error}"),
+                "Use a stopped deployment and an existing active administrator principal with valid replacement login methods.",
+            )
+        })?;
+    Ok(output::render_output(
+        &SecurityRecoveryResult {
+            principal_id,
             catalog_revision: revision,
         },
         format,

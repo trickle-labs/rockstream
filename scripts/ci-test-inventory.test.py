@@ -5,8 +5,10 @@ import copy
 import contextlib
 import importlib.util
 import io
+import os
 import json
 import re
+import sys
 import tempfile
 import tomllib
 import unittest
@@ -196,6 +198,80 @@ class GateSelfTests(unittest.TestCase):
             self.assertEqual(len(target_list), len(set(target_list)))
         self.assertIn("dst_fuzz_harness", POLICY["sim_groups"]["nightly-seeds"])
         self.assertIn("rolling_upgrade_tests", POLICY["sim_groups"]["release-docker"])
+
+    def test_traced_gateway_runner_preserves_terminal_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = ("import json; print(json.dumps({'type':'test', 'event':'started', "
+                      "'name':'complete_case'}), flush=True); "
+                      "print(json.dumps({'type':'test', 'event':'ok', "
+                      "'name':'complete_case'}), flush=True)")
+            env = dict(os.environ, ROCKSTREAM_CI_TRACE_TESTS="1")
+            with contextlib.redirect_stdout(io.StringIO()) as log:
+                result = gate.run_cmd(
+                    [sys.executable, "-c", script, "-Z"], Path(tmp), env,
+                )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                [e["event"] for e in gate.parse_events(result.stdout)],
+                ["started", "ok"],
+            )
+            self.assertIn("CI libtest started: complete_case", log.getvalue())
+
+    def test_traced_gateway_runner_timeout_fails_closed_and_names_stuck_case(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = ("import json, time; print(json.dumps({'type':'test', 'event':'started', "
+                      "'name':'blocked_case'}), flush=True); time.sleep(30)")
+            env = dict(os.environ, ROCKSTREAM_CI_TRACE_TESTS="1")
+            with patch.object(gate, "MAX_GATEWAY_HARNESS_SECONDS", 5.0), \
+                 contextlib.redirect_stdout(io.StringIO()) as log:
+                result = gate.run_cmd(
+                    [sys.executable, "-c", script, "-Z"], Path(tmp), env,
+                )
+            self.assertEqual(result.returncode, 124)
+            self.assertIn("blocked_case", result.stderr)
+            self.assertIn("CI libtest timeout", log.getvalue())
+            results, errors, passed = gate.observed_results(
+                self.target, ["blocked_case"], gate.parse_events(result.stdout), {},
+            )
+            self.assertEqual(passed, 0)
+            self.assertTrue(any("missing terminal execution event" in error for error in errors))
+            self.assertEqual(results[0]["outcome"], "not_run")
+
+    def test_traced_gateway_cargo_build_keeps_cargo_json_and_reports_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_cargo = Path(tmp) / "cargo"
+            fake_cargo.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, sys\n"
+                "print(json.dumps({'reason':'compiler-artifact', 'executable':'test-binary'}), flush=True)\n"
+                "print('Compiling gateway test bins', file=sys.stderr, flush=True)\n"
+            )
+            fake_cargo.chmod(0o755)
+            env = dict(os.environ, ROCKSTREAM_CI_TRACE_TESTS="1")
+            with contextlib.redirect_stdout(io.StringIO()) as log:
+                result = gate.run_cmd([str(fake_cargo), "test", "--no-run"], Path(tmp), env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["reason"], "compiler-artifact")
+            self.assertIn("Compiling gateway test bins", log.getvalue())
+
+    def test_traced_gateway_cargo_build_timeout_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_cargo = Path(tmp) / "cargo"
+            fake_cargo.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys, time\n"
+                "print('Compiling stuck gateway test', file=sys.stderr, flush=True)\n"
+                "time.sleep(60)\n"
+            )
+            fake_cargo.chmod(0o755)
+            env = dict(os.environ, ROCKSTREAM_CI_TRACE_TESTS="1")
+            with patch.object(gate, "MAX_GATEWAY_BUILD_SECONDS", 5.0), \
+                 contextlib.redirect_stdout(io.StringIO()) as log:
+                result = gate.run_cmd([str(fake_cargo), "test", "--no-run"], Path(tmp), env)
+            self.assertEqual(result.returncode, 124)
+            self.assertIn("CI cargo build exceeded", result.stderr)
+            self.assertIn("Compiling stuck gateway test", log.getvalue())
+            self.assertIn("CI cargo build timeout", log.getvalue())
 
     def test_results_parser(self):
         raw = '{"type":"test","event":"ok","name":"a"}\nnot json\n{"type":"suite","event":"ok"}\n'
