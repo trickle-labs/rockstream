@@ -104,6 +104,7 @@ pub struct OidcVerifier {
     client: Client,
     cache: RwLock<Option<CachedJwks>>,
     refresh: Mutex<()>,
+    cache_metric: rockstream_types::metrics::JwksCacheSizeMetric,
 }
 
 impl OidcVerifier {
@@ -118,6 +119,7 @@ impl OidcVerifier {
             client,
             cache: RwLock::new(None),
             refresh: Mutex::new(()),
+            cache_metric: rockstream_types::metrics::JwksCacheSizeMetric::register(),
         };
         let fetched = verifier.fetch_jwks().await?;
         verifier.store_jwks(fetched);
@@ -280,14 +282,19 @@ impl OidcVerifier {
     }
 
     fn store_jwks(&self, fetched: FetchedJwks) {
-        if fetched.ttl.is_zero() {
+        let ttl = fetched.ttl.min(JWKS_CACHE_TTL);
+        if ttl.is_zero() {
             *self.cache.write() = None;
+            self.cache_metric.set(0, None);
             return;
         }
+        let expires_at = Instant::now() + ttl;
+        let cache_size = fetched.keys.len() as u64;
         *self.cache.write() = Some(CachedJwks {
             keys: fetched.keys,
-            expires_at: Instant::now() + fetched.ttl.min(JWKS_CACHE_TTL),
+            expires_at,
         });
+        self.cache_metric.set(cache_size, Some(expires_at));
     }
 
     async fn fetch_jwks(&self) -> Result<FetchedJwks, AuthError> {

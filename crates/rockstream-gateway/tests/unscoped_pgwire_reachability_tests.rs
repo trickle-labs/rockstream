@@ -80,19 +80,19 @@ async fn start_test_gateway_inner(authenticated: bool) -> (tokio_postgres::Clien
         let durable_catalog = catalog
             .get_durable_store()
             .expect("authorized test principal has a durable catalog");
-        let operations = rockstream_control::ManagementOperationStore::new(Arc::new(
-            object_store::memory::InMemory::new(),
-        ));
         Arc::new(
             SecretStore::open_durable(
                 "unscoped-reachability-secrets",
-                store,
+                store.clone(),
                 Arc::new(EnvKekProvider::from_passphrase("test-passphrase")),
             )
             .await
             .unwrap()
             .with_security_audit_catalog(durable_catalog)
-            .with_management_operation_store(operations, "unscoped-reachability".into()),
+            .with_management_operation_store(
+                rockstream_control::ManagementOperationStore::new(store.clone()),
+                "unscoped-reachability".to_string(),
+            ),
         )
     } else {
         Arc::new(SecretStore::new(
@@ -390,7 +390,7 @@ async fn test_reachability_secret_ddl() {
 
     assert_command_ok(
         &client,
-        "SET rockstream.idempotency_key = '00000000-0000-4000-8000-000000000003';",
+        "SET rockstream.idempotency_key = '00000000-0000-4000-8000-000000000361';",
     )
     .await;
     assert_command_ok(&client, "ALTER SECRET s_kfk SET (password = 'p2');").await;

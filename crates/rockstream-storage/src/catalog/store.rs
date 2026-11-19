@@ -41,7 +41,6 @@ use rockstream_types::workload::WorkloadDef;
 
 const SECURITY_AUDIT_RETENTION_MS: u64 = 90 * 24 * 60 * 60 * 1000;
 const MAX_SECURITY_AUDIT_BYTES: u64 = 1024 * 1024 * 1024;
-
 pub const SECURITY_AUDIT_APPEND_ATTEMPTS: usize = 8;
 
 /// Abstract interface for catalog operations.
@@ -614,6 +613,24 @@ impl DurableCatalogStore {
                     path.as_ref()
                 )));
             }
+            if revision == expected_revision
+                && last_replayed_log.as_ref().is_some_and(
+                    |(last_revision, last_operation_id, last_bytes)| {
+                        *last_revision == revision
+                            && *last_operation_id == txn.operation_id
+                            && last_bytes.as_slice() == bytes.as_ref()
+                    },
+                )
+            {
+                continue;
+            }
+            if revision != expected_revision.saturating_add(1) {
+                return Err(CatalogError::DecodeError(format!(
+                    "[RS-1003] incomplete catalog log history: expected revision {}, found {}; next_steps: inspect catalog log files",
+                    expected_revision.saturating_add(1),
+                    revision
+                )));
+            }
             if recovered_state
                 .committed_operations
                 .contains(&txn.operation_id)
@@ -621,13 +638,6 @@ impl DurableCatalogStore {
                 return Err(CatalogError::DecodeError(format!(
                     "[RS-1003] duplicate catalog operation {} at revision {}; next_steps: inspect catalog log files",
                     txn.operation_id, revision
-                )));
-            }
-            if revision != expected_revision.saturating_add(1) {
-                return Err(CatalogError::DecodeError(format!(
-                    "[RS-1003] incomplete catalog log history: expected revision {}, found {}; next_steps: inspect catalog log files",
-                    expected_revision.saturating_add(1),
-                    revision
                 )));
             }
 
@@ -1660,7 +1670,6 @@ impl CatalogStore for DurableCatalogStore {
         if state.committed_operations.contains(&txn.operation_id) {
             return Ok(state.revision);
         }
-
         let next_revision = state.revision.checked_add(1).ok_or_else(|| {
             CatalogError::OptimisticConflict("catalog revision is exhausted".to_owned())
         })?;
@@ -2197,6 +2206,80 @@ mod security_audit_budget_tests {
             Err(CatalogError::Storage(message))
                 if message == "security audit retention budget is full (1 GiB); required security operation was not committed"
         ));
+    }
+
+    #[tokio::test]
+    async fn full_audit_budget_rejects_first_admin_without_catalog_effects() {
+        let object_store = Arc::new(object_store::memory::InMemory::new());
+        let catalog = DurableCatalogStore::new(object_store.clone(), "audit-budget-full");
+        let existing = audit_record("existing", current_time_ms().unwrap());
+        catalog
+            .commit_txn(
+                CatalogTxn::new(
+                    1,
+                    1,
+                    vec![CatalogMutation::AppendSecurityAudit(existing.clone())],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        catalog.state.write().await.security_audit_bytes = MAX_SECURITY_AUDIT_BYTES;
+
+        let administrator = SecurityPrincipal {
+            format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+            id: PrincipalId(77),
+            display_name: "bootstrap-admin".to_string(),
+            enabled: true,
+            revision: 1,
+            login_methods: vec![LoginMethod::Oidc {
+                issuer: "https://issuer.example".to_string(),
+                subject: "bootstrap-admin".to_string(),
+            }],
+            preset_grants: vec![ScopedPresetGrant {
+                preset: PermissionPreset::Administrator,
+                scope: PolicyScope::Cluster,
+            }],
+            scoped_grants: vec![],
+        };
+        let error = catalog
+            .preprovision_first_administrator(administrator.clone(), 2)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CatalogError::Storage(message)
+                if message == "security audit retention budget is full (1 GiB); required security operation was not committed"
+        ));
+        assert_eq!(catalog.get_revision().await, 1);
+        assert_eq!(
+            catalog.list_security_audit_records().await.unwrap(),
+            vec![existing.clone()]
+        );
+        assert_eq!(
+            catalog
+                .get_security_principal(administrator.id)
+                .await
+                .unwrap(),
+            None
+        );
+
+        let recovered = DurableCatalogStore::recover(object_store, "audit-budget-full")
+            .await
+            .unwrap();
+        assert_eq!(recovered.get_revision().await, 1);
+        assert_eq!(
+            recovered.list_security_audit_records().await.unwrap(),
+            vec![existing]
+        );
+        assert_eq!(
+            recovered
+                .get_security_principal(administrator.id)
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

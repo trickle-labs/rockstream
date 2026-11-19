@@ -4991,6 +4991,7 @@ dependencies = [
  "object_store 0.14.2",
  "parking_lot",
  "rcgen",
+ "rdkafka",
  "rockstream-connectors",
  "rockstream-control",
  "rockstream-docgen",
@@ -5215,6 +5216,7 @@ dependencies = [
 name = "rockstream-management-proto"
 version = "0.72.0"
 dependencies = [
+ "futures",
  "prost 0.13.5",
  "protoc-bin-vendored",
  "tokio",

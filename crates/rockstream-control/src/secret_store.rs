@@ -12,8 +12,8 @@ use crate::management_store::{
 use parking_lot::RwLock;
 use rockstream_storage::catalog::{CatalogMutation, CatalogStore, CatalogTxn};
 use rockstream_types::authorization::{
-    AuditCorrelation, AuditField, AuditIdentity, SecurityAuditClass, SecurityAuditOutcome,
-    SecurityAuditRecord, SECURITY_AUDIT_FORMAT_VERSION,
+    AuditCorrelation, AuditField, AuditIdentity, PolicyScope, SecurityAuditClass,
+    SecurityAuditOutcome, SecurityAuditRecord, SECURITY_AUDIT_FORMAT_VERSION,
 };
 use rockstream_types::error_code::{
     ErrorCode, RS_2420, RS_2421, RS_2422, RS_2423, RS_2424, RS_2425, RS_2426, RS_3601,
@@ -129,6 +129,13 @@ pub enum SecretRotationOperationError {
     Secret(#[from] SecretStoreError),
 }
 
+/// Actor, scope, operation identity, and audit binding for one secret rotation.
+pub struct SecretRotationOperationContext {
+    pub actor_id: Option<u64>,
+    pub scope: PolicyScope,
+    pub operation_id: String,
+    pub audit: SecurityAuditRecord,
+}
 impl SecretStoreError {
     pub fn not_found(name: impl Into<String>) -> Self {
         Self::NotFound {
@@ -361,14 +368,19 @@ impl SecretStore {
         catalog: &dyn CatalogStore,
         record: &SecurityAuditRecord,
     ) -> Result<(), SecretStoreError> {
+        let transaction_id = rand::random::<u64>().max(1);
         for attempt in 0..rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS {
+            catalog.refresh().await.map_err(|error| {
+                rockstream_types::metrics::set_security_audit_degraded(true);
+                SecretStoreError::storage(error.to_string())
+            })?;
             let revision = catalog.get_revision().await.checked_add(1).ok_or_else(|| {
                 rockstream_types::metrics::set_security_audit_degraded(true);
                 SecretStoreError::storage("durable catalog revision exhausted")
             })?;
             let transaction = CatalogTxn::new(
                 revision,
-                rand::random::<u64>().max(1),
+                transaction_id,
                 vec![CatalogMutation::AppendSecurityAudit(record.clone())],
             )
             .map_err(|error| {
@@ -842,18 +854,20 @@ impl SecretStore {
     }
 
     /// Apply or reconcile a secret rotation under its client-generated operation UUID.
-    #[allow(clippy::too_many_arguments)]
     pub async fn alter_secret_with_operation(
         &self,
         namespace_id: u128,
         name: &str,
         payload: HashMap<String, String>,
         actor: &str,
-        actor_id: Option<u64>,
-        scope: rockstream_types::authorization::PolicyScope,
-        operation_id: &str,
-        audit: SecurityAuditRecord,
+        context: SecretRotationOperationContext,
     ) -> Result<OperationRecord, SecretRotationOperationError> {
+        let SecretRotationOperationContext {
+            actor_id,
+            scope,
+            operation_id,
+            audit,
+        } = context;
         let operations = self.management_operations.as_ref().ok_or_else(|| {
             SecretStoreError::storage("durable security operation store is unavailable")
         })?;
@@ -874,10 +888,10 @@ impl SecretStore {
         let now_ms = chrono::Utc::now().timestamp_millis().max(1);
         let mut operation = operations
             .accept_idempotent(
-                operation_id,
+                &operation_id,
                 rockstream_management_proto::PROTOCOL_VERSION as u16,
                 &request,
-                operation_id,
+                operation_id.clone(),
                 OperationKind::SecretRotation,
                 now_ms,
             )
@@ -887,7 +901,7 @@ impl SecretStore {
             OperationStatus::Pending | OperationStatus::Waiting => {
                 operation = match operations
                     .transition_if(
-                        operation_id,
+                        &operation_id,
                         operation.status(),
                         operation.phase(),
                         OperationUpdate {
@@ -903,9 +917,9 @@ impl SecretStore {
                 {
                     Ok(operation) => operation,
                     Err(OperationStoreError::TransitionConflict(_)) => operations
-                        .get(operation_id)
+                        .get(&operation_id)
                         .await?
-                        .ok_or_else(|| OperationStoreError::NotFound(operation_id.to_owned()))?,
+                        .ok_or_else(|| OperationStoreError::NotFound(operation_id.clone()))?,
                     Err(error) => return Err(error.into()),
                 };
             }
@@ -925,7 +939,7 @@ impl SecretStore {
                 payload,
                 actor,
                 Some(audit),
-                Some(operation_id),
+                Some(&operation_id),
             )
             .await
         {
@@ -933,15 +947,15 @@ impl SecretStore {
                 return Err(error.into());
             }
             let current = operations
-                .get(operation_id)
+                .get(&operation_id)
                 .await?
-                .ok_or_else(|| OperationStoreError::NotFound(operation_id.to_owned()))?;
+                .ok_or_else(|| OperationStoreError::NotFound(operation_id.clone()))?;
             if current.status() != OperationStatus::Running {
                 return Ok(current);
             }
             return operations
                 .transition_if_with_result(
-                    operation_id,
+                    &operation_id,
                     OperationStatus::Running,
                     current.phase(),
                     OperationUpdate {
@@ -959,15 +973,15 @@ impl SecretStore {
         }
 
         let current = operations
-            .get(operation_id)
+            .get(&operation_id)
             .await?
-            .ok_or_else(|| OperationStoreError::NotFound(operation_id.to_owned()))?;
+            .ok_or_else(|| OperationStoreError::NotFound(operation_id.clone()))?;
         if current.status() != OperationStatus::Running {
             return Ok(current);
         }
         match operations
             .transition_if_with_result(
-                operation_id,
+                &operation_id,
                 OperationStatus::Running,
                 current.phase(),
                 OperationUpdate {
@@ -984,9 +998,9 @@ impl SecretStore {
         {
             Ok(operation) => Ok(operation),
             Err(OperationStoreError::TransitionConflict(_)) => operations
-                .get(operation_id)
+                .get(&operation_id)
                 .await?
-                .ok_or_else(|| OperationStoreError::NotFound(operation_id.to_owned()))
+                .ok_or_else(|| OperationStoreError::NotFound(operation_id.clone()))
                 .map_err(Into::into),
             Err(error) => Err(error.into()),
         }

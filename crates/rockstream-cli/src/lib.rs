@@ -1704,9 +1704,37 @@ pub fn run_start_with_dev_transport(
                     rockstream_types::ids::WorkerId(opts.worker_id.unwrap_or(1)),
                 );
                 if let Some(addr) = &node_config.control.management_addr {
+                    let management_store = if let Some(shared_dir) = &opts.control_shared_storage {
+                        fs::create_dir_all(shared_dir).map_err(|e| {
+                            CliError::new(
+                                RS_0003,
+                                format!("failed to create management shared-storage dir: {e}"),
+                                "Check filesystem permissions for --control-shared-storage.",
+                            )
+                        })?;
+                        Arc::new(
+                            object_store::local::LocalFileSystem::new_with_prefix(shared_dir)
+                                .map_err(|e| {
+                                    CliError::new(
+                                        RS_0003,
+                                        format!("failed to open management shared storage: {e}"),
+                                        "Check filesystem permissions for --control-shared-storage.",
+                                    )
+                                })?,
+                        ) as Arc<dyn object_store::ObjectStore>
+                    } else {
+                        rockstream_storage::build_runtime_object_store(&opts.storage, "management")
+                            .map_err(|error| {
+                                CliError::new(
+                                    RS_0003,
+                                    format!("failed to open management store: {error}"),
+                                    "Check storage directory permissions or object-store credentials.",
+                                )
+                            })?
+                    };
                     service = service.with_management(
                         addr.clone(),
-                        management_store.clone(),
+                        management_store,
                         node_config.clone(),
                     );
                 }
@@ -1807,9 +1835,24 @@ pub fn run_start_with_dev_transport(
                 )));
             if opts.daemon {
                 if let Some(addr) = &node_config.control.management_addr {
+                    let management_store = if opts.control_shared_storage.is_some() {
+                        shared_object_store.clone()
+                    } else {
+                        rockstream_storage::build_runtime_object_store(
+                            &shared_store_dir,
+                            "management",
+                        )
+                        .map_err(|error| {
+                            CliError::new(
+                                RS_0003,
+                                format!("failed to open management store: {error}"),
+                                "Check storage directory permissions or object-store credentials.",
+                            )
+                        })?
+                    };
                     service = service.with_management(
                         addr.clone(),
-                        shared_object_store.clone(),
+                        management_store,
                         node_config.clone(),
                     );
                 }

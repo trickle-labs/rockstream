@@ -6,7 +6,8 @@ service ShuffleService {
   // A bidirectional stream to send and receive shuffle batches.
   // Multiplexes batches for all active exchanges and shards.
   rpc ShuffleStream(stream ShuffleFrame) returns (stream ShuffleAck);
-  // v0.67 Direct data plane exchange frame stream.
+  // Retained for wire compatibility. The runtime returns UNIMPLEMENTED because
+  // no execution handler is connected; use ShuffleStream for worker shuffle delivery.
   rpc ExchangeStream(stream ExchangeFrame) returns (stream ExchangeAck);
 }
 

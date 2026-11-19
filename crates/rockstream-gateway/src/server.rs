@@ -1201,6 +1201,7 @@ const FALLBACK_QUERY_MAX_ROWS: usize = 10_000;
 const FALLBACK_QUERY_MAX_ARRAY_BYTES: usize = 8 * 1024 * 1024;
 const FALLBACK_QUERY_MAX_WALL_MS: u64 = 5_000;
 const FALLBACK_QUERY_MAX_CONCURRENT: usize = 16;
+const SECURITY_POLICY_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 static FALLBACK_QUERY_PERMITS: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(FALLBACK_QUERY_MAX_CONCURRENT);
 static NEXT_DISTRIBUTED_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -2133,6 +2134,7 @@ pub struct GatewayHandler {
     query_time_shard_topology_provider: Option<Arc<QueryTimeShardTopologyProvider>>,
     /// Authentication mode for this gateway instance.
     auth_mode: AuthMode,
+    security_policy_refreshed_at: tokio::sync::Mutex<Option<std::time::Instant>>,
     /// Configured RS256 verifier for OIDC-authenticated public connections.
     oidc_verifier: Option<Arc<crate::auth::OidcVerifier>>,
     /// Legacy RoleCatalog for MD5 compatibility; SCRAM credentials come from durable principals.
@@ -2589,6 +2591,7 @@ impl GatewayHandler {
         };
         let operation_id = rand::random::<u64>().max(1);
         for attempt in 0..rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS {
+            store.refresh().await.map_err(|error| error.to_string())?;
             let revision = store
                 .get_revision()
                 .await
@@ -2697,6 +2700,15 @@ impl GatewayHandler {
             .catalog
             .get_durable_store()
             .ok_or_else(|| "durable security catalog is unavailable".to_string())?;
+        let mut refreshed_at = self.security_policy_refreshed_at.lock().await;
+        if refreshed_at
+            .as_ref()
+            .is_none_or(|last| last.elapsed() >= SECURITY_POLICY_REFRESH_INTERVAL)
+        {
+            store.refresh().await.map_err(|error| error.to_string())?;
+            *refreshed_at = Some(std::time::Instant::now());
+        }
+        drop(refreshed_at);
         let principals = store
             .list_security_principals()
             .await
@@ -3138,6 +3150,102 @@ impl GatewayHandler {
             .map_err(|error| error.to_string())
     }
 
+    async fn refresh_kafka_secret_at_epoch(
+        &self,
+        runtime: &mut SourceRuntimeCoordinator<KafkaSource>,
+        lease: &SourceOwnerLease,
+        source: &CatalogSourceEntry,
+    ) -> Result<bool, GatewayError> {
+        let (bound_name, active_version) = runtime
+            .kafka_secret_binding(lease)
+            .map_err(source_backfill_error)?;
+        let Some(bound_name) = bound_name.map(str::to_string) else {
+            if source.options.contains_key("secret") {
+                return Err(GatewayError::QueryTimeExecutionFailed {
+                    detail: "Kafka source secret binding is unavailable".to_string(),
+                });
+            }
+            return Ok(false);
+        };
+        let reference =
+            source
+                .options
+                .get("secret")
+                .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                    detail: "Kafka source secret reference is unavailable".to_string(),
+                })?;
+        let secret_name = self
+            .authorize_source_secret_use(source, reference)
+            .await
+            .map_err(|detail| GatewayError::QueryTimeExecutionFailed { detail })?;
+        if secret_name != bound_name {
+            return Err(GatewayError::QueryTimeExecutionFailed {
+                detail: "Kafka source secret binding changed".to_string(),
+            });
+        }
+        let namespace = source.secret_namespace.as_deref().ok_or_else(|| {
+            GatewayError::QueryTimeExecutionFailed {
+                detail: "source secret reference has no durable namespace".to_string(),
+            }
+        })?;
+        let namespace_id = self
+            .secret_namespace_id(namespace)
+            .await
+            .map_err(|detail| GatewayError::QueryTimeExecutionFailed { detail })?;
+        let metadata = self
+            .secret_store
+            .get_secret_metadata(namespace_id, &secret_name)
+            .await
+            .map_err(|error| GatewayError::QueryTimeExecutionFailed {
+                detail: error.to_string(),
+            })?;
+        if metadata.version < active_version {
+            return Err(GatewayError::QueryTimeExecutionFailed {
+                detail: "Kafka source secret version moved backwards".to_string(),
+            });
+        }
+        if metadata.version == active_version {
+            return Ok(false);
+        }
+        let secret = self
+            .resolve_source_secret(source, reference)
+            .await
+            .map_err(|detail| GatewayError::QueryTimeExecutionFailed { detail })?;
+        if secret.metadata.version < metadata.version {
+            return Err(GatewayError::QueryTimeExecutionFailed {
+                detail: "Kafka source secret changed during credential resolution".to_string(),
+            });
+        }
+        if secret.secret_type != rockstream_types::secret::SecretType::SaslPlain {
+            return Err(GatewayError::QueryTimeExecutionFailed {
+                detail: "Kafka source secret must use type sasl_plain".to_string(),
+            });
+        }
+        let username = secret
+            .payload
+            .get("username")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                detail: "Kafka source secret has no username".to_string(),
+            })?;
+        let password = secret
+            .payload
+            .get("password")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                detail: "Kafka source secret has no password".to_string(),
+            })?;
+        runtime
+            .rotate_kafka_secret_at_epoch(
+                lease,
+                &secret_name,
+                secret.metadata.version,
+                username,
+                password,
+            )
+            .map_err(source_backfill_error)
+    }
+
     async fn refresh_pgoutput_secret_at_epoch(
         &self,
         coordinator: &mut SharedPgOutputCoordinator,
@@ -3278,6 +3386,7 @@ impl GatewayHandler {
         };
         let operation_id = rand::random::<u64>().max(1);
         for attempt in 0..rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS {
+            store.refresh().await.map_err(|error| error.to_string())?;
             let revision = store
                 .get_revision()
                 .await
@@ -3491,6 +3600,7 @@ impl GatewayHandler {
             query_time_shard_topology: None,
             query_time_shard_topology_provider: None,
             auth_mode: AuthMode::Off,
+            security_policy_refreshed_at: tokio::sync::Mutex::new(None),
             oidc_verifier: None,
             role_catalog: Arc::new(RoleCatalog::new()),
             acl_store: Arc::new(rockstream_control::AclStore::new()),
@@ -3542,6 +3652,7 @@ impl GatewayHandler {
             query_time_shard_topology: None,
             query_time_shard_topology_provider: None,
             auth_mode: AuthMode::Off,
+            security_policy_refreshed_at: tokio::sync::Mutex::new(None),
             oidc_verifier: None,
             role_catalog: Arc::new(RoleCatalog::new()),
             acl_store: Arc::new(rockstream_control::AclStore::new()),
@@ -4526,21 +4637,72 @@ impl GatewayHandler {
             .or_else(|| source.options.get("group_id"))
             .map(|configured| format!("{configured}-{connector_id}"))
             .unwrap_or_else(|| format!("rockstream-{connector_id}"));
-        let mut runtime = KafkaSource::connect(
-            connector_id,
-            catalog_columns_to_schema(&table.columns),
-            bootstrap,
-            topic,
-            &group_id,
-        )
-        .map_err(source_backfill_error)?;
-        if let Some(secret_reference) = source.options.get("secret") {
-            let secret_name = self
-                .authorize_source_secret_use(source, secret_reference)
+        let schema = catalog_columns_to_schema(&table.columns);
+        let runtime = if let Some(secret_reference) = source.options.get("secret") {
+            let secret = self
+                .resolve_source_secret(source, secret_reference)
                 .await
                 .map_err(|detail| GatewayError::QueryTimeExecutionFailed { detail })?;
-            runtime.bind_secret(secret_name);
+            if secret.secret_type != rockstream_types::secret::SecretType::SaslPlain {
+                return Err(GatewayError::QueryTimeExecutionFailed {
+                    detail: "Kafka source secret must use type sasl_plain".to_string(),
+                });
+            }
+            let security_protocol = match source
+                .options
+                .get("security.protocol")
+                .or_else(|| source.options.get("security_protocol"))
+                .map(String::as_str)
+            {
+                Some(protocol) if protocol.eq_ignore_ascii_case("SASL_SSL") => "SASL_SSL",
+                Some(protocol) if protocol.eq_ignore_ascii_case("SASL_PLAINTEXT") => {
+                    "SASL_PLAINTEXT"
+                }
+                _ => {
+                    return Err(GatewayError::QueryTimeExecutionFailed {
+                        detail: "Kafka secret sources require security.protocol SASL_SSL or SASL_PLAINTEXT"
+                            .to_string(),
+                    });
+                }
+            };
+            let username = secret
+                .payload
+                .get("username")
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                    detail: "Kafka source secret has no username".to_string(),
+                })?;
+            let password = secret
+                .payload
+                .get("password")
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                    detail: "Kafka source secret has no password".to_string(),
+                })?;
+            KafkaSource::connect_with_sasl_plain(
+                connector_id,
+                schema,
+                bootstrap,
+                topic,
+                &group_id,
+                security_protocol,
+                &secret.name,
+                secret.metadata.version,
+                username,
+                password,
+            )
+        } else {
+            if source.options.contains_key("security.protocol")
+                || source.options.contains_key("security_protocol")
+            {
+                return Err(GatewayError::QueryTimeExecutionFailed {
+                    detail: "Kafka SASL security.protocol requires a bound sasl_plain secret"
+                        .to_string(),
+                });
+            }
+            KafkaSource::connect(connector_id, schema, bootstrap, topic, &group_id)
         }
+        .map_err(source_backfill_error)?;
         Ok((table, connector_id, runtime))
     }
 
@@ -5543,7 +5705,7 @@ impl GatewayHandler {
     fn pgoutput_source_aliases(&self, connector_id: ConnectorId) -> Vec<CatalogSourceEntry> {
         self.pgoutput_registered_aliases(connector_id)
             .into_iter()
-            .filter(|source| source.status == "OK")
+            .filter(|source| matches!(source.status.as_str(), "OK" | "RUNNING"))
             .collect()
     }
 
@@ -6101,12 +6263,12 @@ impl GatewayHandler {
         Ok(())
     }
 
-    async fn run_live_source_worker<S: SourceConnector>(
+    async fn run_live_source_worker(
         weak: Weak<GatewayHandler>,
         source: CatalogSourceEntry,
         view_name: String,
         table: CatalogTable,
-        mut runtime: SourceRuntimeCoordinator<S>,
+        mut runtime: SourceRuntimeCoordinator<KafkaSource>,
         shard_db: Arc<rockstream_storage::ShardDb>,
     ) {
         if runtime.recover().await.is_err() {
@@ -6144,6 +6306,17 @@ impl GatewayHandler {
                     continue;
                 }
             };
+            let Some(handler) = weak.upgrade() else {
+                break;
+            };
+            if let Err(error) = handler
+                .refresh_kafka_secret_at_epoch(&mut runtime, &lease, &source)
+                .await
+            {
+                tracing::warn!(view = %view_name, %error, "Kafka source credential refresh failed");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
             if delta.batches.is_empty() {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
@@ -6179,9 +6352,6 @@ impl GatewayHandler {
                 continue;
             }
             let Ok(epoch) = runtime.next_epoch() else {
-                break;
-            };
-            let Some(handler) = weak.upgrade() else {
                 break;
             };
             if let Err(error) = handler
@@ -11394,10 +11564,12 @@ impl GatewayHandler {
                 &parsed.name,
                 parsed.payload,
                 "pgwire",
-                durable_principal.as_ref().map(|principal| principal.id.0),
-                scope,
-                &operation_id,
-                audit,
+                rockstream_control::secret_store::SecretRotationOperationContext {
+                    actor_id: durable_principal.as_ref().map(|principal| principal.id.0),
+                    scope,
+                    operation_id: operation_id.clone(),
+                    audit,
+                },
             )
             .await
         {

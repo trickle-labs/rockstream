@@ -365,11 +365,21 @@ impl Default for ShardManager {
 
 /// A serializable point-in-time snapshot of [`ShardManager`]'s state
 /// (v0.45.2 M7-S4/S5).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShardManagerSnapshot {
     pub leases: HashMap<ShardId, ShardLease>,
     pub next_token: u64,
     pub leader_epoch: u64,
+}
+
+impl Default for ShardManagerSnapshot {
+    fn default() -> Self {
+        Self {
+            leases: HashMap::new(),
+            next_token: 1,
+            leader_epoch: 0,
+        }
+    }
 }
 
 /// Durable store for [`ShardManagerSnapshot`], backed by the same shared
@@ -442,6 +452,20 @@ mod tests {
         assert_eq!(lease.shard_id, ShardId(1));
         assert_eq!(lease.worker_id, WorkerId(10));
         assert_eq!(m.len(), 1);
+    }
+
+    #[test]
+    fn restoring_empty_snapshot_keeps_first_lease_token_nonzero() {
+        let manager = mgr();
+        manager.restore(ShardManagerSnapshot::default());
+        assert_eq!(
+            manager
+                .acquire(ShardId(1), WorkerId(10))
+                .unwrap()
+                .lease_token
+                .0,
+            1
+        );
     }
 
     #[test]
