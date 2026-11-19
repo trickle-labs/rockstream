@@ -363,8 +363,7 @@ struct PgOutputTextChange {
     new_values: Option<Vec<String>>,
 }
 
-type SnapshotSyncHook =
-    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+type SnapshotSyncHook = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 struct QueuedChange {
     change: CdcChange,
@@ -1807,9 +1806,11 @@ async fn read_pg_backend_message(
 ) -> Result<postgres_protocol::message::backend::Message, SourceError> {
     use tokio::io::AsyncReadExt;
     loop {
-        if let Some(message) = postgres_protocol::message::backend::Message::parse(buf)
-            .map_err(|error| SourceError::StartSnapshotFailed {
-                reason: format!("parse PostgreSQL replication message: {error}"),
+        if let Some(message) =
+            postgres_protocol::message::backend::Message::parse(buf).map_err(|error| {
+                SourceError::StartSnapshotFailed {
+                    reason: format!("parse PostgreSQL replication message: {error}"),
+                }
             })?
         {
             return Ok(message);
@@ -1843,10 +1844,10 @@ async fn create_logical_slot_and_export_snapshot(
     config: &PgOutputConfig,
     slot: &str,
 ) -> Result<(tokio::net::TcpStream, PgLsn, String), SourceError> {
-    use tokio_postgres::fallible_iterator::FallibleIterator;
     use postgres_protocol::authentication::{md5_hash, sasl};
     use postgres_protocol::message::{backend::Message, frontend};
     use tokio::io::AsyncWriteExt;
+    use tokio_postgres::fallible_iterator::FallibleIterator;
 
     let mut stream = tokio::net::TcpStream::connect((config.host.as_str(), config.port))
         .await
@@ -1941,9 +1942,11 @@ async fn create_logical_slot_and_export_snapshot(
                 scram = Some(state);
             }
             Message::AuthenticationSaslContinue(body) => {
-                let state = scram.as_mut().ok_or_else(|| SourceError::StartSnapshotFailed {
-                    reason: "unexpected SCRAM continue message".to_string(),
-                })?;
+                let state = scram
+                    .as_mut()
+                    .ok_or_else(|| SourceError::StartSnapshotFailed {
+                        reason: "unexpected SCRAM continue message".to_string(),
+                    })?;
                 state
                     .update(body.data())
                     .map_err(|error| SourceError::StartSnapshotFailed {
@@ -1963,20 +1966,27 @@ async fn create_logical_slot_and_export_snapshot(
                     })?;
             }
             Message::AuthenticationSaslFinal(body) => {
-                let state = scram.as_mut().ok_or_else(|| SourceError::StartSnapshotFailed {
-                    reason: "unexpected SCRAM final message".to_string(),
-                })?;
+                let state = scram
+                    .as_mut()
+                    .ok_or_else(|| SourceError::StartSnapshotFailed {
+                        reason: "unexpected SCRAM final message".to_string(),
+                    })?;
                 state
                     .finish(body.data())
                     .map_err(|error| SourceError::StartSnapshotFailed {
                         reason: format!("SCRAM verification failed: {error}"),
                     })?;
             }
-            Message::ParameterStatus(_) | Message::BackendKeyData(_) | Message::NoticeResponse(_) => {}
+            Message::ParameterStatus(_)
+            | Message::BackendKeyData(_)
+            | Message::NoticeResponse(_) => {}
             Message::ReadyForQuery(_) => break,
             Message::ErrorResponse(body) => {
                 return Err(SourceError::StartSnapshotFailed {
-                    reason: format!("PostgreSQL replication auth failed: {}", pg_error_detail(&body)),
+                    reason: format!(
+                        "PostgreSQL replication auth failed: {}",
+                        pg_error_detail(&body)
+                    ),
                 });
             }
             _ => {
@@ -2015,9 +2025,9 @@ async fn create_logical_slot_and_export_snapshot(
                 let mut cols = Vec::new();
                 let mut ranges = body.ranges();
                 while let Ok(Some(range)) = ranges.next() {
-                    cols.push(range.map(|r| {
-                        String::from_utf8_lossy(&body.buffer()[r]).into_owned()
-                    }));
+                    cols.push(
+                        range.map(|r| String::from_utf8_lossy(&body.buffer()[r]).into_owned()),
+                    );
                 }
                 if let Some(Some(lsn_str)) = cols.get(1) {
                     consistent_point = Some(PgLsn::parse(lsn_str)?);

@@ -501,7 +501,9 @@ async fn pgoutput_gateway_synchronized_snapshot_handoff_multi_relation_and_resta
     assert_eq!(rows(&restarted_client, "ab_view").await, expected_ab);
 
     upstream
-        .batch_execute("BEGIN; INSERT INTO a VALUES (4, 40); INSERT INTO b VALUES (4, 400); COMMIT;")
+        .batch_execute(
+            "BEGIN; INSERT INTO a VALUES (4, 40); INSERT INTO b VALUES (4, 400); COMMIT;",
+        )
         .await
         .unwrap();
     let expected_ab_after = vec![

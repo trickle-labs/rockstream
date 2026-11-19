@@ -719,14 +719,10 @@ async fn postgres_cdc_synchronized_snapshot_handoff_is_exact_across_restart() {
     // Restart from durable checkpoint (has_checkpoint = true) and verify no
     // duplicates or missed changes.
     drop(source);
-    let mut restarted = PostgresCdcSource::connect_pgoutput(
-        ConnectorId(5_501),
-        items_schema,
-        items_config,
-        true,
-    )
-    .await
-    .unwrap();
+    let mut restarted =
+        PostgresCdcSource::connect_pgoutput(ConnectorId(5_501), items_schema, items_config, true)
+            .await
+            .unwrap();
     assert!(restarted
         .poll_delta(offset.clone(), 8 * 1024 * 1024, 4_096, None)
         .await
