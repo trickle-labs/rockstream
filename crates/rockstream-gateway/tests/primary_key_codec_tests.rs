@@ -65,7 +65,11 @@ fn assert_unique_violation(err: &tokio_postgres::Error) {
     let db_err = err
         .as_db_error()
         .unwrap_or_else(|| panic!("expected DbError, got {err:?}"));
-    assert_eq!(db_err.code().code(), "23505", "unexpected error: {db_err:?}");
+    assert_eq!(
+        db_err.code().code(),
+        "23505",
+        "unexpected error: {db_err:?}"
+    );
 }
 
 #[tokio::test]
@@ -74,8 +78,7 @@ async fn composite_text_keys_with_delimiters_do_not_collide() {
     let store: Arc<dyn ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
     let catalog = Arc::new(CatalogStubs::new());
-    let (port, handle, _shard_db) =
-        start_gateway("pk-composite-delimiters", store, catalog).await;
+    let (port, handle, _shard_db) = start_gateway("pk-composite-delimiters", store, catalog).await;
     let client = connect_port(port).await;
 
     client
@@ -315,8 +318,7 @@ async fn durable_reopen_preserves_uniqueness_and_complete_contents() {
     }
 
     // Reopen durable storage with a fresh GatewayServer
-    let (port, handle, shard_db) =
-        start_gateway(shard_path, store.clone(), catalog.clone()).await;
+    let (port, handle, shard_db) = start_gateway(shard_path, store.clone(), catalog.clone()).await;
     let client = connect_port(port).await;
 
     let comp_rows = client
@@ -373,7 +375,12 @@ async fn legacy_persisted_textual_keys_are_reconciled_and_conflicts_fail_closed(
 
     // Pre-populate ShardDb with legacy unescaped keys
     {
-        let shard_db = Arc::new(ShardDb::builder(shard_path, store.clone()).build().await.unwrap());
+        let shard_db = Arc::new(
+            ShardDb::builder(shard_path, store.clone())
+                .build()
+                .await
+                .unwrap(),
+        );
         shard_db
             .put(b"view_output/legacy_tbl/id=1", b"1\talice")
             .await
