@@ -11,7 +11,8 @@ use parking_lot::RwLock;
 use rockstream_control::audit::FileAuditLog;
 use rockstream_control::MANAGEMENT_OPERATION_RECORD_VERSION;
 use rockstream_management_proto::v1::{
-    Operation as ManagementWireOperation, SetSecurityPrincipalGrantsRequest,
+    CreateBackupRequest, Operation as ManagementWireOperation, SecurityActionGrant,
+    SecurityPresetGrant, SetSecurityPrincipalGrantsRequest,
 };
 use rockstream_runtime::exchange::pool::ShuffleClientPool;
 use rockstream_runtime::exchange::proto::ShuffleFrame;
@@ -238,6 +239,28 @@ async fn oidc_authentication_error(
         Err(error) => error,
         Ok(_) => panic!("the release process accepted a rejected OIDC token"),
     }
+}
+
+async fn assert_scram_login_rejected(port: u16, username: &str) {
+    let error = match tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={port} user={username} password=unused dbname=test sslmode=disable"
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("the release SCRAM process accepted service-only principal '{username}'"),
+    };
+    let database_error = error.as_db_error().unwrap();
+    assert_eq!(database_error.code().code(), "28P01");
+    assert_eq!(
+        database_error.message(),
+        format!(
+            "[RS-2401] auth.invalid_password: password authentication failed for user '{username}'. next_steps: Check password and retry"
+        )
+    );
 }
 
 fn oidc_principal() -> SecurityPrincipal {
@@ -1074,16 +1097,26 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
     let pki = rockstream_test_support::pki::TestPki::generate();
     let fixtures =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../rockstream-control/tests/fixtures");
+    let reader_certificates = rustls_pemfile::certs(&mut BufReader::new(
+        std::fs::File::open(&pki.cli_reader_cert_path).unwrap(),
+    ))
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap();
     let gateway_actor = SecurityPrincipal {
         format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
         id: PrincipalId(2),
         display_name: "Release delegated SQL actor".to_owned(),
         enabled: true,
         revision: 1,
-        login_methods: vec![LoginMethod::Oidc {
-            issuer: "https://issuer.example".to_owned(),
-            subject: "alice".to_owned(),
-        }],
+        login_methods: vec![
+            LoginMethod::Oidc {
+                issuer: "https://issuer.example".to_owned(),
+                subject: "alice".to_owned(),
+            },
+            LoginMethod::Mtls {
+                certificate_sha256: sha2::Sha256::digest(reader_certificates[0].as_ref()).into(),
+            },
+        ],
         preset_grants: vec![ScopedPresetGrant {
             preset: PermissionPreset::Builder,
             scope: PolicyScope::Namespace {
@@ -1122,20 +1155,8 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
         toml::to_string(&control_config).unwrap(),
     )
     .unwrap();
-    let control_storage = temp.path().join("control-storage");
+    let control_storage = gateway_storage.clone();
     let control_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-    let mut control_seed_process = start_control_process(
-        &control_working_dir,
-        &control_storage,
-        control_address,
-        &pki,
-        Some(control_actor.clone()),
-        false,
-    )
-    .await;
-    wait_for_gateway(&mut control_seed_process.0, control_address).await;
-    control_seed_process.0.kill().unwrap();
-    control_seed_process.0.wait().unwrap();
     let control_store = rockstream_storage::build_runtime_object_store(
         &control_storage.join("gateway-shard"),
         "gateway-shard",
@@ -1157,7 +1178,6 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
     control_catalog.refresh().await.unwrap();
     let mut principals_before = control_catalog.list_security_principals().await.unwrap();
     principals_before.sort_by_key(|principal| principal.id);
-    let audit_before = control_catalog.list_security_audit_records().await.unwrap();
 
     let mut tls_params = rcgen::CertificateParams::new(vec!["localhost".to_owned()]).unwrap();
     tls_params
@@ -1206,10 +1226,27 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
         .await
         .expect("normal OIDC PostgreSQL client should connect to the delegated gateway");
     let connection_task = tokio::spawn(connection);
+    control_catalog.refresh().await.unwrap();
+    let audit_before = control_catalog.list_security_audit_records().await.unwrap();
     client
         .execute("CREATE TABLE orders (id BIGINT, amount BIGINT)", &[])
         .await
         .unwrap();
+    client
+        .batch_execute("INSERT INTO orders VALUES (7, 70), (7, 70), (9, NULL)")
+        .await
+        .unwrap();
+    let initial_rows = client
+        .query(
+            "SELECT id, amount FROM orders ORDER BY id, amount NULLS LAST",
+            &[],
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.get::<_, i64>(0), row.get::<_, Option<i64>>(1)))
+        .collect::<Vec<_>>();
+    assert_eq!(initial_rows, [(7, Some(70)), (7, Some(70)), (9, None)]);
 
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut management = loop {
@@ -1229,11 +1266,14 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
             expected_revision: 1,
             expected_grantor_revision: 1,
             idempotency_key: operation_id.clone(),
-            preset_grants: Vec::new(),
+            preset_grants: vec![SecurityPresetGrant {
+                preset: "operator".to_owned(),
+                scope_json: serde_json::to_string(&PolicyScope::Cluster).unwrap(),
+            }],
             scoped_grants: Vec::new(),
         })
         .await
-        .expect("authenticated management request should revoke the actor grants")
+        .expect("authenticated management request should leave only operator grants")
         .into_inner();
     assert_eq!(
         response.protocol_version,
@@ -1258,18 +1298,21 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
             error_code: String::new(),
             next_steps: Vec::new(),
             source_version: format!("operation-record:{MANAGEMENT_OPERATION_RECORD_VERSION}"),
-            result_json: r#"{"effective_permissions":[],"preset_grants":[],"principal_id":2,"revision":2,"scoped_grants":[]}"#.to_owned(),
+            result_json: r#"{"effective_permissions":[{"action":"cluster_observe","scope":"cluster"},{"action":"node_drain","scope":"cluster"},{"action":"shard_migrate","scope":"cluster"},{"action":"operation_cancel","scope":"cluster"},{"action":"operation_history_read","scope":"cluster"},{"action":"diagnostics_read","scope":"cluster"},{"action":"support_generate","scope":"cluster"},{"action":"support_download","scope":"cluster"}],"preset_grants":[{"preset":"operator","scope":"cluster"}],"principal_id":2,"revision":2,"scoped_grants":[]}"#.to_owned(),
         }
     );
 
-    let mut revoked_actor = control_actor.clone();
-    revoked_actor.revision = 2;
-    revoked_actor.preset_grants.clear();
+    let mut operator_only_actor = control_actor.clone();
+    operator_only_actor.revision = 2;
+    operator_only_actor.preset_grants = vec![ScopedPresetGrant {
+        preset: PermissionPreset::Operator,
+        scope: PolicyScope::Cluster,
+    }];
     let mut principals_after_grant = principals_before.clone();
     *principals_after_grant
         .iter_mut()
         .find(|principal| principal.id == PrincipalId(2))
-        .expect("delegated actor is provisioned") = revoked_actor.clone();
+        .expect("delegated actor is provisioned") = operator_only_actor.clone();
     control_catalog.refresh().await.unwrap();
     let mut current_principals = control_catalog.list_security_principals().await.unwrap();
     current_principals.sort_by_key(|principal| principal.id);
@@ -1333,9 +1376,9 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
     ))
     .unwrap();
     let after_policy = serde_json::to_string(&(
-        revoked_actor.enabled,
-        &revoked_actor.preset_grants,
-        &revoked_actor.scoped_grants,
+        operator_only_actor.enabled,
+        &operator_only_actor.preset_grants,
+        &operator_only_actor.scoped_grants,
     ))
     .unwrap();
     let grant = &audit_after_grant[audit_before.len() + 2];
@@ -1403,6 +1446,293 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
             .get::<_, i64>(0),
         1_i64
     );
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let data_denial = client
+        .query(
+            "SELECT id, amount FROM orders ORDER BY id, amount NULLS LAST",
+            &[],
+        )
+        .await
+        .expect_err("the operator preset must not authorize business-data reads");
+    assert_eq!(data_denial.as_db_error().unwrap().code().code(), "42501");
+    assert_eq!(
+        data_denial.as_db_error().unwrap().message(),
+        "[RS-2401] auth.permission_denied: principal 'alice' is not authorized for action 'DataRead' on public.orders. next_steps: Request an authorized scoped grant, then retry."
+    );
+    assert_eq!(
+        client
+            .query_one("SELECT 1 AS value", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        1_i64,
+        "a denied read must preserve the authenticated session"
+    );
+
+    let operator_tls = tonic::transport::ClientTlsConfig::new()
+        .ca_certificate(tonic::transport::Certificate::from_pem(
+            std::fs::read(&pki.ca_cert_path).unwrap(),
+        ))
+        .identity(tonic::transport::Identity::from_pem(
+            std::fs::read(&pki.cli_reader_cert_path).unwrap(),
+            std::fs::read(&pki.cli_reader_key_path).unwrap(),
+        ));
+    let operator_channel =
+        tonic::transport::Endpoint::from_shared(format!("https://{management_address}"))
+            .unwrap()
+            .tls_config(operator_tls)
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+    let mut operator_management =
+        rockstream_management_proto::v1::management_service_client::ManagementServiceClient::new(
+            operator_channel,
+        );
+    let self_grant_error = operator_management
+        .set_security_principal_grants(SetSecurityPrincipalGrantsRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            principal_id: 2,
+            expected_revision: 2,
+            expected_grantor_revision: 2,
+            idempotency_key: uuid::Uuid::new_v4().to_string(),
+            preset_grants: vec![SecurityPresetGrant {
+                preset: "administrator".to_owned(),
+                scope_json: serde_json::to_string(&PolicyScope::Cluster).unwrap(),
+            }],
+            scoped_grants: Vec::new(),
+        })
+        .await
+        .expect_err("the operator preset must not authorize grant administration");
+    assert_eq!(self_grant_error.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        self_grant_error.message(),
+        "management action is not authorized"
+    );
+
+    let backup_destination = temp.path().join("operator-backup");
+    let backup_scope = PolicyScope::BackupDestination {
+        destination: backup_destination.display().to_string(),
+    };
+    let backup_operation_id = uuid::Uuid::new_v4().to_string();
+    let operator_backup_denial = operator_management
+        .create_backup(CreateBackupRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            destination: backup_destination.display().to_string(),
+            idempotency_key: backup_operation_id.clone(),
+        })
+        .await
+        .expect_err("the operator preset must not authorize backup creation");
+    assert_eq!(operator_backup_denial.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        operator_backup_denial.message(),
+        "management action is not authorized"
+    );
+    assert!(!backup_destination.exists());
+    control_catalog.refresh().await.unwrap();
+    let mut principals_after_operator_denials =
+        control_catalog.list_security_principals().await.unwrap();
+    principals_after_operator_denials.sort_by_key(|principal| principal.id);
+    assert_eq!(principals_after_operator_denials, principals_after_grant);
+    let audit_before_scoped_grant = control_catalog.list_security_audit_records().await.unwrap();
+    let self_grant_denial_record = &audit_before_scoped_grant[audit_before_scoped_grant.len() - 2];
+    assert!(self_grant_denial_record
+        .event_id
+        .starts_with("management-denial-"));
+    assert!(self_grant_denial_record.timestamp_ms > 0);
+    assert_eq!(
+        self_grant_denial_record,
+        &SecurityAuditRecord {
+            format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: self_grant_denial_record.event_id.clone(),
+            timestamp_ms: self_grant_denial_record.timestamp_ms,
+            actor: AuditIdentity::Verified("principal:2".to_owned()),
+            target: AuditField::Known("GrantManage".to_owned()),
+            scope: AuditField::Known(serde_json::to_string(&PolicyScope::Cluster).unwrap()),
+            action: SecurityAuditClass::AuthorizationDenial,
+            outcome: SecurityAuditOutcome::Denied,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::Known(2),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
+    );
+    let backup_denial_record = audit_before_scoped_grant
+        .last()
+        .expect("operator backup denial is durably audited");
+    assert!(backup_denial_record
+        .event_id
+        .starts_with("management-denial-"));
+    assert!(backup_denial_record.timestamp_ms > 0);
+    assert_eq!(
+        backup_denial_record,
+        &SecurityAuditRecord {
+            format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: backup_denial_record.event_id.clone(),
+            timestamp_ms: backup_denial_record.timestamp_ms,
+            actor: AuditIdentity::Verified("principal:2".to_owned()),
+            target: AuditField::Known("BackupCreate".to_owned()),
+            scope: AuditField::Known(serde_json::to_string(&backup_scope).unwrap()),
+            action: SecurityAuditClass::AuthorizationDenial,
+            outcome: SecurityAuditOutcome::Denied,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::Known(2),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
+    );
+
+    let scoped_operation_id = uuid::Uuid::new_v4().to_string();
+    let scoped_response = management
+        .set_security_principal_grants(SetSecurityPrincipalGrantsRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            principal_id: 2,
+            expected_revision: 2,
+            expected_grantor_revision: 1,
+            idempotency_key: scoped_operation_id.clone(),
+            preset_grants: vec![SecurityPresetGrant {
+                preset: "operator".to_owned(),
+                scope_json: serde_json::to_string(&PolicyScope::Cluster).unwrap(),
+            }],
+            scoped_grants: vec![SecurityActionGrant {
+                action: "backup_create".to_owned(),
+                scope_json: serde_json::to_string(&backup_scope).unwrap(),
+            }],
+        })
+        .await
+        .expect("the administrator should add a scoped backup-create grant")
+        .into_inner();
+    assert_eq!(
+        scoped_response.protocol_version,
+        rockstream_management_proto::PROTOCOL_VERSION
+    );
+    let mut scoped_operation = scoped_response.operation.expect("scoped grant operation");
+    assert_eq!(scoped_operation.operation_id, scoped_operation_id);
+    assert!(chrono::DateTime::parse_from_rfc3339(&scoped_operation.started_at).is_ok());
+    assert!(chrono::DateTime::parse_from_rfc3339(&scoped_operation.updated_at).is_ok());
+    scoped_operation.started_at = "<timestamp>".to_owned();
+    scoped_operation.updated_at = "<timestamp>".to_owned();
+    assert_eq!(
+        scoped_operation,
+        ManagementWireOperation {
+            operation_id: scoped_operation_id.clone(),
+            kind: "security_principal_grants".to_owned(),
+            state: "succeeded".to_owned(),
+            started_at: "<timestamp>".to_owned(),
+            updated_at: "<timestamp>".to_owned(),
+            progress: "100%".to_owned(),
+            phase: "security_policy_committed".to_owned(),
+            error_code: String::new(),
+            next_steps: Vec::new(),
+            source_version: format!("operation-record:{MANAGEMENT_OPERATION_RECORD_VERSION}"),
+            result_json: serde_json::json!({
+                "principal_id": 2,
+                "revision": 3,
+                "preset_grants": [{"preset": "operator", "scope": "cluster"}],
+                "scoped_grants": [{
+                    "action": "backup_create",
+                    "scope": {"backup_destination": {"destination": backup_destination.display().to_string()}}
+                }],
+                "effective_permissions": [
+                    {"action": "cluster_observe", "scope": "cluster"},
+                    {"action": "node_drain", "scope": "cluster"},
+                    {"action": "shard_migrate", "scope": "cluster"},
+                    {"action": "operation_cancel", "scope": "cluster"},
+                    {"action": "operation_history_read", "scope": "cluster"},
+                    {"action": "diagnostics_read", "scope": "cluster"},
+                    {"action": "support_generate", "scope": "cluster"},
+                    {"action": "support_download", "scope": "cluster"},
+                    {"action": "backup_create", "scope": {"backup_destination": {"destination": backup_destination.display().to_string()}}}
+                ]
+            })
+            .to_string(),
+        }
+    );
+
+    let mut scoped_actor = operator_only_actor.clone();
+    scoped_actor.revision = 3;
+    scoped_actor.scoped_grants = vec![ScopedActionGrant {
+        action: SecurityAction::BackupCreate,
+        scope: backup_scope,
+    }];
+    let mut principals_after_scoped_grant = principals_after_grant.clone();
+    *principals_after_scoped_grant
+        .iter_mut()
+        .find(|principal| principal.id == PrincipalId(2))
+        .expect("delegated actor is provisioned") = scoped_actor.clone();
+    control_catalog.refresh().await.unwrap();
+    let mut current_principals = control_catalog.list_security_principals().await.unwrap();
+    current_principals.sort_by_key(|principal| principal.id);
+    assert_eq!(current_principals, principals_after_scoped_grant);
+    let audit_after_scoped_grant = control_catalog.list_security_audit_records().await.unwrap();
+    assert_eq!(
+        audit_after_scoped_grant.len(),
+        audit_before_scoped_grant.len() + 3
+    );
+    assert_eq!(
+        &audit_after_scoped_grant[..audit_before_scoped_grant.len()],
+        audit_before_scoped_grant.as_slice()
+    );
+    let scoped_grant_record = &audit_after_scoped_grant[audit_before_scoped_grant.len() + 1];
+    assert_eq!(scoped_grant_record.action, SecurityAuditClass::GrantChange);
+    assert_eq!(scoped_grant_record.outcome, SecurityAuditOutcome::Success);
+    assert_eq!(
+        scoped_grant_record.correlation,
+        AuditCorrelation::Observed(scoped_operation_id.clone())
+    );
+    assert_eq!(scoped_grant_record.policy_revision, AuditField::Known(3));
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let backup_response = operator_management
+        .create_backup(CreateBackupRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            destination: backup_destination.display().to_string(),
+            idempotency_key: backup_operation_id.clone(),
+        })
+        .await
+        .expect_err("the control-only fixture has no backup executor");
+    assert_eq!(
+        backup_response.code(),
+        tonic::Code::Unavailable,
+        "the granted action passed authorization before executor availability was checked"
+    );
+    assert_eq!(
+        backup_response.message(),
+        "CreateBackup executor is not attached"
+    );
+    assert!(!backup_destination.exists());
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let scoped_data_denial = client
+        .query(
+            "SELECT id, amount FROM orders ORDER BY id, amount NULLS LAST",
+            &[],
+        )
+        .await
+        .expect_err("the scoped backup grant must not authorize business-data reads");
+    assert_eq!(
+        scoped_data_denial.as_db_error().unwrap().code().code(),
+        "42501"
+    );
+    assert_eq!(
+        scoped_data_denial.as_db_error().unwrap().message(),
+        "[RS-2401] auth.permission_denied: principal 'alice' is not authorized for action 'DataRead' on public.orders. next_steps: Request an authorized scoped grant, then retry."
+    );
+    assert_eq!(
+        client
+            .query_one("SELECT 1 AS value", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        1_i64,
+        "a denied read must preserve the authenticated session after the separate grant"
+    );
+
+    control_catalog.refresh().await.unwrap();
+    let audit_before_shutdown = control_catalog.list_security_audit_records().await.unwrap();
     drop(client);
     connection_task.abort();
     jwks_task.await.unwrap();
@@ -1437,14 +1767,62 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
         .unwrap();
     let mut principals_after = recovered.list_security_principals().await.unwrap();
     principals_after.sort_by_key(|principal| principal.id);
-    assert_eq!(principals_after, principals_after_grant);
+    assert_eq!(principals_after, principals_after_scoped_grant);
     let records = recovered.list_security_audit_records().await.unwrap();
-    assert_eq!(records.len(), audit_after_grant.len() + 1);
-    assert_eq!(
-        &records[..audit_after_grant.len()],
-        audit_after_grant.as_slice()
+    assert_eq!(records, audit_before_shutdown);
+    let data_denials = records
+        .iter()
+        .filter(|record| {
+            record.target == AuditField::Known("public.orders".to_owned())
+                && record.action == SecurityAuditClass::AuthorizationDenial
+                && record.outcome == SecurityAuditOutcome::Denied
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(data_denials.len(), 2);
+    let data_scope = AuditField::Known(
+        serde_json::to_string(&PolicyScope::Resource {
+            namespace: "public".to_owned(),
+            kind: ResourceKind::Table,
+            name: "orders".to_owned(),
+        })
+        .unwrap(),
     );
-    let denial = &records[audit_after_grant.len()];
+    let actor = AuditIdentity::Verified(format!(
+        "oidc:{}:{}:{}:{}",
+        "https://issuer.example".len(),
+        "https://issuer.example",
+        "alice".len(),
+        "alice"
+    ));
+    for (record, policy_revision) in data_denials.into_iter().zip([2, 3]) {
+        assert!(record.event_id.starts_with("gateway-authz-"));
+        assert!(record.timestamp_ms > 0);
+        assert!(
+            matches!(&record.correlation, AuditCorrelation::Observed(value) if !value.is_empty())
+        );
+        assert_eq!(
+            record,
+            &SecurityAuditRecord {
+                format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: record.event_id.clone(),
+                timestamp_ms: record.timestamp_ms,
+                actor: actor.clone(),
+                target: AuditField::Known("public.orders".to_owned()),
+                scope: data_scope.clone(),
+                action: SecurityAuditClass::AuthorizationDenial,
+                outcome: SecurityAuditOutcome::Denied,
+                correlation: record.correlation.clone(),
+                operation_id: AuditField::NotApplicable,
+                policy_revision: AuditField::Known(policy_revision),
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::NotApplicable,
+            }
+        );
+    }
+    let denial = records
+        .iter()
+        .find(|record| record.target == AuditField::Known("ViewAuthor".to_owned()))
+        .expect("stale-view denial is durably audited");
     assert!(denial.event_id.starts_with("gateway-delegation:"));
     assert!(denial.timestamp_ms > 0);
     assert_eq!(
@@ -2191,7 +2569,7 @@ async fn release_process_rejects_scram_with_empty_durable_credentials_before_lis
 }
 
 #[tokio::test]
-async fn scram_failures_run_in_release_process_and_audit_after_restart() {
+async fn scram_failures_and_service_only_login_rejection_run_in_release_process() {
     let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let temp = tempfile::tempdir().unwrap();
@@ -2199,12 +2577,74 @@ async fn scram_failures_run_in_release_process_and_audit_after_restart() {
     let shard_dir = storage.join("gateway-shard");
     std::fs::create_dir_all(&shard_dir).unwrap();
     let principal = scram_principal();
+    let service_scope = PolicyScope::Secret {
+        namespace: "public".to_owned(),
+        name: "kafka".to_owned(),
+        consumer: Some(PrincipalId(2)),
+    };
+    let service_principal = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(2),
+        display_name: "Release service-only consumer".to_owned(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::Service {
+            service_id: "release-service-only".to_owned(),
+        }],
+        preset_grants: vec![],
+        scoped_grants: vec![ScopedActionGrant {
+            action: SecurityAction::SecretUse,
+            scope: service_scope,
+        }],
+    };
     let store =
         rockstream_storage::build_runtime_object_store(&shard_dir, "gateway-shard").unwrap();
-    DurableCatalogStore::new(store, "gateway")
+    let catalog = DurableCatalogStore::new(store, "gateway");
+    catalog
         .preprovision_first_administrator(principal.clone(), 1)
         .await
         .unwrap();
+    let service_policy = serde_json::to_string(&(
+        service_principal.enabled,
+        &service_principal.preset_grants,
+        &service_principal.scoped_grants,
+    ))
+    .unwrap();
+    let grant_audit = SecurityAuditRecord {
+        format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: "release-service-only-grant".to_owned(),
+        timestamp_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64,
+        actor: AuditIdentity::Verified("principal:1".to_owned()),
+        target: AuditField::Known("principal:2".to_owned()),
+        scope: AuditField::Known("cluster".to_owned()),
+        action: SecurityAuditClass::GrantChange,
+        outcome: SecurityAuditOutcome::Success,
+        correlation: AuditCorrelation::Unknown,
+        operation_id: AuditField::Known("2".to_owned()),
+        policy_revision: AuditField::Known(1),
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::Known(format!("revision=1;policy={service_policy}")),
+    };
+    catalog
+        .commit_txn(
+            CatalogTxn::new(
+                2,
+                2,
+                vec![CatalogMutation::PutSecurityPrincipal {
+                    principal: service_principal.clone(),
+                    expected_revision: None,
+                    grantor_revision: Some((PrincipalId(1), 1)),
+                    audit: grant_audit.clone(),
+                }],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    drop(catalog);
 
     let tls_key = rcgen::KeyPair::generate().unwrap();
     let tls_cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
@@ -2268,6 +2708,7 @@ async fn scram_failures_run_in_release_process_and_audit_after_restart() {
         wrong_password.as_db_error().unwrap().message(),
         "[RS-2401] auth.invalid_password: password authentication failed for user 'alice'. next_steps: Check password and retry"
     );
+    assert_scram_login_rejected(address.port(), "release-service-only").await;
 
     let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
     let mut startup = Vec::new();
@@ -2317,24 +2758,123 @@ async fn scram_failures_run_in_release_process_and_audit_after_restart() {
     let recovered = DurableCatalogStore::recover(store, "gateway")
         .await
         .unwrap();
+    assert_eq!(recovered.list_security_principals().await.unwrap().len(), 2);
     assert_eq!(
-        recovered.list_security_principals().await.unwrap(),
-        vec![principal]
+        recovered
+            .get_security_principal(principal.id)
+            .await
+            .unwrap(),
+        Some(principal.clone())
+    );
+    assert_eq!(
+        recovered
+            .get_security_principal(service_principal.id)
+            .await
+            .unwrap(),
+        Some(service_principal.clone())
     );
     let records = recovered.list_security_audit_records().await.unwrap();
-    assert_eq!(records.len(), 4);
-    assert_eq!(records[0].action, SecurityAuditClass::GrantChange);
-    assert_eq!(records[0].outcome, SecurityAuditOutcome::Success);
-    assert_eq!(records[1].action, SecurityAuditClass::AuthenticationSuccess);
-    for record in &records[2..] {
+    assert_eq!(records.len(), 6);
+    assert_eq!(
+        records[0],
+        expected_bootstrap_audit(&principal, 1, records[0].timestamp_ms)
+    );
+    assert_eq!(records[1], grant_audit);
+    assert_eq!(records[2].action, SecurityAuditClass::AuthenticationSuccess);
+    assert_eq!(records[2].outcome, SecurityAuditOutcome::Success);
+    assert_eq!(
+        records[2].actor,
+        AuditIdentity::Verified("scram:alice".to_owned())
+    );
+    assert_eq!(
+        records[2].target,
+        AuditField::Known("principal:1".to_owned())
+    );
+    assert_eq!(records[2].policy_revision, AuditField::Known(1));
+    for record in &records[3..] {
         assert_eq!(record.action, SecurityAuditClass::AuthenticationFailure);
         assert_eq!(record.outcome, SecurityAuditOutcome::Failure);
+        assert_eq!(record.scope, AuditField::NotApplicable);
+        assert!(matches!(
+            &record.correlation,
+            AuditCorrelation::Observed(id)
+                if id.len() == 32 && id.chars().all(|character| character.is_ascii_hexdigit())
+        ));
+        assert_eq!(record.operation_id, AuditField::NotApplicable);
+        assert_eq!(record.before_state, AuditField::NotApplicable);
+        assert_eq!(record.after_state, AuditField::NotApplicable);
+        assert!(record.event_id.starts_with("gateway-authn-"));
+        assert_eq!(record.event_id.len(), "gateway-authn-".len() + 32);
+        assert!(record.timestamp_ms > 0);
+    }
+    for record in [&records[3], &records[5]] {
         assert_eq!(
             record.actor,
-            AuditIdentity::Unverified("scram:alice".to_string())
+            AuditIdentity::Unverified("scram:alice".to_owned())
         );
-        assert_eq!(record.target, AuditField::Known("principal:1".to_string()));
+        assert_eq!(record.target, AuditField::Known("principal:1".to_owned()));
+        assert_eq!(record.policy_revision, AuditField::Known(1));
     }
+    assert_eq!(
+        records[4].actor,
+        AuditIdentity::Unverified("scram:release-service-only".to_owned())
+    );
+    assert_eq!(records[4].target, AuditField::Unknown);
+    assert_eq!(records[4].policy_revision, AuditField::Unknown);
+
+    let records_before_restart = records;
+    let restarted_address: std::net::SocketAddr =
+        format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut restarted_process = start_gateway_process(
+        temp.path(),
+        &storage,
+        restarted_address,
+        &cert_path,
+        &key_path,
+        "scram",
+        None,
+        "",
+        "",
+        "",
+    );
+    wait_for_gateway(&mut restarted_process.0, restarted_address).await;
+    assert_scram_login_rejected(restarted_address.port(), "release-service-only").await;
+    restarted_process.0.kill().unwrap();
+    restarted_process.0.wait().unwrap();
+
+    let store =
+        rockstream_storage::build_runtime_object_store(&shard_dir, "gateway-shard").unwrap();
+    let recovered = DurableCatalogStore::recover(store, "gateway")
+        .await
+        .unwrap();
+    assert_eq!(
+        recovered
+            .get_security_principal(service_principal.id)
+            .await
+            .unwrap(),
+        Some(service_principal)
+    );
+    let records = recovered.list_security_audit_records().await.unwrap();
+    assert_eq!(records.len(), 7);
+    assert_eq!(&records[..6], records_before_restart.as_slice());
+    let failure = &records[6];
+    assert_eq!(failure.action, SecurityAuditClass::AuthenticationFailure);
+    assert_eq!(failure.outcome, SecurityAuditOutcome::Failure);
+    assert_eq!(
+        failure.actor,
+        AuditIdentity::Unverified("scram:release-service-only".to_owned())
+    );
+    assert_eq!(failure.target, AuditField::Unknown);
+    assert_eq!(failure.policy_revision, AuditField::Unknown);
+    assert_eq!(failure.scope, AuditField::NotApplicable);
+    assert_eq!(failure.operation_id, AuditField::NotApplicable);
+    assert_eq!(failure.before_state, AuditField::NotApplicable);
+    assert_eq!(failure.after_state, AuditField::NotApplicable);
+    assert!(matches!(
+        &failure.correlation,
+        AuditCorrelation::Observed(id)
+            if id.len() == 32 && id.chars().all(|character| character.is_ascii_hexdigit())
+    ));
     assert!(!serde_json::to_string(&records).unwrap().contains("pencil"));
 }
 
