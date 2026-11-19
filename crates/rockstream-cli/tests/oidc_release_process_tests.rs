@@ -1782,10 +1782,11 @@ async fn security_audit_history_uses_release_pgwire_pages_after_denial() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
-        + 60_000;
+        + 1;
+    let audit_window_end_ms = base_ms + 300_000;
     let audit_scope = PolicyScope::AuditRange {
         from_ms: Some(base_ms),
-        to_ms: Some(base_ms),
+        to_ms: Some(audit_window_end_ms),
     };
     let mut auditor = scram_principal();
     auditor.id = PrincipalId(2);
@@ -1808,7 +1809,7 @@ async fn security_audit_history_uses_release_pgwire_pages_after_denial() {
     let grant_audit = SecurityAuditRecord {
         format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
         event_id: "audit-reader-grant".to_string(),
-        timestamp_ms: base_ms - 60_000,
+        timestamp_ms: base_ms - 1,
         actor: AuditIdentity::Verified("principal:1".to_string()),
         target: AuditField::Known("principal:2".to_string()),
         scope: AuditField::Known("cluster".to_string()),
@@ -1846,7 +1847,7 @@ async fn security_audit_history_uses_release_pgwire_pages_after_denial() {
         scope: AuditField::Known("listener".to_string()),
         action: SecurityAuditClass::AuthenticationFailure,
         outcome: SecurityAuditOutcome::Failure,
-        correlation: AuditCorrelation::Observed("client:request-a".to_string()),
+        correlation: AuditCorrelation::Unknown,
         operation_id: AuditField::NotApplicable,
         policy_revision: AuditField::Unknown,
         before_state: AuditField::NotApplicable,
@@ -1870,7 +1871,7 @@ async fn security_audit_history_uses_release_pgwire_pages_after_denial() {
     let excluded_event = SecurityAuditRecord {
         format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
         event_id: "outside-range".to_string(),
-        timestamp_ms: base_ms + 1,
+        timestamp_ms: audit_window_end_ms + 1,
         actor: AuditIdentity::Verified("principal:1".to_string()),
         target: AuditField::Known("principal:2".to_string()),
         scope: AuditField::Known("cluster".to_string()),
@@ -1935,6 +1936,34 @@ async fn security_audit_history_uses_release_pgwire_pages_after_denial() {
     .expect("the normal PostgreSQL client should authenticate to the release process");
     let connection_task = tokio::spawn(connection);
 
+    let page_one = simple_query_rows(
+        &client
+            .simple_query(&format!(
+                "SHOW SECURITY AUDIT FROM {base_ms} TO {audit_window_end_ms} LIMIT 1"
+            ))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        page_one,
+        vec![vec![
+            Some("1".to_string()),
+            Some("a".to_string()),
+            Some(base_ms.to_string()),
+            Some("unverified:presented:alice".to_string()),
+            Some("unknown".to_string()),
+            Some("known:listener".to_string()),
+            Some("authentication_failure".to_string()),
+            Some("failure".to_string()),
+            Some("unknown".to_string()),
+            Some("not_applicable".to_string()),
+            Some("unknown".to_string()),
+            Some("not_applicable".to_string()),
+            Some("not_applicable".to_string()),
+            Some(format!("{base_ms}:YQ")),
+        ]]
+    );
+
     let denied = client
         .simple_query("CREATE TABLE blocked (id BIGINT)")
         .await
@@ -1965,38 +1994,10 @@ async fn security_audit_history_uses_release_pgwire_pages_after_denial() {
     drop(admin_client);
     admin_connection_task.abort();
 
-    let page_one = simple_query_rows(
-        &client
-            .simple_query(&format!(
-                "SHOW SECURITY AUDIT FROM {base_ms} TO {base_ms} LIMIT 1"
-            ))
-            .await
-            .unwrap(),
-    );
-    assert_eq!(
-        page_one,
-        vec![vec![
-            Some("1".to_string()),
-            Some("a".to_string()),
-            Some(base_ms.to_string()),
-            Some("unverified:presented:alice".to_string()),
-            Some("unknown".to_string()),
-            Some("known:listener".to_string()),
-            Some("authentication_failure".to_string()),
-            Some("failure".to_string()),
-            Some("observed:client:request-a".to_string()),
-            Some("not_applicable".to_string()),
-            Some("unknown".to_string()),
-            Some("not_applicable".to_string()),
-            Some("not_applicable".to_string()),
-            Some(format!("{base_ms}:YQ")),
-        ]]
-    );
-
     let page_two = simple_query_rows(
         &client
             .simple_query(&format!(
-                "SHOW SECURITY AUDIT FROM {base_ms} TO {base_ms} AFTER {base_ms}:YQ LIMIT 1"
+                "SHOW SECURITY AUDIT FROM {base_ms} TO {audit_window_end_ms} AFTER {base_ms}:YQ LIMIT 1"
             ))
             .await
             .unwrap(),
@@ -2024,12 +2025,75 @@ async fn security_audit_history_uses_release_pgwire_pages_after_denial() {
     let page_three = simple_query_rows(
         &client
             .simple_query(&format!(
-                "SHOW SECURITY AUDIT FROM {base_ms} TO {base_ms} AFTER {base_ms}:eg LIMIT 1"
+                "SHOW SECURITY AUDIT FROM {base_ms} TO {audit_window_end_ms} AFTER {base_ms}:eg LIMIT 10"
             ))
             .await
             .unwrap(),
     );
-    assert!(page_three.is_empty());
+    assert_eq!(page_three.len(), 3);
+    assert!(page_three
+        .iter()
+        .all(|row| row.len() == 14 && row[0].as_deref() == Some("1")));
+    let mut page_three_actions: Vec<_> = page_three
+        .iter()
+        .map(|row| row[6].as_deref().unwrap())
+        .collect();
+    page_three_actions.sort_unstable();
+    assert_eq!(
+        page_three_actions,
+        vec![
+            "authentication_success",
+            "authentication_success",
+            "authorization_denial"
+        ]
+    );
+    let live_denial = page_three
+        .iter()
+        .find(|row| row[4].as_deref() == Some("known:public.blocked"))
+        .unwrap();
+    assert_eq!(live_denial[3].as_deref(), Some("verified:scram:auditor"));
+    assert_eq!(
+        live_denial[5].as_deref(),
+        Some(
+            format!(
+                "known:{}",
+                serde_json::to_string(&PolicyScope::Resource {
+                    namespace: "public".to_string(),
+                    kind: ResourceKind::Table,
+                    name: "blocked".to_string(),
+                })
+                .unwrap()
+            )
+            .as_str()
+        )
+    );
+    assert_eq!(live_denial[6].as_deref(), Some("authorization_denial"));
+    assert_eq!(live_denial[7].as_deref(), Some("denied"));
+    assert_eq!(live_denial[9].as_deref(), Some("not_applicable"));
+    assert_eq!(live_denial[10].as_deref(), Some("known:1"));
+    assert_eq!(live_denial[11].as_deref(), Some("not_applicable"));
+    assert_eq!(live_denial[12].as_deref(), Some("not_applicable"));
+    assert!(matches!(
+        live_denial[8].as_deref(),
+        Some(correlation) if correlation.starts_with("observed:") && correlation.len() > "observed:".len()
+    ));
+    let page_three_keys: Vec<_> = page_three
+        .iter()
+        .map(|row| (row[2].as_deref().unwrap(), row[1].as_deref().unwrap()))
+        .collect();
+    assert!(page_three_keys
+        .windows(2)
+        .all(|window| window[0] <= window[1]));
+    let last_cursor = page_three.last().unwrap()[13].as_deref().unwrap();
+    let page_four = simple_query_rows(
+        &client
+            .simple_query(&format!(
+                "SHOW SECURITY AUDIT FROM {base_ms} TO {audit_window_end_ms} AFTER {last_cursor} LIMIT 1"
+            ))
+            .await
+            .unwrap(),
+    );
+    assert!(page_four.is_empty());
     let out_of_scope = client
         .simple_query("SHOW SECURITY AUDIT LIMIT 1")
         .await
@@ -2043,7 +2107,7 @@ async fn security_audit_history_uses_release_pgwire_pages_after_denial() {
         simple_query_rows(
             &client
                 .simple_query(&format!(
-                    "SHOW SECURITY AUDIT FROM {base_ms} TO {base_ms} LIMIT 1"
+                    "SHOW SECURITY AUDIT FROM {base_ms} TO {audit_window_end_ms} LIMIT 1"
                 ))
                 .await
                 .unwrap()
