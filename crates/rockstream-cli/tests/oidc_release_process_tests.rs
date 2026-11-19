@@ -2051,6 +2051,13 @@ async fn security_audit_history_uses_release_pgwire_pages_after_denial() {
         .iter()
         .find(|row| row[4].as_deref() == Some("known:public.blocked"))
         .unwrap();
+    let reader_login = page_three
+        .iter()
+        .find(|row| {
+            row[3].as_deref() == Some("verified:scram:auditor")
+                && row[6].as_deref() == Some("authentication_success")
+        })
+        .unwrap();
     assert_eq!(live_denial[3].as_deref(), Some("verified:scram:auditor"));
     assert_eq!(
         live_denial[5].as_deref(),
@@ -2077,6 +2084,18 @@ async fn security_audit_history_uses_release_pgwire_pages_after_denial() {
         live_denial[8].as_deref(),
         Some(correlation) if correlation.starts_with("observed:") && correlation.len() > "observed:".len()
     ));
+    assert_eq!(live_denial[8], reader_login[8]);
+    let denial_event_id = live_denial[1].as_deref().unwrap();
+    assert_eq!(denial_event_id.len(), "gateway-authz-".len() + 32);
+    assert!(denial_event_id["gateway-authz-".len()..]
+        .bytes()
+        .all(|byte| byte.is_ascii_hexdigit()));
+    let denial_timestamp = live_denial[2].as_deref().unwrap();
+    assert!((base_ms..=audit_window_end_ms).contains(&denial_timestamp.parse().unwrap()));
+    assert!(live_denial[13]
+        .as_deref()
+        .unwrap()
+        .starts_with(&format!("{denial_timestamp}:")));
     let page_three_keys: Vec<_> = page_three
         .iter()
         .map(|row| (row[2].as_deref().unwrap(), row[1].as_deref().unwrap()))
