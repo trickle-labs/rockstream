@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -334,7 +334,7 @@ impl SupportArtifactStore {
             .map(|(id, _)| id.clone())
             .collect();
         if expired.is_empty() {
-            return Ok(());
+            return self.cleanup_orphaned_artifacts().await;
         }
         let paths = expired
             .iter()
@@ -357,8 +357,41 @@ impl SupportArtifactStore {
                 .retain(|_, artifact| artifact.expires_at_ms > now_ms);
             Ok(ledger.artifacts.len() != before)
         })
-        .await
-        .map(|_| ())
+        .await?;
+        self.cleanup_orphaned_artifacts().await
+    }
+
+    async fn cleanup_orphaned_artifacts(&self) -> Result<(), ArtifactStoreError> {
+        let artifact_prefix = self.prefix.clone().join("artifacts/").to_string();
+        let paths = self
+            .store
+            .list(Some(&self.prefix))
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|_| ArtifactStoreError::StorageUnavailable)?;
+        let (ledger, _) = self.read_ledger().await?;
+        let retained = ledger
+            .artifacts
+            .keys()
+            .map(|id| self.artifact_path(id))
+            .collect::<BTreeSet<_>>();
+        let orphaned = paths
+            .into_iter()
+            .map(|meta| meta.location)
+            .filter(|path| path.as_ref().starts_with(&artifact_prefix))
+            .filter(|path| !retained.contains(path))
+            .map(Ok::<_, ObjectStoreError>)
+            .collect::<Vec<_>>();
+        let _: Vec<()> = self
+            .store
+            .delete_stream(futures::stream::iter(orphaned).boxed())
+            .map(|result| match result {
+                Ok(_) | Err(ObjectStoreError::NotFound { .. }) => Ok(()),
+                Err(_) => Err(ArtifactStoreError::StorageUnavailable),
+            })
+            .try_collect()
+            .await?;
+        Ok(())
     }
 
     async fn delete_artifact(&self, id: &str) -> Result<(), ArtifactStoreError> {
@@ -588,6 +621,115 @@ mod tests {
                 .unwrap()
                 .size,
             committed_content.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn orphaned_late_write_is_removed_during_restart_cleanup() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut writer = SupportArtifactStore::new(Arc::clone(&object_store));
+        let cleaner = SupportArtifactStore::new(Arc::clone(&object_store));
+        writer.initialize().await.unwrap();
+        let now_ms = 1_000_000;
+        let expiry = ArtifactExpiry {
+            unix_ms: now_ms + ARTIFACT_TTL.as_millis() as u64,
+        };
+        let retained_content: Arc<[u8]> = Arc::from(b"other actor's artifact".to_vec());
+        cleaner
+            .insert(
+                "retained-artifact".to_owned(),
+                PrincipalId(8),
+                PolicyScope::Cluster,
+                retained_content.clone(),
+                expiry,
+                now_ms,
+            )
+            .await
+            .unwrap();
+
+        let started = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        writer.artifact_put_gate = Some((Arc::clone(&started), Arc::clone(&resume)));
+        let writer_task = tokio::spawn(async move {
+            writer
+                .insert(
+                    "late-artifact".to_owned(),
+                    PrincipalId(7),
+                    PolicyScope::Cluster,
+                    Arc::from(b"late write".to_vec()),
+                    expiry,
+                    now_ms,
+                )
+                .await
+        });
+        started.notified().await;
+
+        cleaner
+            .remove("late-artifact", PrincipalId(7))
+            .await
+            .unwrap();
+        resume.notify_one();
+        writer_task.await.unwrap().unwrap();
+        assert_eq!(
+            object_store
+                .get(&cleaner.artifact_path("late-artifact"))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .as_ref(),
+            b"late write"
+        );
+        let listed = object_store
+            .list(Some(&cleaner.prefix))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(
+            listed
+                .iter()
+                .any(|meta| meta.location == cleaner.artifact_path("late-artifact")),
+            "late object was not returned by artifact-prefix listing: {listed:?}"
+        );
+        assert_eq!(
+            cleaner
+                .read_ledger()
+                .await
+                .unwrap()
+                .0
+                .artifacts
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["retained-artifact"]
+        );
+
+        let restarted = SupportArtifactStore::new(Arc::clone(&object_store));
+        restarted.initialize().await.unwrap();
+        restarted.cleanup_expired(now_ms).await.unwrap();
+        assert!(matches!(
+            object_store
+                .get(&restarted.artifact_path("late-artifact"))
+                .await,
+            Err(ObjectStoreError::NotFound { .. })
+        ));
+        let (retained, _, _) = restarted
+            .download("retained-artifact", PrincipalId(8), now_ms)
+            .await
+            .unwrap();
+        assert_eq!(retained.as_ref(), retained_content.as_ref());
+        assert_eq!(
+            restarted
+                .read_ledger()
+                .await
+                .unwrap()
+                .0
+                .artifacts
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["retained-artifact"]
         );
     }
 
@@ -1106,41 +1248,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conflicting_existing_object_does_not_reserve_artifact_quota() {
+    async fn untracked_object_is_reclaimed_before_insert() {
         let object_store = Arc::new(InMemory::new());
         let store = SupportArtifactStore::new(object_store.clone());
         store.initialize().await.unwrap();
         let id = "existing-collision";
-        let existing_content = b"existing object";
+        let requested_content: Arc<[u8]> = Arc::from(b"requested object".to_vec());
         object_store
-            .put(&store.artifact_path(id), existing_content.to_vec().into())
+            .put(&store.artifact_path(id), b"orphaned object".to_vec().into())
             .await
             .unwrap();
 
+        store
+            .insert(
+                id.to_owned(),
+                PrincipalId(1),
+                PolicyScope::Cluster,
+                requested_content.clone(),
+                ArtifactExpiry { unix_ms: 2_000 },
+                1_000,
+            )
+            .await
+            .unwrap();
         assert_eq!(
             store
-                .insert(
-                    id.to_owned(),
-                    PrincipalId(1),
-                    PolicyScope::Cluster,
-                    Arc::from(b"requested object".to_vec()),
-                    ArtifactExpiry { unix_ms: 2_000 },
-                    1_000,
-                )
-                .await,
-            Err(ArtifactStoreError::Exists)
-        );
-        assert!(store.read_ledger().await.unwrap().0.artifacts.is_empty());
-        assert_eq!(
-            object_store
-                .get(&store.artifact_path(id))
+                .download(id, PrincipalId(1), 1_000)
                 .await
                 .unwrap()
-                .bytes()
-                .await
-                .unwrap()
+                .0
                 .as_ref(),
-            existing_content
+            requested_content.as_ref()
+        );
+        assert_eq!(
+            store.read_ledger().await.unwrap().0.artifacts,
+            BTreeMap::from([(
+                id.to_owned(),
+                LedgerArtifact {
+                    owner: PrincipalId(1),
+                    scope: PolicyScope::Cluster,
+                    size: requested_content.len(),
+                    expires_at_ms: 2_000,
+                },
+            )])
         );
     }
 
