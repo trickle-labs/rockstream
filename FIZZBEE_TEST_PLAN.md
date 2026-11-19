@@ -754,8 +754,12 @@ stream continuity while both certificate generations are trusted. Worker
 startup starts the listener, but production does not register `ExchangeInlet`s
 or connect them to compiled pipelines; application result delivery remains
 incomplete. The release-process test covers worker-stream continuity for this
-path. M1–M7 do not model this protocol, so these tests are implementation
-evidence, not formal proof.
+path. `ExchangeStream` now returns `UNIMPLEMENTED` after identity and protocol
+validation because it has no execution path; `ShuffleStream` is the handler
+that dispatches to registered inlets. This prevents a successful acknowledgment
+for undelivered data, but does not complete production pipeline wiring. M1–M7
+do not model this protocol, so these tests are implementation evidence, not
+formal proof.
 
 Issue #203 replaces the public `aws_kms` provider's ARN/region-derived local
 encryption with signed KMS `Encrypt` and `Decrypt` requests. Both operations

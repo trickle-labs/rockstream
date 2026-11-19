@@ -1201,6 +1201,7 @@ const FALLBACK_QUERY_MAX_ROWS: usize = 10_000;
 const FALLBACK_QUERY_MAX_ARRAY_BYTES: usize = 8 * 1024 * 1024;
 const FALLBACK_QUERY_MAX_WALL_MS: u64 = 5_000;
 const FALLBACK_QUERY_MAX_CONCURRENT: usize = 16;
+const SECURITY_POLICY_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 static FALLBACK_QUERY_PERMITS: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(FALLBACK_QUERY_MAX_CONCURRENT);
 static NEXT_DISTRIBUTED_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -2133,6 +2134,7 @@ pub struct GatewayHandler {
     query_time_shard_topology_provider: Option<Arc<QueryTimeShardTopologyProvider>>,
     /// Authentication mode for this gateway instance.
     auth_mode: AuthMode,
+    security_policy_refreshed_at: tokio::sync::Mutex<Option<std::time::Instant>>,
     /// Configured RS256 verifier for OIDC-authenticated public connections.
     oidc_verifier: Option<Arc<crate::auth::OidcVerifier>>,
     /// Legacy RoleCatalog for MD5 compatibility; SCRAM credentials come from durable principals.
@@ -2697,6 +2699,15 @@ impl GatewayHandler {
             .catalog
             .get_durable_store()
             .ok_or_else(|| "durable security catalog is unavailable".to_string())?;
+        let mut refreshed_at = self.security_policy_refreshed_at.lock().await;
+        if refreshed_at
+            .as_ref()
+            .is_none_or(|last| last.elapsed() >= SECURITY_POLICY_REFRESH_INTERVAL)
+        {
+            store.refresh().await.map_err(|error| error.to_string())?;
+            *refreshed_at = Some(std::time::Instant::now());
+        }
+        drop(refreshed_at);
         let principals = store
             .list_security_principals()
             .await
@@ -3502,6 +3513,7 @@ impl GatewayHandler {
             query_time_shard_topology: None,
             query_time_shard_topology_provider: None,
             auth_mode: AuthMode::Off,
+            security_policy_refreshed_at: tokio::sync::Mutex::new(None),
             oidc_verifier: None,
             role_catalog: Arc::new(RoleCatalog::new()),
             acl_store: Arc::new(rockstream_control::AclStore::new()),
@@ -3553,6 +3565,7 @@ impl GatewayHandler {
             query_time_shard_topology: None,
             query_time_shard_topology_provider: None,
             auth_mode: AuthMode::Off,
+            security_policy_refreshed_at: tokio::sync::Mutex::new(None),
             oidc_verifier: None,
             role_catalog: Arc::new(RoleCatalog::new()),
             acl_store: Arc::new(rockstream_control::AclStore::new()),

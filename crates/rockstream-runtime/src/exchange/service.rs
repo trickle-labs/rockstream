@@ -917,50 +917,9 @@ impl ShuffleService for ShuffleServer {
             return Err(status);
         }
         self.validate_protocol_version(request.metadata())?;
-        let mut stream = request.into_inner();
-        let registry = self.registry.clone();
-        let require_local_assignment = self.require_worker_identity;
-        let (tx, rx) = mpsc::channel(64);
-        tokio::spawn(async move {
-            while let Some(result) = stream.next().await {
-                match result {
-                    Ok(frame) => {
-                        if require_local_assignment
-                            && u32::try_from(frame.shard_id)
-                                .ok()
-                                .and_then(|shard_id| registry.get_shard_db(shard_id))
-                                .is_none()
-                        {
-                            let _ = tx
-                                .send(Err(Status::permission_denied(format!(
-                                    "{RS_2401}: target shard is not assigned to this worker"
-                                ))))
-                                .await;
-                            break;
-                        }
-                        let ack = crate::exchange::proto::ExchangeAck {
-                            protocol_version: frame.protocol_version,
-                            workload_id: frame.workload_id,
-                            shard_id: frame.shard_id,
-                            operator_id: frame.operator_id,
-                            epoch: frame.epoch,
-                            lease_token: frame.lease_token,
-                            success: true,
-                            error_code: String::new(),
-                            error_message: String::new(),
-                        };
-                        if tx.send(Ok(ack)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(e)).await;
-                        break;
-                    }
-                }
-            }
-        });
-        Ok(Response::new(Box::pin(RxStream { rx })))
+        Err(Status::unimplemented(
+            "ExchangeStream has no execution handler; use ShuffleStream for worker shuffle delivery",
+        ))
     }
 }
 
