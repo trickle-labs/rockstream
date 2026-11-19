@@ -1082,17 +1082,28 @@ pub fn validate_node_config_semantic_bounds(
 
     // auth mode
     let auth_mode_norm = node_cfg.auth.mode.trim().to_lowercase();
-    let valid_auth = ["off", "scram", "md5", "oidc", "mtls"];
+    let valid_auth = ["off", "scram", "oidc", "mtls"];
     if !valid_auth.contains(&auth_mode_norm.as_str()) {
+        let (message, suggestion) = if auth_mode_norm == "md5" {
+            (
+                "authentication mode `md5` is unavailable: MD5 is not a release authentication mode".to_string(),
+                "Use a release-supported authentication mode.".to_string(),
+            )
+        } else {
+            (
+                format!(
+                    "unknown auth mode `{}`; supported: off, scram, oidc, mtls",
+                    node_cfg.auth.mode
+                ),
+                "Set auth mode to off, scram, oidc, or mtls".to_string(),
+            )
+        };
         diagnostics.push(ConfigDiagnostic {
             path: "auth.mode".to_string(),
             severity: ConfigDiagnosticSeverity::Error,
             code: "RS-0002".to_string(),
-            message: format!(
-                "unknown auth mode `{}`; supported: off, scram, md5, oidc, mtls",
-                node_cfg.auth.mode
-            ),
-            suggestion: Some("Set auth mode to off, scram, md5, oidc, or mtls".to_string()),
+            message,
+            suggestion: Some(suggestion),
             line: None,
             column: None,
         });

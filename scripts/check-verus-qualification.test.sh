@@ -134,6 +134,10 @@ printf 'if [ "${1:-}" = "--version" ]; then\n' >> "$SHIM_BIN/cargo"
 printf '  echo "cargo 1.95.0"\n' >> "$SHIM_BIN/cargo"
 printf '  exit 0\n' >> "$SHIM_BIN/cargo"
 printf 'fi\n' >> "$SHIM_BIN/cargo"
+printf 'if [ "${1:-}" = "fetch" ] && [ "${MOCK_CARGO_FETCH_FAIL:-0}" = "1" ]; then\n' >> "$SHIM_BIN/cargo"
+printf '  echo "simulated locked-registry fetch failure" >&2\n' >> "$SHIM_BIN/cargo"
+printf '  exit 23\n' >> "$SHIM_BIN/cargo"
+printf 'fi\n' >> "$SHIM_BIN/cargo"
 printf 'if [ "${1:-}" = "verus" ]; then\n' >> "$SHIM_BIN/cargo"
 printf '  if [ -n "${VERUS_MUTATION_ID:-}" ]; then\n' >> "$SHIM_BIN/cargo"
 printf '    if [ "${MOCK_VERUS_MODE:-}" = "compile_error" ]; then\n' >> "$SHIM_BIN/cargo"
@@ -229,6 +233,20 @@ expected_compile_error="production mutations: PM01: intended verifier rejection 
 [[ "$(<"$COMPILE_ERROR_OUT/PM01.log")" == "error: simulated compiler failure" ]] || fail "compiler failure log was lost"
 cmp -s "$ROOT/crates/rockstream-verified/src/frontier.rs" "$TMP_ROOT/original-frontier.rs" || \
   fail "production mutation changed the source worktree"
+# Failed registry prefetch must fail closed before any release build can
+# count as qualification evidence. Keep the production compile budget intact.
+CASE_FETCH_FAIL_OUT="$TMP_ROOT/case-fetch-fail-out"
+mkdir -p "$CASE_FETCH_FAIL_OUT"
+set +e
+PATH="$SHIM_BIN:$PATH" MOCK_CARGO_FETCH_FAIL=1 MOCK_CP_MODE=normal \
+  VERUS_QUALIFICATION_PHASE=release VERUS_QUALIFICATION_OUTPUT="$CASE_FETCH_FAIL_OUT" \
+  bash "$ROOT/scripts/run-verus-qualification.sh" >"$CASE_FETCH_FAIL_OUT/run.log" 2>&1
+fetch_fail_status=$?
+set -e
+[[ "$fetch_fail_status" -ne 0 ]] || fail "release qualification accepted a failed locked dependency fetch"
+grep -Fq "locked release dependencies could not be fetched" "$CASE_FETCH_FAIL_OUT/run.log" || \
+  fail "release fetch failure was not diagnosed"
+
 # Exercise legacy all-phase artifact failure cases independent of CI's split phase.
 export VERUS_QUALIFICATION_PHASE=all
 

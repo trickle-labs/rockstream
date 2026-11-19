@@ -354,6 +354,163 @@ async fn security_preprovision_uses_all_role_catalog_layout() {
     assert_eq!(audit_records, vec![expected_audit]);
 }
 
+#[tokio::test]
+async fn security_recover_admin_uses_offline_cli_and_reconciles_exact_audit() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("node-storage");
+    let principal = oidc_bootstrap_administrator();
+    let principal_file = temp.path().join("administrator.json");
+    std::fs::write(&principal_file, serde_json::to_vec(&principal).unwrap()).unwrap();
+    let bootstrap = Command::new(env!("CARGO_BIN_EXE_rockstream"))
+        .arg("--json")
+        .arg("security")
+        .arg("preprovision-admin")
+        .arg("--storage")
+        .arg(&storage)
+        .arg("--layout")
+        .arg("all")
+        .arg("--principal-file")
+        .arg(&principal_file)
+        .arg("--operation-id")
+        .arg("1")
+        .arg("--yes")
+        .output()
+        .unwrap();
+    assert!(
+        bootstrap.status.success(),
+        "{}",
+        String::from_utf8_lossy(&bootstrap.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(bootstrap.stdout).unwrap(),
+        "{\n  \"principal_id\": 1,\n  \"catalog_revision\": 1\n}\n"
+    );
+
+    let replacement_login = vec![LoginMethod::ScramSha256 {
+        username: "recovered-admin".into(),
+        salt: vec![4; 16],
+        iterations: 4096,
+        stored_key: vec![5; 32],
+        server_key: vec![6; 32],
+    }];
+    let login_methods_file = temp.path().join("replacement-login-methods.json");
+    std::fs::write(
+        &login_methods_file,
+        serde_json::to_vec(&replacement_login).unwrap(),
+    )
+    .unwrap();
+    let run_recovery = |confirmed: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_rockstream"));
+        command
+            .arg("--json")
+            .arg("security")
+            .arg("recover-admin")
+            .arg("--storage")
+            .arg(&storage)
+            .arg("--layout")
+            .arg("all")
+            .arg("--principal-id")
+            .arg(principal.id.0.to_string())
+            .arg("--login-methods-file")
+            .arg(&login_methods_file)
+            .arg("--operation-id")
+            .arg("2");
+        if confirmed {
+            command.arg("--yes");
+        }
+        command.output().unwrap()
+    };
+    let unconfirmed = run_recovery(false);
+    assert!(!unconfirmed.status.success());
+    assert!(String::from_utf8_lossy(&unconfirmed.stderr)
+        .contains("destructive command confirmation required in non-interactive environment"));
+    let store =
+        rockstream_storage::build_runtime_object_store(&storage.join("shards/0"), "shards/0")
+            .unwrap();
+    let catalog = DurableCatalogStore::recover(store, "db").await.unwrap();
+    assert_eq!(
+        catalog.get_security_principal(principal.id).await.unwrap(),
+        Some(principal.clone())
+    );
+    let initial_audits = catalog.list_security_audit_records().await.unwrap();
+    assert_eq!(initial_audits.len(), 1);
+    assert_eq!(
+        initial_audits,
+        vec![expected_bootstrap_audit(
+            &principal,
+            1,
+            initial_audits[0].timestamp_ms,
+        )]
+    );
+
+    let recovery = run_recovery(true);
+    assert!(
+        recovery.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovery.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(recovery.stdout).unwrap(),
+        "{\n  \"principal_id\": 1,\n  \"catalog_revision\": 2\n}\n"
+    );
+    let retry = run_recovery(true);
+    assert!(retry.status.success());
+    assert_eq!(
+        String::from_utf8(retry.stdout).unwrap(),
+        "{\n  \"principal_id\": 1,\n  \"catalog_revision\": 2\n}\n"
+    );
+
+    let store =
+        rockstream_storage::build_runtime_object_store(&storage.join("shards/0"), "shards/0")
+            .unwrap();
+    let catalog = DurableCatalogStore::recover(store, "db").await.unwrap();
+    let mut recovered_principal = principal.clone();
+    recovered_principal.revision = 2;
+    recovered_principal.login_methods = replacement_login;
+    assert_eq!(
+        catalog.get_security_principal(principal.id).await.unwrap(),
+        Some(recovered_principal.clone())
+    );
+    let audit_records = catalog.list_security_audit_records().await.unwrap();
+    assert_eq!(
+        audit_records,
+        vec![
+            expected_bootstrap_audit(&principal, 1, audit_records[0].timestamp_ms),
+            SecurityAuditRecord {
+                format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: "offline-admin-recovery:2".into(),
+                timestamp_ms: audit_records[1].timestamp_ms,
+                actor: AuditIdentity::Unknown,
+                target: AuditField::Known("principal:1".into()),
+                scope: AuditField::Known("cluster".into()),
+                action: SecurityAuditClass::AdminOperationCompletion,
+                outcome: SecurityAuditOutcome::Success,
+                correlation: AuditCorrelation::NotApplicable,
+                operation_id: AuditField::Known("2".into()),
+                policy_revision: AuditField::Known(2),
+                before_state: AuditField::Known(format!(
+                    "revision=1;policy={}",
+                    serde_json::to_string(&(
+                        principal.enabled,
+                        &principal.preset_grants,
+                        &principal.scoped_grants,
+                    ))
+                    .unwrap()
+                )),
+                after_state: AuditField::Known(format!(
+                    "revision=2;policy={}",
+                    serde_json::to_string(&(
+                        recovered_principal.enabled,
+                        &recovered_principal.preset_grants,
+                        &recovered_principal.scoped_grants,
+                    ))
+                    .unwrap()
+                )),
+            },
+        ]
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn start_gateway_process(
     working_dir: &Path,

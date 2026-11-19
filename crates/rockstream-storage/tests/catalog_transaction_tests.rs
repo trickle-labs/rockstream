@@ -397,7 +397,7 @@ async fn test_create_mat_view_atomic_mutations_recovered() {
 }
 
 #[tokio::test]
-async fn test_create_mat_view_storage_failure_fails_closed() {
+async fn test_catalog_and_admin_bootstrap_storage_failure_fails_closed() {
     // Failing object store simulator
     use object_store::path::Path as ObjectPath;
     use object_store::{
@@ -509,6 +509,55 @@ async fn test_create_mat_view_storage_failure_fails_closed() {
     // In-memory state unchanged
     assert_eq!(catalog.get_view(ViewId(99)).await.unwrap(), None);
     assert_eq!(catalog.get_revision().await, 0);
+
+    let administrator = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(77),
+        display_name: "bootstrap-admin".into(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::ScramSha256 {
+            username: "bootstrap-admin".into(),
+            salt: vec![1; 16],
+            iterations: 4096,
+            stored_key: vec![2; 32],
+            server_key: vec![3; 32],
+        }],
+        preset_grants: vec![ScopedPresetGrant {
+            preset: PermissionPreset::Administrator,
+            scope: PolicyScope::Cluster,
+        }],
+        scoped_grants: vec![],
+    };
+    assert!(catalog
+        .preprovision_first_administrator(administrator.clone(), 301)
+        .await
+        .is_err());
+    assert_eq!(
+        catalog
+            .get_security_principal(administrator.id)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(catalog.list_security_audit_records().await.unwrap(), vec![]);
+    assert_eq!(catalog.get_revision().await, 0);
+
+    let recovered = DurableCatalogStore::recover(failing_store, "test")
+        .await
+        .unwrap();
+    assert_eq!(
+        recovered
+            .get_security_principal(administrator.id)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        recovered.list_security_audit_records().await.unwrap(),
+        vec![]
+    );
+    assert_eq!(recovered.get_revision().await, 0);
 }
 
 #[tokio::test]
