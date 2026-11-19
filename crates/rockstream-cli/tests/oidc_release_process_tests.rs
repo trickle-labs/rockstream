@@ -3193,7 +3193,7 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
         rockstream_storage::build_runtime_object_store(&shard_dir, "gateway-shard").unwrap();
     let durable = DurableCatalogStore::new(store.clone(), "gateway");
     durable
-        .preprovision_first_administrator(principal, 1)
+        .preprovision_first_administrator(principal.clone(), 1)
         .await
         .unwrap();
     durable
@@ -3220,6 +3220,15 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
         )
         .await
         .unwrap();
+
+    let audit_before_client = durable.list_security_audit_records().await.unwrap();
+    assert_eq!(audit_before_client.len(), 1);
+    let bootstrap = &audit_before_client[0];
+    assert!(bootstrap.timestamp_ms > 0);
+    assert_eq!(
+        bootstrap,
+        &expected_bootstrap_audit(&principal, 1, bootstrap.timestamp_ms)
+    );
 
     let tls_key = rcgen::KeyPair::generate().unwrap();
     let tls_cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
@@ -3472,57 +3481,116 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
         .payload
         .get("password")
         .is_some_and(|value| value == "rotated-fixture-value"));
-    let rotation_audits = durable_catalog
-        .list_security_audit_records()
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|record| record.action == SecurityAuditClass::SecretRotation)
+    let records = durable_catalog.list_security_audit_records().await.unwrap();
+    assert_eq!(
+        records.len(),
+        audit_before_client.len() + 3,
+        "unexpected release audit sequence: {records:#?}"
+    );
+    assert_eq!(
+        &records[..audit_before_client.len()],
+        audit_before_client.as_slice()
+    );
+    let events = &records[audit_before_client.len()..];
+    let authentication_events = events
+        .iter()
+        .filter(|record| record.action == SecurityAuditClass::AuthenticationSuccess)
         .collect::<Vec<_>>();
-    assert_eq!(rotation_audits.len(), 1);
-    let rotation_audit = &rotation_audits[0];
-    assert!(rotation_audit
-        .event_id
-        .starts_with("gateway-secret-rotation-"));
-    assert!(rotation_audit.timestamp_ms > 0);
+    let rotation_audit = events
+        .iter()
+        .find(|record| record.action == SecurityAuditClass::SecretRotation)
+        .unwrap();
+    assert_eq!(events.len(), 3);
+    assert_eq!(authentication_events.len(), 2);
+    let rotation_correlation = rotation_audit.correlation.clone();
+    assert!(matches!(
+        &rotation_correlation,
+        AuditCorrelation::Observed(_)
+    ));
+    let rotation_authentication = authentication_events
+        .iter()
+        .copied()
+        .find(|record| record.correlation == rotation_correlation)
+        .unwrap();
+    let restart_authentication = authentication_events
+        .iter()
+        .copied()
+        .find(|record| record.correlation != rotation_correlation)
+        .unwrap();
+    assert!(matches!(
+        &restart_authentication.correlation,
+        AuditCorrelation::Observed(_)
+    ));
+    assert_ne!(
+        rotation_authentication.correlation,
+        restart_authentication.correlation
+    );
+    for (record, prefix) in authentication_events
+        .iter()
+        .map(|record| (*record, "gateway-authn-"))
+        .chain(std::iter::once((
+            rotation_audit,
+            "gateway-secret-rotation-",
+        )))
+    {
+        let suffix = record.event_id.strip_prefix(prefix).unwrap();
+        assert_eq!(suffix.len(), 32);
+        assert!(u128::from_str_radix(suffix, 16).is_ok());
+        assert!(record.timestamp_ms > 0);
+    }
+    let expected_authentication = |record: &SecurityAuditRecord| SecurityAuditRecord {
+        format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: record.event_id.clone(),
+        timestamp_ms: record.timestamp_ms,
+        actor: AuditIdentity::Verified("scram:alice".to_string()),
+        target: AuditField::Known("principal:1".to_string()),
+        scope: AuditField::NotApplicable,
+        action: SecurityAuditClass::AuthenticationSuccess,
+        outcome: SecurityAuditOutcome::Success,
+        correlation: record.correlation.clone(),
+        operation_id: AuditField::NotApplicable,
+        policy_revision: AuditField::Known(1),
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::NotApplicable,
+    };
     assert_eq!(
-        rotation_audit.format_version,
-        rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION
+        rotation_authentication,
+        &expected_authentication(rotation_authentication)
     );
     assert_eq!(
-        rotation_audit.actor,
-        AuditIdentity::Verified("principal:1".to_string())
+        restart_authentication,
+        &expected_authentication(restart_authentication)
     );
-    assert_eq!(
-        rotation_audit.target,
-        AuditField::Known("secret:public/pg_auth".to_string())
-    );
-    assert_eq!(
-        rotation_audit.scope,
-        AuditField::Known(
+    let expected_rotation = SecurityAuditRecord {
+        format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: rotation_audit.event_id.clone(),
+        timestamp_ms: rotation_audit.timestamp_ms,
+        actor: AuditIdentity::Verified("principal:1".to_string()),
+        target: AuditField::Known("secret:public/pg_auth".to_string()),
+        scope: AuditField::Known(
             serde_json::to_string(&PolicyScope::Secret {
                 namespace: "public".to_string(),
                 name: "pg_auth".to_string(),
                 consumer: None,
             })
-            .unwrap()
-        )
-    );
-    assert_eq!(rotation_audit.outcome, SecurityAuditOutcome::Success);
-    assert!(matches!(
-        &rotation_audit.correlation,
-        AuditCorrelation::Observed(id) if !id.is_empty()
-    ));
-    assert_eq!(rotation_audit.operation_id, AuditField::Unknown);
-    assert_eq!(rotation_audit.policy_revision, AuditField::Known(1));
-    assert_eq!(
-        rotation_audit.before_state,
-        AuditField::Known("version=1".to_string())
-    );
-    assert_eq!(
-        rotation_audit.after_state,
-        AuditField::Known("version=2".to_string())
-    );
+            .unwrap(),
+        ),
+        action: SecurityAuditClass::SecretRotation,
+        outcome: SecurityAuditOutcome::Success,
+        correlation: rotation_correlation,
+        operation_id: AuditField::Unknown,
+        policy_revision: AuditField::Known(1),
+        before_state: AuditField::Known("version=1".to_string()),
+        after_state: AuditField::Known("version=2".to_string()),
+    };
+    assert_eq!(rotation_audit, &expected_rotation);
+    let mut expected_events = vec![
+        (*rotation_authentication).clone(),
+        expected_rotation,
+        (*restart_authentication).clone(),
+    ];
+    expected_events.sort_by_key(|record| (record.timestamp_ms, record.event_id.clone()));
+    assert_eq!(events, expected_events.as_slice());
 }
 
 #[tokio::test]
