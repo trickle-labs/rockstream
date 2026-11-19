@@ -11,7 +11,8 @@ use parking_lot::RwLock;
 use rockstream_control::audit::FileAuditLog;
 use rockstream_control::MANAGEMENT_OPERATION_RECORD_VERSION;
 use rockstream_management_proto::v1::{
-    Operation as ManagementWireOperation, SetSecurityPrincipalGrantsRequest,
+    GetOperationRequest, ListSecurityPrincipalsRequest, Operation as ManagementWireOperation,
+    SetSecurityPrincipalGrantsRequest,
 };
 use rockstream_runtime::exchange::pool::ShuffleClientPool;
 use rockstream_runtime::exchange::proto::ShuffleFrame;
@@ -621,6 +622,13 @@ fn start_delegated_oidc_gateway_process(
     RunningGateway(child)
 }
 
+fn minio_runtime_object_store(port: u16, bucket: &str) -> Arc<dyn object_store::ObjectStore> {
+    Arc::new(object_store::prefix::PrefixStore::new(
+        rockstream_test_support::minio::minio_object_store(port, bucket),
+        "gateway-shard",
+    ))
+}
+
 async fn start_control_process(
     working_dir: &Path,
     storage: &Path,
@@ -628,6 +636,7 @@ async fn start_control_process(
     pki: &rockstream_test_support::pki::TestPki,
     additional_principal: Option<SecurityPrincipal>,
     seed_worker_secret: bool,
+    minio: Option<(u16, &str)>,
 ) -> RunningGateway {
     let certs = rustls_pemfile::certs(&mut BufReader::new(
         std::fs::File::open(&pki.cli_cert_path).unwrap(),
@@ -649,11 +658,15 @@ async fn start_control_process(
         }],
         scoped_grants: vec![],
     };
-    let security_store = rockstream_storage::build_runtime_object_store(
-        &storage.join("gateway-shard"),
-        "gateway-shard",
-    )
-    .unwrap();
+    let security_store = minio
+        .map(|(port, bucket)| minio_runtime_object_store(port, bucket))
+        .unwrap_or_else(|| {
+            rockstream_storage::build_runtime_object_store(
+                &storage.join("gateway-shard"),
+                "gateway-shard",
+            )
+            .unwrap()
+        });
     let catalog = DurableCatalogStore::new(security_store.clone(), "gateway");
     catalog
         .preprovision_first_administrator(principal, 1)
@@ -818,7 +831,15 @@ async fn start_control_process(
         drop(secret_store);
     }
 
-    spawn_control_process(working_dir, storage, address, pki, seed_worker_secret, None)
+    spawn_control_process(
+        working_dir,
+        storage,
+        address,
+        pki,
+        seed_worker_secret,
+        None,
+        minio,
+    )
 }
 
 fn spawn_control_process(
@@ -828,6 +849,7 @@ fn spawn_control_process(
     pki: &rockstream_test_support::pki::TestPki,
     seed_worker_secret: bool,
     management_address: Option<std::net::SocketAddr>,
+    minio: Option<(u16, &str)>,
 ) -> RunningGateway {
     let mut command = Command::new(env!("CARGO_BIN_EXE_rockstream"));
     command
@@ -861,6 +883,23 @@ fn spawn_control_process(
     }
     if seed_worker_secret {
         command.env("RS_SECRET_KEK", "release-test-kek");
+    }
+    if let Some((port, bucket)) = minio {
+        command
+            .env(
+                "ROCKSTREAM_OBJECT_STORE_ENDPOINT",
+                format!("http://127.0.0.1:{port}"),
+            )
+            .env("ROCKSTREAM_OBJECT_STORE_BUCKET", bucket)
+            .env("ROCKSTREAM_OBJECT_STORE_REGION", "us-east-1")
+            .env(
+                "ROCKSTREAM_OBJECT_STORE_ACCESS_KEY",
+                rockstream_test_support::minio::MINIO_USER,
+            )
+            .env(
+                "ROCKSTREAM_OBJECT_STORE_SECRET_KEY",
+                rockstream_test_support::minio::MINIO_PASS,
+            );
     }
     let child = command.spawn().unwrap();
     RunningGateway(child)
@@ -906,6 +945,7 @@ async fn delegated_actor_policy_is_rechecked_by_release_control_process() {
         &pki,
         Some(actor.clone()),
         false,
+        None,
     )
     .await;
     wait_for_gateway(&mut process.0, address).await;
@@ -1105,6 +1145,7 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
         &pki,
         Some(gateway_actor.clone()),
         false,
+        None,
     )
     .await;
     wait_for_gateway(&mut seed_process.0, seed_address).await;
@@ -1131,6 +1172,7 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
         &pki,
         Some(control_actor.clone()),
         false,
+        None,
     )
     .await;
     wait_for_gateway(&mut control_seed_process.0, control_address).await;
@@ -1152,6 +1194,7 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
         &pki,
         false,
         Some(management_address),
+        None,
     );
     wait_for_gateway(&mut control_process.0, control_address).await;
     control_catalog.refresh().await.unwrap();
@@ -1528,6 +1571,7 @@ async fn delegated_worker_secret_uses_durable_store_in_release_control_process()
         &pki,
         Some(actor.clone()),
         true,
+        None,
     )
     .await;
     wait_for_gateway(&mut process.0, address).await;
@@ -2234,6 +2278,268 @@ async fn security_audit_history_uses_release_pgwire_pages_after_denial() {
     assert_eq!(audit_denial.before_state, AuditField::NotApplicable);
     assert_eq!(audit_denial.after_state, AuditField::NotApplicable);
     assert!(!serde_json::to_string(&records).unwrap().contains("pencil"));
+}
+
+#[tokio::test]
+async fn management_storage_outage_rejects_grant_change_across_process_restart() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let bucket = "release-audit-outage";
+    let (mut minio_container, minio_port) = rockstream_test_support::minio::start_minio(bucket)
+        .await
+        .expect("MinIO is required for release-process audit-storage qualification");
+    let minio_config = Some((minio_port, bucket));
+    let temp = tempfile::tempdir().unwrap();
+    let pki = rockstream_test_support::pki::TestPki::generate();
+    let actor = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(2),
+        display_name: "Release audit outage target".to_owned(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::Service {
+            service_id: "release-audit-outage-target".to_owned(),
+        }],
+        preset_grants: vec![ScopedPresetGrant {
+            preset: PermissionPreset::Builder,
+            scope: PolicyScope::Cluster,
+        }],
+        scoped_grants: Vec::new(),
+    };
+    let seed_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let storage = temp.path().join("control-storage");
+    let mut seed_process = start_control_process(
+        temp.path(),
+        &storage,
+        seed_address,
+        &pki,
+        Some(actor),
+        false,
+        minio_config,
+    )
+    .await;
+    wait_for_gateway(&mut seed_process.0, seed_address).await;
+    seed_process.0.kill().unwrap();
+    seed_process.0.wait().unwrap();
+
+    let mut catalog =
+        DurableCatalogStore::recover(minio_runtime_object_store(minio_port, bucket), "gateway")
+            .await
+            .unwrap();
+    let mut principals_before = catalog.list_security_principals().await.unwrap();
+    principals_before.sort_by_key(|principal| principal.id);
+    let audit_before = catalog.list_security_audit_records().await.unwrap();
+    let revision_before = catalog.get_revision().await;
+
+    let address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let management_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut process = spawn_control_process(
+        temp.path(),
+        &storage,
+        address,
+        &pki,
+        false,
+        Some(management_address),
+        minio_config,
+    );
+    wait_for_gateway(&mut process.0, address).await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut management = loop {
+        match try_management_client(management_address, &pki).await {
+            Ok(client) => break client,
+            Err(_) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => panic!("management endpoint did not start: {error}"),
+        }
+    };
+    let listed = management
+        .list_security_principals(ListSecurityPrincipalsRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            page_size: 10,
+            page_token: String::new(),
+        })
+        .await
+        .expect("authenticated management client should list principals")
+        .into_inner();
+    assert_eq!(
+        listed,
+        rockstream_management_proto::v1::ListSecurityPrincipalsResponse {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            principals: [
+                (
+                    1,
+                    "release control test administrator",
+                    "administrator",
+                    PermissionPreset::Administrator,
+                ),
+                (
+                    2,
+                    "Release audit outage target",
+                    "builder",
+                    PermissionPreset::Builder,
+                ),
+            ]
+            .into_iter()
+            .map(|(principal_id, display_name, preset_name, preset)| {
+                let scope_json = "\"cluster\"".to_owned();
+                rockstream_management_proto::v1::SecurityPrincipal {
+                    principal_id,
+                    display_name: display_name.to_owned(),
+                    enabled: true,
+                    revision: 1,
+                    preset_grants: vec![rockstream_management_proto::v1::SecurityPresetGrant {
+                        preset: preset_name.to_owned(),
+                        scope_json: scope_json.clone(),
+                    }],
+                    scoped_grants: Vec::new(),
+                    effective_permissions: preset
+                        .actions()
+                        .iter()
+                        .map(
+                            |action| rockstream_management_proto::v1::SecurityActionGrant {
+                                action: serde_json::to_value(action)
+                                    .unwrap()
+                                    .as_str()
+                                    .unwrap()
+                                    .to_owned(),
+                                scope_json: scope_json.clone(),
+                            },
+                        )
+                        .collect(),
+                }
+            })
+            .collect(),
+            next_page_token: String::new(),
+        }
+    );
+
+    catalog.refresh().await.unwrap();
+    let mut principals_authenticated = catalog.list_security_principals().await.unwrap();
+    principals_authenticated.sort_by_key(|principal| principal.id);
+    let audit_authenticated = catalog.list_security_audit_records().await.unwrap();
+    let revision_authenticated = catalog.get_revision().await;
+    assert_eq!(principals_authenticated, principals_before);
+    assert_eq!(audit_authenticated.len(), audit_before.len() + 1);
+    assert_eq!(
+        &audit_authenticated[..audit_before.len()],
+        audit_before.as_slice()
+    );
+    assert_eq!(revision_authenticated, revision_before + 1);
+
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    minio_container.stop().await.unwrap();
+    let error = management
+        .set_security_principal_grants(SetSecurityPrincipalGrantsRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            principal_id: 2,
+            expected_revision: 1,
+            expected_grantor_revision: 1,
+            idempotency_key: operation_id.clone(),
+            preset_grants: Vec::new(),
+            scoped_grants: Vec::new(),
+        })
+        .await
+        .expect_err("grant mutation must fail while durable policy storage is unavailable");
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    assert_eq!(error.message(), "management security policy is unavailable");
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+
+    minio_container.start().await.unwrap();
+    let minio_port = minio_container.get_host_port_ipv4(9000).await.unwrap();
+    let minio_config = Some((minio_port, bucket));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut recovered = loop {
+        match DurableCatalogStore::recover(
+            minio_runtime_object_store(minio_port, bucket),
+            "gateway",
+        )
+        .await
+        {
+            Ok(catalog) => break catalog,
+            Err(_error) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => panic!("MinIO did not recover its durable catalog: {error}"),
+        }
+    };
+    let mut principals_after = recovered.list_security_principals().await.unwrap();
+    principals_after.sort_by_key(|principal| principal.id);
+    assert_eq!(principals_after, principals_authenticated);
+    assert_eq!(
+        recovered.list_security_audit_records().await.unwrap(),
+        audit_authenticated
+    );
+    assert_eq!(recovered.get_revision().await, revision_authenticated);
+
+    let mut recovered_process = spawn_control_process(
+        temp.path(),
+        &storage,
+        address,
+        &pki,
+        false,
+        Some(management_address),
+        minio_config,
+    );
+    wait_for_gateway(&mut recovered_process.0, address).await;
+    let mut recovered_management = try_management_client(management_address, &pki)
+        .await
+        .expect("management endpoint should recover after MinIO returns");
+    let missing = recovered_management
+        .get_operation(GetOperationRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            operation_id: operation_id.clone(),
+        })
+        .await
+        .expect_err("failed grant mutation must not leave an accepted operation");
+    assert_eq!(missing.code(), tonic::Code::NotFound);
+    assert_eq!(
+        missing.message(),
+        format!("operation {operation_id} not found")
+    );
+    recovered.refresh().await.unwrap();
+    let mut principals_after_restart = recovered.list_security_principals().await.unwrap();
+    principals_after_restart.sort_by_key(|principal| principal.id);
+    assert_eq!(principals_after_restart, principals_authenticated);
+    let audit_after_restart = recovered.list_security_audit_records().await.unwrap();
+    assert_eq!(
+        &audit_after_restart[..audit_authenticated.len()],
+        audit_authenticated.as_slice()
+    );
+    assert_eq!(audit_after_restart.len(), audit_authenticated.len() + 1);
+    let authentication = audit_after_restart.last().unwrap();
+    let authentication_id = authentication
+        .event_id
+        .strip_prefix("management-authn-")
+        .expect("recovered management authentication audit event");
+    assert!(uuid::Uuid::parse_str(authentication_id).is_ok());
+    assert!(authentication.timestamp_ms > 0);
+    assert_eq!(
+        &SecurityAuditRecord {
+            event_id: String::new(),
+            timestamp_ms: 0,
+            ..authentication.clone()
+        },
+        &SecurityAuditRecord {
+            format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: String::new(),
+            timestamp_ms: 0,
+            actor: AuditIdentity::Verified("principal:1".to_owned()),
+            target: AuditField::Known("management-api".to_owned()),
+            scope: AuditField::NotApplicable,
+            action: SecurityAuditClass::AuthenticationSuccess,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::Known(1),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
+    );
+    assert_eq!(recovered.get_revision().await, revision_authenticated + 1);
+    recovered_process.0.kill().unwrap();
+    recovered_process.0.wait().unwrap();
 }
 
 #[tokio::test]
@@ -3379,7 +3685,7 @@ async fn expired_and_wrong_ca_worker_certificates_are_rejected_by_release_contro
     let pki = rockstream_test_support::pki::TestPki::generate();
     let address: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
     let mut process =
-        start_control_process(temp.path(), &storage, address, &pki, None, false).await;
+        start_control_process(temp.path(), &storage, address, &pki, None, false, None).await;
     wait_for_gateway(&mut process.0, address).await;
 
     let audit_path = storage.join("audit.jsonl");
@@ -3522,7 +3828,7 @@ async fn wrong_node_certificate_is_rejected_by_release_control_process() {
     let pki = rockstream_test_support::pki::TestPki::generate();
     let address: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
     let mut process =
-        start_control_process(temp.path(), &storage, address, &pki, None, false).await;
+        start_control_process(temp.path(), &storage, address, &pki, None, false, None).await;
     wait_for_gateway(&mut process.0, address).await;
 
     let security_store = rockstream_storage::build_runtime_object_store(
@@ -3641,7 +3947,7 @@ async fn worker_peer_certificate_rejections_are_audited_by_release_process() {
     let pki = rockstream_test_support::pki::TestPki::generate();
     let control_addr: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
     let mut control =
-        start_control_process(temp.path(), &storage, control_addr, &pki, None, false).await;
+        start_control_process(temp.path(), &storage, control_addr, &pki, None, false, None).await;
     wait_for_gateway(&mut control.0, control_addr).await;
 
     let security_store = rockstream_storage::build_runtime_object_store(
@@ -3884,7 +4190,7 @@ async fn worker_shuffle_mtls_rollover_preserves_release_process_stream() {
     gen2_client_tls.ca_cert_path = Some(gen2_ca_path);
     let control_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
     let mut control =
-        start_control_process(temp.path(), &storage, control_addr, &pki, None, false).await;
+        start_control_process(temp.path(), &storage, control_addr, &pki, None, false, None).await;
     wait_for_gateway(&mut control.0, control_addr).await;
 
     let server_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
@@ -4163,7 +4469,7 @@ async fn in_flight_internal_mtls_rotation_preserves_release_worker_stream() {
     let pki = rockstream_test_support::pki::TestPki::generate();
     let address: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
     let mut process =
-        start_control_process(temp.path(), &storage, address, &pki, None, false).await;
+        start_control_process(temp.path(), &storage, address, &pki, None, false, None).await;
     wait_for_gateway(&mut process.0, address).await;
     let process_id = process.0.id();
 
