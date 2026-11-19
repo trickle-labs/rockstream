@@ -1753,6 +1753,407 @@ fn simple_query_rows(messages: &[tokio_postgres::SimpleQueryMessage]) -> Vec<Vec
 }
 
 #[tokio::test]
+async fn security_audit_history_uses_release_pgwire_pages_after_denial() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("node-storage");
+    let shard_dir = storage.join("gateway-shard");
+    std::fs::create_dir_all(&shard_dir).unwrap();
+
+    let store =
+        rockstream_storage::build_runtime_object_store(&shard_dir, "gateway-shard").unwrap();
+    let catalog = DurableCatalogStore::new(store, "gateway");
+    let mut administrator = scram_principal();
+    administrator.preset_grants.push(ScopedPresetGrant {
+        preset: PermissionPreset::Builder,
+        scope: PolicyScope::Resource {
+            namespace: "public".to_string(),
+            kind: ResourceKind::Table,
+            name: "blocked".to_string(),
+        },
+    });
+    catalog
+        .preprovision_first_administrator(administrator, 1)
+        .await
+        .unwrap();
+
+    let base_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 60_000;
+    let audit_scope = PolicyScope::AuditRange {
+        from_ms: Some(base_ms),
+        to_ms: Some(base_ms),
+    };
+    let mut auditor = scram_principal();
+    auditor.id = PrincipalId(2);
+    auditor.display_name = "Scoped audit reader".to_string();
+    auditor.preset_grants = vec![ScopedPresetGrant {
+        preset: PermissionPreset::Administrator,
+        scope: audit_scope.clone(),
+    }];
+    let LoginMethod::ScramSha256 { username, .. } = &mut auditor.login_methods[0] else {
+        unreachable!("scram_principal creates a SCRAM login")
+    };
+    *username = "auditor".to_string();
+
+    let audit_policy = serde_json::to_string(&(
+        auditor.enabled,
+        &auditor.preset_grants,
+        &auditor.scoped_grants,
+    ))
+    .unwrap();
+    let grant_audit = SecurityAuditRecord {
+        format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: "audit-reader-grant".to_string(),
+        timestamp_ms: base_ms - 60_000,
+        actor: AuditIdentity::Verified("principal:1".to_string()),
+        target: AuditField::Known("principal:2".to_string()),
+        scope: AuditField::Known("cluster".to_string()),
+        action: SecurityAuditClass::GrantChange,
+        outcome: SecurityAuditOutcome::Success,
+        correlation: AuditCorrelation::NotApplicable,
+        operation_id: AuditField::Known("2".to_string()),
+        policy_revision: AuditField::Known(1),
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::Known(format!("revision=1;policy={audit_policy}")),
+    };
+    catalog
+        .commit_txn(
+            CatalogTxn::new(
+                2,
+                2,
+                vec![CatalogMutation::PutSecurityPrincipal {
+                    principal: auditor,
+                    expected_revision: None,
+                    grantor_revision: Some((PrincipalId(1), 1)),
+                    audit: grant_audit,
+                }],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let event_a = SecurityAuditRecord {
+        format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: "a".to_string(),
+        timestamp_ms: base_ms,
+        actor: AuditIdentity::Unverified("presented:alice".to_string()),
+        target: AuditField::Unknown,
+        scope: AuditField::Known("listener".to_string()),
+        action: SecurityAuditClass::AuthenticationFailure,
+        outcome: SecurityAuditOutcome::Failure,
+        correlation: AuditCorrelation::Observed("client:request-a".to_string()),
+        operation_id: AuditField::NotApplicable,
+        policy_revision: AuditField::Unknown,
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::NotApplicable,
+    };
+    let event_z = SecurityAuditRecord {
+        format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: "z".to_string(),
+        timestamp_ms: base_ms,
+        actor: AuditIdentity::Unknown,
+        target: AuditField::NotApplicable,
+        scope: AuditField::Known("node:7".to_string()),
+        action: SecurityAuditClass::NodeIdentityRejection,
+        outcome: SecurityAuditOutcome::Denied,
+        correlation: AuditCorrelation::Unknown,
+        operation_id: AuditField::NotApplicable,
+        policy_revision: AuditField::NotApplicable,
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::NotApplicable,
+    };
+    let excluded_event = SecurityAuditRecord {
+        format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: "outside-range".to_string(),
+        timestamp_ms: base_ms + 1,
+        actor: AuditIdentity::Verified("principal:1".to_string()),
+        target: AuditField::Known("principal:2".to_string()),
+        scope: AuditField::Known("cluster".to_string()),
+        action: SecurityAuditClass::AdminOperationCompletion,
+        outcome: SecurityAuditOutcome::Success,
+        correlation: AuditCorrelation::NotApplicable,
+        operation_id: AuditField::Known("3".to_string()),
+        policy_revision: AuditField::Known(1),
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::NotApplicable,
+    };
+    catalog
+        .commit_txn(
+            CatalogTxn::new(
+                3,
+                3,
+                vec![
+                    CatalogMutation::AppendSecurityAudit(event_z.clone()),
+                    CatalogMutation::AppendSecurityAudit(event_a.clone()),
+                    CatalogMutation::AppendSecurityAudit(excluded_event.clone()),
+                ],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let initial_audit = catalog.list_security_audit_records().await.unwrap();
+
+    let tls_key = rcgen::KeyPair::generate().unwrap();
+    let tls_cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+        .unwrap()
+        .self_signed(&tls_key)
+        .unwrap();
+    let cert_path = temp.path().join("gateway.pem");
+    let key_path = temp.path().join("gateway-key.pem");
+    std::fs::write(&cert_path, tls_cert.pem()).unwrap();
+    std::fs::write(&key_path, tls_key.serialize_pem()).unwrap();
+
+    let address: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut process = start_gateway_process(
+        temp.path(),
+        &storage,
+        address,
+        &cert_path,
+        &key_path,
+        "scram",
+        None,
+        "",
+        "",
+        "",
+    );
+    wait_for_gateway(&mut process.0, address).await;
+
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=auditor password=pencil dbname=test sslmode=disable",
+            address.port()
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("the normal PostgreSQL client should authenticate to the release process");
+    let connection_task = tokio::spawn(connection);
+
+    let denied = client
+        .simple_query("CREATE TABLE blocked (id BIGINT)")
+        .await
+        .unwrap_err();
+    assert_eq!(denied.as_db_error().unwrap().code().code(), "42501");
+    assert_eq!(
+        denied.as_db_error().unwrap().message(),
+        "[RS-2401] auth.permission_denied: principal 'auditor' is not authorized for action 'TableCreate' on public.blocked. next_steps: Request an authorized scoped grant, then retry."
+    );
+    let (admin_client, admin_connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=alice password=pencil dbname=test sslmode=disable",
+            address.port()
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("the preprovisioned administrator should authenticate to the release process");
+    let admin_connection_task = tokio::spawn(admin_connection);
+    let authorized_create = admin_client
+        .simple_query("CREATE TABLE blocked (id BIGINT)")
+        .await
+        .unwrap();
+    assert!(matches!(
+        authorized_create.as_slice(),
+        [tokio_postgres::SimpleQueryMessage::CommandComplete(0)]
+    ));
+    drop(admin_client);
+    admin_connection_task.abort();
+
+    let page_one = simple_query_rows(
+        &client
+            .simple_query(&format!(
+                "SHOW SECURITY AUDIT FROM {base_ms} TO {base_ms} LIMIT 1"
+            ))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        page_one,
+        vec![vec![
+            Some("1".to_string()),
+            Some("a".to_string()),
+            Some(base_ms.to_string()),
+            Some("unverified:presented:alice".to_string()),
+            Some("unknown".to_string()),
+            Some("known:listener".to_string()),
+            Some("authentication_failure".to_string()),
+            Some("failure".to_string()),
+            Some("observed:client:request-a".to_string()),
+            Some("not_applicable".to_string()),
+            Some("unknown".to_string()),
+            Some("not_applicable".to_string()),
+            Some("not_applicable".to_string()),
+            Some(format!("{base_ms}:YQ")),
+        ]]
+    );
+
+    let page_two = simple_query_rows(
+        &client
+            .simple_query(&format!(
+                "SHOW SECURITY AUDIT FROM {base_ms} TO {base_ms} AFTER {base_ms}:YQ LIMIT 1"
+            ))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        page_two,
+        vec![vec![
+            Some("1".to_string()),
+            Some("z".to_string()),
+            Some(base_ms.to_string()),
+            Some("unknown".to_string()),
+            Some("not_applicable".to_string()),
+            Some("known:node:7".to_string()),
+            Some("node_identity_rejection".to_string()),
+            Some("denied".to_string()),
+            Some("unknown".to_string()),
+            Some("not_applicable".to_string()),
+            Some("not_applicable".to_string()),
+            Some("not_applicable".to_string()),
+            Some("not_applicable".to_string()),
+            Some(format!("{base_ms}:eg")),
+        ]]
+    );
+
+    let page_three = simple_query_rows(
+        &client
+            .simple_query(&format!(
+                "SHOW SECURITY AUDIT FROM {base_ms} TO {base_ms} AFTER {base_ms}:eg LIMIT 1"
+            ))
+            .await
+            .unwrap(),
+    );
+    assert!(page_three.is_empty());
+    let out_of_scope = client
+        .simple_query("SHOW SECURITY AUDIT LIMIT 1")
+        .await
+        .unwrap_err();
+    assert_eq!(out_of_scope.as_db_error().unwrap().code().code(), "42501");
+    assert_eq!(
+        out_of_scope.as_db_error().unwrap().message(),
+        "[RS-2401] auth.permission_denied: principal 'auditor' is not authorized for action 'SecurityAuditRead' on the requested security audit range. next_steps: Request an authorized scoped grant, then retry."
+    );
+    assert_eq!(
+        simple_query_rows(
+            &client
+                .simple_query(&format!(
+                    "SHOW SECURITY AUDIT FROM {base_ms} TO {base_ms} LIMIT 1"
+                ))
+                .await
+                .unwrap()
+        ),
+        page_one
+    );
+
+    drop(client);
+    connection_task.abort();
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+
+    let store =
+        rockstream_storage::build_runtime_object_store(&shard_dir, "gateway-shard").unwrap();
+    let recovered = DurableCatalogStore::recover(store, "gateway")
+        .await
+        .unwrap();
+    let records = recovered.list_security_audit_records().await.unwrap();
+    assert_eq!(&records[..initial_audit.len()], initial_audit.as_slice());
+    assert_eq!(records.len(), initial_audit.len() + 4);
+    let login = &records[initial_audit.len()];
+    assert_eq!(login.action, SecurityAuditClass::AuthenticationSuccess);
+    assert_eq!(login.outcome, SecurityAuditOutcome::Success);
+    assert_eq!(
+        login.actor,
+        AuditIdentity::Verified("scram:auditor".to_string())
+    );
+    assert_eq!(login.target, AuditField::Known("principal:2".to_string()));
+    let table_denial = &records[initial_audit.len() + 1];
+    assert!(table_denial.event_id.starts_with("gateway-authz-"));
+    assert!(table_denial.timestamp_ms > 0);
+    assert_eq!(
+        table_denial.actor,
+        AuditIdentity::Verified("scram:auditor".to_string())
+    );
+    assert_eq!(
+        table_denial.target,
+        AuditField::Known("public.blocked".to_string())
+    );
+    assert_eq!(
+        table_denial.scope,
+        AuditField::Known(
+            serde_json::to_string(&PolicyScope::Resource {
+                namespace: "public".to_string(),
+                kind: ResourceKind::Table,
+                name: "blocked".to_string(),
+            })
+            .unwrap()
+        )
+    );
+    assert_eq!(table_denial.action, SecurityAuditClass::AuthorizationDenial);
+    assert_eq!(table_denial.outcome, SecurityAuditOutcome::Denied);
+    assert!(matches!(
+        &table_denial.correlation,
+        AuditCorrelation::Observed(value) if !value.is_empty()
+    ));
+    assert_eq!(table_denial.policy_revision, AuditField::Known(1));
+    assert_eq!(table_denial.before_state, AuditField::NotApplicable);
+    assert_eq!(table_denial.after_state, AuditField::NotApplicable);
+
+    let admin_login = &records[initial_audit.len() + 2];
+    assert_eq!(
+        admin_login.action,
+        SecurityAuditClass::AuthenticationSuccess
+    );
+    assert_eq!(admin_login.outcome, SecurityAuditOutcome::Success);
+    assert_eq!(
+        admin_login.actor,
+        AuditIdentity::Verified("scram:alice".to_string())
+    );
+    assert_eq!(
+        admin_login.target,
+        AuditField::Known("principal:1".to_string())
+    );
+
+    let audit_denial = &records[initial_audit.len() + 3];
+    assert!(audit_denial.event_id.starts_with("gateway-authz-"));
+    assert!(audit_denial.timestamp_ms > 0);
+    assert_eq!(
+        audit_denial.actor,
+        AuditIdentity::Verified("scram:auditor".to_string())
+    );
+    assert_eq!(
+        audit_denial.target,
+        AuditField::Known("security_audit".to_string())
+    );
+    assert_eq!(
+        audit_denial.scope,
+        AuditField::Known(
+            serde_json::to_string(&PolicyScope::AuditRange {
+                from_ms: None,
+                to_ms: None,
+            })
+            .unwrap()
+        )
+    );
+    assert_eq!(audit_denial.action, SecurityAuditClass::AuthorizationDenial);
+    assert_eq!(audit_denial.outcome, SecurityAuditOutcome::Denied);
+    assert!(matches!(
+        &audit_denial.correlation,
+        AuditCorrelation::Observed(value) if !value.is_empty()
+    ));
+    assert_eq!(audit_denial.operation_id, AuditField::NotApplicable);
+    assert_eq!(audit_denial.policy_revision, AuditField::Known(1));
+    assert_eq!(audit_denial.before_state, AuditField::NotApplicable);
+    assert_eq!(audit_denial.after_state, AuditField::NotApplicable);
+    assert!(!serde_json::to_string(&records).unwrap().contains("pencil"));
+}
+
+#[tokio::test]
 async fn oidc_password_auth_runs_in_release_process_and_audits_after_restart() {
     let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
