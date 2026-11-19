@@ -272,6 +272,8 @@ async fn failed_drop_preserves_table_until_durable_deletion() {
     );
     assert_eq!(public_tables(&client).await, vec!["durable_rows"]);
     assert_eq!(table_columns(&client).await, columns);
+    // Recovery may rewrite a legacy log path while inspecting the durable state.
+    store.fail.store(false, Ordering::SeqCst);
     assert_eq!(
         durable_table(object_store.clone()).await,
         Some(original.clone())
@@ -284,7 +286,6 @@ async fn failed_drop_preserves_table_until_durable_deletion() {
     assert_eq!(public_tables(&client).await, vec!["durable_rows"]);
     assert_eq!(table_columns(&client).await, columns);
     assert_eq!(durable_table(object_store.clone()).await, Some(original));
-    store.fail.store(false, Ordering::SeqCst);
     client
         .simple_query("DROP TABLE durable_rows")
         .await
