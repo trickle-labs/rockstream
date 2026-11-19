@@ -2208,6 +2208,80 @@ mod security_audit_budget_tests {
         ));
     }
 
+    #[tokio::test]
+    async fn full_audit_budget_rejects_first_admin_without_catalog_effects() {
+        let object_store = Arc::new(object_store::memory::InMemory::new());
+        let catalog = DurableCatalogStore::new(object_store.clone(), "audit-budget-full");
+        let existing = audit_record("existing", current_time_ms().unwrap());
+        catalog
+            .commit_txn(
+                CatalogTxn::new(
+                    1,
+                    1,
+                    vec![CatalogMutation::AppendSecurityAudit(existing.clone())],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        catalog.state.write().await.security_audit_bytes = MAX_SECURITY_AUDIT_BYTES;
+
+        let administrator = SecurityPrincipal {
+            format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+            id: PrincipalId(77),
+            display_name: "bootstrap-admin".to_string(),
+            enabled: true,
+            revision: 1,
+            login_methods: vec![LoginMethod::Oidc {
+                issuer: "https://issuer.example".to_string(),
+                subject: "bootstrap-admin".to_string(),
+            }],
+            preset_grants: vec![ScopedPresetGrant {
+                preset: PermissionPreset::Administrator,
+                scope: PolicyScope::Cluster,
+            }],
+            scoped_grants: vec![],
+        };
+        let error = catalog
+            .preprovision_first_administrator(administrator.clone(), 2)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CatalogError::Storage(message)
+                if message == "security audit retention budget is full (1 GiB); required security operation was not committed"
+        ));
+        assert_eq!(catalog.get_revision().await, 1);
+        assert_eq!(
+            catalog.list_security_audit_records().await.unwrap(),
+            vec![existing.clone()]
+        );
+        assert_eq!(
+            catalog
+                .get_security_principal(administrator.id)
+                .await
+                .unwrap(),
+            None
+        );
+
+        let recovered = DurableCatalogStore::recover(object_store, "audit-budget-full")
+            .await
+            .unwrap();
+        assert_eq!(recovered.get_revision().await, 1);
+        assert_eq!(
+            recovered.list_security_audit_records().await.unwrap(),
+            vec![existing]
+        );
+        assert_eq!(
+            recovered
+                .get_security_principal(administrator.id)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
     #[test]
     fn audit_retention_excludes_expired_records_but_rejects_expired_new_events() {
         let now_ms = SECURITY_AUDIT_RETENTION_MS + 1_000;
