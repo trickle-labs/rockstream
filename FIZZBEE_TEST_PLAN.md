@@ -893,6 +893,20 @@ fail before another poll. M1–M7 do not model Kafka group assignment or source
 offsets, so this documents the external source boundary without adding an abstract
 invariant (see `docs/testing/worker-source-ack-gap-recovery.md`).
 
+Issue #304 adds Kafka SASL source credential rotation through the release
+runtime. When the runtime observes a newer secret version at the epoch
+boundary, it replaces only the native `StreamConsumer`, clears stale assignment
+state, and resumes from the durable source offset after the replacement
+consumer joins its group; the connector process and committed view checkpoints
+remain in place. The release-process oracle,
+`kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_consumers`,
+exercises two maintained views over three partitions, pending work, and an
+unaffected consumer. It compares each view’s complete results and checkpoints,
+post-restart recovery, and the exact rotation audit record. Kafka authentication,
+group assignment, and broker cursor state remain outside M1–M7; this records
+concrete external-protocol evidence without adding an abstract invariant or
+claiming full qualification of the experimental Kafka sink.
+
 Issue #298 covers the Kafka source poll-error boundary. If `poll_delta` consumes
 records and then fails decoding a record, refreshing assignment, encoding the
 next offset token, or building batches, it seeks assigned partitions back to the
