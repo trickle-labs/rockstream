@@ -860,6 +860,25 @@ the complete operation, audit, and artifact state across crash and restart
 boundaries. M1–M7 do not model this management workflow; these tests are
 implementation evidence, not formal proof.
 
+PR #388 (issue #302) hardens the durable catalog audit-append retry
+boundary against concurrent writers. The secret-store rotation audit writer
+and the gateway authentication and authorization audit writers refresh their
+catalog handle after an optimistic-revision conflict, then construct a new
+transaction at the refreshed revision. The shared
+`SECURITY_AUDIT_APPEND_ATTEMPTS` limit remains eight attempts; exhausted
+retries, refresh failures, and other storage errors fail rather than
+acknowledging an audit append that was not committed. Secret-store failures
+also mark the security-audit storage health metric as degraded. The regression
+`secret_rotation_refreshes_catalog_after_a_concurrent_audit_append` in
+`secrets_management_durability_tests.rs` and
+`gateway_security_audit_writers_refresh_after_catalog_conflicts` in
+`crates/rockstream-gateway/src/server.rs` check that a stale writer
+refreshes after another catalog handle commits, preserves earlier audit
+records, and advances the catalog revision. This is a catalog revision/retry
+boundary outside the M1–M7 worker, lease, frontier, and sink state machines;
+the tests do not establish unbounded contention liveness, crash durability,
+or assembled release-process qualification.
+
 Issue #305 strengthens the file-backed audit append boundary in
 `crates/rockstream-control/src/audit.rs`. `FileAuditLog::append` writes each
 JSONL event and calls `sync_all` on the file before returning success. On Unix,
