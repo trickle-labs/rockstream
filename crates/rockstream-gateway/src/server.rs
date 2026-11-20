@@ -6310,6 +6310,7 @@ impl GatewayHandler {
         let Ok(lease) = runtime.acquire_owner(format!("gateway:{view_name}:live")) else {
             return;
         };
+        let mut needs_pipeline_recovery = false;
         loop {
             let Some(handler) = weak.upgrade() else {
                 break;
@@ -6334,15 +6335,21 @@ impl GatewayHandler {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
+                needs_pipeline_recovery = true;
+            }
+            if needs_pipeline_recovery {
                 // The failed ACK happened after the atomic M3 write. Restore
                 // in-memory pipeline state from that write, not from a replay
                 // of the input, before allowing the next batch to execute.
+                // Retain this obligation across transient recovery failures,
+                // even if no further input ever arrives.
                 let _guard = handler.shard_commit_lock.lock().await;
                 if let Err(error) = handler.recover_pending_views_locked().await {
                     tracing::warn!(view = %view_name, %error, "live source committed view state recovery failed");
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
+                needs_pipeline_recovery = false;
                 handler.refresh_backfill_progress(&view_name).await;
             }
             if let Some(reason) = runtime.blocked_reason() {
