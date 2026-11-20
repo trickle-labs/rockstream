@@ -292,8 +292,9 @@ async fn restore_and_assert(
         })
     );
     let restored_manifest = CheckpointManifestStore::new(target.clone())
-        .load_manifest(checkpoint.checkpoint_id)
-        .await;
+        .load_latest_manifest()
+        .await
+        .unwrap();
     assert_eq!(restored_manifest, Some(checkpoint.clone()));
     let catalog = target
         .get(&Path::from("control/catalog/views"))
@@ -312,7 +313,11 @@ async fn restore_and_assert(
         .unwrap();
     assert_eq!(source_resume.as_ref(), b"offset=42");
     let recovery = RecoveryDriver::new();
-    recovery.load_checkpoint(checkpoint.clone());
+    recovery.load_checkpoint(
+        restored_manifest
+            .clone()
+            .expect("recovery must select checkpoint from restored durable state"),
+    );
     let shard = recovery
         .recover_shard(ShardId(0), "shards/0", target, LeaseToken(1), LeaseToken(1))
         .await
@@ -575,6 +580,68 @@ async fn lfs_export_racing_committed_manifest_fails_closed_and_recovers_newest()
     )
     .await;
 }
+
+#[tokio::test]
+async fn lfs_export_rejects_mutable_catalog_changed_during_inventory() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let export_dir = tempfile::tempdir().unwrap();
+    let source: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(source_dir.path()).unwrap());
+    let export: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(export_dir.path()).unwrap());
+    seed_checkpoint(source.clone(), 40).await;
+    let entered = Arc::new(tokio::sync::Barrier::new(2));
+    let resume = Arc::new(tokio::sync::Barrier::new(2));
+    let gated: Arc<dyn ObjectStore> = Arc::new(FaultInjectingStore::gate_root_list(
+        source.clone(),
+        entered.clone(),
+        resume.clone(),
+    ));
+    let export_for_task = export.clone();
+    let task = tokio::spawn(async move {
+        let manifests = CheckpointManifestStore::new(gated.clone());
+        CheckpointExportService::new()
+            .export_latest_prefix(
+                gated,
+                export_for_task,
+                &manifests,
+                "mutable-catalog-race",
+                &Path::from(""),
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(30), entered.wait())
+        .await
+        .expect("export did not reach root inventory");
+    // The manifest is still A. Even an uncommitted catalog/source mutation
+    // must not be misrepresented as checkpoint A's coherent control state.
+    source
+        .put(
+            &Path::from("control/catalog/views"),
+            bytes::Bytes::from_static(b"view=v committed_epoch=41").into(),
+        )
+        .await
+        .unwrap();
+    resume.wait().await;
+    let error = tokio::time::timeout(std::time::Duration::from_secs(120), task)
+        .await
+        .expect("export hung")
+        .expect("export task panicked")
+        .expect_err("mutable control metadata must invalidate pinned checkpoint A");
+    assert!(
+        error.to_string().contains("metadata"),
+        "unexpected export failure: {error}"
+    );
+    assert!(matches!(
+        export
+            .head(&Path::from(
+                "checkpoint-exports/mutable-catalog-race/commit"
+            ))
+            .await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+}
+
 #[tokio::test]
 async fn lfs_export_under_writes_restores_one_committed_epoch() {
     let source_dir = tempfile::tempdir().unwrap();
@@ -779,9 +846,11 @@ async fn minio_restore_process_fixture() {
         .await
         .unwrap();
     let checkpoint = CheckpointManifestStore::new(target.clone())
-        .load_manifest(CheckpointId(12))
+        .load_latest_manifest()
         .await
-        .unwrap();
+        .unwrap()
+        .expect("fresh-process restore must select its own latest checkpoint");
+    assert_eq!(checkpoint.checkpoint_id, CheckpointId(12));
     let recovery = RecoveryDriver::new();
     recovery.load_checkpoint(checkpoint.clone());
     let shard = recovery
