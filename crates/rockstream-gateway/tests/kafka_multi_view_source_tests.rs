@@ -159,3 +159,187 @@ async fn two_views_with_one_group_each_receive_every_partition() {
     drop(client);
     handle.abort();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn real_broker_ack_outage_after_m3_recovers_with_no_new_input_in_same_process() {
+    use arrow::datatypes::{DataType, Field, Schema};
+    use rockstream_connectors::{
+        KafkaSource, OffsetToken, SourceCheckpoint, SourceCheckpointStore,
+        SourceRuntimeCoordinator,
+    };
+    use rockstream_storage::{
+        keys::{ShardKeyEncoder, ShardPrefix},
+        WriteBatch,
+    };
+    use rockstream_types::ids::ConnectorId;
+    use std::process::Command;
+
+    assert!(
+        rockstream_test_support::docker_available(),
+        "Docker is required for the real broker ACK outage proof",
+    );
+    let broker = apache::Kafka::default().start().await.unwrap();
+    let bootstrap = format!(
+        "127.0.0.1:{}",
+        broker.get_host_port_ipv4(KAFKA_PORT).await.unwrap()
+    );
+    let topic = "gateway-kafka-ack-outage";
+    let admin: AdminClient<_> = ClientConfig::new()
+        .set("bootstrap.servers", &bootstrap)
+        .create()
+        .unwrap();
+    assert_eq!(
+        admin
+            .create_topics(
+                &[NewTopic::new(topic, 1, TopicReplication::Fixed(1))],
+                &AdminOptions::new(),
+            )
+            .await
+            .unwrap(),
+        vec![Ok(topic.to_string())]
+    );
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", &bootstrap)
+        .create()
+        .unwrap();
+    let connector_id = ConnectorId(5132);
+    let shard_db = Arc::new(
+        ShardDb::builder(
+            "gateway-kafka-ack-outage",
+            Arc::new(object_store::memory::InMemory::new()),
+        )
+        .build()
+        .await
+        .unwrap(),
+    );
+    let store = SourceCheckpointStore::new(Arc::clone(&shard_db), 0, connector_id);
+    let source = KafkaSource::connect(
+        connector_id,
+        Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)])),
+        &bootstrap,
+        topic,
+        "gateway-kafka-ack-outage-group",
+    )
+    .unwrap();
+    let mut runtime = SourceRuntimeCoordinator::new(
+        source,
+        connector_id,
+        OffsetToken::new(vec![]),
+        store.clone(),
+    );
+    runtime.recover().await.unwrap();
+    let owner = runtime.acquire_owner("gateway-kafka-live").unwrap();
+    producer
+        .send(
+            FutureRecord::<(), _>::to(topic)
+                .payload(r#"{"timestamp":1,"values":[1],"weight":1}"#),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let token = loop {
+        let delta = runtime.poll_delta(64 * 1024, 16).await.unwrap();
+        if !delta.batches.is_empty() {
+            break delta.new_offset;
+        }
+        assert!(Instant::now() < deadline, "Kafka source never received first input");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    fn m3(epoch: u64) -> WriteBatch {
+        let mut batch = WriteBatch::new();
+        batch.put(&[ShardPrefix::OpState.as_byte(), 1], b"pipeline-state");
+        batch.put(&[ShardPrefix::ViewOutput.as_byte(), 1], b"materialized-once");
+        batch.put(&ShardKeyEncoder::frontier_key(), &epoch.to_be_bytes());
+        batch
+    }
+
+    // Blackhole the *actual* broker before the M3 + ACK boundary. The
+    // checkpoint and view output are persisted locally, but the broker cannot
+    // accept the synchronous offset commit. Unlike a process restart, the
+    // same coordinator must recover and release its pending in-flight slot.
+    let container_id = broker.id().to_string();
+    fn docker_action(action: &str, id: &str) {
+        let status = Command::new("docker").args([action, id]).status().unwrap();
+        assert!(status.success(), "docker {action} {id} failed: {status}");
+    }
+    struct UnpauseOnDrop(String);
+    impl Drop for UnpauseOnDrop {
+        fn drop(&mut self) {
+            let _ = Command::new("docker").args(["unpause", &self.0]).status();
+        }
+    }
+    docker_action("pause", &container_id);
+    let unpause = UnpauseOnDrop(container_id);
+    let failure = runtime
+        .commit_epoch(&owner, 1, token.clone(), m3(1))
+        .await
+        .unwrap_err();
+    assert!(failure.to_string().contains("RS-4016"), "{failure}");
+    assert!(runtime.has_pending_ack());
+    assert_eq!(
+        store.highest_committed().await.unwrap(),
+        Some(SourceCheckpoint::prepared(connector_id, 1, token.clone()).committed()),
+    );
+    assert_eq!(
+        shard_db
+            .get(&[ShardPrefix::ViewOutput.as_byte(), 1])
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(b"materialized-once".as_slice()),
+    );
+    assert!(runtime.poll_delta(1024, 1).await.is_err());
+    docker_action("unpause", &unpause.0);
+    std::mem::forget(unpause); // Already resumed; do not run a second unpause.
+
+    let retry_deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        match runtime.acknowledge_recovered(&owner).await {
+            Ok(()) => break,
+            Err(error) => {
+                assert!(Instant::now() < retry_deadline, "Kafka ACK did not recover: {error}");
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
+    assert_eq!(runtime.blocked_reason(), None);
+    assert!(!runtime.has_pending_ack());
+    assert_eq!(
+        runtime.metrics().await.unwrap().source_runtime_in_flight_epochs,
+        0
+    );
+    assert_eq!(
+        store.highest_committed().await.unwrap(),
+        Some(SourceCheckpoint::prepared(connector_id, 1, token).committed())
+    );
+
+    // Do not restart either the gateway process or the coordinator; verify
+    // subsequent real Kafka input can still commit after the idle recovery.
+    producer
+        .send(
+            FutureRecord::<(), _>::to(topic)
+                .payload(r#"{"timestamp":2,"values":[2],"weight":1}"#),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let next_token = loop {
+        let delta = runtime.poll_delta(64 * 1024, 16).await.unwrap();
+        if !delta.batches.is_empty() {
+            break delta.new_offset;
+        }
+        assert!(Instant::now() < deadline, "Kafka source did not resume after ACK retry");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    runtime
+        .commit_epoch(&owner, 2, next_token.clone(), m3(2))
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime.into_inner().last_committed(),
+        Some((2, next_token)),
+    );
+}
