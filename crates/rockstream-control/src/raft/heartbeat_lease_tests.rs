@@ -323,13 +323,13 @@ async fn heartbeat_replacement_schedule(delay: Delay) {
     let b_proxy_addr = b_proxy.local_addr().unwrap();
     let (b_done_tx, mut b_done_rx) = oneshot::channel();
     let (b_release_tx, b_release_rx) = oneshot::channel();
-    let b_task = tokio::spawn(relay_b(
+    let mut b_task = Some(tokio::spawn(relay_b(
         b_proxy,
         b.addr,
         RpcKind::Heartbeat,
         b_done_tx,
         (delay == Delay::QuorumAck).then_some(b_release_rx),
-    ));
+    )));
     let (c_addr, c_task, mut c_entered, c_release) = if delay == Delay::UnrelatedPeer {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -368,6 +368,11 @@ async fn heartbeat_replacement_schedule(delay: Delay) {
     assert_eq!(Instant::now(), origin);
     assert_eq!(b.inner.read().last_contact, origin);
     assert_eq!(a.inner.read().last_quorum_contact, origin);
+    if delay == Delay::UnrelatedPeer {
+        // Prove B's response was forwarded at time 0; only C holds join_all.
+        completed(b_task.take().unwrap()).await;
+        assert_eq!(Instant::now(), origin);
+    }
     assert!(!heartbeat.is_finished());
 
     // Deliver B's OLD ACK at 74ms, or hold its prompt ACK in join_all
@@ -379,7 +384,9 @@ async fn heartbeat_replacement_schedule(delay: Delay) {
         c_release.unwrap().send(()).unwrap();
     }
     completed(heartbeat).await;
-    completed(b_task).await;
+    if let Some(task) = b_task {
+        completed(task).await;
+    }
     if let Some(task) = c_task {
         completed(task).await;
     }
@@ -514,6 +521,9 @@ async fn election_promotion_uses_request_age_not_join_completion_time() {
     });
     signaled(&mut b_done_rx).await;
     signaled(&mut entered_rx).await;
+    // The majority response is actually delivered before the unrelated C
+    // connection is released, so only join_all can age the observation.
+    completed(relay).await;
     assert_eq!(Instant::now(), origin);
     assert_eq!(b.inner.read().last_contact, origin);
     assert_eq!(a.handle.role(), RaftRole::Candidate);
@@ -521,7 +531,6 @@ async fn election_promotion_uses_request_age_not_join_completion_time() {
     tokio::time::advance(Duration::from_millis(74)).await;
     release_tx.send(()).unwrap();
     completed(election).await;
-    completed(relay).await;
     completed(held).await;
     assert_eq!(a.handle.require_leader(), Ok(1));
     assert_eq!(a.inner.read().last_quorum_contact, origin);
