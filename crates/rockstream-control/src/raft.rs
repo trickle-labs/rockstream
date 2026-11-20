@@ -28,7 +28,11 @@
 
 use std::io;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// Tokio's Instant tracks the same monotonic clock in production, and lets
+// socket-gated regression tests advance Raft time without wall-clock sleeps.
+use tokio::time::Instant;
 
 use futures::future::join_all;
 use object_store::path::Path;
@@ -152,7 +156,8 @@ struct RaftInner {
     role: RaftRole,
     current_leader: Option<RaftNodeId>,
     last_contact: Instant,
-    /// Last majority-backed confirmation of this node's leadership.
+    /// Conservative send/start time of the last majority-backed round, NOT
+    /// the time its responses finished arriving.
     last_quorum_contact: Instant,
     /// Strictly shorter than a follower's earliest election timeout.
     leader_quorum_timeout: Duration,
@@ -367,6 +372,37 @@ impl RaftConfig {
             rpc_timeout: DEFAULT_RPC_TIMEOUT,
         }
     }
+
+    /// Keep every leadership lease strictly inside the earliest follower
+    /// election timeout. Reject settings that defeat the timing margin or
+    /// make healthy quorum rounds impossible within one election window.
+    fn validate(&self) -> io::Result<()> {
+        if self.election_timeout_min.is_zero()
+            || self.election_timeout_min >= self.election_timeout_max
+            || self.heartbeat_interval.is_zero()
+            || self.heartbeat_interval >= self.election_timeout_min
+            || self.rpc_timeout.is_zero()
+            || self.rpc_timeout >= self.election_timeout_min
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "RS-1731: invalid Raft timing: require 0 < heartbeat_interval, rpc_timeout < election_timeout_min < election_timeout_max and heartbeat_interval < election_timeout_min (min={:?}, max={:?}, heartbeat={:?}, rpc={:?})",
+                    self.election_timeout_min,
+                    self.election_timeout_max,
+                    self.heartbeat_interval,
+                    self.rpc_timeout,
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn leader_quorum_timeout(&self) -> Duration {
+        // At least one nanosecond of separation, even for tiny test configs.
+        self.election_timeout_min
+            - (self.heartbeat_interval / 2).max(Duration::from_nanos(1))
+    }
 }
 
 /// Parse a `--peers` CLI argument of the form `"1@host:port,2@host:port"`
@@ -415,6 +451,7 @@ pub async fn spawn_raft_node(
     config: RaftConfig,
     object_store: Arc<dyn ObjectStore>,
 ) -> io::Result<RaftNodeHandleFull> {
+    config.validate()?;
     let store = Arc::new(RaftPersistentStore::new(object_store));
     let initial = store.load().await?;
     let inner = Arc::new(RwLock::new(RaftInner {
@@ -424,12 +461,8 @@ pub async fn spawn_raft_node(
         current_leader: None,
         last_contact: Instant::now(),
         last_quorum_contact: Instant::now(),
-        // Expire stale authority before surviving followers can elect a new
-        // leader. Every majority heartbeat round renews this lease.
-        leader_quorum_timeout: config
-            .election_timeout_min
-            .saturating_sub(config.heartbeat_interval / 2)
-            .max(config.heartbeat_interval),
+        // The lease is strictly shorter than any follower's election floor.
+        leader_quorum_timeout: config.leader_quorum_timeout(),
     }));
 
     let listener = TcpListener::bind(bind_addr).await?;
@@ -680,18 +713,21 @@ async fn start_election(
 ) {
     // Persist the self-vote before sending any RPCs. Never hold this lock
     // across peer network calls, which can themselves lead to transitions.
-    let (term, node_id) = {
+    let (term, node_id, election_started) = {
         let _transition = store.transition_lock.lock().await;
-        let (term, snapshot) = {
+        let (term, snapshot, election_started) = {
             let mut guard = inner.write();
             guard.role = RaftRole::Candidate;
+            guard.current_leader = None;
             guard.persistent.current_term += 1;
             guard.persistent.voted_for = Some(config.node_id);
             guard.last_contact = Instant::now();
-            (guard.persistent.current_term, guard.persistent)
+            (guard.persistent.current_term, guard.persistent, guard.last_contact)
         };
         store.save(&snapshot).await;
-        (term, config.node_id)
+        // Self-vote persistence and delayed vote responses must never age
+        // a quorum acknowledgment into a brand-new leadership lease.
+        (term, config.node_id, election_started)
     };
 
     let mut votes = 1usize; // vote for self
@@ -730,10 +766,12 @@ async fn start_election(
             guard.role = RaftRole::Follower;
             Some(guard.persistent)
         } else {
-            if votes >= majority {
+            if votes >= majority
+                && election_started.elapsed() < guard.leader_quorum_timeout
+            {
                 guard.role = RaftRole::Leader;
                 guard.current_leader = Some(node_id);
-                guard.last_quorum_contact = Instant::now();
+                guard.last_quorum_contact = election_started;
                 // node_role is ephemeral (not persisted) — matches the
                 // FizzBee spec's `@state(ephemeral=["node_role", ...])`
                 // annotation.
@@ -754,9 +792,18 @@ async fn send_heartbeats(
     inner: &Arc<RwLock<RaftInner>>,
     store: &RaftPersistentStore,
 ) {
-    let (term, node_id) = {
-        let guard = inner.read();
-        (guard.persistent.current_term, config.node_id)
+    let (term, node_id, round_started) = {
+        let mut guard = inner.write();
+        if !has_live_leader_quorum(&guard) {
+            // An expired leader must campaign again. It cannot revive a
+            // lapsed lease merely by getting one new round of old-term ACKs.
+            if guard.role == RaftRole::Leader {
+                guard.role = RaftRole::Follower;
+                guard.current_leader = None;
+            }
+            return;
+        }
+        (guard.persistent.current_term, config.node_id, Instant::now())
     };
     let futures = config
         .peers
@@ -795,11 +842,18 @@ async fn send_heartbeats(
     } else {
         let mut guard = inner.write();
         if guard.role == RaftRole::Leader && guard.persistent.current_term == term {
-            if acknowledgements >= majority {
-                guard.last_quorum_contact = Instant::now();
-            } else if !has_live_leader_quorum(&guard) {
-                // Loss of majority is an ephemeral demotion; no durable term
-                // or vote changes. The isolated process cannot grant leases.
+            if acknowledgements >= majority
+                && round_started.elapsed() < guard.leader_quorum_timeout
+            {
+                // A follower's election timer starts when it receives this
+                // request, which cannot precede round_started. Waiting for
+                // a delayed ACK (or an unrelated peer in join_all) must not
+                // make this evidence any newer.
+                guard.last_quorum_contact = guard.last_quorum_contact.max(round_started);
+            }
+            if !has_live_leader_quorum(&guard) {
+                // No usable majority proof remains, even if a stale round
+                // eventually returned a nominal quorum.
                 guard.role = RaftRole::Follower;
                 guard.current_leader = None;
             }
@@ -948,3 +1002,6 @@ mod tests {
 
 #[cfg(test)]
 mod persistence_ordering_tests;
+
+#[cfg(test)]
+mod heartbeat_lease_tests;
