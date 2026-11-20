@@ -766,9 +766,7 @@ async fn start_election(
             guard.role = RaftRole::Follower;
             Some(guard.persistent)
         } else {
-            if votes >= majority
-                && election_started.elapsed() < guard.leader_quorum_timeout
-            {
+            if votes >= majority && election_started.elapsed() < guard.leader_quorum_timeout {
                 guard.role = RaftRole::Leader;
                 guard.current_leader = Some(node_id);
                 guard.last_quorum_contact = election_started;
