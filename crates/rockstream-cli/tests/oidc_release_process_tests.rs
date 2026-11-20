@@ -5621,6 +5621,29 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
         rotation_audit.after_state,
         AuditField::Known("version=2".to_string())
     );
+    let operation = rockstream_control::ManagementOperationStore::new(
+        rockstream_storage::build_runtime_object_store(&shard_dir, "gateway-shard").unwrap(),
+    )
+    .get(rotation_operation_id)
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(operation.operation_id(), rotation_operation_id);
+    assert_eq!(
+        operation.kind(),
+        rockstream_control::OperationKind::SecretRotation
+    );
+    assert_eq!(
+        operation.status(),
+        rockstream_control::OperationStatus::Succeeded
+    );
+    assert_eq!(
+        operation.result(),
+        Some(&serde_json::json!({"command_tag": "ALTER SECRET", "rows": 0}))
+    );
+    assert!(!serde_json::to_string(operation.request().unwrap())
+        .unwrap()
+        .contains("rotated-fixture-value"));
 }
 
 #[tokio::test]

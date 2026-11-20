@@ -372,6 +372,7 @@ async fn leader_crash_composed_with_shard_fence_no_split_brain() {
 // gracefully (rather than failing, and rather than `#[ignore]`, which has
 // no precedent anywhere in this codebase) when Docker is not present.
 mod tc {
+    use super::management_security::preprovision_management_catalog;
     use std::net::SocketAddr;
     use std::path::Path;
     use std::time::{Duration, Instant};
@@ -484,6 +485,26 @@ mod tc {
             ] {
                 std::fs::copy(source, shared_dir.path().join(name))
                     .unwrap_or_else(|error| panic!("copy test TLS file {name}: {error}"));
+            }
+            for i in 0..3 {
+                let node_storage = shared_dir.path().join(format!("node-storage-{i}"));
+                preprovision_management_catalog(&node_storage, &pki).await;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+
+                    let catalog_root = node_storage.join("gateway-shard");
+                    for path in [
+                        node_storage.clone(),
+                        catalog_root.clone(),
+                        catalog_root.join("gateway"),
+                        catalog_root.join("gateway/catalog"),
+                        catalog_root.join("gateway/catalog/log"),
+                    ] {
+                        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777))
+                            .unwrap();
+                    }
+                }
             }
             #[cfg(unix)]
             {
@@ -999,6 +1020,9 @@ mod tc {
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 }
+
+#[path = "common/management_security.rs"]
+mod management_security;
 
 /// **S1 (closing the item deferred from Phase 3a) / S4 precondition** —
 /// `three_node_tc_cluster_boots_and_elects_leader`: a real 3-container
