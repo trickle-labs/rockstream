@@ -624,7 +624,8 @@ impl SourceRuntimeCoordinator<KafkaSource> {
         &self,
         lease: &SourceOwnerLease,
     ) -> Result<(Option<&str>, u64), SourceError> {
-        self.require_active_lease(lease)?;
+        // Rotation remains possible while a failed ACK is blocking ingestion.
+        self.require_owner_lease(lease)?;
         Ok(self.source.secret_binding())
     }
 
@@ -636,7 +637,7 @@ impl SourceRuntimeCoordinator<KafkaSource> {
         username: &str,
         password: &str,
     ) -> Result<bool, SourceError> {
-        self.require_active_lease(lease)?;
+        self.require_owner_lease(lease)?;
         self.source
             .rotate_sasl_plain_credentials(secret_name, version, username, password)
     }
