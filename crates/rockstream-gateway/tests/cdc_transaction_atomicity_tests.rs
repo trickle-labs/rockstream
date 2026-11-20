@@ -203,7 +203,7 @@ impl SharedSlotScenario {
         match self {
             Self::RestartBeforeM3 => "before-m3-write",
             Self::RestartAfterM3 => "after-durable-m3-before-slot-ack",
-            Self::ThreeTableDisconnect => "postgres-backend-terminated",
+            Self::ThreeTableDisconnect => "postgres-backend-terminated-after-buffered-change",
             Self::SchemaChangeBeforeCommit => "upstream-transaction-before-commit",
         }
     }
@@ -791,31 +791,33 @@ async fn run_shared_slot_scenario(scenario: SharedSlotScenario) {
             recovered_handler.abort_source_workers_for_test();
         }
         SharedSlotScenario::ThreeTableDisconnect => {
-            let pid = tokio::time::timeout(Duration::from_secs(20), async {
-                loop {
-                    if let Some(pid) = pgoutput_backend_pid(&upstream).await {
-                        break pid;
-                    }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-            })
-            .await
-            .expect("shared slot never opened a PostgreSQL backend");
-            // Leave a transaction touching all three tables open while the
-            // actual PostgreSQL connection is terminated. It cannot publish
-            // any rows until COMMIT, and the new backend must ingest it once.
-            upstream
-                .batch_execute(
-                    "BEGIN; UPDATE a SET val = 15 WHERE id = 1; INSERT INTO a VALUES (3,30); \
-                     DELETE FROM b WHERE id = 12; INSERT INTO b VALUES (13,130); \
-                     UPDATE c SET val = 215 WHERE id = 21; INSERT INTO c VALUES (23,230);",
-                )
+            // Pause the real production decoder immediately after it buffers
+            // its first changed row in a *committed* cross-table envelope.
+            // Unlike killing an idle connection before upstream COMMIT, this
+            // proves that the partially consumed envelope is discarded and
+            // all three relations are replayed from the logical slot.
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            db.pause_next_pgoutput_change(Arc::clone(&entered), Arc::clone(&release));
+            apply_cross_table_transaction(&upstream, true).await;
+            tokio::time::timeout(Duration::from_secs(40), entered.notified())
                 .await
-                .unwrap();
+                .expect("gateway never buffered the first pgoutput change");
             assert_exact_relations(
                 &client, names, HistoryPhase::Initial, scenario, &revision, &pg_version,
             )
             .await;
+            let partially_decoded = shared_slot_progress(&upstream, &db, connector_id).await;
+            assert_eq!(
+                partially_decoded, before,
+                "partial pgoutput envelope must not advance M3 or the slot"
+            );
+            proof_progress(
+                scenario, &revision, &pg_version, "partial-envelope-before-disconnect", &partially_decoded,
+            );
+            let pid = pgoutput_backend_pid(&upstream)
+                .await
+                .expect("partial pgoutput decode must hold a real PostgreSQL backend");
             let terminated: bool = upstream
                 .query_one("SELECT pg_terminate_backend($1)", &[&pid])
                 .await
@@ -827,7 +829,7 @@ async fn run_shared_slot_scenario(scenario: SharedSlotScenario) {
                 scenario.identity(),
                 scenario.cut(),
             );
-            upstream.batch_execute("COMMIT").await.unwrap();
+            release.notify_one();
             let resumed_pid = tokio::time::timeout(Duration::from_secs(20), async {
                 loop {
                     if let Some(next) = pgoutput_backend_pid(&upstream).await {
