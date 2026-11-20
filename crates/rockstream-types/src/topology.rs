@@ -181,7 +181,7 @@ impl WorkerRegistration {
             capacity_headroom,
             location: WorkerLocation::default(),
             capabilities: WorkerCapabilities::default(),
-            protocol_range: SupportedVersionRange::v3_only(),
+            protocol_range: SupportedVersionRange::v4_only(),
             storage_format_range: SupportedStorageFormatRange::default(),
             registered_at_ms,
         }
@@ -305,6 +305,12 @@ pub enum ControlMessage {
     },
     WorkloadSnapshot {
         snapshot: crate::data_plane::WorkloadSnapshot,
+    },
+    ReadWorkload {
+        version: u32,
+        request_id: String,
+        workload_id: crate::ids::WorkloadId,
+        shard_ids: Vec<ShardId>,
     },
     ReadOperatorStats {
         request_id: String,
@@ -852,7 +858,17 @@ pub enum WorkerMessage {
         output_rows: u64,
     },
     ReadWorkload {
+        #[serde(default)]
+        version: u32,
         workload_id: crate::ids::WorkloadId,
+    },
+    WorkloadReadReport {
+        version: u32,
+        request_id: String,
+        workload_id: crate::ids::WorkloadId,
+        worker_id: WorkerId,
+        available: bool,
+        shards: Vec<crate::data_plane::ShardOutput>,
     },
     ReadOperatorStats {
         request_id: String,
@@ -1040,7 +1056,7 @@ mod tests {
     fn control_message_registered_roundtrip() {
         let msg = ControlMessage::Registered {
             worker_id: WorkerId(3),
-            protocol_version: ProtocolVersion::V3,
+            protocol_version: ProtocolVersion::V4,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let decoded: ControlMessage = serde_json::from_str(&json).unwrap();
@@ -1050,7 +1066,7 @@ mod tests {
                 protocol_version,
             } => {
                 assert_eq!(worker_id, WorkerId(3));
-                assert_eq!(protocol_version, ProtocolVersion::V3);
+                assert_eq!(protocol_version, ProtocolVersion::V4);
             }
             _ => panic!("unexpected message variant"),
         }
