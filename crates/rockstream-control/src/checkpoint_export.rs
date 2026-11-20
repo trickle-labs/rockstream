@@ -81,7 +81,7 @@ struct CommitMarker {
 struct ExportGuard {
     require_latest: bool,
     require_manifest: bool,
-    metadata_baseline: Option<BTreeMap<Path, String>>,
+    metadata_baseline: Option<(Path, BTreeMap<Path, String>)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -291,7 +291,7 @@ impl CheckpointExportService {
             ExportGuard {
                 require_latest: true,
                 require_manifest: true,
-                metadata_baseline: Some(metadata_baseline),
+                metadata_baseline: Some((prefix.clone(), metadata_baseline)),
             },
         )
         .await
@@ -857,7 +857,7 @@ impl CheckpointExportService {
             )?;
             if require_latest && is_unversioned_export_metadata(&source_path) {
                 let source_digest = digest_bytes(&source_bytes);
-                if let Some(baseline) = &metadata_baseline {
+                if let Some((_, baseline)) = &metadata_baseline {
                     if baseline.get(&source_path) != Some(&source_digest) {
                         return Err(CheckpointExportError::Integrity(format!(
                             "unversioned checkpoint metadata {source_path} changed since checkpoint selection"
@@ -929,15 +929,26 @@ impl CheckpointExportService {
             ));
         }
         if require_latest {
-            // Hashes alone only prove copied bytes, not their epoch. Re-read
-            // unversioned control/catalog/source metadata and fence the entire
-            // copy against another committed cluster checkpoint.
-            for (path, expected_digest) in mutable_metadata {
-                let current = self.read_bytes(&source, &path).await?;
-                if digest_bytes(&current) != expected_digest {
-                    return Err(CheckpointExportError::Integrity(format!(
-                        "unversioned checkpoint metadata {path} changed during export"
-                    )));
+            // Re-scan membership *and bytes* of unversioned metadata. Merely
+            // checking the copied paths would miss newly added source/catalog
+            // records after inventory. The durable checkpoint must also still
+            // be the one selected before the scan.
+            if let Some((prefix, baseline)) = &metadata_baseline {
+                let current = self.snapshot_live_metadata(&source, prefix).await?;
+                if &current != baseline {
+                    return Err(CheckpointExportError::Integrity(
+                        "unversioned control/catalog/source metadata changed during export"
+                            .to_string(),
+                    ));
+                }
+            } else {
+                for (path, expected_digest) in mutable_metadata {
+                    let current = self.read_bytes(&source, &path).await?;
+                    if digest_bytes(&current) != expected_digest {
+                        return Err(CheckpointExportError::Integrity(format!(
+                            "unversioned checkpoint metadata {path} changed during export"
+                        )));
+                    }
                 }
             }
             let latest = crate::checkpoint_store::CheckpointManifestStore::new(source.clone())
@@ -1121,13 +1132,31 @@ fn validate_checkpoint_metadata_record(
         }
         return Ok(true);
     }
-    if path.starts_with("control/changelog-checkpoints/")
-        && !is_selected_checkpoint_metadata(&Path::from(path), checkpoint)
-    {
-        return Err(CheckpointExportError::Integrity(format!(
-            "export contains a changelog contribution outside selected checkpoint {}: {path}",
-            checkpoint.checkpoint_id.0
-        )));
+    if let Some(suffix) = path.strip_prefix("control/changelog-checkpoints/") {
+        if !is_selected_checkpoint_metadata(&Path::from(path), checkpoint) {
+            return Err(CheckpointExportError::Integrity(format!(
+                "export contains a changelog contribution outside selected checkpoint {}: {path}",
+                checkpoint.checkpoint_id.0
+            )));
+        }
+        let (epoch, _) = suffix.split_once('-').ok_or_else(|| {
+            CheckpointExportError::Integrity(format!(
+                "invalid checkpoint changelog contribution path: {path}"
+            ))
+        })?;
+        let contribution: crate::checkpoint::ChangelogCheckpointContribution =
+            serde_json::from_slice(bytes).map_err(|error| {
+                CheckpointExportError::Integrity(format!(
+                    "malformed checkpoint changelog contribution {path}: {error}"
+                ))
+            })?;
+        if contribution.checkpoint_id.0.to_string() != epoch
+            || contribution.checkpoint_id != checkpoint.checkpoint_id
+        {
+            return Err(CheckpointExportError::Integrity(format!(
+                "changelog contribution {path} identifies a different checkpoint epoch"
+            )));
+        }
     }
     Ok(false)
 }
