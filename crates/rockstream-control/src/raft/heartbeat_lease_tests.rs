@@ -697,15 +697,27 @@ async fn healthy_quorum_survives_repeated_unrelated_peer_rpc_timeouts() {
     }
     assert_eq!(b.handle.current_leader(), Some(A));
 
-    for _ in 0..21 {
+    for step in 1..=21 {
         tokio::time::advance(Duration::from_millis(20)).await;
         for _ in 0..100 {
             tokio::task::yield_now().await;
         }
+        // A fast majority ACK must refresh the safely anchored lease BEFORE
+        // the slow minority RPC finishes, with no temporary admission gap.
+        assert_eq!(
+            a.handle.require_leader(),
+            Ok(1),
+            "healthy quorum lost write authority at {}ms",
+            step * 20
+        );
+        assert!(
+            a.inner.read().last_quorum_contact.elapsed() < Duration::from_millis(125),
+            "healthy quorum evidence aged out at {}ms",
+            step * 20
+        );
     }
-    // Reaching 420ms with term 1 and a LIVE lease proves that we kept
-    // refreshing B before our original 125ms lease expired. Reverting the
-    // cadence to "RPC wait + heartbeat sleep" would demote A at 125ms.
+    // Reaching 420ms continuously live also confirms the driver starts each
+    // round relative to its previous start, not after an extra 50ms sleep.
     assert_eq!(a.handle.current_term(), 1);
     assert_eq!(a.handle.require_leader(), Ok(1));
     assert!(a.inner.read().last_quorum_contact.elapsed() < Duration::from_millis(125));
