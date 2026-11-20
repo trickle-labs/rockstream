@@ -2175,7 +2175,7 @@ pub struct GatewayHandler {
     /// Bound only by `GatewayServer`; source tasks upgrade it per poll and
     /// exit when the server releases its handler.
     self_ref: Arc<Mutex<Weak<GatewayHandler>>>,
-    source_workers: Arc<DashMap<String, ()>>,
+    source_workers: Arc<DashMap<String, futures::future::AbortHandle>>,
     pgoutput_coordinators:
         Arc<DashMap<ConnectorId, Arc<tokio::sync::Mutex<SharedPgOutputCoordinator>>>>,
     /// ponytail: source creation is rare; replace this global lock with
@@ -5326,6 +5326,28 @@ impl GatewayHandler {
         );
     }
 
+    /// Cancel every live source worker, including one paused inside an M3
+    /// commit. The gateway process can then be retired without allowing an
+    /// old slot owner to race a newly recovered owner.
+    #[doc(hidden)]
+    pub fn abort_source_workers_for_test(&self) -> usize {
+        let handles = self
+            .source_workers
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect::<Vec<_>>();
+        for handle in &handles {
+            handle.abort();
+        }
+        handles.len()
+    }
+
+    /// Observe task cleanup after a simulated owner crash.
+    #[doc(hidden)]
+    pub fn active_source_worker_count_for_test(&self) -> usize {
+        self.source_workers.len()
+    }
+
     fn spawn_kafka_source_worker(
         &self,
         source: CatalogSourceEntry,
@@ -5333,7 +5355,12 @@ impl GatewayHandler {
         shard_db: Arc<rockstream_storage::ShardDb>,
     ) {
         let key = format!("{}:{view_name}", source.name);
-        if self.source_workers.insert(key.clone(), ()).is_some() {
+        let (abort, registration) = futures::future::AbortHandle::new_pair();
+        if let dashmap::mapref::entry::Entry::Vacant(entry) =
+            self.source_workers.entry(key.clone())
+        {
+            entry.insert(abort);
+        } else {
             return;
         }
         let weak = self.self_ref.lock().clone();
@@ -5342,8 +5369,11 @@ impl GatewayHandler {
             return;
         }
         tokio::spawn(async move {
-            GatewayHandler::run_kafka_source_worker(weak.clone(), source, view_name, shard_db)
-                .await;
+            let _ = futures::future::Abortable::new(
+                GatewayHandler::run_kafka_source_worker(weak.clone(), source, view_name, shard_db),
+                registration,
+            )
+            .await;
             if let Some(handler) = weak.upgrade() {
                 handler.source_workers.remove(&key);
             }
@@ -5361,7 +5391,12 @@ impl GatewayHandler {
         };
         let connector_id = identity.connector_id();
         let key = format!("pgoutput:{}", connector_id.0);
-        if self.source_workers.insert(key.clone(), ()).is_some() {
+        let (abort, registration) = futures::future::AbortHandle::new_pair();
+        if let dashmap::mapref::entry::Entry::Vacant(entry) =
+            self.source_workers.entry(key.clone())
+        {
+            entry.insert(abort);
+        } else {
             return;
         }
         let weak = self.self_ref.lock().clone();
@@ -5370,11 +5405,14 @@ impl GatewayHandler {
             return;
         }
         tokio::spawn(async move {
-            GatewayHandler::run_postgres_cdc_source_worker(
-                weak.clone(),
-                source,
-                view_name,
-                shard_db,
+            let _ = futures::future::Abortable::new(
+                GatewayHandler::run_postgres_cdc_source_worker(
+                    weak.clone(),
+                    source,
+                    view_name,
+                    shard_db,
+                ),
+                registration,
             )
             .await;
             if let Some(handler) = weak.upgrade() {
@@ -5609,6 +5647,54 @@ impl GatewayHandler {
                     drop(coordinator);
                     drop(handler);
                     tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                Err(rockstream_connectors::SourceError::Io(reason))
+                    if reason.starts_with("RS-4017: pgoutput connection disconnected:") =>
+                {
+                    // Only transport loss is retryable: the slot still owns the
+                    // unacknowledged transaction. Discard partial relation
+                    // messages and spill, reopen under the same fenced owner,
+                    // and replay from the durable slot/checkpoint.
+                    tracing::warn!(%reason, "pgoutput transport lost; reopening shared slot");
+                    if let Err(error) = coordinator
+                        .discard_interrupted_envelope(&shard_db)
+                        .await
+                    {
+                        handler.block_pgoutput_aliases(
+                            &aliases,
+                            format!("pgoutput disconnect cleanup failed: {error}"),
+                        );
+                        break;
+                    }
+                    if !coordinator.runtime.close_pgoutput(&lease) {
+                        handler.block_pgoutput_aliases(
+                            &aliases,
+                            "RS-4012: pgoutput owner lease was fenced during reconnect".to_string(),
+                        );
+                        break;
+                    }
+                    let mut last_error = None;
+                    for _ in 0..20 {
+                        match coordinator.runtime.open_pgoutput(&lease).await {
+                            Ok(()) => {
+                                last_error = None;
+                                break;
+                            }
+                            Err(error) => {
+                                last_error = Some(error);
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                        }
+                    }
+                    if let Some(error) = last_error {
+                        handler.block_pgoutput_aliases(
+                            &aliases,
+                            format!("pgoutput reconnect failed: {error}"),
+                        );
+                        break;
+                    }
+                    handler.project_pgoutput_status(&coordinator);
                     continue;
                 }
                 Err(error) => {
