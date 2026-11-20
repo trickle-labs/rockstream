@@ -1745,14 +1745,12 @@ impl PostgresCdcSource {
             let row = row.map_err(|error| SourceError::PollDeltaFailed {
                 reason: format!("read bounded pgoutput COPY: {error}"),
             })?;
-            let frame_len: Option<i32> =
-                row.try_get(0).map_err(|error| pgoutput_transport_error(&format!(
-                    "decode COPY frame length: {error}"
-                )))?;
-            let chunk: Vec<u8> =
-                row.try_get(1).map_err(|error| pgoutput_transport_error(&format!(
-                    "decode COPY frame chunk: {error}"
-                )))?;
+            let frame_len: Option<i32> = row
+                .try_get(0)
+                .map_err(|error| pgoutput_transport_error(&format!("decode COPY frame length: {error}")))?;
+            let chunk: Vec<u8> = row
+                .try_get(1)
+                .map_err(|error| pgoutput_transport_error(&format!("decode COPY frame chunk: {error}")))?;
             let Some(payload) = pgoutput.event_frame.push_chunk(
                 frame_len,
                 &chunk,
