@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -123,6 +123,7 @@ impl CheckpointExportService {
             objects,
             false,
             false,
+            None,
         )
         .await
     }
@@ -136,6 +137,7 @@ impl CheckpointExportService {
         objects: I,
         guard_latest: bool,
         requires_checkpoint_manifest: bool,
+        metadata_baseline: Option<BTreeMap<Path, String>>,
     ) -> Result<CheckpointExportOutcome, CheckpointExportError>
     where
         I: IntoIterator<Item = Path>,
@@ -158,6 +160,7 @@ impl CheckpointExportService {
                 objects,
                 guard_latest,
                 requires_checkpoint_manifest,
+                metadata_baseline,
             )
             .await;
         rockstream_types::metrics::set_checkpoint_export_objects_in_flight(0);
@@ -202,6 +205,7 @@ impl CheckpointExportService {
             select_objects(&checkpoint),
             true,
             false,
+            None,
         )
         .await
     }
@@ -260,7 +264,22 @@ impl CheckpointExportService {
         // Pin the actual manifest and shard objects to the selected epoch.
         // Live control manifests (and changelog contributions) of other
         // epochs must never become independently discoverable after restore.
+        // Snapshot unversioned catalog/source metadata *before* the live root
+        // scan. Membership and bytes must remain stable through the export,
+        // otherwise a concurrent writer could smuggle new control state into A.
+        let metadata_baseline = self.snapshot_live_metadata(&source, prefix).await?;
         let objects = Self::list_checkpoint_objects(&source, &checkpoint, prefix).await?;
+        let inventoried_metadata: BTreeSet<&Path> = objects
+            .iter()
+            .filter(|path| is_unversioned_export_metadata(path))
+            .collect();
+        let selected_metadata: BTreeSet<&Path> = metadata_baseline.keys().collect();
+        if inventoried_metadata != selected_metadata {
+            return Err(CheckpointExportError::Integrity(
+                "unversioned control/catalog/source metadata changed between checkpoint selection and inventory"
+                    .to_string(),
+            ));
+        }
         self.export_objects_with_guard(
             source,
             destination,
@@ -269,6 +288,7 @@ impl CheckpointExportService {
             objects,
             true,
             true,
+            Some(metadata_baseline),
         )
         .await
     }
@@ -286,6 +306,58 @@ impl CheckpointExportService {
     ) -> Result<CheckpointExportOutcome, CheckpointExportError> {
         self.export_checkpoint_prefix(source, destination, checkpoint, generation, prefix)
             .await
+    }
+
+
+    /// Capture mutable control/catalog/source names and bytes before the root
+    /// inventory can observe a subsequently committed checkpoint. An immutable
+    /// checkpoint manifest is authoritative, but the remaining legacy control
+    /// paths have no epoch qualifier, so instability must fail closed.
+    async fn snapshot_live_metadata(
+        &self,
+        source: &Arc<dyn ObjectStore>,
+        prefix: &Path,
+    ) -> Result<BTreeMap<Path, String>, CheckpointExportError> {
+        let path = prefix.as_ref();
+        let roots = if path.is_empty() {
+            vec![
+                Path::from("control"),
+                Path::from("topology"),
+                Path::from("catalog"),
+                Path::from("sources"),
+            ]
+        } else if ["control", "topology", "catalog", "sources"]
+            .iter()
+            .any(|root| path == *root || path.starts_with(&format!("{root}/")))
+        {
+            vec![prefix.clone()]
+        } else {
+            Vec::new()
+        };
+        let mut snapshot = BTreeMap::new();
+        let mut scanned = 0_usize;
+        for root in roots {
+            let mut listing = source.list(Some(&root));
+            while let Some(entry) = listing.next().await {
+                let meta = entry
+                    .map_err(|error| CheckpointExportError::ObjectStore(error.to_string()))?;
+                scanned += 1;
+                if scanned > MAX_CHECKPOINT_EXPORT_SCAN_WINDOW {
+                    return Err(CheckpointExportError::Integrity(format!(
+                        "metadata snapshot scan exceeded MAX_CHECKPOINT_EXPORT_SCAN_WINDOW={MAX_CHECKPOINT_EXPORT_SCAN_WINDOW}"
+                    )));
+                }
+                if !is_unversioned_export_metadata(&meta.location)
+                    || is_uncheckpointed_operational_path(&meta.location)
+                    || meta.location.as_ref() == "control/bootstrap/active-generation"
+                {
+                    continue;
+                }
+                let bytes = self.read_bytes(source, &meta.location).await?;
+                snapshot.insert(meta.location, digest_bytes(&bytes));
+            }
+        }
+        Ok(snapshot)
     }
 
     async fn list_checkpoint_objects(
@@ -644,6 +716,7 @@ impl CheckpointExportService {
         objects: I,
         guard_latest: bool,
         requires_checkpoint_manifest: bool,
+        metadata_baseline: Option<BTreeMap<Path, String>>,
     ) -> Result<CheckpointExportOutcome, CheckpointExportError>
     where
         I: IntoIterator<Item = Path>,
@@ -723,7 +796,15 @@ impl CheckpointExportService {
                 &generation_record.checkpoint,
             )?;
             if guard_latest && is_unversioned_export_metadata(&source_path) {
-                mutable_metadata.push((source_path.clone(), digest_bytes(&source_bytes)));
+                let source_digest = digest_bytes(&source_bytes);
+                if let Some(baseline) = &metadata_baseline {
+                    if baseline.get(&source_path) != Some(&source_digest) {
+                        return Err(CheckpointExportError::Integrity(format!(
+                            "unversioned checkpoint metadata {source_path} changed since checkpoint selection"
+                        )));
+                    }
+                }
+                mutable_metadata.push((source_path.clone(), source_digest));
             }
             let source_name = source_path.to_string();
             let destination_name = object_path(&generation, index as u64).to_string();
