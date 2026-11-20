@@ -55,7 +55,7 @@ one shared source checkpoint epoch apiece.
 | --- | --- | --- | --- |
 | `restart-before-m3` | Pause before the actual shared-slot batch's view-output/M3 write; abort owning worker, **without releasing pause** | Barrier entered; source checkpoint and slot LSN exactly unchanged | Close/reopen SlateDB; new gateway/worker replays transaction once, then continues at next commit |
 | `restart-after-m3-before-slot-ack` | Pause after durable M3 flush in `SourceRuntimeCoordinator::commit_replayable_epoch`, before the PostgreSQL slot ACK; abort owning worker, **without releasing pause** | Barrier entered; exactly one durable epoch advanced; slot LSN unchanged | Close/reopen SlateDB; new owner recovers exact same epoch, acknowledges slot, does not reapply rows, and continues |
-| `three-table-disconnect-resume` | Terminate the *actual* named pgoutput PostgreSQL backend by PID while a three-table upstream transaction is open, then commit | `pg_terminate_backend` returns true; distinct new backend PID observed; all three tables in publication | Original gateway reconnects under the fenced owner; exact three-table results and monotone checkpoint/slot after both commits |
+| `three-table-disconnect-resume` | Commit a three-table upstream transaction, pause immediately after the real decoder buffers its first changed row but before M3, then terminate the *actual* named pgoutput backend by PID and release the pause | Cut reached with a partially buffered envelope and unchanged checkpoint/slot; `pg_terminate_backend` returns true; distinct new backend PID observed; all three tables in publication | Original gateway reconnects under the fenced owner; exact three-table results and monotone checkpoint/slot after both commits |
 | `schema-change-before-commit` | Begin upstream transaction that inserts into a, drops b's PK/id, then inserts b's new shape; assert before COMMIT, then COMMIT | Before COMMIT no new imported rows/LSN; after COMMIT source reports exact `BLOCKED` / `RS-1002` | Neither base nor view changes; neither checkpoint nor slot advances. A further valid upstream a-only insert remains blocked until an explicit rebuild/resnapshot |
 
 The schema case's **supported** outcome is fail-closed rejection of the
@@ -63,6 +63,8 @@ whole shared-slot transaction. It must not claim continued ingestion while
 the source remains `BLOCKED`: repair/resnapshot is a separate user action,
 not an automatic retry of an incompatible schema. The other three cases
 prove continued progress with a subsequent valid transaction.
+
+The disconnect case forces replay of a partially decoded (in-memory) transaction rather than relying on a harmless idle disconnect. The first row cut is required; all three tables must appear together only after the transaction is re-decoded and committed.
 
 The restart cases deliberately cancel the **source task**, not merely
 the TCP accept loop. They assert task exit, drop the old gateway and
