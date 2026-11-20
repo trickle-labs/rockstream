@@ -393,6 +393,36 @@ fn assert_progress_advances(previous: &SharedSlotProgress, next: &SharedSlotProg
     );
 }
 
+// Visibility of an M3 view write precedes PostgreSQL slot ACK. Never
+// confuse a readable projection with successful upstream acknowledgement.
+async fn wait_acknowledged_progress(
+    upstream: &Client,
+    db: &Arc<ShardDb>,
+    connector_id: ConnectorId,
+    expected_epoch: u64,
+    previous_slot_lsn: PgLsn,
+) -> SharedSlotProgress {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let current = shared_slot_progress(upstream, db, connector_id).await;
+        if current.checkpoint.source_epoch == expected_epoch
+            && current.slot_lsn > previous_slot_lsn
+        {
+            let durable = PgLsn::from_offset_token(&current.checkpoint.token).unwrap();
+            assert!(
+                current.slot_lsn <= durable,
+                "PostgreSQL ACK surpassed its durable checkpoint: {current:?}"
+            );
+            return current;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected committed epoch {expected_epoch} and slot LSN > {previous_slot_lsn}; last observed: {current:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 fn proof_progress(
     scenario: SharedSlotScenario,
     revision: &str,
@@ -757,7 +787,19 @@ async fn run_shared_slot_scenario(scenario: SharedSlotScenario) {
                 &pg_version,
             )
             .await;
-            let recovered = shared_slot_progress(&upstream, &db, connector_id).await;
+            let expected_recovery_epoch = if matches!(scenario, SharedSlotScenario::RestartBeforeM3) {
+                before.checkpoint.source_epoch + 1
+            } else {
+                at_cut.checkpoint.source_epoch
+            };
+            let recovered = wait_acknowledged_progress(
+                &upstream,
+                &db,
+                connector_id,
+                expected_recovery_epoch,
+                before.slot_lsn,
+            )
+            .await;
             proof_progress(scenario, &revision, &pg_version, "recovered", &recovered);
             if matches!(scenario, SharedSlotScenario::RestartBeforeM3) {
                 assert_progress_advances(&before, &recovered);
@@ -784,7 +826,14 @@ async fn run_shared_slot_scenario(scenario: SharedSlotScenario) {
                 &pg_version,
             )
             .await;
-            let after_followup = shared_slot_progress(&upstream, &db, connector_id).await;
+            let after_followup = wait_acknowledged_progress(
+                &upstream,
+                &db,
+                connector_id,
+                recovered.checkpoint.source_epoch + 1,
+                recovered.slot_lsn,
+            )
+            .await;
             assert_progress_advances(&recovered, &after_followup);
             proof_progress(scenario, &revision, &pg_version, "continued", &after_followup);
             recovered_task.abort();
@@ -852,7 +901,14 @@ async fn run_shared_slot_scenario(scenario: SharedSlotScenario) {
                 &client, names, HistoryPhase::Committed, scenario, &revision, &pg_version,
             )
             .await;
-            let recovered = shared_slot_progress(&upstream, &db, connector_id).await;
+            let recovered = wait_acknowledged_progress(
+                &upstream,
+                &db,
+                connector_id,
+                before.checkpoint.source_epoch + 1,
+                before.slot_lsn,
+            )
+            .await;
             assert_progress_advances(&before, &recovered);
             proof_progress(scenario, &revision, &pg_version, "resumed", &recovered);
             for name in names {
@@ -866,7 +922,14 @@ async fn run_shared_slot_scenario(scenario: SharedSlotScenario) {
                 &client, names, HistoryPhase::Continued, scenario, &revision, &pg_version,
             )
             .await;
-            let after_followup = shared_slot_progress(&upstream, &db, connector_id).await;
+            let after_followup = wait_acknowledged_progress(
+                &upstream,
+                &db,
+                connector_id,
+                recovered.checkpoint.source_epoch + 1,
+                recovered.slot_lsn,
+            )
+            .await;
             assert_progress_advances(&recovered, &after_followup);
             proof_progress(scenario, &revision, &pg_version, "continued", &after_followup);
             task.abort();
