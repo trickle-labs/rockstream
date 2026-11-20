@@ -5704,6 +5704,12 @@ impl GatewayHandler {
                 }
             };
             let is_commit = matches!(&event, PgOutputEvent::Commit { .. });
+            let is_change = matches!(
+                &event,
+                PgOutputEvent::Insert { .. }
+                    | PgOutputEvent::Update { .. }
+                    | PgOutputEvent::Delete { .. }
+            );
             let mut result = match event {
                 PgOutputEvent::Begin { xid } if coordinator.active_envelope.is_none() => {
                     match handler
@@ -5792,6 +5798,12 @@ impl GatewayHandler {
                 {
                     result = Err(error);
                 }
+            }
+            if is_change && result.is_ok() {
+                // The test barrier ensures a real partial envelope has been
+                // buffered before the PostgreSQL backend is disconnected.
+                // This is otherwise a no-op, including in production builds.
+                shard_db.await_pgoutput_change_cut_for_test().await;
             }
             if let Err(error) = result {
                 let reason = match &error {
