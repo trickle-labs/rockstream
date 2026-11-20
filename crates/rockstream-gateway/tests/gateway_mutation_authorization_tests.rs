@@ -11,7 +11,7 @@ use rockstream_control::SecretStore;
 use rockstream_gateway::auth::Principal;
 use rockstream_gateway::catalog_stubs::{CatalogColumn, CatalogStubs, CatalogTable, CatalogView};
 use rockstream_gateway::role_catalog::{gen_scram_verifiers, RoleEntry};
-use rockstream_gateway::server::GatewayHandler;
+use rockstream_gateway::server::{CancelToken, GatewayHandler, CANCEL_TOKEN};
 use rockstream_gateway::view_reader::{ViewReadStrategy, ViewReader};
 use rockstream_gateway::GatewayError;
 use rockstream_storage::catalog::{
@@ -1515,6 +1515,32 @@ async fn show_security_audit_returns_stable_pages_and_denies_operator_only_acces
         denied_event.correlation,
         AuditCorrelation::Observed("audit-operator".to_string())
     );
+
+    let cancel_token = CancelToken::new();
+    cancel_token.cancel();
+    let cancelled = CANCEL_TOKEN
+        .scope(
+            cancel_token,
+            handler.dispatch_async_with_conn(
+                &format!(
+                    "SHOW SECURITY AUDIT FROM {base_ms} TO {} LIMIT 1",
+                    base_ms + 2
+                ),
+                Some("audit-admin"),
+            ),
+        )
+        .await
+        .unwrap();
+    let [pgwire::api::results::Response::Error(error)] = cancelled.as_slice() else {
+        panic!("a cancelled audit page must return one error response");
+    };
+    assert_eq!(error.severity, "ERROR");
+    assert_eq!(error.code, "57014");
+    assert_eq!(
+        error.message,
+        "[RS-2050] query.cancelled: query was cancelled by a client CancelRequest. next_steps: Retry the query or await client timeout settings."
+    );
+    assert_eq!(durable.list_security_audit_records().await.unwrap(), audit);
 }
 
 #[cfg(feature = "testcontainers")]
