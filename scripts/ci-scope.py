@@ -20,7 +20,7 @@ PROSE_DIRS = (
 HEAVY_JOBS = (
     "check-tests", "gateway", "postgres-differential",
     "control-plane-ha", "formal-verify", "docker-build",
-    "verus-consumer", "current-stable-compile",
+    "verus-consumer", "current-stable-compile", "security-release-process",
 )
 
 
