@@ -357,6 +357,48 @@ jobs:
       - name: Build ordinary Cargo consumer
         run: cargo build --locked --release -p rockstream-cli
 
+  security-release-process:
+    needs: ci-policy
+    if: needs.ci-policy.outputs.scope == 'full'
+    name: Security release-process (release CLI)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: security-release-process
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: Require Docker
+        run: docker info
+      - name: Record release test metadata
+        run: |
+          mkdir -p target/security-release-evidence
+          printf 'revision: %s\n' "$GITHUB_SHA" > target/security-release-evidence/manifest.txt
+          printf '%s\n' 'cargo test --locked --release -p rockstream-cli --test oidc_release_process_tests -- --test-threads=1' >> target/security-release-evidence/manifest.txt
+      - name: Run security release-process tests against the release CLI
+        run: |
+          set -o pipefail
+          cargo test --locked --release -p rockstream-cli --test oidc_release_process_tests -- --test-threads=1 2>&1 | tee target/security-release-evidence/test.log
+      - name: Record release CLI digest
+        if: always()
+        run: sha256sum target/release/rockstream > target/security-release-evidence/rockstream.sha256
+      - name: Upload release-process evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-release-process-evidence
+          path: target/security-release-evidence/
+          if-no-files-found: error
+          retention-days: 90
+
   check-tests:
     needs: ci-policy
     if: needs.ci-policy.outputs.scope == 'full'
@@ -538,6 +580,7 @@ jobs:
       - nexmark-regression-gate
       - benchmark
       - docker-build
+      - security-release-process
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
