@@ -137,24 +137,28 @@ impl ObjectStore for FaultInjectingStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-        let listing = self.inner.list(prefix);
         if prefix.is_some_and(|path| path.as_ref().is_empty())
             && !self.root_list_gated.swap(true, Ordering::SeqCst)
         {
             if let Some((entered, resume)) = &self.root_list_gate {
                 let entered = entered.clone();
                 let resume = resume.clone();
+                let source = self.inner.clone();
+                let prefix = prefix.cloned();
+                // Construct the real listing only *after* B has committed:
+                // some ObjectStore implementations snapshot on list(), not
+                // when the returned stream is first polled.
                 return Box::pin(
                     futures::stream::once(async move {
                         entered.wait().await;
                         resume.wait().await;
-                        listing
+                        source.list(prefix.as_ref())
                     })
                     .flatten(),
                 );
             }
         }
-        listing
+        self.inner.list(prefix)
     }
 
     fn list_with_offset(
