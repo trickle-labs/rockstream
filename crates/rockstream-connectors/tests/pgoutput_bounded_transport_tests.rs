@@ -40,18 +40,19 @@ fn config(fixture: &ConnectorFixture, slot: &str, table: &str) -> PgOutputConfig
 }
 
 /// Expected values are computed by PostgreSQL separately from the source's
-/// decoder. These aggregate SQL queries return only a count/byte total and
-/// the eight-byte COMMIT end LSN, not the multi-thousand-frame transcript.
-async fn pg_transcript_sizes(client: &Client, slot: &str) -> (u64, u64, PgLsn) {
+/// decoder. These aggregate SQL queries return only counts, total bytes,
+/// maximum frame length and the COMMIT end LSN, not the whole transcript.
+async fn pg_transcript_sizes(client: &Client, slot: &str) -> (u64, u64, usize, PgLsn) {
     let row = client
         .query_one(
-            "SELECT count(*), coalesce(sum(octet_length(data)), 0)::bigint FROM pg_logical_slot_peek_binary_changes($1, NULL, 1, 'proto_version', '1', 'publication_names', 'orders_pub')",
+            "SELECT count(*), coalesce(sum(octet_length(data)), 0)::bigint, coalesce(max(octet_length(data)), 0)::integer FROM pg_logical_slot_peek_binary_changes($1, NULL, 1, 'proto_version', '1', 'publication_names', 'orders_pub')",
             &[&slot],
         )
         .await
         .unwrap();
     let count: i64 = row.get(0);
     let bytes: i64 = row.get(1);
+    let max_frame: i32 = row.get(2);
     let row = client
         .query_one(
             "SELECT substring(data FROM 11 FOR 8) FROM pg_logical_slot_peek_binary_changes($1, NULL, 1, 'proto_version', '1', 'publication_names', 'orders_pub') WHERE get_byte(data, 0) = 67",
@@ -60,7 +61,12 @@ async fn pg_transcript_sizes(client: &Client, slot: &str) -> (u64, u64, PgLsn) {
         .await
         .unwrap();
     let end_lsn: Vec<u8> = row.get(0);
-    (count as u64, bytes as u64, PgLsn(u64::from_be_bytes(end_lsn.try_into().unwrap())))
+    (
+        count as u64,
+        bytes as u64,
+        max_frame as usize,
+        PgLsn(u64::from_be_bytes(end_lsn.try_into().unwrap())),
+    )
 }
 
 async fn first_transaction(source: &mut PostgresCdcSource) -> Vec<PgOutputEvent> {
@@ -108,7 +114,7 @@ async fn pgoutput_bounded_copy_preserves_complete_ordered_thousand_row_transcrip
         .batch_execute("INSERT INTO orders SELECT generate_series(1, 2500); COMMIT")
         .await
         .unwrap();
-    let (frame_count, byte_count, end_lsn) =
+    let (frame_count, byte_count, max_frame, end_lsn) =
         pg_transcript_sizes(&fixture.postgres, "slot_bounded_copy_order").await;
     let relation_id = fixture
         .postgres
@@ -153,6 +159,11 @@ async fn pgoutput_bounded_copy_preserves_complete_ordered_thousand_row_transcrip
     assert_eq!(transport.payload_bytes_received, byte_count);
     assert_eq!(frame_count, expected.len() as u64);
     assert!(transport.peak_chunk_bytes <= 8 * 1024);
+    assert_eq!(
+        transport.peak_frame_buffered_bytes,
+        max_frame,
+        "peak buffered payload must match PostgreSQL's measured largest frame"
+    );
     assert!(transport.peak_frame_buffered_bytes <= POSTGRES_CDC_MAX_TRANSACTION_BYTES);
     assert!(transport.peak_transaction_payload_bytes <= POSTGRES_CDC_MAX_TRANSACTION_BYTES);
 
@@ -209,9 +220,10 @@ async fn pgoutput_copy_rejects_oversized_frame_before_buffer_or_checkpoint_advan
         )
         .await
         .unwrap();
-    let (full_frames, full_bytes, end_lsn) =
+    let (full_frames, full_bytes, max_frame, end_lsn) =
         pg_transcript_sizes(&fixture.postgres, "slot_bounded_copy_overflow").await;
     assert!(full_bytes > POSTGRES_CDC_MAX_TRANSACTION_BYTES as u64);
+    assert!(max_frame > POSTGRES_CDC_MAX_TRANSACTION_BYTES);
 
     let (received, error) = tokio::time::timeout(Duration::from_secs(45), async {
         let mut received = Vec::new();
@@ -240,7 +252,10 @@ async fn pgoutput_copy_rejects_oversized_frame_before_buffer_or_checkpoint_advan
     assert!(transport.payload_bytes_received < full_bytes);
     assert!(transport.peak_chunk_bytes <= 8 * 1024);
     assert!(transport.peak_frame_buffered_bytes <= POSTGRES_CDC_MAX_TRANSACTION_BYTES);
-    assert!(transport.peak_frame_buffered_bytes < 1024, "oversized frame was rejected from its header");
+    assert!(
+        transport.peak_frame_buffered_bytes < 1024,
+        "oversized frame was rejected from its header"
+    );
     assert_eq!(source.last_committed_lsn(), None);
     assert_eq!(source.quad_lsn_progress().durable_lsn, PgLsn::ZERO);
     assert_eq!(source.confirmed_flush_lsn().await.unwrap(), before_ack);
