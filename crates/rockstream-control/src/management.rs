@@ -3677,6 +3677,7 @@ mod tests {
             unix_ms: now_ms + ARTIFACT_TTL.as_millis() as u64,
         };
         let replacement: Arc<[u8]> = Arc::from(b"replacement".to_vec());
+        service.support_artifacts.artifact_put_gate = None;
         service
             .support_artifacts
             .insert(
