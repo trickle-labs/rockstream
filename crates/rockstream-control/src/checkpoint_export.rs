@@ -77,6 +77,13 @@ struct CommitMarker {
     outcome: CheckpointExportOutcome,
 }
 
+#[derive(Default)]
+struct ExportGuard {
+    require_latest: bool,
+    require_manifest: bool,
+    metadata_baseline: Option<BTreeMap<Path, String>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct BootstrapPointer {
     checkpoint_id: CheckpointId,
@@ -121,9 +128,7 @@ impl CheckpointExportService {
             checkpoint,
             generation,
             objects,
-            false,
-            false,
-            None,
+            ExportGuard::default(),
         )
         .await
     }
@@ -135,9 +140,7 @@ impl CheckpointExportService {
         checkpoint: ClusterCheckpoint,
         generation: impl Into<String>,
         objects: I,
-        guard_latest: bool,
-        requires_checkpoint_manifest: bool,
-        metadata_baseline: Option<BTreeMap<Path, String>>,
+        guard: ExportGuard,
     ) -> Result<CheckpointExportOutcome, CheckpointExportError>
     where
         I: IntoIterator<Item = Path>,
@@ -158,9 +161,7 @@ impl CheckpointExportService {
                 checkpoint,
                 generation,
                 objects,
-                guard_latest,
-                requires_checkpoint_manifest,
-                metadata_baseline,
+                guard,
             )
             .await;
         rockstream_types::metrics::set_checkpoint_export_objects_in_flight(0);
@@ -203,9 +204,10 @@ impl CheckpointExportService {
             checkpoint.clone(),
             generation,
             select_objects(&checkpoint),
-            true,
-            false,
-            None,
+            ExportGuard {
+                require_latest: true,
+                ..Default::default()
+            },
         )
         .await
     }
@@ -286,9 +288,11 @@ impl CheckpointExportService {
             checkpoint,
             generation,
             objects,
-            true,
-            true,
-            Some(metadata_baseline),
+            ExportGuard {
+                require_latest: true,
+                require_manifest: true,
+                metadata_baseline: Some(metadata_baseline),
+            },
         )
         .await
     }
@@ -716,7 +720,6 @@ impl CheckpointExportService {
         })
     }
 
-
     async fn reject_other_target_manifests(
         &self,
         target: &Arc<dyn ObjectStore>,
@@ -768,14 +771,17 @@ impl CheckpointExportService {
         checkpoint: ClusterCheckpoint,
         generation: String,
         objects: I,
-        guard_latest: bool,
-        requires_checkpoint_manifest: bool,
-        metadata_baseline: Option<BTreeMap<Path, String>>,
+        guard: ExportGuard,
     ) -> Result<CheckpointExportOutcome, CheckpointExportError>
     where
         I: IntoIterator<Item = Path>,
         I::IntoIter: ExactSizeIterator,
     {
+        let ExportGuard {
+            require_latest,
+            require_manifest,
+            metadata_baseline,
+        } = guard;
         match destination.head(&commit_path(&generation)).await {
             Ok(_) => {
                 let outcome = self
@@ -805,7 +811,7 @@ impl CheckpointExportService {
             generation: generation.clone(),
             checkpoint,
             object_count: total,
-            requires_checkpoint_manifest,
+            requires_checkpoint_manifest: require_manifest,
         };
         let generation_location = generation_path(&generation);
         match self
@@ -849,7 +855,7 @@ impl CheckpointExportService {
                 &source_bytes,
                 &generation_record.checkpoint,
             )?;
-            if guard_latest && is_unversioned_export_metadata(&source_path) {
+            if require_latest && is_unversioned_export_metadata(&source_path) {
                 let source_digest = digest_bytes(&source_bytes);
                 if let Some(baseline) = &metadata_baseline {
                     if baseline.get(&source_path) != Some(&source_digest) {
@@ -917,12 +923,12 @@ impl CheckpointExportService {
             rockstream_types::metrics::set_checkpoint_export_copy_progress(copied, total);
         }
 
-        if requires_checkpoint_manifest && !selected_manifest_present {
+        if require_manifest && !selected_manifest_present {
             return Err(CheckpointExportError::Integrity(
                 "selected control checkpoint manifest is missing from export inventory".to_string(),
             ));
         }
-        if guard_latest {
+        if require_latest {
             // Hashes alone only prove copied bytes, not their epoch. Re-read
             // unversioned control/catalog/source metadata and fence the entire
             // copy against another committed cluster checkpoint.
