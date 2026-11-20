@@ -518,7 +518,8 @@ impl PostgresCdcSource {
             .host(&config.host)
             .port(config.port)
             .dbname(&config.database)
-            .user(&config.user);
+            .user(&config.user)
+            .application_name(&format!("rockstream-pgoutput-{}", config.slot));
         if let Some(password) = &config.password {
             connection_config.password(password);
         }
@@ -1544,8 +1545,20 @@ impl PostgresCdcSource {
                 &[&pgoutput.slot, &limit, &pgoutput.publication],
             )
             .await
-            .map_err(|error| SourceError::PollDeltaFailed {
-                reason: format!("peek pgoutput event: {error}"),
+            .map_err(|error| {
+                // Network disconnects are retryable at the durable slot LSN.
+                // Protocol, schema and decoding failures must still block.
+                if error.is_closed()
+                    || error
+                        .as_db_error()
+                        .is_some_and(|db| db.code().code() == "57P01")
+                {
+                    SourceError::Io(format!("RS-4017: pgoutput connection disconnected: {error}"))
+                } else {
+                    SourceError::PollDeltaFailed {
+                        reason: format!("peek pgoutput event: {error}"),
+                    }
+                }
             })?;
         let Some(message) = messages.into_iter().nth(self.native_seen_messages) else {
             return Ok(None);
