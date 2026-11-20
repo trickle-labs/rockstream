@@ -385,7 +385,6 @@ async fn lfs_export_restore_fresh_cluster_is_bit_identical() {
     .await;
 }
 
-
 async fn assert_export_racing_new_manifest_fails_closed(
     source: Arc<dyn ObjectStore>,
     export: Arc<dyn ObjectStore>,
@@ -634,9 +633,7 @@ async fn lfs_export_rejects_mutable_catalog_changed_during_inventory() {
     );
     assert!(matches!(
         export
-            .head(&Path::from(
-                "checkpoint-exports/mutable-catalog-race/commit"
-            ))
+            .head(&Path::from("checkpoint-exports/mutable-catalog-race/commit"))
             .await,
         Err(object_store::Error::NotFound { .. })
     ));
