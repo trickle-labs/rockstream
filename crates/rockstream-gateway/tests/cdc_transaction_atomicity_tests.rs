@@ -2,22 +2,21 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use object_store::local::LocalFileSystem;
+use rockstream_connectors::{PgLsn, SourceCheckpoint, SourceCheckpointStore};
 use rockstream_gateway::{
     catalog_stubs::CatalogStubs,
+    pgoutput_coordinator::SourceIdentityV1,
+    server::GatewayHandler,
     view_reader::{ViewReadStrategy, ViewReader},
     GatewayError, GatewayServer,
 };
 use rockstream_storage::ShardDb;
-use rockstream_connectors::{PgLsn, SourceCheckpoint, SourceCheckpointStore};
-use rockstream_gateway::pgoutput_coordinator::SourceIdentityV1;
-use rockstream_gateway::server::GatewayHandler;
 use rockstream_types::ids::ConnectorId;
-use tokio_postgres::{Client, SimpleQueryMessage};
 use tempfile::TempDir;
 use testcontainers::core::WaitFor;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
-use tokio_postgres::NoTls;
+use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 
 struct NoopViewReader;
 
@@ -376,9 +375,10 @@ async fn shared_slot_progress(
 }
 
 fn assert_progress_advances(previous: &SharedSlotProgress, next: &SharedSlotProgress) {
-    assert!(
-        next.checkpoint.source_epoch > previous.checkpoint.source_epoch,
-        "source checkpoint epoch did not advance: {previous:?} -> {next:?}"
+    assert_eq!(
+        next.checkpoint.source_epoch,
+        previous.checkpoint.source_epoch + 1,
+        "one upstream COMMIT must advance the source checkpoint by exactly one epoch: {previous:?} -> {next:?}"
     );
     let old = PgLsn::from_offset_token(&previous.checkpoint.token).unwrap();
     let new = PgLsn::from_offset_token(&next.checkpoint.token).unwrap();
@@ -768,7 +768,10 @@ async fn run_shared_slot_scenario(scenario: SharedSlotScenario) {
                     "after-M3 restart must recover the same durable epoch, not reapply"
                 );
                 assert!(recovered.slot_lsn > before.slot_lsn);
-                assert!(recovered.slot_lsn <= PgLsn::from_offset_token(&recovered.checkpoint.token).unwrap());
+                assert!(
+                    recovered.slot_lsn
+                        <= PgLsn::from_offset_token(&recovered.checkpoint.token).unwrap()
+                );
             }
             assert_eq!(recovered_handler.active_source_worker_count_for_test(), 1);
             apply_followup(&upstream, false).await;
