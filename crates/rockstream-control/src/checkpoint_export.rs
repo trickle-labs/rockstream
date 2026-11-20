@@ -308,7 +308,6 @@ impl CheckpointExportService {
             .await
     }
 
-
     /// Capture mutable control/catalog/source names and bytes before the root
     /// inventory can observe a subsequently committed checkpoint. An immutable
     /// checkpoint manifest is authoritative, but the remaining legacy control
@@ -616,6 +615,10 @@ impl CheckpointExportService {
             .ok_or_else(|| {
                 CheckpointExportError::Integrity("generation record is missing".to_string())
             })?;
+        // A target may be partially populated even without an active pointer.
+        // Publishing A over a pre-existing B would make recovery select B.
+        self.reject_other_target_manifests(&target, &generation_record.checkpoint)
+            .await?;
         let pointer_path = Path::from("control/bootstrap/active-generation");
         if let Some(existing) = self
             .read_json::<BootstrapPointer>(&target, &pointer_path)
@@ -628,6 +631,8 @@ impl CheckpointExportService {
                     "target already has a different active generation".to_string(),
                 ));
             }
+            self.assert_restored_checkpoint(&target, &generation_record.checkpoint)
+                .await?;
             return Ok(CheckpointRestoreOutcome {
                 checkpoint_id: outcome.checkpoint_id,
                 generation: generation.to_string(),
@@ -688,6 +693,10 @@ impl CheckpointExportService {
             }
         }
 
+        // Check the exact durable discovery path a fresh recovery will use
+        // before publishing the bootstrap pointer and SUCCESS.
+        self.assert_restored_checkpoint(&target, &generation_record.checkpoint)
+            .await?;
         self.put_json(
             &target,
             &pointer_path,
@@ -705,6 +714,51 @@ impl CheckpointExportService {
             restored_shards: generation_record.checkpoint.shards.len(),
             status: "SUCCESS".to_string(),
         })
+    }
+
+
+    async fn reject_other_target_manifests(
+        &self,
+        target: &Arc<dyn ObjectStore>,
+        checkpoint: &ClusterCheckpoint,
+    ) -> Result<(), CheckpointExportError> {
+        let expected_path = format!("control/checkpoints/{}", checkpoint.checkpoint_id.0);
+        let mut listing = target.list(Some(&Path::from("control/checkpoints")));
+        let mut scanned = 0_usize;
+        while let Some(entry) = listing.next().await {
+            let meta =
+                entry.map_err(|error| CheckpointExportError::ObjectStore(error.to_string()))?;
+            scanned += 1;
+            if scanned > MAX_CHECKPOINT_EXPORT_SCAN_WINDOW {
+                return Err(CheckpointExportError::Integrity(format!(
+                    "restore target manifest scan exceeded MAX_CHECKPOINT_EXPORT_SCAN_WINDOW={MAX_CHECKPOINT_EXPORT_SCAN_WINDOW}"
+                )));
+            }
+            if meta.location.as_ref() != expected_path {
+                return Err(CheckpointExportError::Integrity(format!(
+                    "restore target contains another discoverable checkpoint manifest: {}",
+                    meta.location
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    async fn assert_restored_checkpoint(
+        &self,
+        target: &Arc<dyn ObjectStore>,
+        checkpoint: &ClusterCheckpoint,
+    ) -> Result<(), CheckpointExportError> {
+        let discovered = crate::checkpoint_store::CheckpointManifestStore::new(target.clone())
+            .load_latest_manifest()
+            .await
+            .map_err(CheckpointExportError::Integrity)?;
+        if discovered.as_ref() != Some(checkpoint) {
+            return Err(CheckpointExportError::Integrity(
+                "restored latest control checkpoint does not match export generation".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     async fn export_objects_inner<I>(
@@ -1419,7 +1473,6 @@ mod tests {
         }
     }
 
-
     #[tokio::test]
     async fn checkpoint_inventory_pins_only_selected_control_manifest() {
         let source: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -1508,6 +1561,42 @@ mod tests {
             .restore_generation(export, target.clone(), generation)
             .await
             .is_err());
+        assert!(matches!(
+            target.head(&Path::from("control/bootstrap/active-generation")).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_preexisting_newer_checkpoint_without_success_pointer() {
+        let source: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let export: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let target: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let selected = ClusterCheckpoint::new(CheckpointId(7));
+        crate::checkpoint_store::CheckpointManifestStore::new(source.clone())
+            .save_manifest(&selected, false, None)
+            .await
+            .unwrap();
+        let service = CheckpointExportService::new();
+        service
+            .export_latest_prefix(
+                source.clone(),
+                export.clone(),
+                &crate::checkpoint_store::CheckpointManifestStore::new(source),
+                "target-has-newer",
+                &Path::from(""),
+            )
+            .await
+            .unwrap();
+        crate::checkpoint_store::CheckpointManifestStore::new(target.clone())
+            .save_manifest(&ClusterCheckpoint::new(CheckpointId(8)), false, None)
+            .await
+            .unwrap();
+        let error = service
+            .restore_generation(export, target.clone(), "target-has-newer")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("another discoverable checkpoint"));
         assert!(matches!(
             target.head(&Path::from("control/bootstrap/active-generation")).await,
             Err(object_store::Error::NotFound { .. })
