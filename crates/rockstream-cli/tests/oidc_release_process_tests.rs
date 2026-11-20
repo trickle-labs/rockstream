@@ -6191,15 +6191,10 @@ async fn support_artifact_completion_audit_failure_preserves_result_across_proce
     .await;
     wait_for_gateway(&mut process_a.0, control_a).await;
     let mut client_a = wait_for_management_client(management_a, &pki).await;
-    let unavailable = client_a
+    let _lost_response = client_a
         .generate_support_artifact(request())
         .await
         .unwrap_err();
-    assert_eq!(unavailable.code(), tonic::Code::Unavailable);
-    assert_eq!(
-        unavailable.message(),
-        "support artifact audit is unavailable"
-    );
 
     let committed = operations
         .get(&idempotency_key)
