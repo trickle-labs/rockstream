@@ -4217,6 +4217,55 @@ async fn mtls_certificate_rejections_run_in_release_process_and_audit_after_rest
         .unwrap();
 
     let address: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mismatched_key_path = temp.path().join("gateway-mismatched-key.pem");
+    let mismatched_key_pem = rcgen::KeyPair::generate().unwrap().serialize_pem();
+    std::fs::write(&mismatched_key_path, &mismatched_key_pem).unwrap();
+    let mut mismatched_process = start_gateway_process(
+        temp.path(),
+        &storage,
+        address,
+        &cert_path,
+        &mismatched_key_path,
+        "mtls",
+        Some(&ca_path),
+        "",
+        "",
+        "",
+    );
+    let status = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(status) = mismatched_process.0.try_wait().unwrap() {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("release gateway did not reject the mismatched TLS key");
+    assert_eq!(status.code(), Some(1));
+    let mut stderr = String::new();
+    mismatched_process
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(
+        stderr.contains("[RS-0002]")
+            && stderr.contains("gateway mTLS configuration is invalid")
+            && stderr.contains("Check the gateway certificate, key, and client CA files."),
+        "unexpected startup error: {stderr}"
+    );
+    assert!(
+        !stderr.contains(&mismatched_key_pem),
+        "startup error exposed key material"
+    );
+    let listener = tokio::net::TcpListener::bind(address)
+        .await
+        .expect("invalid TLS configuration left the gateway listener bound");
+    drop(listener);
+
     let mut process = start_gateway_process(
         temp.path(),
         &storage,
