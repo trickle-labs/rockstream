@@ -5667,16 +5667,13 @@ impl GatewayHandler {
                         );
                         break;
                     }
-                    if !coordinator.runtime.close_pgoutput(&lease) {
-                        handler.block_pgoutput_aliases(
-                            &aliases,
-                            "RS-4012: pgoutput owner lease was fenced during reconnect".to_string(),
-                        );
-                        break;
-                    }
                     let mut last_error = None;
                     for _ in 0..20 {
-                        match coordinator.runtime.open_pgoutput(&lease).await {
+                        match coordinator
+                            .runtime
+                            .reopen_pgoutput_after_disconnect(&lease)
+                            .await
+                        {
                             Ok(()) => {
                                 last_error = None;
                                 break;
