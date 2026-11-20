@@ -503,6 +503,38 @@ async fn assert_export_racing_new_manifest_fails_closed(
         .await
         .unwrap();
     assert_eq!(outcome_b.checkpoint_id, 36);
+    assert_eq!(outcome_b.status, "SUCCESS");
+    let inventory = export_inventory_records(&export, &generation_b).await;
+    assert_eq!(inventory.len() as u64, outcome_b.object_count);
+    let inventory_sources = inventory
+        .iter()
+        .map(|entry| entry["record"]["source"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        inventory_sources
+            .iter()
+            .filter(|path| path.starts_with("control/checkpoints/"))
+            .copied()
+            .collect::<Vec<_>>(),
+        vec!["control/checkpoints/36"]
+    );
+    let record = export
+        .get(&Path::from(format!(
+            "checkpoint-exports/{generation_b}/generation"
+        )))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let record: serde_json::Value = serde_json::from_slice(&record).unwrap();
+    assert_eq!(record["checkpoint_id"], serde_json::json!(36));
+    assert_eq!(
+        record["checkpoint"],
+        serde_json::to_value(&checkpoint_b).unwrap()
+    );
+    assert_eq!(record["object_count"], serde_json::json!(outcome_b.object_count));
+    assert_eq!(record["requires_checkpoint_manifest"], serde_json::json!(true));
     service
         .validate_generation(export.clone(), &generation_b)
         .await
@@ -512,6 +544,21 @@ async fn assert_export_racing_new_manifest_fails_closed(
         .await
         .unwrap();
     assert_eq!(restored.checkpoint_id, 36);
+    assert_eq!(restored.object_count, outcome_b.object_count);
+    assert_eq!(restored.byte_count, outcome_b.byte_count);
+    assert_eq!(restored.restored_shards, 1);
+    assert_eq!(restored.status, "SUCCESS");
+    let pointer = target
+        .get(&Path::from("control/bootstrap/active-generation"))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&pointer).unwrap(),
+        serde_json::json!({"checkpoint_id": 36, "generation": generation_b})
+    );
     let selected = CheckpointManifestStore::new(target.clone())
         .load_latest_manifest()
         .await
@@ -534,6 +581,11 @@ async fn assert_export_racing_new_manifest_fails_closed(
         shard.reader.get(b"view/rows").await.unwrap().unwrap().as_ref(),
         b"committed-newer"
     );
+    assert_eq!(
+        shard.reader.get(b"view/rows/1").await.unwrap().unwrap().as_ref(),
+        b"committed"
+    );
+    assert_eq!(shard.reader.get(b"view/rows/2").await.unwrap(), None);
     assert_eq!(
         shard.reader.get(b"view/rows/3").await.unwrap().unwrap().as_ref(),
         b"newer-second-row"
