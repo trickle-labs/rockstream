@@ -27,7 +27,7 @@ else
 fi
 
 # Benchmark baselines record measurements, not protocol changes.
-changed_files=$(git diff --name-only "$RANGE" 2>/dev/null \
+changed_files=$(git diff --ignore-all-space --ignore-blank-lines --name-only "$RANGE" 2>/dev/null \
     | grep -v '^formal/verus/' \
     | grep -v '/benches/baseline/' || true)
 
