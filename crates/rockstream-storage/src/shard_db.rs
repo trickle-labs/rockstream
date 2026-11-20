@@ -175,6 +175,8 @@ pub struct ShardDb {
     #[cfg(feature = "test-utils")]
     pause_after_view_write_once: TestPause,
     #[cfg(feature = "test-utils")]
+    pause_source_ack_once: TestPause,
+    #[cfg(feature = "test-utils")]
     pause_flush_once: TestPause,
     #[cfg(feature = "test-utils")]
     pause_scan_page_once: TestPause,
@@ -525,6 +527,8 @@ impl ShardDbBuilder {
             pause_view_output_once: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(feature = "test-utils")]
             pause_after_view_write_once: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(feature = "test-utils")]
+            pause_source_ack_once: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(feature = "test-utils")]
             pause_flush_once: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(feature = "test-utils")]
@@ -1328,6 +1332,31 @@ impl ShardDb {
         release: Arc<tokio::sync::Notify>,
     ) {
         *self.pause_view_output_once.lock().unwrap() = Some((entered, release));
+    }
+
+    /// Arm a one-shot cut after the replayable PostgreSQL source M3 write
+    /// has been flushed but before the source acknowledgement. The caller
+    /// must abort the owning task to model a crash; simply releasing the
+    /// barrier is not a recovery test.
+    #[cfg(feature = "test-utils")]
+    pub fn pause_next_source_ack(
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self.pause_source_ack_once.lock().unwrap() = Some((entered, release));
+    }
+
+    /// Real-source M3/ACK cut. A no-op without the storage test-utils feature.
+    pub async fn await_source_ack_cut_for_test(&self) {
+        #[cfg(feature = "test-utils")]
+        {
+            let pause = self.pause_source_ack_once.lock().unwrap().take();
+            if let Some((entered, release)) = pause {
+                entered.notify_one();
+                release.notified().await;
+            }
+        }
     }
 
     /// Pause the next flush for cancellation tests.
