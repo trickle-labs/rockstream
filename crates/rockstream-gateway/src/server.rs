@@ -4457,6 +4457,15 @@ impl GatewayHandler {
             .backfill_lifecycle(view_name)
             .await
             .map_err(source_backfill_error)?;
+        // The recovered M3 checkpoint may have committed immediately before
+        // an ACK failure. Reconcile the broker first, even for a completed
+        // backfill; never replay a durable input batch during recovery.
+        if runtime.has_pending_ack() {
+            runtime
+                .acknowledge_recovered(&lease)
+                .await
+                .map_err(source_backfill_error)?;
+        }
         if recovered
             .as_ref()
             .is_some_and(|lifecycle| lifecycle.phase == BackfillPhase::Running)
@@ -6306,6 +6315,38 @@ impl GatewayHandler {
                 break;
             };
             if handler.catalog.get_source(&source.name).is_none() {
+                break;
+            }
+            // No new records are needed to make progress on a failed ACK.
+            // This branch runs *before* polling, including on a fresh worker
+            // that restored an M3 checkpoint from a previous process.
+            if runtime.has_pending_ack() {
+                if let Err(error) = handler
+                    .refresh_kafka_secret_at_epoch(&mut runtime, &lease, &source)
+                    .await
+                {
+                    tracing::warn!(view = %view_name, %error, "Kafka source credential refresh before ACK retry failed");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                if let Err(error) = runtime.acknowledge_recovered(&lease).await {
+                    tracing::warn!(view = %view_name, %error, "live source durable checkpoint ACK retry failed");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                // The failed ACK happened after the atomic M3 write. Restore
+                // in-memory pipeline state from that write, not from a replay
+                // of the input, before allowing the next batch to execute.
+                let _guard = handler.shard_commit_lock.lock().await;
+                if let Err(error) = handler.recover_pending_views_locked().await {
+                    tracing::warn!(view = %view_name, %error, "live source committed view state recovery failed");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                handler.refresh_backfill_progress(&view_name).await;
+            }
+            if let Some(reason) = runtime.blocked_reason() {
+                tracing::error!(view = %view_name, %reason, "live source remains blocked without a retryable ACK");
                 break;
             }
             drop(handler);
