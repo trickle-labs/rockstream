@@ -4456,7 +4456,7 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
     rotation_admin_task.await.unwrap();
     let old_credential_error = match tokio_postgres::connect(
         &format!(
-            "host={postgres_host} port={postgres_port} user=postgres password=rotation-fixture-value dbname=postgres"
+            "host=127.0.0.1 port={postgres_port} user=postgres password=rotation-fixture-value dbname=postgres"
         ),
         tokio_postgres::NoTls,
     )
@@ -4465,12 +4465,12 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
         Err(error) => error,
         Ok(_) => panic!("PostgreSQL accepted the old credential after rotation"),
     };
+    let old_credential_db_error = old_credential_error.as_db_error().unwrap_or_else(|| {
+        panic!("old credential failed outside PostgreSQL: {old_credential_error:?}")
+    });
+    assert_eq!(old_credential_db_error.code().code(), "28P01");
     assert_eq!(
-        old_credential_error.as_db_error().unwrap().code().code(),
-        "28P01"
-    );
-    assert_eq!(
-        old_credential_error.as_db_error().unwrap().message(),
+        old_credential_db_error.message(),
         "password authentication failed for user \"postgres\""
     );
     let rotation_id = "d931137e-9e28-4a29-96f2-0cb10e5acb21";
