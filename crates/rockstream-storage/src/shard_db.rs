@@ -177,6 +177,8 @@ pub struct ShardDb {
     #[cfg(feature = "test-utils")]
     pause_source_ack_once: TestPause,
     #[cfg(feature = "test-utils")]
+    pause_pgoutput_change_once: TestPause,
+    #[cfg(feature = "test-utils")]
     pause_flush_once: TestPause,
     #[cfg(feature = "test-utils")]
     pause_scan_page_once: TestPause,
@@ -529,6 +531,8 @@ impl ShardDbBuilder {
             pause_after_view_write_once: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(feature = "test-utils")]
             pause_source_ack_once: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(feature = "test-utils")]
+            pause_pgoutput_change_once: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(feature = "test-utils")]
             pause_flush_once: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(feature = "test-utils")]
@@ -1352,6 +1356,29 @@ impl ShardDb {
         #[cfg(feature = "test-utils")]
         {
             let pause = self.pause_source_ack_once.lock().unwrap().take();
+            if let Some((entered, release)) = pause {
+                entered.notify_one();
+                release.notified().await;
+            }
+        }
+    }
+
+    /// Stop one real pgoutput stream immediately after buffering its first
+    /// row change, before reading the next message and before M3. A test
+    /// may terminate the PostgreSQL backend while this barrier is held.
+    #[cfg(feature = "test-utils")]
+    pub fn pause_next_pgoutput_change(
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self.pause_pgoutput_change_once.lock().unwrap() = Some((entered, release));
+    }
+
+    pub async fn await_pgoutput_change_cut_for_test(&self) {
+        #[cfg(feature = "test-utils")]
+        {
+            let pause = self.pause_pgoutput_change_once.lock().unwrap().take();
             if let Some((entered, release)) = pause {
                 entered.notify_one();
                 release.notified().await;
