@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use object_store::local::LocalFileSystem;
+use rockstream_connectors::POSTGRES_CDC_MAX_TRANSACTION_BYTES;
 use rockstream_gateway::{
     catalog_stubs::CatalogStubs,
     view_reader::{ViewReadStrategy, ViewReader},
@@ -94,7 +95,8 @@ async fn run_gateway_proof() {
     });
     upstream
         .batch_execute(
-            "CREATE TABLE orders (id BIGINT PRIMARY KEY); ALTER TABLE orders REPLICA IDENTITY FULL; \
+            "CREATE TABLE orders (id BIGINT PRIMARY KEY, payload TEXT NOT NULL); \
+             ALTER TABLE orders REPLICA IDENTITY FULL; \
              CREATE PUBLICATION orders_pub FOR TABLE orders",
         )
         .await
@@ -127,7 +129,7 @@ async fn run_gateway_proof() {
         let _ = connection.await;
     });
     for sql in [
-        "CREATE TABLE orders (id BIGINT)",
+        "CREATE TABLE orders (id BIGINT, payload TEXT)",
         &format!(
             "CREATE SOURCE orders TYPE postgres_cdc (credential_ref='none://trusted', host='{host}', port='{port}', database='postgres', user='postgres', publication='orders_pub', slot='bounded_gateway_slot', table='orders') FORMAT pgoutput"
         ),
@@ -154,7 +156,7 @@ async fn run_gateway_proof() {
     assert_eq!(view_ids(&gateway).await, Vec::<i64>::new());
 
     upstream
-        .batch_execute("BEGIN; INSERT INTO orders SELECT generate_series(1, 2500)")
+        .batch_execute("BEGIN; INSERT INTO orders SELECT generate_series(1, 2500), 'small'")
         .await
         .unwrap();
     assert_eq!(
@@ -193,5 +195,47 @@ async fn run_gateway_proof() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert_eq!(view_ids(&gateway).await, expected, "no duplicate publication after ACK");
+
+    // A frame larger than the 8 MiB source transport bound must block the
+    // source before the router can see a partial row or advance its checkpoint.
+    let committed_slot_lsn = slot_lsn(&upstream).await;
+    upstream
+        .execute(
+            "INSERT INTO orders VALUES (3000, repeat('x', $1))",
+            &[&((POSTGRES_CDC_MAX_TRANSACTION_BYTES + 1024) as i32)],
+        )
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let blocked_reason = loop {
+        let status = gateway
+            .query("SHOW SOURCE STATUS FOR orders", &[])
+            .await
+            .unwrap();
+        let state: Option<String> = status[0].get(3);
+        if state.as_deref() == Some("BLOCKED") {
+            break status[0].get::<_, Option<String>>(9);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "oversized pgoutput frame did not block the gateway source"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let blocked_reason = blocked_reason.unwrap_or_default();
+    assert!(
+        blocked_reason.contains("RS-4014") || blocked_reason.contains("pgoutput"),
+        "unexpected transport rejection reason: {blocked_reason}"
+    );
+    assert_eq!(
+        view_ids(&gateway).await,
+        expected,
+        "oversized transaction must never partially publish to M3"
+    );
+    assert_eq!(
+        slot_lsn(&upstream).await,
+        committed_slot_lsn,
+        "oversized transaction must not advance the PostgreSQL slot"
+    );
     server_task.abort();
 }
