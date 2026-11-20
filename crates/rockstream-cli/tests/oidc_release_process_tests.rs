@@ -9175,6 +9175,21 @@ async fn support_artifact_download_limit_holds_under_release_process_pressure() 
         .await
         .unwrap();
 
+    let second_control_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let second_management_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut second_process = start_control_process(
+        temp.path(),
+        &temp.path().join("control-two"),
+        second_control_address,
+        second_management_address,
+        &pki,
+        Some((minio_port, bucket)),
+        true,
+    )
+    .await;
+    wait_for_gateway(&mut second_process.0, second_control_address).await;
+    let mut second_client = wait_for_management_client(second_management_address, &pki).await;
+
     let security_store: Arc<dyn ObjectStore> = Arc::new(object_store::prefix::PrefixStore::new(
         rockstream_test_support::minio::minio_object_store(minio_port, bucket),
         "gateway-shard",
@@ -9225,7 +9240,7 @@ async fn support_artifact_download_limit_holds_under_release_process_pressure() 
     catalog.refresh().await.unwrap();
     let audit_before = catalog.list_security_audit_records().await.unwrap();
 
-    let mut streams = Vec::new();
+    let mut first_streams = Vec::new();
     for _ in 0..8 {
         let stream = client
             .download_support_artifact(DownloadSupportArtifactRequest {
@@ -9233,12 +9248,25 @@ async fn support_artifact_download_limit_holds_under_release_process_pressure() 
                 opaque_id: artifact_id.clone(),
             })
             .await
-            .expect("the first eight concurrent release downloads should be admitted")
+            .expect("the first process should admit its first eight concurrent downloads")
             .into_inner();
-        streams.push(stream);
+        first_streams.push(stream);
     }
 
-    let rejected = match client
+    let mut second_streams = Vec::new();
+    for _ in 0..8 {
+        let stream = second_client
+            .download_support_artifact(DownloadSupportArtifactRequest {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                opaque_id: artifact_id.clone(),
+            })
+            .await
+            .expect("the second process should admit its first eight concurrent downloads")
+            .into_inner();
+        second_streams.push(stream);
+    }
+
+    let first_rejected = match client
         .download_support_artifact(DownloadSupportArtifactRequest {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
             opaque_id: artifact_id.clone(),
@@ -9248,16 +9276,38 @@ async fn support_artifact_download_limit_holds_under_release_process_pressure() 
         Ok(_) => panic!("the ninth concurrent release download was admitted"),
         Err(error) => error,
     };
-    assert_eq!(rejected.code(), tonic::Code::ResourceExhausted);
+    assert_eq!(first_rejected.code(), tonic::Code::ResourceExhausted);
     assert_eq!(
-        rejected.message(),
+        first_rejected.message(),
         "support artifact download limit reached"
     );
 
-    let full_stream = streams.pop().expect("one admitted stream remains open");
-    drop(streams);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let recovered_stream = loop {
+    let second_rejected = match second_client
+        .download_support_artifact(DownloadSupportArtifactRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            opaque_id: artifact_id.clone(),
+        })
+        .await
+    {
+        Ok(_) => panic!("the ninth concurrent release download was admitted"),
+        Err(error) => error,
+    };
+    assert_eq!(second_rejected.code(), tonic::Code::ResourceExhausted);
+    assert_eq!(
+        second_rejected.message(),
+        "support artifact download limit reached"
+    );
+
+    let first_full_stream = first_streams
+        .pop()
+        .expect("one admitted stream remains open");
+    let second_full_stream = second_streams
+        .pop()
+        .expect("one admitted stream remains open");
+    drop(first_streams);
+    drop(second_streams);
+    let first_deadline = Instant::now() + Duration::from_secs(5);
+    let first_recovered_stream = loop {
         match client
             .download_support_artifact(DownloadSupportArtifactRequest {
                 protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
@@ -9267,31 +9317,73 @@ async fn support_artifact_download_limit_holds_under_release_process_pressure() 
         {
             Ok(response) => break response.into_inner(),
             Err(error)
-                if error.code() == tonic::Code::ResourceExhausted && Instant::now() < deadline =>
+                if error.code() == tonic::Code::ResourceExhausted
+                    && Instant::now() < first_deadline =>
             {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            Err(error) => panic!("download capacity did not recover after stream close: {error}"),
+            Err(error) => panic!(
+                "first-process download capacity did not recover after stream close: {error}"
+            ),
         }
     };
-    drop(recovered_stream);
-    let (full_bytes, full_expiry) = tokio::time::timeout(
-        Duration::from_secs(120),
-        read_support_artifact_stream(full_stream, Vec::new()),
-    )
-    .await
-    .expect("one admitted download did not drain");
-    assert_eq!(full_bytes, content);
-    assert_eq!(full_expiry, expires_at_ms);
-    let completed_stream = client
+    let second_deadline = Instant::now() + Duration::from_secs(5);
+    let second_recovered_stream = loop {
+        match second_client
+            .download_support_artifact(DownloadSupportArtifactRequest {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                opaque_id: artifact_id.clone(),
+            })
+            .await
+        {
+            Ok(response) => break response.into_inner(),
+            Err(error)
+                if error.code() == tonic::Code::ResourceExhausted
+                    && Instant::now() < second_deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => panic!(
+                "second-process download capacity did not recover after stream close: {error}"
+            ),
+        }
+    };
+    drop(first_recovered_stream);
+    drop(second_recovered_stream);
+    let (first_full, second_full) = tokio::join!(
+        tokio::time::timeout(
+            Duration::from_secs(120),
+            read_support_artifact_stream(first_full_stream, Vec::new()),
+        ),
+        tokio::time::timeout(
+            Duration::from_secs(120),
+            read_support_artifact_stream(second_full_stream, Vec::new()),
+        ),
+    );
+    let (first_bytes, first_expiry) = first_full.expect("first-process download did not drain");
+    let (second_bytes, second_expiry) = second_full.expect("second-process download did not drain");
+    assert_eq!(first_bytes, content);
+    assert_eq!(first_expiry, expires_at_ms);
+    assert_eq!(second_bytes, content);
+    assert_eq!(second_expiry, expires_at_ms);
+    let first_completed_stream = client
         .download_support_artifact(DownloadSupportArtifactRequest {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
             opaque_id: artifact_id.clone(),
         })
         .await
-        .expect("a completed download should release its permit")
+        .expect("a completed first-process download should release its permit")
         .into_inner();
-    drop(completed_stream);
+    drop(first_completed_stream);
+    let second_completed_stream = second_client
+        .download_support_artifact(DownloadSupportArtifactRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            opaque_id: artifact_id.clone(),
+        })
+        .await
+        .expect("a completed second-process download should release its permit")
+        .into_inner();
+    drop(second_completed_stream);
 
     let operations_after = client
         .list_operations(ListOperationsRequest {
@@ -9312,15 +9404,17 @@ async fn support_artifact_download_limit_holds_under_release_process_pressure() 
         operations_before.next_page_token
     );
     assert_eq!(
-        management_store
-            .get(&ledger_path)
-            .await
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap()
-            .as_ref(),
-        ledger_bytes.as_slice()
+        serde_json::from_slice::<serde_json::Value>(
+            &management_store
+                .get(&ledger_path)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+        )
+        .unwrap(),
+        ledger
     );
     assert_eq!(
         management_store
@@ -9336,6 +9430,8 @@ async fn support_artifact_download_limit_holds_under_release_process_pressure() 
 
     process.0.kill().unwrap();
     process.0.wait().unwrap();
+    second_process.0.kill().unwrap();
+    second_process.0.wait().unwrap();
     let security_store: Arc<dyn ObjectStore> = Arc::new(object_store::prefix::PrefixStore::new(
         rockstream_test_support::minio::minio_object_store(minio_port, bucket),
         "gateway-shard",
@@ -9347,7 +9443,7 @@ async fn support_artifact_download_limit_holds_under_release_process_pressure() 
         .list_security_audit_records()
         .await
         .unwrap();
-    assert_eq!(records.len(), audit_before.len() + 10);
+    assert_eq!(records.len(), audit_before.len() + 20);
     assert_eq!(&records[..audit_before.len()], audit_before.as_slice());
     let expected_scope = serde_json::to_string(&PolicyScope::Artifact {
         opaque_id: artifact_id.clone(),
@@ -9382,7 +9478,7 @@ async fn support_artifact_download_limit_holds_under_release_process_pressure() 
                 before_state: AuditField::NotApplicable,
                 after_state: AuditField::NotApplicable,
             };
-            10
+            20
         ]
     );
 }
