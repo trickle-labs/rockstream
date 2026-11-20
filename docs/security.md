@@ -278,11 +278,14 @@ and `AFTER` excludes that row. Pages default to 100 rows and are limited to 500.
 The gateway checks the requested time-range grant on every page and durably
 audits denials while preserving an authenticated session. The result includes
 explicit verified, unverified, unknown, and not-applicable field states.
+For bounded audit-only access, an `administrator` preset may be scoped to an
+`AuditRange`; that grant permits only audit reads within the granted range.
 Pages use live keyset ordering rather than a multi-request snapshot. Records
 committed during pagination may appear when their key sorts after the cursor;
 restart from the first page to include records that sort at or before it. If
 the policy revision changes between authorization and page read, return a
-retryable conflict without disclosing records.
+retryable conflict without disclosing records. A client `CancelRequest` stops
+an audit-page read with RS-2050 and leaves retained history unchanged.
 
 ## First administrator preprovisioning
 

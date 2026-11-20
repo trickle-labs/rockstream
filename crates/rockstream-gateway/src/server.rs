@@ -2979,16 +2979,27 @@ impl GatewayHandler {
         let Some(authorized_principal) = matching_principal.as_ref() else {
             return Ok(vec![security_audit_policy_changed_response()]);
         };
-        let records = match store
-            .list_security_audit_page(
+        let mut cancel_token = CANCEL_TOKEN
+            .try_with(|token| token.clone())
+            .unwrap_or_else(|_| CancelToken::new());
+        let page = tokio::select! {
+            biased;
+            _ = cancel_token.cancelled() => {
+                return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "57014".to_string(),
+                    "[RS-2050] query.cancelled: query was cancelled by a client CancelRequest. next_steps: Retry the query or await client timeout settings.".to_string(),
+                )))]);
+            }
+            page = store.list_security_audit_page(
                 (authorized_principal.id, authorized_principal.revision),
                 query.from_ms,
                 query.to_ms,
                 query.after,
                 query.limit,
-            )
-            .await
-        {
+            ) => page,
+        };
+        let records = match page {
             Ok(records) => records,
             Err(rockstream_storage::catalog::CatalogError::OptimisticConflict(_)) => {
                 return Ok(vec![security_audit_policy_changed_response()]);
@@ -12587,13 +12598,21 @@ impl GatewayHandler {
         // durable flush and subscription publication. Releasing this guard
         // before flushing allowed a later epoch to publish out of order.
         let _commit_guard = self.shard_commit_lock.lock().await;
+        // Reject before view recovery can flush unrelated work for this commit attempt.
+        let (ops, conflicted) = committed_dml_ops(shard_db, ops)
+            .await
+            .map_err(|e| PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e))))?;
+        if conflicted {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "40001".to_owned(),
+                "transaction conflict: a row changed or a primary key became occupied after this transaction staged its writes; no writes were committed. Re-read current rows, resolve any key conflicts, and retry the transaction.".to_owned(),
+            ))));
+        }
         self.recover_pending_views_locked()
             .await
             .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
         let (epoch, ops, changes, distributed_deltas) = {
-            let ops = committed_dml_ops(shard_db, ops).await.map_err(|e| {
-                PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
-            })?;
             if ops.is_empty() {
                 if let Some(conn_id) = conn_id {
                     self.flush_pending_notifies(conn_id);
@@ -14191,16 +14210,18 @@ impl GatewayHandler {
         let mut new_keys_in_batch = HashSet::new();
 
         for (old_row_key, existing_fields) in &matched_rows {
-            let mut row_map: HashMap<String, Option<String>> = HashMap::new();
+            let mut original_row: HashMap<String, Option<String>> = HashMap::new();
             for (i, col) in table_columns.iter().enumerate() {
                 let val = existing_fields.get(i).cloned();
                 let val_opt = match val {
                     Some(ref s) if s == r"\N" => None,
                     other => other,
                 };
-                row_map.insert(col.clone(), val_opt);
+                original_row.insert(col.clone(), val_opt);
             }
 
+            let mut staged_assignments: Vec<(String, Option<String>)> =
+                Vec::with_capacity(assignments.len());
             for (col_name, scalar_expr) in &assignments {
                 let Some(target_type) = column_types.get(col_name) else {
                     return Ok(vec![promote_response(Response::Error(Box::new(
@@ -14211,34 +14232,47 @@ impl GatewayHandler {
                         ),
                     )))]);
                 };
-                let new_val =
-                    match scalar_expr.evaluate_assignment(&row_map, &column_types, target_type) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            let err_str = e.to_string();
-                            let sqlstate = if err_str.contains("RS-1016") {
-                                if err_str.contains("division by zero") {
-                                    "22012"
-                                } else {
-                                    "22003"
-                                }
-                            } else if err_str.contains("RS-1013") {
-                                "0A000"
+                let new_val = match scalar_expr.evaluate_assignment(
+                    &original_row,
+                    &column_types,
+                    target_type,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        let sqlstate = if err_str.contains("RS-1016") {
+                            if err_str.contains("division by zero") {
+                                "22012"
                             } else {
-                                "42601"
-                            };
-                            return Ok(vec![promote_response(Response::Error(Box::new(
-                                ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), err_str),
-                            )))]);
-                        }
-                    };
-                row_map.insert(col_name.clone(), new_val);
+                                "22003"
+                            }
+                        } else if err_str.contains("RS-1013") {
+                            "0A000"
+                        } else {
+                            "42601"
+                        };
+                        return Ok(vec![promote_response(Response::Error(Box::new(
+                            ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), err_str),
+                        )))]);
+                    }
+                };
+                staged_assignments.push((col_name.clone(), new_val));
+            }
+
+            let mut updated_row = original_row;
+            for (col_name, new_val) in staged_assignments {
+                let target_col = table_columns
+                    .iter()
+                    .find(|tc| tc.eq_ignore_ascii_case(&col_name))
+                    .cloned()
+                    .unwrap_or(col_name);
+                updated_row.insert(target_col, new_val);
             }
 
             let new_vals: Vec<String> = table_columns
                 .iter()
                 .map(|c| {
-                    row_map
+                    updated_row
                         .get(c)
                         .and_then(|o| o.clone())
                         .unwrap_or_else(|| r"\N".to_string())
@@ -19104,7 +19138,7 @@ fn append_dml_ops(batch: &mut rockstream_storage::WriteBatch, ops: &[DmlOp]) {
 async fn committed_dml_ops(
     shard_db: &rockstream_storage::ShardDb,
     ops: Vec<DmlOp>,
-) -> Result<Vec<DmlOp>, rockstream_storage::StorageError> {
+) -> Result<(Vec<DmlOp>, bool), rockstream_storage::StorageError> {
     let mut images = stream::iter(dml_image_tables(&ops))
         .map(|(key, table)| async move {
             let storage_key = format!("view_output/{table}/{}", key.1);
@@ -19120,6 +19154,7 @@ async fn committed_dml_ops(
         .into_iter()
         .collect::<HashMap<_, _>>();
     let mut committed = Vec::with_capacity(ops.len());
+    let mut conflicted = false;
     for op in ops {
         let valid = match &op {
             DmlOp::Insert {
@@ -19147,7 +19182,11 @@ async fn committed_dml_ops(
                 new_tsv,
             } => {
                 let image = cached_row_image(shard_db, &mut images, table, old_row_key).await?;
-                if image.as_deref() == Some(old_tsv) {
+                let destination_available = old_row_key == new_row_key
+                    || cached_row_image(shard_db, &mut images, table, new_row_key)
+                        .await?
+                        .is_none();
+                if image.as_deref() == Some(old_tsv) && destination_available {
                     images.insert((table.to_ascii_lowercase(), old_row_key.clone()), None);
                     images.insert(
                         (table.to_ascii_lowercase(), new_row_key.clone()),
@@ -19174,9 +19213,11 @@ async fn committed_dml_ops(
         };
         if valid {
             committed.push(op);
+        } else {
+            conflicted = true;
         }
     }
-    Ok(committed)
+    Ok((committed, conflicted))
 }
 
 fn dml_image_tables(ops: &[DmlOp]) -> HashMap<(String, String), String> {
