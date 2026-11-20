@@ -150,22 +150,19 @@ impl WriteBuffer {
         self.savepoints.clear();
     }
 
-    /// Create or overwrite a named savepoint at the current ops position.
+    /// Create a named savepoint at the current ops position.
     ///
-    /// Postgres semantics: SAVEPOINT with existing name replaces the prior entry.
+    /// PostgreSQL semantics: SAVEPOINT pushes a new entry onto the savepoint stack,
+    /// shadowing any earlier savepoint with the same name while keeping it reachable
+    /// once the newer entry is released.
     /// Returns `SavepointLimitExceeded` when a new entry would exceed `MAX_SAVEPOINTS_PER_BUFFER`.
     pub fn create_savepoint(&mut self, name: &str) -> Result<(), GatewayError> {
-        let pos = self.ops.len();
-        // If name already exists, overwrite it (Postgres replace semantics).
-        if let Some(idx) = self.savepoints.iter().rposition(|(n, _)| n == name) {
-            self.savepoints[idx] = (name.to_string(), pos);
-            return Ok(());
-        }
         if self.savepoints.len() == MAX_SAVEPOINTS_PER_BUFFER {
             return Err(GatewayError::SavepointLimitExceeded {
                 limit: MAX_SAVEPOINTS_PER_BUFFER,
             });
         }
+        let pos = self.ops.len();
         self.savepoints.push((name.to_string(), pos));
         Ok(())
     }
@@ -437,21 +434,52 @@ mod tests {
         }
     }
 
-    /// S2 green gate: SAVEPOINT with existing name overwrites (Postgres semantics).
+    /// PostgreSQL semantics: SAVEPOINT with an existing name shadows the prior entry,
+    /// and releasing the newer entry exposes the older one again.
     #[test]
-    fn savepoint_overwrite_replaces() {
+    fn savepoint_same_name_shadows_and_remains_reachable_after_release() {
         let mut buf = WriteBuffer::new();
         buf.push(make_insert("t", "1")).unwrap();
-        buf.create_savepoint("s").unwrap(); // ops_len = 1
+        buf.create_savepoint("s").unwrap(); // ops_len = 1 (older)
         buf.push(make_insert("t", "2")).unwrap();
         buf.push(make_insert("t", "3")).unwrap();
-        buf.create_savepoint("s").unwrap(); // ops_len = 3 (overwrite)
+        buf.create_savepoint("s").unwrap(); // ops_len = 3 (newer, shadows older)
         buf.push(make_insert("t", "4")).unwrap();
+        assert_eq!(buf.savepoints_len(), 2);
+
         buf.rollback_to_savepoint("s").unwrap();
         assert_eq!(
             buf.len(),
             3,
-            "should roll back to the overwritten savepoint position"
+            "should roll back to the most recent shadowed savepoint position"
         );
+        assert_eq!(buf.savepoints_len(), 2);
+
+        buf.release_savepoint("s").unwrap();
+        assert_eq!(buf.savepoints_len(), 1);
+
+        buf.rollback_to_savepoint("s").unwrap();
+        assert_eq!(
+            buf.len(),
+            1,
+            "releasing newer savepoint should expose the older same-name savepoint"
+        );
+        assert_eq!(buf.savepoints_len(), 1);
+    }
+
+    /// Configured savepoint bound counts all live entries, including shadowed same-name ones.
+    #[test]
+    fn savepoint_limit_counts_shadowed_entries() {
+        let mut buf = WriteBuffer::new();
+        for _ in 0..MAX_SAVEPOINTS_PER_BUFFER {
+            buf.create_savepoint("s").unwrap();
+        }
+        assert_eq!(buf.savepoints_len(), MAX_SAVEPOINTS_PER_BUFFER);
+        match buf.create_savepoint("s") {
+            Err(GatewayError::SavepointLimitExceeded { limit }) => {
+                assert_eq!(limit, MAX_SAVEPOINTS_PER_BUFFER);
+            }
+            other => panic!("expected SavepointLimitExceeded, got {other:?}"),
+        }
     }
 }
