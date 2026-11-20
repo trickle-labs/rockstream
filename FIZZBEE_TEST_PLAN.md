@@ -878,8 +878,12 @@ boundaries. Cleanup runs every second and caps each sweep at 29 seconds, leaving
 time for two passes and a cleanup tick within the 60-second deletion bound;
 `minio_cleanup_at_the_artifact_count_limit_finishes_within_the_bound` exercises
 the maximum count, and `cleanup_rescans_artifacts_that_expire_during_a_sweep`
-checks expiry during cleanup. M1–M7 do not model this management workflow;
-these tests are implementation evidence, not formal proof.
+checks expiry during cleanup. Each reservation records an object generation in
+ledger format v2; legacy format-v1 entries keep their original object path.
+Retries use a fresh generation path, so expiry and orphan cleanup delete only
+the generation they observed and cannot remove a concurrent retry's object;
+restart cleanup removes unreferenced late writes. M1–M7 do not model this
+management workflow; these tests are implementation evidence, not formal proof.
 
 PR #388 (issue #302) hardens the durable catalog audit-append retry
 boundary against concurrent writers. The secret-store rotation audit writer
