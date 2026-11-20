@@ -224,7 +224,7 @@ async fn run_gateway_proof() {
     };
     let blocked_reason = blocked_reason.unwrap_or_default();
     assert!(
-        blocked_reason.contains("RS-4014") || blocked_reason.contains("pgoutput"),
+        blocked_reason.contains("RS-4014"),
         "unexpected transport rejection reason: {blocked_reason}"
     );
     assert_eq!(
