@@ -3050,3 +3050,72 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod pgoutput_bounded_copy_assembly_tests {
+    use super::*;
+
+    #[test]
+    fn copy_chunks_assemble_exact_frame_and_track_real_transport_bytes() {
+        let mut frame = PgOutputFrameAssembly::default();
+        let mut stats = PgOutputTransportStats::default();
+        assert_eq!(
+            frame.push_chunk(Some(7), &[1, 2, 3], &mut stats).unwrap(),
+            None
+        );
+        assert_eq!(
+            frame.push_chunk(None, &[4, 5, 6, 7], &mut stats).unwrap(),
+            Some(vec![1, 2, 3, 4, 5, 6, 7])
+        );
+        assert_eq!(
+            stats,
+            PgOutputTransportStats {
+                peek_queries: 0,
+                frames_received: 1,
+                payload_bytes_received: 7,
+                peak_chunk_bytes: 4,
+                peak_frame_buffered_bytes: 7,
+                peak_transaction_payload_bytes: 7,
+            }
+        );
+    }
+
+    #[test]
+    fn copy_rejects_oversized_single_frame_without_buffering() {
+        let mut frame = PgOutputFrameAssembly::default();
+        let mut stats = PgOutputTransportStats::default();
+        let error = frame
+            .push_chunk(
+                Some((POSTGRES_CDC_MAX_TRANSACTION_BYTES + 1) as i32),
+                &[42],
+                &mut stats,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("RS-4014"));
+        assert_eq!(frame.bytes, Vec::<u8>::new());
+        assert_eq!(stats, PgOutputTransportStats::default());
+    }
+
+    #[test]
+    fn copy_rejects_cumulative_transaction_limit_before_next_frame() {
+        let mut frame = PgOutputFrameAssembly {
+            transaction_bytes: POSTGRES_CDC_MAX_TRANSACTION_BYTES - 2,
+            ..PgOutputFrameAssembly::default()
+        };
+        let mut stats = PgOutputTransportStats::default();
+        let error = frame.push_chunk(Some(3), &[9], &mut stats).unwrap_err();
+        assert!(error.to_string().contains("RS-4014"));
+        assert_eq!(frame.bytes, Vec::<u8>::new());
+        assert_eq!(stats, PgOutputTransportStats::default());
+    }
+
+    #[test]
+    fn copy_rejects_missing_or_out_of_order_chunk_boundaries() {
+        let mut frame = PgOutputFrameAssembly::default();
+        let mut stats = PgOutputTransportStats::default();
+        assert!(frame.push_chunk(None, &[1], &mut stats).is_err());
+        assert_eq!(frame.push_chunk(Some(3), &[1], &mut stats).unwrap(), None);
+        assert!(frame.push_chunk(Some(3), &[2], &mut stats).is_err());
+        assert!(frame.push_chunk(None, &[2, 3, 4], &mut stats).is_err());
+    }
+}
