@@ -1260,6 +1260,10 @@ mod tests {
                 PerShardCheckpoint::new(CheckpointId(7), handle.shard_checkpoint_id)
                     .with_snapshot_id(handle.snapshot_id),
             );
+            crate::checkpoint_store::CheckpointManifestStore::new(source.clone())
+                .save_manifest(&cluster, false, None)
+                .await
+                .unwrap();
             let snapshot_id = cluster.shards[&ShardId(1)]
                 .snapshot_id
                 .as_deref()
@@ -1274,8 +1278,10 @@ mod tests {
             .await
             .unwrap();
             assert!(!objects.is_empty());
+            assert!(objects.contains(&Path::from("control/checkpoints/7")));
             assert!(objects
                 .iter()
+                .filter(|path| is_shard_path(path))
                 .all(|path| path.as_ref().starts_with(expected_root)));
             assert!(objects.iter().any(|path| {
                 path.as_ref().ends_with(&format!(
@@ -1330,6 +1336,101 @@ mod tests {
                 b"namespace-value"
             );
         }
+    }
+
+
+    #[tokio::test]
+    async fn checkpoint_inventory_pins_only_selected_control_manifest() {
+        let source: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let manifests = crate::checkpoint_store::CheckpointManifestStore::new(source.clone());
+        let checkpoint_a = ClusterCheckpoint::new(CheckpointId(7));
+        let checkpoint_b = ClusterCheckpoint::new(CheckpointId(8));
+        manifests
+            .save_manifest(&checkpoint_a, false, None)
+            .await
+            .unwrap();
+        manifests
+            .save_manifest(&checkpoint_b, false, None)
+            .await
+            .unwrap();
+
+        // Even when the live root lists B, inventory of an explicitly
+        // selected A must contain exactly A's discoverable control manifest.
+        let objects = CheckpointExportService::list_checkpoint_objects(
+            &source,
+            &checkpoint_a,
+            &Path::from(""),
+        )
+        .await
+        .unwrap();
+        assert_eq!(objects, vec![Path::from("control/checkpoints/7")]);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_validator_rejects_newer_manifest_with_valid_hashes() {
+        let export: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let target: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let service = CheckpointExportService::new();
+        let generation = "tampered-manifest";
+        let selected = ClusterCheckpoint::new(CheckpointId(7));
+        let newer = ClusterCheckpoint::new(CheckpointId(8));
+        let bytes = serde_json::to_vec(&newer).unwrap();
+        let record = InventoryRecord {
+            source: "control/checkpoints/8".to_string(),
+            destination: object_path(generation, 0).to_string(),
+            byte_len: bytes.len() as u64,
+            sha256: digest_bytes(&bytes),
+        };
+        export
+            .put(&object_path(generation, 0), bytes.into())
+            .await
+            .unwrap();
+        service
+            .put_json(
+                &export,
+                &generation_path(generation),
+                &GenerationRecord {
+                    checkpoint_id: selected.checkpoint_id,
+                    generation: generation.to_string(),
+                    checkpoint: selected,
+                    object_count: 1,
+                    requires_checkpoint_manifest: true,
+                },
+            )
+            .await
+            .unwrap();
+        service
+            .put_json(&export, &inventory_path(generation, 0), &record)
+            .await
+            .unwrap();
+        let mut digest = Sha256::new();
+        update_digest(&mut digest, &record).unwrap();
+        let outcome = CheckpointExportOutcome {
+            checkpoint_id: 7,
+            generation: generation.to_string(),
+            object_count: 1,
+            byte_count: record.byte_len,
+            inventory_digest: hex::encode(digest.finalize()),
+            status: "SUCCESS".to_string(),
+        };
+        service
+            .put_json(&export, &commit_path(generation), &CommitMarker { outcome })
+            .await
+            .unwrap();
+
+        let error = service
+            .validate_generation(export.clone(), generation)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("other than selected checkpoint"));
+        assert!(service
+            .restore_generation(export, target.clone(), generation)
+            .await
+            .is_err());
+        assert!(matches!(
+            target.head(&Path::from("control/bootstrap/active-generation")).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
     }
 
     #[tokio::test]
@@ -1441,6 +1542,10 @@ mod tests {
                 .unwrap();
         }
 
+        crate::checkpoint_store::CheckpointManifestStore::new(source.clone())
+            .save_manifest(&checkpoint(), false, None)
+            .await
+            .unwrap();
         let error = CheckpointExportService::new()
             .export_prefix(
                 source,
