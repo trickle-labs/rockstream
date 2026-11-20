@@ -447,6 +447,13 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
             return self.block(&storage_error(error).to_string());
         }
 
+        // The test cut is after the complete coupled batch is durable, but
+        // before either the in-memory epoch or PostgreSQL slot is advanced.
+        // A cancelled owner must recover this checkpoint and ACK it once.
+        self.checkpoint_store
+            .db()
+            .await_source_ack_cut_for_test()
+            .await;
         self.source_epochs
             .commit_epoch_monotonic(entry)
             .map_err(|error| SourceError::Io(error.to_string()))?;
