@@ -56,6 +56,7 @@ class PolicyTests(unittest.TestCase):
             "ci-policy", "check-quality", "current-stable-compile", "check-tests", "gateway",
             "postgres-differential", "control-plane-ha", "formal-verify",
             "verus-verify", "verus-consumer", "nexmark-regression-gate", "benchmark", "docker-build",
+            "security-release-process",
         ])
         self.assertIn("run: python3 scripts/ci-scope.py check", check)
         self.assertIn("CI_NEEDS: ${{ toJSON(needs) }}", check)
