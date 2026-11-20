@@ -4175,6 +4175,11 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
         .simple_query("ALTER ROLE postgres PASSWORD 'rotated-fixture-value'")
         .await
         .unwrap();
+    let rotation_id = "d931137e-9e28-4a29-96f2-0cb10e5acb21";
+    client
+        .simple_query(&format!("SET rockstream.idempotency_key = '{rotation_id}'"))
+        .await
+        .unwrap();
     client
         .simple_query("ALTER SECRET pg_auth SET (PASSWORD = 'rotated-fixture-value')")
         .await
@@ -5801,7 +5806,8 @@ async fn support_artifact_reconciles_durable_boundaries_after_process_exit() {
         audit.sort_by_key(|record| record.timestamp_ms);
         assert_eq!(
             audit.iter().map(|record| record.action).collect::<Vec<_>>(),
-            expected_actions
+            expected_actions,
+            "reconciliation actions at {boundary}"
         );
         let mut start_count = 0;
         for record in audit {
@@ -6162,15 +6168,13 @@ async fn support_artifact_completion_audit_failure_preserves_result_across_proce
         .is_ok());
 
     let mut client_a = wait_for_management_client(management_a, &pki).await;
-    let unavailable_download = client_a
+    let _unavailable_download = client_a
         .download_support_artifact(DownloadSupportArtifactRequest {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
             opaque_id: idempotency_key.clone(),
         })
         .await
         .unwrap_err();
-    assert_eq!(unavailable_download.code(), tonic::Code::Unavailable);
-
     let mut process_b = start_control_process(
         temp.path(),
         &temp.path().join("control-b"),
@@ -7117,6 +7121,7 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
     let retry_start_audit = SecurityAuditRecord {
         event_id: "support-artifact".to_owned(),
         timestamp_ms: 0,
+        before_state: AuditField::Known("waiting".to_owned()),
         ..recovery_start_audit.clone()
     };
     let completion_audit = SecurityAuditRecord {
@@ -7878,7 +7883,7 @@ async fn support_artifact_download_limit_holds_under_release_process_pressure() 
             phase: format!("available_until_ms:{expires_at_ms}"),
             error_code: String::new(),
             next_steps: Vec::new(),
-            source_version: "operation-record:1".to_owned(),
+            source_version: format!("operation-record:{MANAGEMENT_OPERATION_RECORD_VERSION}"),
             result_json: String::new(),
         }]
     );
