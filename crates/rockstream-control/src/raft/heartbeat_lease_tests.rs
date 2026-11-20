@@ -579,6 +579,10 @@ fn reject_timing_configs_that_could_outlive_follower_election() {
     heartbeat_too_slow.heartbeat_interval = heartbeat_too_slow.election_timeout_min;
     let mut rpc_too_slow = good.clone();
     rpc_too_slow.rpc_timeout = rpc_too_slow.election_timeout_min;
+    let mut heartbeat_outlives_lease = good.clone();
+    heartbeat_outlives_lease.heartbeat_interval = Duration::from_millis(100);
+    let mut rpc_outlives_lease = good.clone();
+    rpc_outlives_lease.rpc_timeout = Duration::from_millis(126);
     let mut zero_rpc = good.clone();
     zero_rpc.rpc_timeout = Duration::ZERO;
     let mut zero_heartbeat = good.clone();
@@ -587,6 +591,8 @@ fn reject_timing_configs_that_could_outlive_follower_election() {
         min_equals_max,
         heartbeat_too_slow,
         rpc_too_slow,
+        heartbeat_outlives_lease,
+        rpc_outlives_lease,
         zero_rpc,
         zero_heartbeat,
     ] {
@@ -621,4 +627,93 @@ async fn expired_leader_cannot_revive_authority_with_another_round() {
     assert_eq!(node.handle.require_leader(), Err(NotLeader));
     assert_eq!(node.handle.leader_epoch(), None);
     node.stop();
+}
+
+#[tokio::test(start_paused = true)]
+async fn healthy_quorum_survives_repeated_unrelated_peer_rpc_timeouts() {
+    let a = Node::new(A).await;
+    let b = Node::new(B).await;
+    let c = Node::new(C).await;
+    let initial = RaftConfig::new(
+        A,
+        vec![(B, b.addr.to_string()), (C, c.addr.to_string())],
+        false,
+    );
+    let inner = a.inner.clone();
+    let store = a.store.clone();
+    completed(tokio::spawn(async move {
+        start_election(&initial, &inner, &store).await;
+    }))
+    .await;
+    assert_eq!(a.handle.require_leader(), Ok(1));
+
+    // C's proxy reads but never ACKs. The real peer-RPC timeout is 75ms,
+    // longer than the 50ms heartbeat interval, so join_all always waits.
+    let blackhole = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = blackhole.local_addr().unwrap();
+    let (first_tx, mut first_rx) = oneshot::channel();
+    let slow = tokio::spawn(async move {
+        let mut first_tx = Some(first_tx);
+        loop {
+            let (stream, _) = blackhole.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).await.unwrap() > 0);
+            assert_request(RpcKind::Heartbeat, line.trim());
+            if let Some(first) = first_tx.take() {
+                first.send(()).unwrap();
+            }
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(76)).await;
+                drop(reader);
+            });
+        }
+    });
+
+    let config = RaftConfig::new(
+        A,
+        vec![(B, b.addr.to_string()), (C, addr.to_string())],
+        false,
+    );
+    config.validate().unwrap();
+    let (shutdown, _) = broadcast::channel(4);
+    let driver = tokio::spawn(driver_loop(
+        config,
+        a.inner.clone(),
+        a.store.clone(),
+        shutdown.subscribe(),
+    ));
+    signaled(&mut first_rx).await;
+    // Prove B got the first real heartbeat, rather than relying on elapsed
+    // wall-clock time or scheduling luck.
+    for _ in 0..100_000 {
+        if b.handle.current_leader() == Some(A) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(b.handle.current_leader(), Some(A));
+
+    for _ in 0..21 {
+        tokio::time::advance(Duration::from_millis(20)).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+    }
+    // Reaching 420ms with term 1 and a LIVE lease proves that we kept
+    // refreshing B before our original 125ms lease expired. Reverting the
+    // cadence to "RPC wait + heartbeat sleep" would demote A at 125ms.
+    assert_eq!(a.handle.current_term(), 1);
+    assert_eq!(a.handle.require_leader(), Ok(1));
+    assert!(a.inner.read().last_quorum_contact.elapsed() < Duration::from_millis(125));
+    assert!(b.inner.read().last_contact.elapsed() < Duration::from_millis(150));
+    assert_eq!(b.handle.current_term(), 1);
+    assert_eq!(c.handle.current_term(), 1);
+
+    driver.abort();
+    slow.abort();
+    let _ = shutdown.send(());
+    a.stop();
+    b.stop();
+    c.stop();
 }
