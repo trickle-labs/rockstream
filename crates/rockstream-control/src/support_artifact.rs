@@ -20,7 +20,8 @@ pub(crate) const ARTIFACT_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
 // Two passes plus one cleanup tick must fit inside the 60-second retention bound.
 const ARTIFACT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(29);
 const LEDGER_CAS_RETRIES: usize = 32;
-const LEDGER_FORMAT_VERSION: u16 = 1;
+const LEGACY_LEDGER_FORMAT_VERSION: u16 = 1;
+const LEDGER_FORMAT_VERSION: u16 = 2;
 
 pub(crate) fn maybe_crash_after_debug_test_boundary(boundary: &str) {
     #[cfg(any(debug_assertions, feature = "test-support-artifact-crash-injection"))]
@@ -38,12 +39,16 @@ pub(crate) struct SupportArtifactStore {
     available: Arc<AtomicBool>,
     #[cfg(test)]
     pub(super) artifact_put_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    #[cfg(test)]
+    cleanup_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 struct ArtifactLedger {
     format_version: u16,
     artifacts: BTreeMap<String, LedgerArtifact>,
+    #[serde(default)]
+    object_generations: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
@@ -84,6 +89,8 @@ impl SupportArtifactStore {
             available: Arc::new(AtomicBool::new(true)),
             #[cfg(test)]
             artifact_put_gate: None,
+            #[cfg(test)]
+            cleanup_gate: None,
         }
     }
 
@@ -127,14 +134,20 @@ impl SupportArtifactStore {
             size: content.len(),
             expires_at_ms: expiry.unix_ms,
         };
+        // A retry gets a fresh object path so stale cleanup snapshots cannot delete it.
+        let new_generation = uuid::Uuid::new_v4().simple().to_string();
+        let storage_generation = std::sync::Mutex::new(None);
         let reserved = self
             .mutate_ledger(|ledger| {
                 if let Some(existing) = ledger.artifacts.get(&id) {
-                    return if existing == &entry {
-                        Ok(false)
-                    } else {
-                        Err(ArtifactStoreError::Exists)
-                    };
+                    if existing == &entry {
+                        *storage_generation
+                            .lock()
+                            .expect("artifact generation mutex poisoned") =
+                            ledger.object_generations.get(&id).cloned();
+                        return Ok(false);
+                    }
+                    return Err(ArtifactStoreError::Exists);
                 }
                 if ledger.artifacts.len() >= MAX_ARTIFACTS_PER_DEPLOYMENT {
                     return Err(ArtifactStoreError::StorageFull);
@@ -150,6 +163,12 @@ impl SupportArtifactStore {
                     return Err(ArtifactStoreError::StorageFull);
                 }
                 ledger.artifacts.insert(id.clone(), entry.clone());
+                ledger
+                    .object_generations
+                    .insert(id.clone(), new_generation.clone());
+                *storage_generation
+                    .lock()
+                    .expect("artifact generation mutex poisoned") = Some(new_generation.clone());
                 Ok(true)
             })
             .await?;
@@ -164,7 +183,10 @@ impl SupportArtifactStore {
             resume.notified().await;
         }
 
-        let path = self.artifact_path(&id);
+        let storage_generation = storage_generation
+            .into_inner()
+            .expect("artifact generation mutex poisoned");
+        let path = self.artifact_path_with_generation(&id, storage_generation.as_deref());
         match self
             .store
             .put_opts(
@@ -198,6 +220,7 @@ impl SupportArtifactStore {
                         self.mutate_ledger(|ledger| {
                             if ledger.artifacts.get(&id) == Some(&entry) {
                                 ledger.artifacts.remove(&id);
+                                ledger.object_generations.remove(&id);
                                 Ok(true)
                             } else {
                                 Ok(false)
@@ -226,7 +249,10 @@ impl SupportArtifactStore {
             .ok_or(ArtifactStoreError::NotFound)?;
         let meta = self
             .store
-            .head(&self.artifact_path(id))
+            .head(&self.artifact_path_with_generation(
+                id,
+                ledger.object_generations.get(id).map(String::as_str),
+            ))
             .await
             .map_err(|error| match error {
                 ObjectStoreError::NotFound { .. } => ArtifactStoreError::NotFound,
@@ -258,14 +284,17 @@ impl SupportArtifactStore {
         if artifact.owner != owner {
             return Err(ArtifactStoreError::WrongOwner);
         }
-        let result =
-            self.store
-                .get(&self.artifact_path(id))
-                .await
-                .map_err(|error| match error {
-                    ObjectStoreError::NotFound { .. } => ArtifactStoreError::NotFound,
-                    _ => ArtifactStoreError::StorageUnavailable,
-                })?;
+        let result = self
+            .store
+            .get(&self.artifact_path_with_generation(
+                id,
+                ledger.object_generations.get(id).map(String::as_str),
+            ))
+            .await
+            .map_err(|error| match error {
+                ObjectStoreError::NotFound { .. } => ArtifactStoreError::NotFound,
+                _ => ArtifactStoreError::StorageUnavailable,
+            })?;
         let content = result
             .bytes()
             .await
@@ -284,29 +313,27 @@ impl SupportArtifactStore {
     pub async fn remove(&self, id: &str, owner: PrincipalId) -> Result<(), ArtifactStoreError> {
         self.ensure_available()?;
         let (ledger, _) = self.read_ledger().await?;
-        if ledger
-            .artifacts
-            .get(id)
-            .is_some_and(|artifact| artifact.owner != owner)
-        {
+        let Some(artifact) = ledger.artifacts.get(id).cloned() else {
+            return self.delete_artifact(id, None).await;
+        };
+        if artifact.owner != owner {
             return Ok(());
         }
-        // A failed generation can remove its ledger reservation before a late retry writes.
-        self.delete_artifact(id).await?;
+        let storage_generation = ledger.object_generations.get(id).cloned();
         self.mutate_ledger(|ledger| {
-            if ledger
-                .artifacts
-                .get(id)
-                .is_some_and(|current| current.owner == owner)
+            if ledger.artifacts.get(id) == Some(&artifact)
+                && ledger.object_generations.get(id) == storage_generation.as_ref()
             {
                 ledger.artifacts.remove(id);
+                ledger.object_generations.remove(id);
                 Ok(true)
             } else {
                 Ok(false)
             }
         })
-        .await
-        .map(|_| ())
+        .await?;
+        self.delete_artifact(id, storage_generation.as_deref())
+            .await
     }
 
     pub async fn cleanup_expired(&self, now_ms: u64) -> Result<(), ArtifactStoreError> {
@@ -331,14 +358,18 @@ impl SupportArtifactStore {
             .artifacts
             .iter()
             .filter(|(_, artifact)| artifact.expires_at_ms <= now_ms)
-            .map(|(id, _)| id.clone())
+            .map(|(id, _)| (id.clone(), ledger.object_generations.get(id).cloned()))
             .collect();
         if expired.is_empty() {
             return self.cleanup_orphaned_artifacts().await;
         }
         let paths = expired
             .iter()
-            .map(|id| Ok::<_, ObjectStoreError>(self.artifact_path(id)))
+            .map(|(id, generation)| {
+                Ok::<_, ObjectStoreError>(
+                    self.artifact_path_with_generation(id, generation.as_deref()),
+                )
+            })
             .collect::<Vec<_>>();
         let _: Vec<()> = self
             .store
@@ -351,11 +382,19 @@ impl SupportArtifactStore {
             .await?;
         maybe_crash_after_debug_test_boundary("cleanup-after-delete");
         self.mutate_ledger(|ledger| {
-            let before = ledger.artifacts.len();
-            ledger
-                .artifacts
-                .retain(|_, artifact| artifact.expires_at_ms > now_ms);
-            Ok(ledger.artifacts.len() != before)
+            let mut changed = false;
+            for (id, _) in &expired {
+                if ledger
+                    .artifacts
+                    .get(id)
+                    .is_some_and(|artifact| artifact.expires_at_ms <= now_ms)
+                {
+                    ledger.artifacts.remove(id);
+                    ledger.object_generations.remove(id);
+                    changed = true;
+                }
+            }
+            Ok(changed)
         })
         .await?;
         self.cleanup_orphaned_artifacts().await
@@ -373,7 +412,12 @@ impl SupportArtifactStore {
         let retained = ledger
             .artifacts
             .keys()
-            .map(|id| self.artifact_path(id))
+            .map(|id| {
+                self.artifact_path_with_generation(
+                    id,
+                    ledger.object_generations.get(id).map(String::as_str),
+                )
+            })
             .collect::<BTreeSet<_>>();
         let orphaned = paths
             .into_iter()
@@ -382,6 +426,11 @@ impl SupportArtifactStore {
             .filter(|path| !retained.contains(path))
             .map(Ok::<_, ObjectStoreError>)
             .collect::<Vec<_>>();
+        #[cfg(test)]
+        if let Some((started, resume)) = &self.cleanup_gate {
+            started.notify_one();
+            resume.notified().await;
+        }
         let _: Vec<()> = self
             .store
             .delete_stream(futures::stream::iter(orphaned).boxed())
@@ -394,8 +443,16 @@ impl SupportArtifactStore {
         Ok(())
     }
 
-    async fn delete_artifact(&self, id: &str) -> Result<(), ArtifactStoreError> {
-        match self.store.delete(&self.artifact_path(id)).await {
+    async fn delete_artifact(
+        &self,
+        id: &str,
+        storage_generation: Option<&str>,
+    ) -> Result<(), ArtifactStoreError> {
+        match self
+            .store
+            .delete(&self.artifact_path_with_generation(id, storage_generation))
+            .await
+        {
             Ok(()) | Err(ObjectStoreError::NotFound { .. }) => Ok(()),
             Err(_) => Err(ArtifactStoreError::StorageUnavailable),
         }
@@ -430,10 +487,14 @@ impl SupportArtifactStore {
                     .bytes()
                     .await
                     .map_err(|_| ArtifactStoreError::StorageUnavailable)?;
-                let ledger: ArtifactLedger = serde_json::from_slice(&bytes)
+                let mut ledger: ArtifactLedger = serde_json::from_slice(&bytes)
                     .map_err(|_| ArtifactStoreError::StorageUnavailable)?;
-                if ledger.format_version != LEDGER_FORMAT_VERSION {
-                    return Err(ArtifactStoreError::StorageUnavailable);
+                match ledger.format_version {
+                    LEGACY_LEDGER_FORMAT_VERSION => {
+                        ledger.format_version = LEDGER_FORMAT_VERSION;
+                    }
+                    LEDGER_FORMAT_VERSION => {}
+                    _ => return Err(ArtifactStoreError::StorageUnavailable),
                 }
                 Ok((ledger, Some(version)))
             }
@@ -441,6 +502,7 @@ impl SupportArtifactStore {
                 ArtifactLedger {
                     format_version: LEDGER_FORMAT_VERSION,
                     artifacts: BTreeMap::new(),
+                    object_generations: BTreeMap::new(),
                 },
                 None,
             )),
@@ -490,10 +552,19 @@ impl SupportArtifactStore {
         self.prefix.clone().join("ledger.json")
     }
 
+    #[cfg(test)]
     fn artifact_path(&self, id: &str) -> Path {
-        self.prefix
-            .clone()
-            .join(format!("artifacts/{}.json", hex::encode(id.as_bytes())))
+        self.artifact_path_with_generation(id, None)
+    }
+
+    fn artifact_path_with_generation(&self, id: &str, storage_generation: Option<&str>) -> Path {
+        let generation = storage_generation
+            .map(|generation| format!("-{generation}"))
+            .unwrap_or_default();
+        self.prefix.clone().join(format!(
+            "artifacts/{}{generation}.json",
+            hex::encode(id.as_bytes())
+        ))
     }
 }
 
@@ -724,6 +795,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_orphan_cleanup_cannot_delete_a_retry_object() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut cleaner = SupportArtifactStore::new(Arc::clone(&object_store));
+        let writer = SupportArtifactStore::new(Arc::clone(&object_store));
+        cleaner.initialize().await.unwrap();
+        writer.initialize().await.unwrap();
+        let id = "orphan-retry";
+        let now_ms = 1_000;
+        let expiry = ArtifactExpiry { unix_ms: 2_000 };
+        let requested: Arc<[u8]> = Arc::from(b"retry result".to_vec());
+        object_store
+            .put(&cleaner.artifact_path(id), b"late orphan".to_vec().into())
+            .await
+            .unwrap();
+
+        let started = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        cleaner.cleanup_gate = Some((Arc::clone(&started), Arc::clone(&resume)));
+        let cleanup = tokio::spawn(async move { cleaner.cleanup_expired(now_ms).await });
+        started.notified().await;
+
+        writer
+            .insert(
+                id.to_owned(),
+                PrincipalId(7),
+                PolicyScope::Cluster,
+                requested.clone(),
+                expiry,
+                now_ms,
+            )
+            .await
+            .unwrap();
+        resume.notify_one();
+        cleanup.await.unwrap().unwrap();
+
+        let (downloaded, _, _) = writer.download(id, PrincipalId(7), now_ms).await.unwrap();
+        assert_eq!(downloaded.as_ref(), requested.as_ref());
+    }
+
+    #[tokio::test]
     async fn orphaned_late_write_is_removed_during_restart_cleanup() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let mut writer = SupportArtifactStore::new(Arc::clone(&object_store));
@@ -749,8 +860,9 @@ mod tests {
         let started = Arc::new(Notify::new());
         let resume = Arc::new(Notify::new());
         writer.artifact_put_gate = Some((Arc::clone(&started), Arc::clone(&resume)));
+        let writer_task_store = writer.clone();
         let writer_task = tokio::spawn(async move {
-            writer
+            writer_task_store
                 .insert(
                     "late-artifact".to_owned(),
                     PrincipalId(7),
@@ -762,6 +874,14 @@ mod tests {
                 .await
         });
         started.notified().await;
+        let ledger = writer.read_ledger().await.unwrap().0;
+        let late_path = writer.artifact_path_with_generation(
+            "late-artifact",
+            ledger
+                .object_generations
+                .get("late-artifact")
+                .map(String::as_str),
+        );
 
         cleaner
             .remove("late-artifact", PrincipalId(7))
@@ -771,7 +891,7 @@ mod tests {
         writer_task.await.unwrap().unwrap();
         assert_eq!(
             object_store
-                .get(&cleaner.artifact_path("late-artifact"))
+                .get(&late_path)
                 .await
                 .unwrap()
                 .bytes()
@@ -786,9 +906,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            listed
-                .iter()
-                .any(|meta| meta.location == cleaner.artifact_path("late-artifact")),
+            listed.iter().any(|meta| meta.location == late_path),
             "late object was not returned by artifact-prefix listing: {listed:?}"
         );
         assert_eq!(
@@ -808,9 +926,7 @@ mod tests {
         restarted.initialize().await.unwrap();
         restarted.cleanup_expired(now_ms).await.unwrap();
         assert!(matches!(
-            object_store
-                .get(&restarted.artifact_path("late-artifact"))
-                .await,
+            object_store.get(&late_path).await,
             Err(ObjectStoreError::NotFound { .. })
         ));
         let (retained, _, _) = restarted
@@ -829,6 +945,62 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>(),
             vec!["retained-artifact"]
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_ledger_keeps_using_the_original_object_path() {
+        let object_store = Arc::new(InMemory::new());
+        let store = SupportArtifactStore::new(object_store.clone());
+        let id = "legacy-artifact";
+        let content: Arc<[u8]> = Arc::from(b"legacy object".to_vec());
+        let mut legacy_ledger = serde_json::to_value(ArtifactLedger {
+            format_version: LEGACY_LEDGER_FORMAT_VERSION,
+            artifacts: BTreeMap::from([(
+                id.to_owned(),
+                LedgerArtifact {
+                    owner: PrincipalId(7),
+                    scope: PolicyScope::Cluster,
+                    size: content.len(),
+                    expires_at_ms: 2_000,
+                },
+            )]),
+            object_generations: BTreeMap::new(),
+        })
+        .unwrap();
+        legacy_ledger
+            .as_object_mut()
+            .unwrap()
+            .remove("object_generations")
+            .unwrap();
+        object_store
+            .put(
+                &store.ledger_path(),
+                serde_json::to_vec(&legacy_ledger).unwrap().into(),
+            )
+            .await
+            .unwrap();
+        object_store
+            .put(&store.artifact_path(id), content.to_vec().into())
+            .await
+            .unwrap();
+
+        store.initialize().await.unwrap();
+        let (downloaded, _, _) = store.download(id, PrincipalId(7), 1_000).await.unwrap();
+        assert_eq!(downloaded.as_ref(), content.as_ref());
+        assert_eq!(
+            store.read_ledger().await.unwrap().0.format_version,
+            LEDGER_FORMAT_VERSION
+        );
+        assert_eq!(
+            store
+                .read_ledger()
+                .await
+                .unwrap()
+                .0
+                .object_generations
+                .get(id),
+            None
         );
     }
 
@@ -870,6 +1042,14 @@ mod tests {
             )
             .await
             .unwrap();
+        let ledger = store.read_ledger().await.unwrap().0;
+        let expired_path = store.artifact_path_with_generation(
+            "opaque-id",
+            ledger
+                .object_generations
+                .get("opaque-id")
+                .map(String::as_str),
+        );
 
         assert_eq!(
             other_service
@@ -898,10 +1078,7 @@ mod tests {
             Err(ArtifactStoreError::NotFound)
         );
         assert!(matches!(
-            restarted_service
-                .store
-                .get(&restarted_service.artifact_path("opaque-id"))
-                .await,
+            restarted_service.store.get(&expired_path).await,
             Err(ObjectStoreError::NotFound { .. })
         ));
         assert_eq!(
@@ -1075,9 +1252,17 @@ mod tests {
             },
         );
         assert_eq!(first.read_ledger().await.unwrap().0.artifacts, expected);
+        let ledger = first.read_ledger().await.unwrap().0;
+        let accepted_path = first.artifact_path_with_generation(
+            accepted_id,
+            ledger
+                .object_generations
+                .get(accepted_id)
+                .map(String::as_str),
+        );
         assert_eq!(
             object_store
-                .get(&first.artifact_path(accepted_id))
+                .get(&accepted_path)
                 .await
                 .unwrap()
                 .bytes()
@@ -1090,6 +1275,86 @@ mod tests {
             object_store.get(&first.artifact_path(rejected_id)).await,
             Err(ObjectStoreError::NotFound { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_artifact_writers_fill_remaining_slots_without_eviction() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = SupportArtifactStore::new(Arc::clone(&object_store));
+        store.initialize().await.unwrap();
+        let now_ms = 1_000;
+        let expiry = ArtifactExpiry { unix_ms: 2_000 };
+        let entry = || LedgerArtifact {
+            owner: PrincipalId(1),
+            scope: PolicyScope::Cluster,
+            size: 0,
+            expires_at_ms: expiry.unix_ms,
+        };
+        let mut expected = (0..MAX_ARTIFACTS_PER_DEPLOYMENT - 8)
+            .map(|index| (format!("retained-{index:04}"), entry()))
+            .collect::<BTreeMap<_, _>>();
+        store
+            .mutate_ledger(|ledger| {
+                ledger.artifacts = expected.clone();
+                Ok(true)
+            })
+            .await
+            .unwrap();
+
+        let services = (0..16)
+            .map(|_| SupportArtifactStore::new(Arc::clone(&object_store)))
+            .collect::<Vec<_>>();
+        let attempts = (0..16).map(|index| {
+            let service = services[index % services.len()].clone();
+            async move {
+                let id = format!("pressure-{index:02}");
+                let result = service
+                    .insert(
+                        id.clone(),
+                        PrincipalId(1),
+                        PolicyScope::Cluster,
+                        Arc::from(Vec::new()),
+                        expiry,
+                        now_ms,
+                    )
+                    .await;
+                (id, result)
+            }
+        });
+        let results = futures::future::join_all(attempts).await;
+        let (accepted, rejected): (Vec<_>, Vec<_>) =
+            results.into_iter().partition(|(_, result)| result.is_ok());
+        assert_eq!(accepted.len(), 8);
+        for (id, result) in accepted {
+            assert_eq!(result, Ok(()));
+            expected.insert(id.clone(), entry());
+            let ledger = store.read_ledger().await.unwrap().0;
+            let path = store.artifact_path_with_generation(
+                &id,
+                ledger.object_generations.get(&id).map(String::as_str),
+            );
+            assert_eq!(
+                object_store
+                    .get(&path)
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                b""
+            );
+        }
+        for (id, result) in rejected {
+            assert_eq!(result, Err(ArtifactStoreError::StorageFull));
+            assert!(matches!(
+                object_store.get(&store.artifact_path(&id)).await,
+                Err(ObjectStoreError::NotFound { .. })
+            ));
+        }
+
+        assert_eq!(expected.len(), MAX_ARTIFACTS_PER_DEPLOYMENT);
+        assert_eq!(store.read_ledger().await.unwrap().0.artifacts, expected);
     }
 
     #[tokio::test]
@@ -1485,6 +1750,7 @@ mod tests {
                 serde_json::to_vec(&ArtifactLedger {
                     format_version: LEDGER_FORMAT_VERSION,
                     artifacts,
+                    object_generations: BTreeMap::new(),
                 })
                 .unwrap()
                 .into(),
@@ -1578,9 +1844,13 @@ mod tests {
                 .sum::<usize>(),
             MAX_ARTIFACT_STORAGE_BYTES
         );
+        let winner_path = SupportArtifactStore::new(store.clone()).artifact_path_with_generation(
+            winner_id,
+            ledger.object_generations.get(winner_id).map(String::as_str),
+        );
         assert_eq!(
             store
-                .get(&SupportArtifactStore::new(store.clone()).artifact_path(winner_id))
+                .get(&winner_path)
                 .await
                 .unwrap()
                 .bytes()
@@ -1589,12 +1859,15 @@ mod tests {
                 .as_ref(),
             b"x"
         );
-        assert!(matches!(
-            store
-                .get(&SupportArtifactStore::new(store.clone()).artifact_path(loser_id))
-                .await,
-            Err(ObjectStoreError::NotFound { .. })
-        ));
+        let loser_prefix = format!("artifacts/{}-", hex::encode(loser_id.as_bytes()));
+        let paths = store
+            .list(Some(&Path::from("control/support-artifacts")))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(!paths
+            .iter()
+            .any(|meta| { meta.location.as_ref().starts_with(&loser_prefix) }));
     }
 
     #[tokio::test]
