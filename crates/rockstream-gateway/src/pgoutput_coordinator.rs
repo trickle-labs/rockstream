@@ -679,6 +679,19 @@ impl SharedPgOutputCoordinator {
         Ok(())
     }
 
+    /// Discard uncommitted transaction messages after a replication transport
+    /// disconnect. The logical slot did not acknowledge them, so the new
+    /// connection must decode them again from the committed checkpoint.
+    pub async fn discard_interrupted_envelope(
+        &mut self,
+        db: &ShardDb,
+    ) -> Result<(), GatewayError> {
+        self.cleanup_recovered_spill(db).await?;
+        self.active_envelope = None;
+        self.activating_views.clear();
+        Ok(())
+    }
+
     pub async fn cleanup_recovered_spill(&mut self, db: &ShardDb) -> Result<(), GatewayError> {
         self.envelope_buffer
             .populate_spilled_keys_from_db()
