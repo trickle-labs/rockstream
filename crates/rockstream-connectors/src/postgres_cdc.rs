@@ -7,7 +7,11 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use std::collections::VecDeque;
+use std::pin::Pin;
+use tokio_postgres::binary_copy::BinaryCopyOutStream;
+use tokio_postgres::types::Type;
 
 use std::sync::Arc;
 
@@ -39,6 +43,22 @@ pub const POSTGRES_CDC_TRANSACTION_MEMORY_BYTES: usize = POSTGRES_CDC_MAX_TRANSA
 pub const POSTGRES_CDC_MAX_WAL_LAG_BYTES: u64 = 256 * 1024 * 1024;
 /// Resnapshot attempts are bounded so a broken publication cannot loop forever.
 pub const POSTGRES_CDC_MAX_RESNAPSHOT_ATTEMPTS: u8 = 3;
+
+/// Maximum bytes returned in one PostgreSQL COPY data chunk. Splitting bytea
+/// in SQL prevents a single oversized pgoutput frame becoming one network row.
+const PGOUTPUT_COPY_CHUNK_BYTES: usize = 8 * 1024;
+
+/// Observed transport sizes, independent of the coordinator's encoded-change
+/// counter. They include metadata, BEGIN and COMMIT frames.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PgOutputTransportStats {
+    pub peek_queries: u64,
+    pub frames_received: u64,
+    pub payload_bytes_received: u64,
+    pub peak_chunk_bytes: usize,
+    pub peak_frame_buffered_bytes: usize,
+    pub peak_transaction_payload_bytes: usize,
+}
 
 /// PostgreSQL LSN encoded as the native 64-bit WAL location.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -321,6 +341,8 @@ pub struct PostgresCdcSource {
     native_transaction: Option<(u32, Vec<PgOutputTextChange>, usize)>,
     native_seen_messages: usize,
     native_xid: Option<u32>,
+    pgoutput_transport_stats: PgOutputTransportStats,
+    pgoutput_transport_failure: Option<String>,
     secret_name: Option<String>,
     secret_version: u64,
     quad_lsn: QuadLsnProgress,
@@ -348,6 +370,87 @@ struct PgOutputConnection {
     snapshot_lsn: Option<PgLsn>,
     relations: std::collections::HashMap<u32, PgOutputRelation>,
     connection_task: tokio::task::JoinHandle<()>,
+    // COPY runs on its own socket so relation-policy queries can proceed
+    // while one source transaction is being read, frame by frame.
+    stream_client: Client,
+    stream_connection_task: tokio::task::JoinHandle<()>,
+    event_copy_sql: String,
+    event_stream: Option<Pin<Box<BinaryCopyOutStream>>>,
+    event_frame: PgOutputFrameAssembly,
+}
+
+/// Reassembles at most one protocol frame. The first COPY row announces its
+/// full length before any payload is retained; subsequent rows are 8 KiB.
+#[derive(Default)]
+struct PgOutputFrameAssembly {
+    expected_len: Option<usize>,
+    bytes: Vec<u8>,
+    transaction_bytes: usize,
+}
+
+impl PgOutputFrameAssembly {
+    fn push_chunk(
+        &mut self,
+        declared_len: Option<i32>,
+        chunk: &[u8],
+        stats: &mut PgOutputTransportStats,
+    ) -> Result<Option<Vec<u8>>, SourceError> {
+        if chunk.is_empty() || chunk.len() > PGOUTPUT_COPY_CHUNK_BYTES {
+            return Err(pgoutput_transport_error("invalid COPY chunk length"));
+        }
+        if let Some(declared_len) = declared_len {
+            if self.expected_len.is_some() {
+                return Err(pgoutput_transport_error("new frame before previous frame ended"));
+            }
+            let len = usize::try_from(declared_len)
+                .map_err(|_| pgoutput_transport_error("invalid pgoutput frame length"))?;
+            if len == 0 || len > POSTGRES_CDC_MAX_TRANSACTION_BYTES {
+                return Err(pgoutput_transport_error(
+                    "pgoutput frame exceeds POSTGRES_CDC_MAX_TRANSACTION_BYTES",
+                ));
+            }
+            let total = self.transaction_bytes.checked_add(len).ok_or_else(|| {
+                pgoutput_transport_error("pgoutput transaction byte count overflow")
+            })?;
+            if total > POSTGRES_CDC_MAX_TRANSACTION_BYTES {
+                return Err(pgoutput_transport_error(
+                    "pgoutput transaction exceeds POSTGRES_CDC_MAX_TRANSACTION_BYTES",
+                ));
+            }
+            self.transaction_bytes = total;
+            stats.peak_transaction_payload_bytes =
+                stats.peak_transaction_payload_bytes.max(total);
+            self.expected_len = Some(len);
+            self.bytes = Vec::with_capacity(len);
+        }
+        let len = self
+            .expected_len
+            .ok_or_else(|| pgoutput_transport_error("COPY continuation without a frame"))?;
+        if self.bytes.len().saturating_add(chunk.len()) > len {
+            return Err(pgoutput_transport_error("COPY chunk exceeds declared frame length"));
+        }
+        self.bytes.extend_from_slice(chunk);
+        stats.payload_bytes_received = stats
+            .payload_bytes_received
+            .saturating_add(chunk.len() as u64);
+        stats.peak_chunk_bytes = stats.peak_chunk_bytes.max(chunk.len());
+        stats.peak_frame_buffered_bytes =
+            stats.peak_frame_buffered_bytes.max(self.bytes.len());
+        if self.bytes.len() == len {
+            stats.frames_received = stats.frames_received.saturating_add(1);
+            self.expected_len = None;
+            return Ok(Some(std::mem::take(&mut self.bytes)));
+        }
+        Ok(None)
+    }
+}
+
+fn pgoutput_transport_error(detail: &str) -> SourceError {
+    SourceError::PollDeltaFailed {
+        reason: format!(
+            "[RS-4014] {detail}; replication is paused without advancing the source checkpoint or slot. Next steps: reduce upstream transaction size or repair the source and resnapshot"
+        ),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -391,6 +494,8 @@ impl PostgresCdcSource {
             native_transaction: None,
             native_seen_messages: 0,
             native_xid: None,
+            pgoutput_transport_stats: PgOutputTransportStats::default(),
+            pgoutput_transport_failure: None,
             secret_name: None,
             secret_version: 0,
             quad_lsn: QuadLsnProgress::new(),
@@ -399,6 +504,10 @@ impl PostgresCdcSource {
 
     pub fn quad_lsn_progress(&self) -> &QuadLsnProgress {
         &self.quad_lsn
+    }
+
+    pub fn pgoutput_transport_stats(&self) -> PgOutputTransportStats {
+        self.pgoutput_transport_stats
     }
 
     pub fn quad_lsn_progress_mut(&mut self) -> &mut QuadLsnProgress {
@@ -581,6 +690,31 @@ impl PostgresCdcSource {
             let _ = connection_task.await;
             return Err(error);
         }
+        // COPY cannot bind SQL parameters. Ask PostgreSQL to quote each
+        // configuration value so neither SQL syntax nor backslashes can alter
+        // the slot/publication chosen for the peek.
+        let quoted = client
+            .query_one(
+                "SELECT quote_literal($1::text), quote_literal($2::text)",
+                &[&config.slot, &config.publication],
+            )
+            .await
+            .map_err(|error| SourceError::Io(format!("quote pgoutput source: {error}")))?;
+        let slot_literal: String = quoted.get(0);
+        let publication_literal: String = quoted.get(1);
+        // The SQL function completes whole transactions even with a limit
+        // of one change. WITH ORDINALITY preserves the exact wire order; the
+        // generated pieces bound every result row independently of frame size.
+        let event_copy_sql = format!(
+            "COPY (SELECT CASE WHEN piece.piece_no = 0 THEN octet_length(decoded.data) ELSE NULL::integer END, substring(decoded.data FROM piece.piece_no * {PGOUTPUT_COPY_CHUNK_BYTES} + 1 FOR {PGOUTPUT_COPY_CHUNK_BYTES}) FROM pg_logical_slot_peek_binary_changes({slot_literal}, NULL, 1, 'proto_version', '1', 'publication_names', {publication_literal}) WITH ORDINALITY AS decoded(lsn, xid, data, ordinality) CROSS JOIN LATERAL generate_series(0, (octet_length(decoded.data) - 1) / {PGOUTPUT_COPY_CHUNK_BYTES}) AS piece(piece_no) ORDER BY decoded.ordinality, piece.piece_no) TO STDOUT (FORMAT binary)"
+        );
+        let (stream_client, stream_connection) = connection_config
+            .connect(NoTls)
+            .await
+            .map_err(|error| SourceError::Io(format!("connect pgoutput COPY stream: {error}")))?;
+        let stream_connection_task = tokio::spawn(async move {
+            let _ = stream_connection.await;
+        });
         self.pgoutput = Some(PgOutputConnection {
             client,
             slot: config.slot,
@@ -589,7 +723,13 @@ impl PostgresCdcSource {
             snapshot_lsn: None,
             relations: std::collections::HashMap::new(),
             connection_task,
+            stream_client,
+            stream_connection_task,
+            event_copy_sql,
+            event_stream: None,
+            event_frame: PgOutputFrameAssembly::default(),
         });
+        self.pgoutput_transport_failure = None;
         Ok(())
     }
 
@@ -650,6 +790,7 @@ impl PostgresCdcSource {
     pub fn close_pgoutput(&mut self) {
         if let Some(connection) = self.pgoutput.take() {
             connection.connection_task.abort();
+            connection.stream_connection_task.abort();
         }
         self.native_xid = None;
         self.native_seen_messages = 0;
@@ -660,11 +801,16 @@ impl PostgresCdcSource {
             let PgOutputConnection {
                 client,
                 connection_task,
+                stream_client,
+                stream_connection_task,
                 ..
             } = connection;
             drop(client);
+            drop(stream_client);
             connection_task.abort();
+            stream_connection_task.abort();
             let _ = connection_task.await;
+            let _ = stream_connection_task.await;
         }
         self.native_xid = None;
         self.native_seen_messages = 0;
@@ -1522,47 +1668,113 @@ impl PostgresCdcSource {
     /// next transaction until the current commit has been durably acknowledged.
     pub async fn poll_pgoutput_event(
         &mut self,
-        max_messages: usize,
+        _max_messages: usize,
     ) -> Result<Option<PgOutputEvent>, SourceError> {
         if self.manually_paused {
             return Err(SourceError::Io(
                 "source is paused; call resume before polling".to_string(),
             ));
         }
+        if let Some(reason) = &self.pgoutput_transport_failure {
+            return Err(SourceError::PollDeltaFailed {
+                reason: reason.clone(),
+            });
+        }
+        let result = self.poll_pgoutput_event_stream().await;
+        if let Err(error) = &result {
+            // A malformed or oversized transaction must never be skipped on
+            // retry. End the COPY connection so no more WAL is transferred.
+            self.pgoutput_transport_failure = Some(error.to_string());
+            self.replication_read_paused = true;
+            if let Some(pgoutput) = self.pgoutput.as_mut() {
+                pgoutput.event_stream = None;
+                pgoutput.stream_connection_task.abort();
+            }
+        }
+        result
+    }
+
+    async fn poll_pgoutput_event_stream(&mut self) -> Result<Option<PgOutputEvent>, SourceError> {
         let pgoutput = self.pgoutput.as_mut().ok_or_else(|| {
             SourceError::Io("native pgoutput connection is unavailable".to_string())
         })?;
-        let limit = i32::try_from(
-            self.native_seen_messages
-                .saturating_add(max_messages.max(1)),
-        )
-        .unwrap_or(i32::MAX);
-        let messages = pgoutput
-            .client
-            .query(
-                "SELECT lsn::text, data FROM pg_logical_slot_peek_binary_changes($1, NULL, $2, 'proto_version', '1', 'publication_names', $3)",
-                &[&pgoutput.slot, &limit, &pgoutput.publication],
-            )
-            .await
-            .map_err(|error| SourceError::PollDeltaFailed {
-                reason: format!("peek pgoutput event: {error}"),
-            })?;
-        let Some(message) = messages.into_iter().nth(self.native_seen_messages) else {
-            return Ok(None);
-        };
-        let payload = message.get::<_, Vec<u8>>(1);
-        self.native_seen_messages = self.native_seen_messages.saturating_add(1);
-        let event = match decode_pgoutput_event(&mut self.native_xid, &payload) {
-            Ok(event) => event,
-            Err(error) => {
-                self.native_seen_messages = self.native_seen_messages.saturating_sub(1);
-                return Err(error);
-            }
-        };
-        if matches!(event, PgOutputEvent::Commit { .. }) {
-            self.native_seen_messages = 0;
+        if pgoutput.event_stream.is_none() {
+            let stream = pgoutput
+                .stream_client
+                .copy_out(&pgoutput.event_copy_sql)
+                .await
+                .map_err(|error| SourceError::PollDeltaFailed {
+                    reason: format!("start bounded pgoutput COPY: {error}"),
+                })?;
+            pgoutput.event_stream = Some(Box::pin(BinaryCopyOutStream::new(
+                stream,
+                &[Type::INT4, Type::BYTEA],
+            )));
+            self.pgoutput_transport_stats.peek_queries =
+                self.pgoutput_transport_stats.peek_queries.saturating_add(1);
         }
-        Ok(Some(event))
+        loop {
+            let row = pgoutput
+                .event_stream
+                .as_mut()
+                .ok_or_else(|| pgoutput_transport_error("missing COPY stream"))?
+                .as_mut()
+                .next()
+                .await;
+            let Some(row) = row else {
+                pgoutput.event_stream = None;
+                if pgoutput.event_frame.expected_len.is_some() || self.native_xid.is_some() {
+                    return Err(pgoutput_transport_error("pgoutput COPY ended mid-transaction"));
+                }
+                return Ok(None);
+            };
+            let row = row.map_err(|error| SourceError::PollDeltaFailed {
+                reason: format!("read bounded pgoutput COPY: {error}"),
+            })?;
+            let frame_len: Option<i32> =
+                row.try_get(0).map_err(|error| pgoutput_transport_error(&format!(
+                    "decode COPY frame length: {error}"
+                )))?;
+            let chunk: Vec<u8> =
+                row.try_get(1).map_err(|error| pgoutput_transport_error(&format!(
+                    "decode COPY frame chunk: {error}"
+                )))?;
+            let Some(payload) = pgoutput.event_frame.push_chunk(
+                frame_len,
+                &chunk,
+                &mut self.pgoutput_transport_stats,
+            )? else {
+                continue;
+            };
+            let event = decode_pgoutput_event(&mut self.native_xid, &payload)?;
+            if matches!(event, PgOutputEvent::Commit { .. }) {
+                // One peek (upto_nchanges=1) must end at this transaction.
+                // Consume CopyDone before ACK so PostgreSQL releases the slot.
+                match pgoutput
+                    .event_stream
+                    .as_mut()
+                    .ok_or_else(|| pgoutput_transport_error("missing COPY stream at COMMIT"))?
+                    .as_mut()
+                    .next()
+                    .await
+                {
+                    None => {}
+                    Some(Ok(_)) => {
+                        return Err(pgoutput_transport_error(
+                            "COPY returned another frame beyond the COMMIT boundary",
+                        ));
+                    }
+                    Some(Err(error)) => {
+                        return Err(pgoutput_transport_error(&format!(
+                            "finish pgoutput COPY: {error}"
+                        )));
+                    }
+                }
+                pgoutput.event_stream = None;
+                pgoutput.event_frame.transaction_bytes = 0;
+            }
+            return Ok(Some(event));
+        }
     }
 }
 
@@ -1734,13 +1946,22 @@ impl SourceConnector for PostgresCdcSource {
                 reason: "pgoutput connection is closed or fenced".to_string(),
             });
         }
+        if let Some(reason) = &self.pgoutput_transport_failure {
+            return Err(SourceError::CommitOffsetFailed {
+                epoch,
+                reason: format!("pgoutput transport is blocked: {reason}"),
+            });
+        }
         if let Some(pgoutput) = &mut self.pgoutput {
             if lsn != PgLsn::ZERO {
                 let target = lsn.to_string();
+                // The slot advances only after M3 is durable. Aggregate in
+                // PostgreSQL rather than transferring/materializing every
+                // decoded binary frame a second time during acknowledgement.
                 pgoutput
-                    .client
-                    .query(
-                        "SELECT lsn FROM pg_logical_slot_get_binary_changes($1, $2::text::pg_lsn, NULL, 'proto_version', '1', 'publication_names', $3)",
+                    .stream_client
+                    .query_one(
+                        "SELECT count(*) FROM pg_logical_slot_get_binary_changes($1, $2::text::pg_lsn, NULL, 'proto_version', '1', 'publication_names', $3)",
                         &[&pgoutput.slot, &target, &pgoutput.publication],
                     )
                     .await
