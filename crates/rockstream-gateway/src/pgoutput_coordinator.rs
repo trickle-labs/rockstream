@@ -687,6 +687,14 @@ impl SharedPgOutputCoordinator {
         db: &ShardDb,
     ) -> Result<(), GatewayError> {
         self.cleanup_recovered_spill(db).await?;
+        // cleanup_recovered_spill removes the persisted spill keys but leaves
+        // unspilled in-memory entries untouched. Never reuse those entries
+        // when the same xid/sequence arrives on a fresh connection.
+        self.envelope_buffer = SpillableArrangement::new(
+            Some(Arc::clone(&self.shard_db)),
+            spill_prefix(self.connector_id),
+            POSTGRES_CDC_TRANSACTION_MEMORY_BYTES,
+        );
         self.active_envelope = None;
         self.activating_views.clear();
         Ok(())
