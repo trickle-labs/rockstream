@@ -88,6 +88,11 @@ fn scope_covers(action: SecurityAction, grant: &PolicyScope, requested: &PolicyS
             PolicyScope::Node { .. },
         ) => true,
         (
+            SecurityAction::SupportDownload,
+            PolicyScope::Cluster | PolicyScope::Node { .. },
+            PolicyScope::Artifact { .. },
+        ) => true,
+        (
             SecurityAction::SecurityAuditRead,
             PolicyScope::Cluster,
             PolicyScope::AuditRange { .. },
@@ -265,7 +270,7 @@ mod tests {
                 node_id: "worker-1".to_string()
             }
         ));
-        assert!(!allows(
+        assert!(allows(
             &policy,
             SecurityAction::SupportDownload,
             &PolicyScope::Artifact {

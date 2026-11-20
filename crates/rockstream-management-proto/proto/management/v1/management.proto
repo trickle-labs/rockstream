@@ -19,6 +19,8 @@ service ManagementService {
   rpc MigrateShard(MigrateShardRequest) returns (MigrateShardResponse);
   rpc CreateBackup(CreateBackupRequest) returns (CreateBackupResponse);
   rpc CancelOperation(CancelOperationRequest) returns (CancelOperationResponse);
+  rpc GenerateSupportArtifact(GenerateSupportArtifactRequest) returns (GenerateSupportArtifactResponse);
+  rpc DownloadSupportArtifact(DownloadSupportArtifactRequest) returns (stream DownloadSupportArtifactChunk);
 }
 
 message GetClusterStatusRequest { uint32 protocol_version = 1; }
@@ -223,3 +225,23 @@ message CancelOperationRequest {
   string operation_id = 2;
 }
 message CancelOperationResponse { uint32 protocol_version = 1; Operation operation = 2; }
+message GenerateSupportArtifactRequest {
+  uint32 protocol_version = 1;
+  string node_id = 2;
+  string idempotency_key = 3;
+}
+message GenerateSupportArtifactResponse {
+  uint32 protocol_version = 1;
+  string opaque_id = 2;
+  uint64 expires_at_ms = 3;
+}
+message DownloadSupportArtifactRequest {
+  uint32 protocol_version = 1;
+  string opaque_id = 2;
+}
+message DownloadSupportArtifactChunk {
+  bytes content = 1;
+  uint64 offset = 2;
+  bool final_chunk = 3;
+  uint64 expires_at_ms = 4;
+}
