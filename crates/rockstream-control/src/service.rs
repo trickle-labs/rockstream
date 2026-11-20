@@ -3377,7 +3377,12 @@ async fn authorize_gateway_actor_assertion(
         tracing::error!(code = %RS_0003, "durable actor policy is unavailable");
         return false;
     };
-    let principals = match catalog_store.list_security_principals().await {
+    let principals = match async {
+        catalog_store.refresh().await?;
+        catalog_store.list_security_principals().await
+    }
+    .await
+    {
         Ok(principals) => principals,
         Err(_) => {
             return reject_gateway_actor_assertion(
@@ -3450,6 +3455,11 @@ async fn authorize_worker_secret_request(
             "durable secret authorization catalog is unavailable",
         ));
     };
+    catalog.refresh().await.map_err(|_| {
+        WorkerSecretAuthorizationError::Unavailable(
+            "durable secret authorization catalog is unavailable",
+        )
+    })?;
     let (request, delegated_actor) = {
         let state = data_plane.lock().await;
         let Some(deployment) = state.deployments.get(&workload_id) else {

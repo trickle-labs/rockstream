@@ -1,4 +1,4 @@
-# Real Kafka and MinIO worker, ACK, sink-cursor, and bounded ENOSPC recovery; no p99 claim.
+# Real Kafka/MinIO recovery and Kafka secret-rotation qualification; no p99 claim.
 
 name: Real Cluster Chaos Soak
 

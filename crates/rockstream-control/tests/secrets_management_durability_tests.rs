@@ -15,6 +15,30 @@ use tempfile::TempDir;
 
 const MINIO_BUCKET: &str = "rockstream-secrets-durability-test";
 
+async fn assert_secret_envelope_is_persisted_without_plaintext(db: &Db) {
+    let bytes = db
+        .get(&secret_key(0, "durable"))
+        .await
+        .unwrap()
+        .expect("durable secret envelope must exist");
+    assert!(!bytes
+        .windows(b"durable-secret".len())
+        .any(|window| window == b"durable-secret"));
+
+    let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(envelope["name"], "durable");
+    assert!(envelope["wrapped_dek"]
+        .as_array()
+        .is_some_and(|value| !value.is_empty()));
+    assert!(envelope["ciphertext"]
+        .as_array()
+        .is_some_and(|value| !value.is_empty()));
+    assert!(envelope["nonce"]
+        .as_array()
+        .is_some_and(|value| !value.is_empty()));
+    assert!(envelope.get("payload").is_none());
+}
+
 fn assert_rotation_audit(records: &[SecurityAuditRecord], rotated_count: usize) {
     assert_eq!(records.len(), 1);
     let record = &records[0];
@@ -53,7 +77,7 @@ async fn secrets_survive_lfs_reopen_and_kek_rotation_uses_point_keys() {
     );
     let audit_catalog = Arc::new(DurableCatalogStore::new(object_store.clone(), "security"));
     let store = SecretStore::new(
-        Some(db.clone()),
+        Some(Arc::clone(&db)),
         Arc::new(EnvKekProvider::from_passphrase("before")),
     )
     .with_security_audit_catalog(audit_catalog.clone());
@@ -67,6 +91,7 @@ async fn secrets_survive_lfs_reopen_and_kek_rotation_uses_point_keys() {
         )
         .await
         .unwrap();
+    assert_secret_envelope_is_persisted_without_plaintext(&db).await;
     assert_eq!(
         store
             .rotate_kek(Arc::new(EnvKekProvider::from_passphrase("after")), "test",)
@@ -74,6 +99,7 @@ async fn secrets_survive_lfs_reopen_and_kek_rotation_uses_point_keys() {
             .unwrap(),
         1
     );
+    assert_secret_envelope_is_persisted_without_plaintext(&db).await;
     assert_eq!(
         store
             .get_secret(0, "durable")
@@ -143,10 +169,9 @@ async fn secrets_survive_minio_tc_reopen_and_kek_rotation() {
         return;
     }
 
-    let (_container, port) = match start_minio(MINIO_BUCKET).await {
-        Some(res) => res,
-        None => return,
-    };
+    let (_container, port) = start_minio(MINIO_BUCKET)
+        .await
+        .expect("MinIO must start when Docker is available");
 
     let object_store = minio_object_store(port, MINIO_BUCKET);
     let db = Arc::new(
@@ -192,16 +217,18 @@ async fn secrets_survive_minio_tc_reopen_and_kek_rotation() {
         audit_catalog.list_security_audit_records().await.unwrap(),
         records
     );
+    let reloaded_db = Arc::new(
+        Db::builder("catalog_db", object_store)
+            .build()
+            .await
+            .unwrap(),
+    );
     let reloaded = SecretStore::new(
-        Some(Arc::new(
-            Db::builder("catalog_db", object_store)
-                .build()
-                .await
-                .unwrap(),
-        )),
+        Some(Arc::clone(&reloaded_db)),
         Arc::new(EnvKekProvider::from_passphrase("after")),
     )
     .with_security_audit_catalog(audit_catalog);
+    assert_secret_envelope_is_persisted_without_plaintext(&reloaded_db).await;
     assert_eq!(
         reloaded
             .get_secret(0, "durable")

@@ -379,6 +379,11 @@ async fn test_reachability_secret_ddl() {
     )
     .await;
 
+    assert_command_ok(
+        &client,
+        "SET rockstream.idempotency_key = '00000000-0000-4000-8000-000000000001';",
+    )
+    .await;
     assert_command_ok(&client, "ALTER SECRET s_kfk SET (password = 'p2');").await;
 
     let rows_secrets = query_rows(&client, "SHOW SECRETS;").await;

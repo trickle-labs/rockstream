@@ -4991,6 +4991,7 @@ dependencies = [
  "object_store 0.14.2",
  "parking_lot",
  "rcgen",
+ "rdkafka",
  "rockstream-connectors",
  "rockstream-control",
  "rockstream-docgen",
