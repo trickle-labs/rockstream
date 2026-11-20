@@ -35,6 +35,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use futures::future::join_all;
+use futures::stream::{FuturesUnordered, StreamExt};
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
 use parking_lot::RwLock;
@@ -804,6 +805,24 @@ async fn start_election(
     }
 }
 
+/// Record a majority's evidence at the start of the request round. It is
+/// safe to do this before unrelated RPCs finish: the follower that ACKed
+/// could not have received the request before round_started. Never revive
+/// already-aged evidence beyond its original follower-election window.
+fn renew_leader_quorum(
+    inner: &Arc<RwLock<RaftInner>>,
+    term: u64,
+    round_started: Instant,
+) {
+    let mut guard = inner.write();
+    if guard.role == RaftRole::Leader
+        && guard.persistent.current_term == term
+        && round_started.elapsed() < guard.leader_quorum_timeout
+    {
+        guard.last_quorum_contact = guard.last_quorum_contact.max(round_started);
+    }
+}
+
 async fn send_heartbeats(
     config: &RaftConfig,
     inner: &Arc<RwLock<RaftInner>>,
@@ -822,21 +841,32 @@ async fn send_heartbeats(
         }
         (guard.persistent.current_term, config.node_id, Instant::now())
     };
-    let futures = config
+    let mut responses: FuturesUnordered<_> = config
         .peers
         .iter()
-        .map(|(_, addr)| send_heartbeat(addr, term, node_id, config.rpc_timeout));
+        .map(|(_, addr)| send_heartbeat(addr, term, node_id, config.rpc_timeout))
+        .collect();
+    let majority = config.peers.len().div_ceil(2) + 1;
     let mut highest = term;
     let mut acknowledgements = 1usize; // the leader itself
-    for resp in join_all(futures).await.into_iter().flatten() {
-        if resp.term > highest {
-            highest = resp.term;
-        }
-        if resp.term == term {
-            acknowledgements += 1;
+    if acknowledgements >= majority {
+        // Single-node groups have a majority without any peer RPCs.
+        renew_leader_quorum(inner, term, round_started);
+    }
+    while let Some(result) = responses.next().await {
+        if let Ok(resp) = result {
+            highest = highest.max(resp.term);
+            if resp.term == term {
+                acknowledgements += 1;
+                if acknowledgements == majority && highest == term {
+                    // Publish a fresh majority promptly. Waiting for an
+                    // unrelated slow peer must neither extend evidence age
+                    // nor suspend otherwise healthy leadership availability.
+                    renew_leader_quorum(inner, term, round_started);
+                }
+            }
         }
     }
-    let majority = config.peers.len().div_ceil(2) + 1;
     if highest > term {
         let _transition = store.transition_lock.lock().await;
         // See `start_election`'s comment: the guard's scope must end at
@@ -859,15 +889,6 @@ async fn send_heartbeats(
     } else {
         let mut guard = inner.write();
         if guard.role == RaftRole::Leader && guard.persistent.current_term == term {
-            if acknowledgements >= majority
-                && round_started.elapsed() < guard.leader_quorum_timeout
-            {
-                // A follower's election timer starts when it receives this
-                // request, which cannot precede round_started. Waiting for
-                // a delayed ACK (or an unrelated peer in join_all) must not
-                // make this evidence any newer.
-                guard.last_quorum_contact = guard.last_quorum_contact.max(round_started);
-            }
             if !has_live_leader_quorum(&guard) {
                 // No usable majority proof remains, even if a stale round
                 // eventually returned a nominal quorum.
