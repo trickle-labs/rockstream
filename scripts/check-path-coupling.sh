@@ -27,9 +27,18 @@ else
 fi
 
 # Benchmark baselines record measurements, not protocol changes.
-changed_files=$(git diff --ignore-all-space --ignore-blank-lines --name-only "$RANGE" 2>/dev/null \
+changed_files=$(git diff --name-only "$RANGE" 2>/dev/null \
     | grep -v '^formal/verus/' \
     | grep -v '/benches/baseline/' || true)
+
+# Blank-line-only edits do not change protocol semantics.
+substantive_files=""
+while IFS= read -r file; do
+    if [ -n "$file" ] && ! git diff --quiet --ignore-blank-lines "$RANGE" -- "$file"; then
+        substantive_files+="${file}"$'\n'
+    fi
+done < <(printf '%s\n' "$changed_files")
+changed_files="${substantive_files%$'\n'}"
 
 if [ -z "$changed_files" ]; then
     echo "check-path-coupling: no changed files found for range '$RANGE' — skipping."
