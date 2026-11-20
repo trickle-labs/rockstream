@@ -164,8 +164,8 @@ async fn two_views_with_one_group_each_receive_every_partition() {
 async fn real_broker_ack_outage_after_m3_recovers_with_no_new_input_in_same_process() {
     use arrow::datatypes::{DataType, Field, Schema};
     use rockstream_connectors::{
-        KafkaSource, OffsetToken, SourceCheckpoint, SourceCheckpointStore,
-        SourceRuntimeCoordinator,
+        BackfillCursor, BackfillLifecycle, BackfillPhase, KafkaSource, OffsetToken,
+        SnapshotDeltaFence, SourceCheckpoint, SourceCheckpointStore, SourceRuntimeCoordinator,
     };
     use rockstream_storage::{
         keys::{ShardKeyEncoder, ShardPrefix},
@@ -255,6 +255,26 @@ async fn real_broker_ack_outage_after_m3_recovers_with_no_new_input_in_same_proc
         batch
     }
 
+    fn lifecycle(epoch: u64, token: &OffsetToken) -> BackfillLifecycle {
+        BackfillLifecycle::new(
+            BackfillPhase::Running,
+            BackfillCursor::new(
+                "kafka_ack_view",
+                0,
+                token.as_bytes().to_vec(),
+                SnapshotDeltaFence::new(
+                    OffsetToken::new(vec![]),
+                    OffsetToken::new(vec![]),
+                ),
+                epoch,
+            ),
+            0,
+            2,
+            0,
+            Some(epoch),
+        )
+    }
+
     // Blackhole the *actual* broker before the M3 + ACK boundary. The
     // checkpoint and view output are persisted locally, but the broker cannot
     // accept the synchronous offset commit. Unlike a process restart, the
@@ -282,12 +302,17 @@ async fn real_broker_ack_outage_after_m3_recovers_with_no_new_input_in_same_proc
         container_id,
         paused: true,
     };
+    let durable_lifecycle = lifecycle(1, &token);
     let failure = runtime
-        .commit_epoch(&owner, 1, token.clone(), m3(1))
+        .commit_backfill_epoch(&owner, 1, token.clone(), durable_lifecycle.clone(), m3(1))
         .await
         .unwrap_err();
     assert!(failure.to_string().contains("RS-4016"), "{failure}");
     assert!(runtime.has_pending_ack());
+    assert_eq!(
+        store.backfill_lifecycle("kafka_ack_view").await.unwrap(),
+        Some(durable_lifecycle),
+    );
     assert_eq!(
         store.highest_committed().await.unwrap(),
         Some(SourceCheckpoint::prepared(connector_id, 1, token.clone()).committed()),
@@ -345,7 +370,13 @@ async fn real_broker_ack_outage_after_m3_recovers_with_no_new_input_in_same_proc
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
     runtime
-        .commit_epoch(&owner, 2, next_token.clone(), m3(2))
+        .commit_backfill_epoch(
+            &owner,
+            2,
+            next_token.clone(),
+            lifecycle(2, &next_token),
+            m3(2),
+        )
         .await
         .unwrap();
     assert_eq!(
