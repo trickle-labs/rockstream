@@ -599,6 +599,20 @@ impl SourceRuntimeCoordinator<PostgresCdcSource> {
             .await
     }
 
+    /// Reopen a disconnected PostgreSQL transport without surrendering the
+    /// current source owner lease. The slot itself is never advanced here;
+    /// any partial pgoutput transaction must be discarded by the caller.
+    pub async fn reopen_pgoutput_after_disconnect(
+        &mut self,
+        lease: &SourceOwnerLease,
+    ) -> Result<(), SourceError> {
+        self.require_active_lease(lease)?;
+        self.source.close_pgoutput();
+        self.source
+            .open_pgoutput(self.source_epochs.current_epoch() != 0)
+            .await
+    }
+
     /// Poll one decoded event while retaining acknowledgement authority here.
     pub async fn poll_pgoutput_event(
         &mut self,
