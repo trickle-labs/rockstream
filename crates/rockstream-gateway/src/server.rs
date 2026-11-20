@@ -5614,6 +5614,10 @@ impl GatewayHandler {
                 Err(error) => {
                     handler
                         .block_pgoutput_aliases(&aliases, format!("pgoutput poll failed: {error}"));
+                    // An oversized frame stops the COPY stream but must also
+                    // release the control socket and source-owner lease.
+                    let _ = coordinator.runtime.close_pgoutput(&lease);
+                    coordinator.owner_lease = None;
                     break;
                 }
             };
