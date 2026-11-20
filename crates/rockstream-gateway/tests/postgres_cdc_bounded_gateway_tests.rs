@@ -172,6 +172,10 @@ async fn run_gateway_proof() {
             break;
         }
         assert!(
+            actual.is_empty(),
+            "a partial M3 transaction became visible before the complete commit: {actual:?}"
+        );
+        assert!(
             Instant::now() < deadline,
             "M3 never published complete transcript: actual={actual:?}, expected={expected:?}"
         );
