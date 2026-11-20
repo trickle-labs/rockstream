@@ -48,6 +48,34 @@ permanent replacements are documented in
 
 ## PostgreSQL CDC
 
+### Bounded pgoutput transport and oversize recovery
+
+The gateway and row-only pgoutput readers stream binary COPY results from a
+single logical-decoding peek per upstream transaction. PostgreSQL is allowed to
+exceed `upto_nchanges` at transaction boundaries; RockStream does not treat
+that argument as an allocation limit. Instead, COPY exposes at most 8 KiB per
+wire row, announces each pgoutput frame's full length first, and rejects any
+frame or cumulative upstream transaction that would exceed the 8 MiB source
+limit **before** buffering the excessive frame. BEGIN, relation metadata and
+COMMIT frames count toward the bound, not just routed row changes.
+
+`PgOutputTransportStats` reports actual received frames, payload bytes,
+peak COPY chunk and frame buffer sizes, and per-transaction payload bytes,
+independently of the coordinator's encoded-change fill metrics.
+The gateway still publishes all changes and the slot LSN together only after
+the transaction-wide M3 durability fence. A transport protocol or size failure
+returns `RS-4014`, blocks further reads and acknowledgments, and leaves the
+durable source checkpoint and PostgreSQL slot position unchanged. After such a
+failure the operator must reduce the upstream transaction size (or repair the
+source), then perform the supported resnapshot/replacement-slot recovery
+workflow; retrying against the unchanged oversized transaction will fail
+closed rather than skip it.
+
+Real PostgreSQL regression coverage:
+`pgoutput_bounded_copy_preserves_complete_ordered_thousand_row_transcript_and_ack`,
+`pgoutput_copy_rejects_oversized_frame_before_buffer_or_checkpoint_advances`,
+and gateway test `pgoutput_gateway_publishes_complete_large_transaction_atomically_and_acks_after_commit`.
+
 | Axis | Guarantee |
 | --- | --- |
 | Delivery / recovery | Snapshot-to-stream uses a captured fence. A committed LSN resumes without a gap or duplicate; recoverable slot loss triggers a bounded resnapshot. |
