@@ -15,7 +15,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
+use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::streaming::StreamingTable;
@@ -1201,6 +1202,7 @@ const FALLBACK_QUERY_MAX_ROWS: usize = 10_000;
 const FALLBACK_QUERY_MAX_ARRAY_BYTES: usize = 8 * 1024 * 1024;
 const FALLBACK_QUERY_MAX_WALL_MS: u64 = 5_000;
 const FALLBACK_QUERY_MAX_CONCURRENT: usize = 16;
+const SECURITY_POLICY_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 static FALLBACK_QUERY_PERMITS: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(FALLBACK_QUERY_MAX_CONCURRENT);
 static NEXT_DISTRIBUTED_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -2133,6 +2135,7 @@ pub struct GatewayHandler {
     query_time_shard_topology_provider: Option<Arc<QueryTimeShardTopologyProvider>>,
     /// Authentication mode for this gateway instance.
     auth_mode: AuthMode,
+    security_policy_refreshed_at: tokio::sync::Mutex<Option<std::time::Instant>>,
     /// Configured RS256 verifier for OIDC-authenticated public connections.
     oidc_verifier: Option<Arc<crate::auth::OidcVerifier>>,
     /// Legacy RoleCatalog for MD5 compatibility; SCRAM credentials come from durable principals.
@@ -2190,6 +2193,9 @@ pub struct GatewayHandler {
     cursor_producer_slots: Arc<tokio::sync::Semaphore>,
     /// Test-only barrier awaited before acquiring `shard_commit_lock` on explicit-key commits.
     commit_lock_barrier_for_test: Option<Arc<tokio::sync::Barrier>>,
+    /// Tables whose persisted primary keys in `shard_db` have been verified/reconciled
+    /// to the canonical typed tuple encoding (`__pk1:`).
+    reconciled_pk_tables: Arc<DashSet<String>>,
 }
 
 fn secret_use_scopes_for_deployment(
@@ -2608,6 +2614,7 @@ impl GatewayHandler {
                     if attempt + 1
                         < rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS =>
                 {
+                    store.refresh().await.map_err(|error| error.to_string())?;
                     continue;
                 }
                 Err(error) => return Err(error.to_string()),
@@ -2699,6 +2706,15 @@ impl GatewayHandler {
             .catalog
             .get_durable_store()
             .ok_or_else(|| "durable security catalog is unavailable".to_string())?;
+        let mut refreshed_at = self.security_policy_refreshed_at.lock().await;
+        if refreshed_at
+            .as_ref()
+            .is_none_or(|last| last.elapsed() >= SECURITY_POLICY_REFRESH_INTERVAL)
+        {
+            store.refresh().await.map_err(|error| error.to_string())?;
+            *refreshed_at = Some(std::time::Instant::now());
+        }
+        drop(refreshed_at);
         let principals = store
             .list_security_principals()
             .await
@@ -2969,16 +2985,27 @@ impl GatewayHandler {
         let Some(authorized_principal) = matching_principal.as_ref() else {
             return Ok(vec![security_audit_policy_changed_response()]);
         };
-        let records = match store
-            .list_security_audit_page(
+        let mut cancel_token = CANCEL_TOKEN
+            .try_with(|token| token.clone())
+            .unwrap_or_else(|_| CancelToken::new());
+        let page = tokio::select! {
+            biased;
+            _ = cancel_token.cancelled() => {
+                return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "57014".to_string(),
+                    "[RS-2050] query.cancelled: query was cancelled by a client CancelRequest. next_steps: Retry the query or await client timeout settings.".to_string(),
+                )))]);
+            }
+            page = store.list_security_audit_page(
                 (authorized_principal.id, authorized_principal.revision),
                 query.from_ms,
                 query.to_ms,
                 query.after,
                 query.limit,
-            )
-            .await
-        {
+            ) => page,
+        };
+        let records = match page {
             Ok(records) => records,
             Err(rockstream_storage::catalog::CatalogError::OptimisticConflict(_)) => {
                 return Ok(vec![security_audit_policy_changed_response()]);
@@ -3297,6 +3324,7 @@ impl GatewayHandler {
                     if attempt + 1
                         < rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS =>
                 {
+                    store.refresh().await.map_err(|error| error.to_string())?;
                     continue;
                 }
                 Err(error) => return Err(error.to_string()),
@@ -3493,6 +3521,7 @@ impl GatewayHandler {
             query_time_shard_topology: None,
             query_time_shard_topology_provider: None,
             auth_mode: AuthMode::Off,
+            security_policy_refreshed_at: tokio::sync::Mutex::new(None),
             oidc_verifier: None,
             role_catalog: Arc::new(RoleCatalog::new()),
             acl_store: Arc::new(rockstream_control::AclStore::new()),
@@ -3521,6 +3550,7 @@ impl GatewayHandler {
             in_flight_queries: Arc::new(AtomicUsize::new(0)),
             cursor_producer_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             commit_lock_barrier_for_test: None,
+            reconciled_pk_tables: Arc::new(DashSet::new()),
         }
     }
 
@@ -3545,6 +3575,7 @@ impl GatewayHandler {
             query_time_shard_topology: None,
             query_time_shard_topology_provider: None,
             auth_mode: AuthMode::Off,
+            security_policy_refreshed_at: tokio::sync::Mutex::new(None),
             oidc_verifier: None,
             role_catalog: Arc::new(RoleCatalog::new()),
             acl_store: Arc::new(rockstream_control::AclStore::new()),
@@ -3573,6 +3604,7 @@ impl GatewayHandler {
             in_flight_queries: Arc::new(AtomicUsize::new(0)),
             cursor_producer_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             commit_lock_barrier_for_test: None,
+            reconciled_pk_tables: Arc::new(DashSet::new()),
         }
     }
 
@@ -3771,6 +3803,11 @@ impl GatewayHandler {
         let Some(shard_db) = self.shard_db.clone() else {
             return Ok(());
         };
+        for table in self.catalog.list_tables() {
+            if !table.pk_cols.is_empty() {
+                self.ensure_table_pk_keys_reconciled(&table.name).await?;
+            }
+        }
         for view in self.catalog.list_views() {
             let Some(op_id) = view.op_id else {
                 continue;
@@ -4453,7 +4490,7 @@ impl GatewayHandler {
             let mut combined = Vec::new();
             for batch in &delta.batches {
                 combined.extend(
-                    source_batch_to_dml_ops(&table.name, &table.columns, batch)
+                    source_batch_to_dml_ops(&table.name, &table.columns, &table.pk_cols, batch)
                         .map_err(|detail| GatewayError::QueryTimeExecutionFailed { detail })?,
                 );
             }
@@ -6169,7 +6206,7 @@ impl GatewayHandler {
             let mut ops = Vec::new();
             let mut decode_failed = false;
             for batch in &delta.batches {
-                match source_batch_to_dml_ops(&table.name, &table.columns, batch) {
+                match source_batch_to_dml_ops(&table.name, &table.columns, &table.pk_cols, batch) {
                     Ok(batch_ops) => ops.extend(batch_ops),
                     Err(error) => {
                         tracing::warn!(view = %view_name, %error, "live source batch decode failed");
@@ -6229,7 +6266,7 @@ impl GatewayHandler {
         estimated_rows: u64,
         shard_db: &Arc<rockstream_storage::ShardDb>,
     ) -> Result<(), GatewayError> {
-        let ops = source_batch_to_dml_ops(&table.name, &table.columns, batch)
+        let ops = source_batch_to_dml_ops(&table.name, &table.columns, &table.pk_cols, batch)
             .map_err(|detail| GatewayError::QueryTimeExecutionFailed { detail })?;
         self.commit_bound_source_ops(
             runtime,
@@ -12331,7 +12368,6 @@ impl GatewayHandler {
         } else {
             idempotency_key
         };
-
         let ops = entry.drain();
         drop(entry); // release DashMap entry guard before await
         self.commit_local_ops(
@@ -12363,9 +12399,6 @@ impl GatewayHandler {
         // out of order; checking idempotency before acquiring it allowed
         // concurrent identical retries to both pass and double-apply.
         let _commit_guard = self.shard_commit_lock.lock().await;
-        self.recover_pending_views_locked()
-            .await
-            .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
         if check_idempotency {
             if let Some(key_hash) = idempotency_key {
                 // Explicit client key — check under the commit lock so concurrent
@@ -12411,10 +12444,21 @@ impl GatewayHandler {
                 }
             }
         }
+        // Reject before view recovery can flush unrelated work for this commit attempt.
+        let (ops, conflicted) = committed_dml_ops(shard_db, ops)
+            .await
+            .map_err(|e| PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e))))?;
+        if conflicted {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "40001".to_owned(),
+                "transaction conflict: a row changed or a primary key became occupied after this transaction staged its writes; no writes were committed. Re-read current rows, resolve any key conflicts, and retry the transaction.".to_owned(),
+            ))));
+        }
+        self.recover_pending_views_locked()
+            .await
+            .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
         let (epoch, ops, changes, distributed_deltas) = {
-            let ops = committed_dml_ops(shard_db, ops).await.map_err(|e| {
-                PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
-            })?;
             if ops.is_empty() {
                 if let Some(conn_id) = conn_id {
                     self.flush_pending_notifies(conn_id);
@@ -13352,22 +13396,37 @@ impl GatewayHandler {
             .get(&table)
             .map(|entry| entry.value().clone());
 
-        let decimal_columns: Vec<_> = self
-            .catalog
-            .get_table(&table)
+        let catalog_table = self.catalog.get_table(&table);
+        let column_types = catalog_table
+            .as_ref()
+            .map(|ct| catalog_column_types(&ct.columns))
+            .unwrap_or_default();
+        let decimal_columns: Vec<_> = catalog_table
+            .as_ref()
             .into_iter()
-            .flat_map(|table| table.columns)
+            .flat_map(|table| table.columns.iter())
             .filter_map(|column| {
                 let datatype = string_to_arrow_datatype(&column.data_type);
-                matches!(datatype, DataType::Decimal128(_, _)).then_some((column.name, datatype))
+                matches!(datatype, DataType::Decimal128(_, _))
+                    .then_some((column.name.clone(), datatype))
             })
             .collect();
 
-        let pk_cols = self
-            .catalog
-            .get_table(&table)
-            .map(|ct| ct.pk_cols)
-            .unwrap_or_default();
+        let pk_cols = catalog_table.map(|ct| ct.pk_cols).unwrap_or_default();
+
+        if !pk_cols.is_empty() {
+            if let Err(e) = self.ensure_table_pk_keys_reconciled(&table).await {
+                let msg = e.to_string();
+                let sqlstate = if msg.contains("RS-2057") {
+                    "23505"
+                } else {
+                    "58000"
+                };
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), msg),
+                )))]);
+            }
+        }
 
         let mut returning_rows: Vec<Vec<String>> = Vec::with_capacity(rows.len());
         let mut row_keys = Vec::with_capacity(rows.len());
@@ -13418,6 +13477,22 @@ impl GatewayHandler {
                 }
             }
 
+            // Validate and normalize primary key columns against declared types.
+            for pk in &pk_cols {
+                if let Some(dt) = column_types.get(&pk.to_lowercase()) {
+                    if let Some(value) = value_map.get_mut(pk).filter(|v| v.as_str() != r"\N") {
+                        match normalize_typed_value(value, dt) {
+                            Ok(normalized) => *value = normalized,
+                            Err(err) => {
+                                return Ok(vec![promote_response(Response::Error(Box::new(
+                                    ErrorInfo::new("ERROR".to_owned(), "22P02".to_owned(), err),
+                                )))]);
+                            }
+                        }
+                    }
+                }
+            }
+
             let stored_cols = if table_columns.is_empty() {
                 cols.clone()
             } else {
@@ -13432,7 +13507,19 @@ impl GatewayHandler {
                         .unwrap_or_else(|| r"\N".to_string())
                 })
                 .collect();
-            let row_key = build_table_row_key(&pk_cols, &stored_cols, &stored_values);
+            let row_key = match build_table_row_key_typed(
+                &pk_cols,
+                &stored_cols,
+                &stored_values,
+                &column_types,
+            ) {
+                Ok(k) => k,
+                Err(err) => {
+                    return Ok(vec![promote_response(Response::Error(Box::new(
+                        ErrorInfo::new("ERROR".to_owned(), "22P02".to_owned(), err),
+                    )))]);
+                }
+            };
 
             if !pk_cols.is_empty() {
                 if !seen_keys.insert(row_key.clone()) {
@@ -13672,6 +13759,93 @@ impl GatewayHandler {
         let mut response = QueryResponse::new(schema, stream);
         response.set_command_tag(command);
         promote_response(Response::Query(response))
+    }
+
+    /// Reconcile any legacy unescaped `{col}={val}` persisted keys under
+    /// `view_output/{table}/` to the canonical `__pk1:` typed tuple format.
+    /// Fails closed if two persisted rows map to the same canonical primary key
+    /// or if a persisted key's row image cannot be normalized.
+    async fn ensure_table_pk_keys_reconciled(&self, table: &str) -> Result<(), GatewayError> {
+        let table_lower = table.to_lowercase();
+        if self.reconciled_pk_tables.contains(&table_lower) {
+            return Ok(());
+        }
+        let Some(shard_db) = &self.shard_db else {
+            return Ok(());
+        };
+        let Some(catalog_table) = self.catalog.get_table(table) else {
+            return Ok(());
+        };
+        if catalog_table.pk_cols.is_empty() {
+            self.reconciled_pk_tables.insert(table_lower);
+            return Ok(());
+        }
+
+        let prefix = format!("view_output/{table}/");
+        let kvs = shard_db.scan_prefix(prefix.as_bytes()).await?;
+        let col_names: Vec<String> = catalog_table
+            .columns
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        let col_types = catalog_column_types(&catalog_table.columns);
+
+        let mut seen_canonical = HashSet::new();
+        let mut legacy_entries = Vec::new();
+        for (k, v) in kvs {
+            let Ok(key_str) = std::str::from_utf8(&k) else {
+                continue;
+            };
+            let Some(row_key) = key_str.strip_prefix(&prefix) else {
+                continue;
+            };
+            if row_key.starts_with(PK_KEY_PREFIX_V1) {
+                if !seen_canonical.insert(row_key.to_string()) {
+                    return Err(GatewayError::QueryTimeExecutionFailed {
+                        detail: format!(
+                            "[RS-2057] duplicate canonical primary key '{row_key}' persisted on table '{table}'"
+                        ),
+                    });
+                }
+            } else if !row_key.starts_with("__heap_") {
+                legacy_entries.push((k, v));
+            }
+        }
+
+        if !legacy_entries.is_empty() {
+            let mut batch = rockstream_storage::WriteBatch::new();
+            for (old_key, val_bytes) in legacy_entries {
+                let val_str = std::str::from_utf8(&val_bytes).map_err(|_| {
+                    GatewayError::QueryTimeExecutionFailed {
+                        detail: format!(
+                            "[RS-2057] legacy row on table '{table}' is not valid UTF-8 and cannot be reconciled"
+                        ),
+                    }
+                })?;
+                let fields: Vec<String> = val_str.split('\t').map(|s| s.to_string()).collect();
+                let canonical_row_key =
+                    build_pk_row_key_typed(&catalog_table.pk_cols, &col_names, &fields, &col_types)
+                        .map_err(|e| GatewayError::QueryTimeExecutionFailed {
+                            detail: format!(
+                        "[RS-2057] legacy primary key reconciliation failed on table '{table}': {e}"
+                    ),
+                        })?;
+                if !seen_canonical.insert(canonical_row_key.clone()) {
+                    return Err(GatewayError::QueryTimeExecutionFailed {
+                        detail: format!(
+                            "[RS-2057] legacy primary key reconciliation conflict on table '{table}': multiple persisted rows map to the same canonical primary key"
+                        ),
+                    });
+                }
+                let new_key = format!("view_output/{table}/{canonical_row_key}");
+                batch.delete(&old_key);
+                batch.put(new_key.as_bytes(), &val_bytes);
+            }
+            shard_db.write_batch(batch).await?;
+        }
+
+        self.reconciled_pk_tables.insert(table_lower);
+        Ok(())
     }
 
     async fn check_pk_exists(
@@ -13966,6 +14140,20 @@ impl GatewayHandler {
             .unwrap_or_default();
         let pk_cols = table_entry.map(|ct| ct.pk_cols).unwrap_or_default();
 
+        if !pk_cols.is_empty() {
+            if let Err(e) = self.ensure_table_pk_keys_reconciled(&table).await {
+                let msg = e.to_string();
+                let sqlstate = if msg.contains("RS-2057") {
+                    "23505"
+                } else {
+                    "58000"
+                };
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), msg),
+                )))]);
+            }
+        }
+
         let matched_rows = match self
             .find_matching_rows_predicate(&table, &table_columns, predicate.as_ref(), conn_id)
             .await
@@ -14011,16 +14199,18 @@ impl GatewayHandler {
         let mut new_keys_in_batch = HashSet::new();
 
         for (old_row_key, existing_fields) in &matched_rows {
-            let mut row_map: HashMap<String, Option<String>> = HashMap::new();
+            let mut original_row: HashMap<String, Option<String>> = HashMap::new();
             for (i, col) in table_columns.iter().enumerate() {
                 let val = existing_fields.get(i).cloned();
                 let val_opt = match val {
                     Some(ref s) if s == r"\N" => None,
                     other => other,
                 };
-                row_map.insert(col.clone(), val_opt);
+                original_row.insert(col.clone(), val_opt);
             }
 
+            let mut staged_assignments: Vec<(String, Option<String>)> =
+                Vec::with_capacity(assignments.len());
             for (col_name, scalar_expr) in &assignments {
                 let Some(target_type) = column_types.get(col_name) else {
                     return Ok(vec![promote_response(Response::Error(Box::new(
@@ -14031,34 +14221,47 @@ impl GatewayHandler {
                         ),
                     )))]);
                 };
-                let new_val =
-                    match scalar_expr.evaluate_assignment(&row_map, &column_types, target_type) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            let err_str = e.to_string();
-                            let sqlstate = if err_str.contains("RS-1016") {
-                                if err_str.contains("division by zero") {
-                                    "22012"
-                                } else {
-                                    "22003"
-                                }
-                            } else if err_str.contains("RS-1013") {
-                                "0A000"
+                let new_val = match scalar_expr.evaluate_assignment(
+                    &original_row,
+                    &column_types,
+                    target_type,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        let sqlstate = if err_str.contains("RS-1016") {
+                            if err_str.contains("division by zero") {
+                                "22012"
                             } else {
-                                "42601"
-                            };
-                            return Ok(vec![promote_response(Response::Error(Box::new(
-                                ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), err_str),
-                            )))]);
-                        }
-                    };
-                row_map.insert(col_name.clone(), new_val);
+                                "22003"
+                            }
+                        } else if err_str.contains("RS-1013") {
+                            "0A000"
+                        } else {
+                            "42601"
+                        };
+                        return Ok(vec![promote_response(Response::Error(Box::new(
+                            ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), err_str),
+                        )))]);
+                    }
+                };
+                staged_assignments.push((col_name.clone(), new_val));
+            }
+
+            let mut updated_row = original_row;
+            for (col_name, new_val) in staged_assignments {
+                let target_col = table_columns
+                    .iter()
+                    .find(|tc| tc.eq_ignore_ascii_case(&col_name))
+                    .cloned()
+                    .unwrap_or(col_name);
+                updated_row.insert(target_col, new_val);
             }
 
             let new_vals: Vec<String> = table_columns
                 .iter()
                 .map(|c| {
-                    row_map
+                    updated_row
                         .get(c)
                         .and_then(|o| o.clone())
                         .unwrap_or_else(|| r"\N".to_string())
@@ -14066,7 +14269,14 @@ impl GatewayHandler {
                 .collect();
 
             let new_row_key = if !pk_cols.is_empty() {
-                build_pk_row_key(&pk_cols, &table_columns, &new_vals)
+                match build_pk_row_key_typed(&pk_cols, &table_columns, &new_vals, &column_types) {
+                    Ok(k) => k,
+                    Err(err) => {
+                        return Ok(vec![promote_response(Response::Error(Box::new(
+                            ErrorInfo::new("ERROR".to_owned(), "22P02".to_owned(), err),
+                        )))]);
+                    }
+                }
             } else {
                 old_row_key.clone()
             };
@@ -14231,9 +14441,26 @@ impl GatewayHandler {
         };
 
         let table_entry = self.catalog.get_table(&table);
+        let has_pk = table_entry
+            .as_ref()
+            .is_some_and(|ct| !ct.pk_cols.is_empty());
         let table_columns: Vec<String> = table_entry
             .map(|ct| ct.columns.iter().map(|c| c.name.clone()).collect())
             .unwrap_or_default();
+
+        if has_pk {
+            if let Err(e) = self.ensure_table_pk_keys_reconciled(&table).await {
+                let msg = e.to_string();
+                let sqlstate = if msg.contains("RS-2057") {
+                    "23505"
+                } else {
+                    "58000"
+                };
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), msg),
+                )))]);
+            }
+        }
 
         let matched_rows = match self
             .find_matching_rows_predicate(&table, &table_columns, predicate.as_ref(), conn_id)
@@ -16028,12 +16255,28 @@ impl CopyHandler for GatewayHandler {
                     state.columns.clone()
                 };
 
-                let row_key = cols
-                    .iter()
-                    .zip(fields.iter())
-                    .map(|(c, v)| format!("{c}={v}"))
-                    .collect::<Vec<_>>()
-                    .join("|");
+                let table_entry = self.catalog.get_table(&state.table);
+                let pk_cols = table_entry
+                    .as_ref()
+                    .map(|ct| ct.pk_cols.clone())
+                    .unwrap_or_default();
+                let column_types = table_entry
+                    .as_ref()
+                    .map(|ct| catalog_column_types(&ct.columns))
+                    .unwrap_or_default();
+                let field_strings: Vec<String> = fields.iter().map(|s| (*s).to_string()).collect();
+                let row_key = if !pk_cols.is_empty() {
+                    build_pk_row_key_typed(&pk_cols, &cols, &field_strings, &column_types)
+                } else {
+                    build_row_key_typed(&cols, &field_strings, &column_types)
+                }
+                .map_err(|err| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "22P02".to_owned(),
+                        err,
+                    )))
+                })?;
                 let values_tsv = fields.join("\t");
                 let op_bytes = values_tsv.len() + row_key.len() + state.table.len() + 64;
 
@@ -18937,7 +19180,7 @@ fn append_dml_ops(batch: &mut rockstream_storage::WriteBatch, ops: &[DmlOp]) {
 async fn committed_dml_ops(
     shard_db: &rockstream_storage::ShardDb,
     ops: Vec<DmlOp>,
-) -> Result<Vec<DmlOp>, rockstream_storage::StorageError> {
+) -> Result<(Vec<DmlOp>, bool), rockstream_storage::StorageError> {
     let mut images = stream::iter(dml_image_tables(&ops))
         .map(|(key, table)| async move {
             let storage_key = format!("view_output/{table}/{}", key.1);
@@ -18953,6 +19196,7 @@ async fn committed_dml_ops(
         .into_iter()
         .collect::<HashMap<_, _>>();
     let mut committed = Vec::with_capacity(ops.len());
+    let mut conflicted = false;
     for op in ops {
         let valid = match &op {
             DmlOp::Insert {
@@ -18980,7 +19224,11 @@ async fn committed_dml_ops(
                 new_tsv,
             } => {
                 let image = cached_row_image(shard_db, &mut images, table, old_row_key).await?;
-                if image.as_deref() == Some(old_tsv) {
+                let destination_available = old_row_key == new_row_key
+                    || cached_row_image(shard_db, &mut images, table, new_row_key)
+                        .await?
+                        .is_none();
+                if image.as_deref() == Some(old_tsv) && destination_available {
                     images.insert((table.to_ascii_lowercase(), old_row_key.clone()), None);
                     images.insert(
                         (table.to_ascii_lowercase(), new_row_key.clone()),
@@ -19007,9 +19255,11 @@ async fn committed_dml_ops(
         };
         if valid {
             committed.push(op);
+        } else {
+            conflicted = true;
         }
     }
-    Ok(committed)
+    Ok((committed, conflicted))
 }
 
 fn dml_image_tables(ops: &[DmlOp]) -> HashMap<(String, String), String> {
@@ -19216,6 +19466,22 @@ fn pgoutput_change_to_dml(
         .iter()
         .map(|column| column.imported_name.clone())
         .collect::<Vec<_>>();
+    let pk_cols = route
+        .columns
+        .iter()
+        .filter(|column| column.key)
+        .map(|column| column.imported_name.clone())
+        .collect::<Vec<_>>();
+    let column_types = route
+        .columns
+        .iter()
+        .map(|column| {
+            (
+                column.imported_name.to_lowercase(),
+                pg_oid_to_arrow_datatype(column.type_oid, column.type_modifier),
+            )
+        })
+        .collect::<HashMap<_, _>>();
     let row = |values: &Option<Vec<Option<String>>>, kind: &str| {
         let values = values
             .as_ref()
@@ -19235,7 +19501,13 @@ fn pgoutput_change_to_dml(
             .iter()
             .map(|value| value.clone().unwrap_or_else(|| r"\N".to_string()))
             .collect::<Vec<_>>();
-        Ok((values.join("\t"), build_row_key(&names, &values)))
+        let row_key = if !pk_cols.is_empty() {
+            build_pk_row_key_typed(&pk_cols, &names, &values, &column_types)
+        } else {
+            build_row_key_typed(&names, &values, &column_types)
+        }
+        .map_err(|detail| GatewayError::QueryTimeExecutionFailed { detail })?;
+        Ok((values.join("\t"), row_key))
     };
     match operation {
         CdcOperation::Insert => {
@@ -19507,13 +19779,13 @@ mod pgoutput_truncate_unit_tests {
             (
                 "a".to_string(),
                 BTreeMap::from([
-                    ("id=1".to_string(), "1".to_string()),
-                    ("id=2".to_string(), "2".to_string()),
+                    ("__pk1:V1:1;".to_string(), "1".to_string()),
+                    ("__pk1:V1:2;".to_string(), "2".to_string()),
                 ]),
             ),
             (
                 "b".to_string(),
-                BTreeMap::from([("id=9".to_string(), "9".to_string())]),
+                BTreeMap::from([("__pk1:V1:9;".to_string(), "9".to_string())]),
             ),
         ]);
         let ops = pgoutput_envelope_to_dml_ops(
@@ -19543,7 +19815,7 @@ mod pgoutput_truncate_unit_tests {
         assert_eq!(ops.len(), 6); // INSERT(3), DELETE(1,2,3), INSERT(4), DELETE(9)
         assert!(matches!(
             &ops[0],
-            DmlOp::Insert { row_key, .. } if row_key == "id=3"
+            DmlOp::Insert { row_key, .. } if row_key == "__pk1:V1:3;"
         ));
         assert!(matches!(
             &ops[1],
@@ -19551,23 +19823,23 @@ mod pgoutput_truncate_unit_tests {
                 row_key,
                 returning_tsv: Some(tsv),
                 ..
-            } if row_key == "id=1" && tsv == "1"
+            } if row_key == "__pk1:V1:1;" && tsv == "1"
         ));
         assert!(matches!(
             &ops[2],
-            DmlOp::Delete { row_key, .. } if row_key == "id=2"
+            DmlOp::Delete { row_key, .. } if row_key == "__pk1:V1:2;"
         ));
         assert!(matches!(
             &ops[3],
-            DmlOp::Delete { row_key, .. } if row_key == "id=3"
+            DmlOp::Delete { row_key, .. } if row_key == "__pk1:V1:3;"
         ));
         assert!(matches!(
             &ops[4],
-            DmlOp::Insert { row_key, .. } if row_key == "id=4"
+            DmlOp::Insert { row_key, .. } if row_key == "__pk1:V1:4;"
         ));
         assert!(matches!(
             &ops[5],
-            DmlOp::Delete { table, row_key, .. } if table == "b" && row_key == "id=9"
+            DmlOp::Delete { table, row_key, .. } if table == "b" && row_key == "__pk1:V1:9;"
         ));
     }
 
@@ -19657,6 +19929,7 @@ fn source_backfill_error(error: rockstream_connectors::SourceError) -> GatewayEr
 fn source_batch_to_dml_ops(
     table: &str,
     columns: &[CatalogColumn],
+    pk_cols: &[String],
     batch: &RecordBatch,
 ) -> Result<Vec<DmlOp>, String> {
     use datafusion::arrow::util::display::array_value_to_string;
@@ -19674,6 +19947,7 @@ fn source_batch_to_dml_ops(
         .iter()
         .map(|column| column.name.clone())
         .collect::<Vec<_>>();
+    let column_types = catalog_column_types(columns);
     let mut ops = Vec::with_capacity(data.num_rows());
     for (row, &weight) in weights.iter().enumerate().take(data.num_rows()) {
         let values = data
@@ -19688,7 +19962,11 @@ fn source_batch_to_dml_ops(
             })
             .collect::<Result<Vec<_>, _>>()?;
         let values_tsv = values.join("\t");
-        let row_key = build_row_key(&names, &values);
+        let row_key = if !pk_cols.is_empty() {
+            build_pk_row_key_typed(pk_cols, &names, &values, &column_types)?
+        } else {
+            build_row_key_typed(&names, &values, &column_types)?
+        };
         match weight {
             weight if weight > 0 => ops.push(DmlOp::Insert {
                 table: table.to_string(),
@@ -22522,28 +22800,176 @@ fn pg_type_to_arrow(pg_type: &str) -> &'static str {
 
 static NEXT_HEAP_ROW_ID: AtomicU64 = AtomicU64::new(1);
 
-fn build_pk_row_key(pk_cols: &[String], cols: &[String], vals: &[String]) -> String {
-    pk_cols
-        .iter()
-        .map(|pk| {
-            let pos = cols.iter().position(|c| c.eq_ignore_ascii_case(pk));
-            let val = pos
-                .and_then(|p| vals.get(p))
-                .map(|s| s.as_str())
-                .unwrap_or("");
-            format!("{pk}={val}")
-        })
-        .collect::<Vec<_>>()
-        .join("|")
+const PK_KEY_PREFIX_V1: &str = "__pk1:";
+
+/// Normalize and validate a textual value against its declared Arrow `DataType`
+/// so numerically/semantically equivalent spellings produce one canonical key.
+fn normalize_typed_value(raw: &str, data_type: &DataType) -> Result<String, String> {
+    if raw == r"\N" {
+        return Ok(r"\N".to_string());
+    }
+    match data_type {
+        DataType::Int16 => raw
+            .trim()
+            .parse::<i16>()
+            .map(|v| v.to_string())
+            .map_err(|e| format!("[RS-2056] invalid SMALLINT key value '{raw}': {e}")),
+        DataType::Int32 => raw
+            .trim()
+            .parse::<i32>()
+            .map(|v| v.to_string())
+            .map_err(|e| format!("[RS-2056] invalid INTEGER key value '{raw}': {e}")),
+        DataType::Int64 => raw
+            .trim()
+            .parse::<i64>()
+            .map(|v| v.to_string())
+            .map_err(|e| format!("[RS-2056] invalid BIGINT key value '{raw}': {e}")),
+        DataType::Float32 => {
+            let v = raw
+                .trim()
+                .parse::<f32>()
+                .map_err(|e| format!("[RS-2056] invalid REAL key value '{raw}': {e}"))?;
+            let v = if v == 0.0 { 0.0 } else { v };
+            Ok(v.to_string())
+        }
+        DataType::Float64 => {
+            let v = raw.trim().parse::<f64>().map_err(|e| {
+                format!("[RS-2056] invalid DOUBLE PRECISION key value '{raw}': {e}")
+            })?;
+            let v = if v == 0.0 { 0.0 } else { v };
+            Ok(v.to_string())
+        }
+        DataType::Boolean => match raw.trim().to_ascii_lowercase().as_str() {
+            "true" | "t" | "1" | "yes" | "y" | "on" => Ok("true".to_string()),
+            "false" | "f" | "0" | "no" | "n" | "off" => Ok("false".to_string()),
+            _ => Err(format!("[RS-2056] invalid BOOLEAN key value '{raw}'")),
+        },
+        DataType::Decimal128(_, _) => {
+            use rockstream_sql::dml::{DmlLiteral, DmlScalarExpr};
+            match DmlScalarExpr::Literal(DmlLiteral::String(raw.to_string())).evaluate_assignment(
+                &HashMap::new(),
+                &HashMap::new(),
+                data_type,
+            ) {
+                Ok(Some(formatted)) => Ok(formatted),
+                Ok(None) => Ok(r"\N".to_string()),
+                Err(error) => Err(error.to_string()),
+            }
+        }
+        DataType::FixedSizeBinary(16) => uuid::Uuid::parse_str(raw.trim())
+            .map(|u| u.hyphenated().to_string())
+            .map_err(|e| format!("[RS-2056] invalid UUID key value '{raw}': {e}")),
+        DataType::Date32 | DataType::Timestamp(_, _) => {
+            use datafusion::arrow::compute::CastOptions;
+            use datafusion::scalar::ScalarValue;
+            let opts = CastOptions {
+                safe: false,
+                ..Default::default()
+            };
+            let parsed = ScalarValue::Utf8(Some(raw.to_string()))
+                .cast_to_with_options(data_type, &opts)
+                .map_err(|e| format!("[RS-2056] invalid temporal key value '{raw}': {e}"))?;
+            let text = parsed
+                .cast_to_with_options(&DataType::Utf8, &opts)
+                .map_err(|e| {
+                    format!("[RS-2056] failed to format temporal key value '{raw}': {e}")
+                })?;
+            Ok(text.to_string())
+        }
+        _ => Ok(raw.to_string()),
+    }
 }
 
-fn build_table_row_key(pk_cols: &[String], cols: &[String], vals: &[String]) -> String {
+/// Encode a tuple of canonical key components using an unambiguous length-prefixed
+/// format (`__pk1:V<byte_len>:<bytes>;` or `N;` for NULL) so delimiters in values
+/// can never collide.
+fn encode_key_components<'a>(components: impl IntoIterator<Item = &'a str>) -> String {
+    use std::fmt::Write;
+    let mut out = String::from(PK_KEY_PREFIX_V1);
+    for val in components {
+        if val == r"\N" {
+            out.push_str("N;");
+        } else {
+            let _ = write!(out, "V{}:{val};", val.len());
+        }
+    }
+    out
+}
+
+fn catalog_column_types(columns: &[CatalogColumn]) -> HashMap<String, DataType> {
+    columns
+        .iter()
+        .map(|c| {
+            (
+                c.name.to_lowercase(),
+                string_to_arrow_datatype(&c.data_type),
+            )
+        })
+        .collect()
+}
+
+fn pg_oid_to_arrow_datatype(type_oid: u32, type_modifier: i32) -> DataType {
+    match type_oid {
+        21 => DataType::Int16,
+        23 => DataType::Int32,
+        20 => DataType::Int64,
+        700 => DataType::Float32,
+        701 => DataType::Float64,
+        16 => DataType::Boolean,
+        2950 => DataType::FixedSizeBinary(16),
+        1082 => DataType::Date32,
+        1114 => DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, None),
+        1184 => DataType::Timestamp(
+            datafusion::arrow::datatypes::TimeUnit::Microsecond,
+            Some("+00:00".into()),
+        ),
+        1700 if type_modifier > 4 => {
+            let mod_val = type_modifier - 4;
+            let precision = ((mod_val >> 16) & 0xffff) as u8;
+            let scale = (mod_val & 0xffff) as i8;
+            if precision > 0 && precision <= 38 {
+                DataType::Decimal128(precision, scale)
+            } else {
+                DataType::Utf8
+            }
+        }
+        _ => DataType::Utf8,
+    }
+}
+
+fn build_pk_row_key_typed(
+    pk_cols: &[String],
+    cols: &[String],
+    vals: &[String],
+    column_types: &HashMap<String, DataType>,
+) -> Result<String, String> {
+    let mut normalized = Vec::with_capacity(pk_cols.len());
+    for pk in pk_cols {
+        let pos = cols.iter().position(|c| c.eq_ignore_ascii_case(pk));
+        let raw = pos
+            .and_then(|p| vals.get(p))
+            .map(|s| s.as_str())
+            .unwrap_or(r"\N");
+        let dt = column_types
+            .get(&pk.to_lowercase())
+            .unwrap_or(&DataType::Utf8);
+        normalized.push(normalize_typed_value(raw, dt)?);
+    }
+    Ok(encode_key_components(normalized.iter().map(String::as_str)))
+}
+
+fn build_table_row_key_typed(
+    pk_cols: &[String],
+    cols: &[String],
+    vals: &[String],
+    column_types: &HashMap<String, DataType>,
+) -> Result<String, String> {
     if !pk_cols.is_empty() {
-        build_pk_row_key(pk_cols, cols, vals)
+        build_pk_row_key_typed(pk_cols, cols, vals, column_types)
     } else {
         let id = NEXT_HEAP_ROW_ID.fetch_add(1, Ordering::Relaxed);
         let uuid = generate_uuid_v4_string();
-        format!("__heap_{uuid}_{id}")
+        Ok(format!("__heap_{uuid}_{id}"))
     }
 }
 
@@ -22599,27 +23025,23 @@ fn try_normalize_where_commas(q: &str) -> Option<String> {
     Some(format!("{prefix}{normalized_where}{returning_part}"))
 }
 
-/// Build a deterministic row key from column names and values.
-///
-/// Format: `col1=val1|col2=val2|...` — stable ordering is preserved from the
-/// input slice. This ensures retries of the same INSERT produce the same key
-/// (idempotent within the write buffer).
-fn build_row_key(cols: &[String], vals: &[String]) -> String {
+/// Build a deterministic, collision-free row key from column names, values, and types.
+fn build_row_key_typed(
+    cols: &[String],
+    vals: &[String],
+    column_types: &HashMap<String, DataType>,
+) -> Result<String, String> {
     if cols.is_empty() {
-        // No explicit column list: use positional indices so each row gets a
-        // unique key even when column names are unknown (e.g. INSERT INTO t
-        // VALUES (...) without a column list).
-        vals.iter()
-            .enumerate()
-            .map(|(i, v)| format!("col{i}={v}"))
-            .collect::<Vec<_>>()
-            .join("|")
+        Ok(encode_key_components(vals.iter().map(String::as_str)))
     } else {
-        cols.iter()
-            .zip(vals.iter())
-            .map(|(c, v)| format!("{c}={v}"))
-            .collect::<Vec<_>>()
-            .join("|")
+        let mut normalized = Vec::with_capacity(cols.len());
+        for (c, v) in cols.iter().zip(vals.iter()) {
+            let dt = column_types
+                .get(&c.to_lowercase())
+                .unwrap_or(&DataType::Utf8);
+            normalized.push(normalize_typed_value(v, dt)?);
+        }
+        Ok(encode_key_components(normalized.iter().map(String::as_str)))
     }
 }
 
@@ -23361,6 +23783,144 @@ mod s4_tests {
     }
 
     // ── S5: audit_carries_principal_actor ────────────────────────────────────
+
+    #[tokio::test]
+    async fn gateway_security_audit_writers_refresh_after_catalog_conflicts() {
+        use rockstream_storage::catalog::{
+            CatalogMutation, CatalogStore, CatalogTxn, DurableCatalogStore,
+        };
+        use rockstream_types::authorization::{
+            AuditCorrelation, AuditField, AuditIdentity, SecurityAuditClass, SecurityAuditOutcome,
+            SecurityAuditRecord, SECURITY_AUDIT_FORMAT_VERSION,
+        };
+
+        let object_store = Arc::new(object_store::memory::InMemory::new());
+        let current_catalog = Arc::new(DurableCatalogStore::new(
+            object_store.clone(),
+            "audit-retry",
+        ));
+        let stale_auth_catalog = Arc::new(DurableCatalogStore::new(
+            object_store.clone(),
+            "audit-retry",
+        ));
+        let stale_denial_catalog = Arc::new(DurableCatalogStore::new(object_store, "audit-retry"));
+        let now_ms = current_time_ms().max(1);
+        let seed_records = ["concurrent-1", "concurrent-2"].map(|event_id| SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: event_id.to_owned(),
+            timestamp_ms: now_ms,
+            actor: AuditIdentity::Unknown,
+            target: AuditField::Unknown,
+            scope: AuditField::NotApplicable,
+            action: SecurityAuditClass::AuthenticationFailure,
+            outcome: SecurityAuditOutcome::Failure,
+            correlation: AuditCorrelation::NotApplicable,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::NotApplicable,
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        });
+        for (index, record) in seed_records.iter().cloned().enumerate() {
+            current_catalog
+                .commit_txn(
+                    CatalogTxn::new(
+                        current_catalog.get_revision().await + 1,
+                        index as u64 + 1,
+                        vec![CatalogMutation::AppendSecurityAudit(record)],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let shard_db = Arc::new(
+            rockstream_storage::ShardDb::builder(
+                "audit-retry-shard",
+                Arc::new(object_store::memory::InMemory::new()),
+            )
+            .build()
+            .await
+            .unwrap(),
+        );
+        let catalog = Arc::new(CatalogStubs::default());
+        catalog.set_durable_store(stale_auth_catalog.clone());
+        let handler =
+            GatewayHandler::with_shard_db(catalog.clone(), Arc::new(NoopViewReader), shard_db);
+        handler
+            .append_authentication_audit(
+                AuditIdentity::Unknown,
+                AuditField::Unknown,
+                AuditField::NotApplicable,
+                false,
+            )
+            .await
+            .unwrap();
+        catalog.set_durable_store(stale_denial_catalog.clone());
+        handler
+            .append_authorization_denial(None, None, None, None, None)
+            .await
+            .unwrap();
+
+        current_catalog.refresh().await.unwrap();
+        let records = current_catalog.list_security_audit_records().await.unwrap();
+        for seed_record in seed_records {
+            assert!(records.contains(&seed_record));
+        }
+        assert_eq!(records.len(), 4);
+        let auth = records
+            .iter()
+            .find(|record| {
+                record.action == SecurityAuditClass::AuthenticationFailure
+                    && record.event_id.starts_with("gateway-authn-")
+            })
+            .unwrap();
+        assert!(auth.timestamp_ms > 0);
+        assert_eq!(
+            auth,
+            &SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: auth.event_id.clone(),
+                timestamp_ms: auth.timestamp_ms,
+                actor: AuditIdentity::Unknown,
+                target: AuditField::Unknown,
+                scope: AuditField::NotApplicable,
+                action: SecurityAuditClass::AuthenticationFailure,
+                outcome: SecurityAuditOutcome::Failure,
+                correlation: AuditCorrelation::Unknown,
+                operation_id: AuditField::NotApplicable,
+                policy_revision: AuditField::NotApplicable,
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::NotApplicable,
+            }
+        );
+        let denial = records
+            .iter()
+            .find(|record| record.action == SecurityAuditClass::AuthorizationDenial)
+            .unwrap();
+        assert!(denial.event_id.starts_with("gateway-authz-"));
+        assert!(denial.timestamp_ms > 0);
+        assert_eq!(
+            denial,
+            &SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: denial.event_id.clone(),
+                timestamp_ms: denial.timestamp_ms,
+                actor: AuditIdentity::Unknown,
+                target: AuditField::Unknown,
+                scope: AuditField::Unknown,
+                action: SecurityAuditClass::AuthorizationDenial,
+                outcome: SecurityAuditOutcome::Denied,
+                correlation: AuditCorrelation::Unknown,
+                operation_id: AuditField::NotApplicable,
+                policy_revision: AuditField::Unknown,
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::NotApplicable,
+            }
+        );
+        assert_eq!(stale_auth_catalog.get_revision().await, 3);
+        assert_eq!(stale_denial_catalog.get_revision().await, 4);
+    }
 
     /// S5 green gate: COMMIT with a Jwt principal produces an audit event with actor = "jwt:alice".
     #[tokio::test]
@@ -24449,6 +25009,7 @@ mod source_batch_tests {
                     data_type: "Utf8".to_string(),
                 },
             ],
+            &[],
             &batch,
         )
         .unwrap();
@@ -24466,7 +25027,7 @@ mod source_batch_tests {
                     &"orders".to_string(),
                     &vec!["id".to_string(), "customer".to_string()],
                     &"7\tada".to_string(),
-                    &"id=7|customer=ada".to_string(),
+                    &"__pk1:V1:7;V3:ada;".to_string(),
                 )
             ),
             _ => panic!("positive source weight must insert"),
@@ -24480,7 +25041,7 @@ mod source_batch_tests {
                 (table, row_key, returning_tsv),
                 (
                     &"orders".to_string(),
-                    &"id=8|customer=bea".to_string(),
+                    &"__pk1:V1:8;V3:bea;".to_string(),
                     &Some("8\tbea".to_string()),
                 )
             ),
@@ -24509,6 +25070,7 @@ mod source_batch_tests {
                 name: "amount".to_string(),
                 data_type: "Decimal(12,2)".to_string(),
             }],
+            &[],
             &batch,
         )
         .unwrap();

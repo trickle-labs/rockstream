@@ -1,6 +1,6 @@
 use rockstream_control::kek::EnvKekProvider;
 use rockstream_control::secret_store::{secret_key, SecretStore, SecretStoreError};
-use rockstream_storage::catalog::{CatalogStore, DurableCatalogStore};
+use rockstream_storage::catalog::{CatalogMutation, CatalogStore, CatalogTxn, DurableCatalogStore};
 use rockstream_test_support::docker_available;
 use rockstream_test_support::minio::{minio_object_store, start_minio};
 use rockstream_types::authorization::{
@@ -38,6 +38,81 @@ fn assert_rotation_audit(records: &[SecurityAuditRecord], rotated_count: usize) 
             after_state: AuditField::Known(format!("rewrapped_envelopes={rotated_count}")),
         }]
     );
+}
+
+#[tokio::test]
+async fn secret_rotation_refreshes_catalog_after_a_concurrent_audit_append() {
+    let dir = TempDir::new().unwrap();
+    let object_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let db = Arc::new(
+        Db::builder("catalog_db", object_store.clone())
+            .build()
+            .await
+            .unwrap(),
+    );
+    let provider = Arc::new(EnvKekProvider::from_passphrase("before"));
+    SecretStore::new(Some(db.clone()), provider.clone())
+        .create_secret(
+            0,
+            "retry",
+            SecretType::SaslPlain,
+            HashMap::from([(String::from("password"), String::from("secret"))]),
+            "test",
+        )
+        .await
+        .unwrap();
+
+    let current_catalog = Arc::new(DurableCatalogStore::new(object_store.clone(), "security"));
+    let stale_catalog = Arc::new(DurableCatalogStore::new(object_store.clone(), "security"));
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let concurrent_audit = SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: "concurrent-audit".to_owned(),
+        timestamp_ms: now_ms,
+        actor: AuditIdentity::Unknown,
+        target: AuditField::Unknown,
+        scope: AuditField::NotApplicable,
+        action: SecurityAuditClass::AuthenticationFailure,
+        outcome: SecurityAuditOutcome::Failure,
+        correlation: AuditCorrelation::NotApplicable,
+        operation_id: AuditField::NotApplicable,
+        policy_revision: AuditField::NotApplicable,
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::NotApplicable,
+    };
+    current_catalog
+        .commit_txn(
+            CatalogTxn::new(
+                1,
+                1,
+                vec![CatalogMutation::AppendSecurityAudit(
+                    concurrent_audit.clone(),
+                )],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        SecretStore::new(Some(db.clone()), provider)
+            .with_security_audit_catalog(stale_catalog.clone())
+            .rotate_kek(Arc::new(EnvKekProvider::from_passphrase("after")), "test")
+            .await
+            .unwrap(),
+        1
+    );
+    current_catalog.refresh().await.unwrap();
+    let records = current_catalog.list_security_audit_records().await.unwrap();
+    assert_eq!(records[0], concurrent_audit);
+    assert_rotation_audit(&records[1..], 1);
+    assert_eq!(stale_catalog.get_revision().await, 2);
+
+    db.close().await.unwrap();
 }
 
 #[tokio::test]
