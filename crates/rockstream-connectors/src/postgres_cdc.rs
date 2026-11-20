@@ -339,7 +339,6 @@ pub struct PostgresCdcSource {
     last_decoded_envelope: Option<CdcTransactionEnvelope>,
     transaction_changes: Vec<CdcChange>,
     native_transaction: Option<(u32, Vec<PgOutputTextChange>, usize)>,
-    native_seen_messages: usize,
     native_xid: Option<u32>,
     pgoutput_transport_stats: PgOutputTransportStats,
     pgoutput_transport_failure: Option<String>,
@@ -492,7 +491,6 @@ impl PostgresCdcSource {
             last_decoded_envelope: None,
             transaction_changes: Vec::new(),
             native_transaction: None,
-            native_seen_messages: 0,
             native_xid: None,
             pgoutput_transport_stats: PgOutputTransportStats::default(),
             pgoutput_transport_failure: None,
@@ -793,7 +791,7 @@ impl PostgresCdcSource {
             connection.stream_connection_task.abort();
         }
         self.native_xid = None;
-        self.native_seen_messages = 0;
+        self.native_transaction = None;
     }
 
     async fn close_pgoutput_and_wait(&mut self) {
@@ -813,7 +811,7 @@ impl PostgresCdcSource {
             let _ = stream_connection_task.await;
         }
         self.native_xid = None;
-        self.native_seen_messages = 0;
+        self.native_transaction = None;
     }
 
     pub async fn confirmed_flush_lsn(&self) -> Result<Option<PgLsn>, SourceError> {
@@ -1575,30 +1573,43 @@ impl PostgresCdcSource {
                 watermark: None,
             });
         }
-        let pgoutput = self.pgoutput.as_mut().ok_or_else(|| {
-            SourceError::Io("native pgoutput connection is unavailable".to_string())
-        })?;
-        let limit = i32::try_from(credits_available.saturating_mul(4)).unwrap_or(i32::MAX);
-        let messages = pgoutput
-            .client
-            .query(
-                "SELECT lsn::text, data FROM pg_logical_slot_peek_binary_changes($1, NULL, $2, 'proto_version', '1', 'publication_names', $3)",
-                &[&pgoutput.slot, &limit, &pgoutput.publication],
-            )
-            .await
-            .map_err(|error| SourceError::PollDeltaFailed {
-                reason: format!("peek pgoutput changes: {error}"),
-            })?;
-        for message in messages.into_iter().skip(self.native_seen_messages) {
-            let lsn = PgLsn::parse(message.get::<_, String>(0).as_str())?;
-            let payload = message.get::<_, Vec<u8>>(1);
-            self.native_seen_messages += 1;
+        if self.manually_paused {
+            return Err(SourceError::Io(
+                "source is paused; call resume before polling".to_string(),
+            ));
+        }
+        if let Some(reason) = &self.pgoutput_transport_failure {
+            return Err(SourceError::PollDeltaFailed {
+                reason: reason.clone(),
+            });
+        }
+        let result = self
+            .poll_pgoutput_streamed(after, max_bytes, credits_available)
+            .await;
+        if let Err(error) = &result {
+            self.block_pgoutput_transport(error);
+        }
+        result
+    }
+
+    async fn poll_pgoutput_streamed(
+        &mut self,
+        after: PgLsn,
+        max_bytes: usize,
+        credits_available: usize,
+    ) -> Result<PollDeltaResult, SourceError> {
+        loop {
+            let Some(payload) = self.read_pgoutput_frame().await? else {
+                return Ok(PollDeltaResult {
+                    batches: Vec::new(),
+                    new_offset: after.to_offset_token(),
+                    watermark: None,
+                });
+            };
             match payload.first() {
                 Some(b'B') => {
                     if self.native_transaction.is_some() {
-                        return Err(SourceError::PollDeltaFailed {
-                            reason: "pgoutput nested BEGIN is invalid".to_string(),
-                        });
+                        return Err(pgoutput_transport_error("nested pgoutput BEGIN"));
                     }
                     self.native_transaction =
                         Some((pgoutput_begin_xid(&payload)?, Vec::new(), payload.len()));
@@ -1607,18 +1618,22 @@ impl PostgresCdcSource {
                 Some(b'C') => {
                     let end_lsn = pgoutput_commit_lsn(&payload)?;
                     let (_, changes, bytes) = self.native_transaction.take().ok_or_else(|| {
-                        SourceError::PollDeltaFailed {
-                            reason: "pgoutput COMMIT without BEGIN is invalid".to_string(),
-                        }
+                        pgoutput_transport_error("pgoutput COMMIT without BEGIN")
                     })?;
-                    if bytes.saturating_add(payload.len()) > POSTGRES_CDC_MAX_TRANSACTION_BYTES {
-                        self.replication_read_paused = true;
-                        return Err(SourceError::PollDeltaFailed { reason: "[RS-4014] pgoutput transaction exceeds POSTGRES_CDC_MAX_TRANSACTION_BYTES; replication is paused. Next steps: increase the bound or reduce upstream transaction size".to_string() });
+                    if bytes.saturating_add(payload.len()) > max_bytes
+                        || changes.len() > credits_available
+                    {
+                        return Err(pgoutput_transport_error(
+                            "pgoutput transaction exceeds poll byte or record credits",
+                        ));
                     }
                     if end_lsn <= after {
-                        continue;
+                        return Ok(PollDeltaResult {
+                            batches: Vec::new(),
+                            new_offset: after.to_offset_token(),
+                            watermark: None,
+                        });
                     }
-                    self.native_seen_messages = 0;
                     return Ok(PollDeltaResult {
                         batches: vec![Self::pgoutput_text_batch(&changes, self.schema.clone())?],
                         new_offset: end_lsn.to_offset_token(),
@@ -1627,40 +1642,23 @@ impl PostgresCdcSource {
                 }
                 _ => {}
             }
-            let change = match decode_native_pgoutput_text_message(
+            let pgoutput = self.pgoutput.as_mut().ok_or_else(|| {
+                SourceError::Io("native pgoutput connection is unavailable".to_string())
+            })?;
+            let change = decode_native_pgoutput_text_message(
                 &mut pgoutput.relations,
                 self.schema.fields().len(),
-                lsn,
+                PgLsn::ZERO,
                 &payload,
-            ) {
-                Ok(change) => change,
-                Err(error) => {
-                    // The row-only caller may retry after a poll error. Do not
-                    // skip an unsupported TRUNCATE (or other malformed frame)
-                    // on retry and accidentally acknowledge its COMMIT.
-                    self.native_seen_messages = self.native_seen_messages.saturating_sub(1);
-                    return Err(error);
-                }
+            )?;
+            let Some((_, changes, bytes)) = &mut self.native_transaction else {
+                return Err(pgoutput_transport_error("pgoutput frame without BEGIN"));
             };
+            *bytes = bytes.saturating_add(payload.len());
             if let Some(change) = change {
-                let Some((_, changes, bytes)) = &mut self.native_transaction else {
-                    return Err(SourceError::PollDeltaFailed {
-                        reason: "pgoutput row frame without BEGIN is invalid".to_string(),
-                    });
-                };
-                *bytes = bytes.saturating_add(payload.len());
-                if *bytes > POSTGRES_CDC_MAX_TRANSACTION_BYTES {
-                    self.replication_read_paused = true;
-                    return Err(SourceError::PollDeltaFailed { reason: "[RS-4014] pgoutput transaction exceeds POSTGRES_CDC_MAX_TRANSACTION_BYTES; replication is paused. Next steps: increase the bound or reduce upstream transaction size".to_string() });
-                }
                 changes.push(change);
             }
         }
-        Ok(PollDeltaResult {
-            batches: Vec::new(),
-            new_offset: after.to_offset_token(),
-            watermark: None,
-        })
     }
 
     /// Read one relation-aware protocol event without advancing the slot.
@@ -1682,19 +1680,32 @@ impl PostgresCdcSource {
         }
         let result = self.poll_pgoutput_event_stream().await;
         if let Err(error) = &result {
-            // A malformed or oversized transaction must never be skipped on
-            // retry. End the COPY connection so no more WAL is transferred.
-            self.pgoutput_transport_failure = Some(error.to_string());
-            self.replication_read_paused = true;
-            if let Some(pgoutput) = self.pgoutput.as_mut() {
-                pgoutput.event_stream = None;
-                pgoutput.stream_connection_task.abort();
-            }
+            self.block_pgoutput_transport(error);
         }
         result
     }
 
+    /// Once decoding has failed, neither API may skip the rejected frame or
+    /// acknowledge a later COMMIT. Abort COPY to stop receiving the payload.
+    fn block_pgoutput_transport(&mut self, error: &SourceError) {
+        self.pgoutput_transport_failure = Some(error.to_string());
+        self.replication_read_paused = true;
+        if let Some(pgoutput) = self.pgoutput.as_mut() {
+            pgoutput.event_stream = None;
+            pgoutput.stream_connection_task.abort();
+        }
+    }
+
     async fn poll_pgoutput_event_stream(&mut self) -> Result<Option<PgOutputEvent>, SourceError> {
+        let Some(payload) = self.read_pgoutput_frame().await? else {
+            return Ok(None);
+        };
+        decode_pgoutput_event(&mut self.native_xid, &payload).map(Some)
+    }
+
+    /// Decode exactly one pgoutput frame from a bounded 8 KiB COPY stream.
+    /// Both the gateway event API and the legacy row-only API use this path.
+    async fn read_pgoutput_frame(&mut self) -> Result<Option<Vec<u8>>, SourceError> {
         let pgoutput = self.pgoutput.as_mut().ok_or_else(|| {
             SourceError::Io("native pgoutput connection is unavailable".to_string())
         })?;
@@ -1723,7 +1734,10 @@ impl PostgresCdcSource {
                 .await;
             let Some(row) = row else {
                 pgoutput.event_stream = None;
-                if pgoutput.event_frame.expected_len.is_some() || self.native_xid.is_some() {
+                if pgoutput.event_frame.expected_len.is_some()
+                    || self.native_xid.is_some()
+                    || self.native_transaction.is_some()
+                {
                     return Err(pgoutput_transport_error("pgoutput COPY ended mid-transaction"));
                 }
                 return Ok(None);
@@ -1746,10 +1760,9 @@ impl PostgresCdcSource {
             )? else {
                 continue;
             };
-            let event = decode_pgoutput_event(&mut self.native_xid, &payload)?;
-            if matches!(event, PgOutputEvent::Commit { .. }) {
-                // One peek (upto_nchanges=1) must end at this transaction.
-                // Consume CopyDone before ACK so PostgreSQL releases the slot.
+            if payload.first() == Some(&b'C') {
+                // The peek uses upto_nchanges=1. After the complete COMMIT
+                // frame, finish COPY before advancing the slot on this socket.
                 match pgoutput
                     .event_stream
                     .as_mut()
@@ -1773,9 +1786,10 @@ impl PostgresCdcSource {
                 pgoutput.event_stream = None;
                 pgoutput.event_frame.transaction_bytes = 0;
             }
-            return Ok(Some(event));
+            return Ok(Some(payload));
         }
     }
+
 }
 
 #[async_trait]
