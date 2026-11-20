@@ -264,14 +264,24 @@ async fn real_broker_ack_outage_after_m3_recovers_with_no_new_input_in_same_proc
         let status = Command::new("docker").args([action, id]).status().unwrap();
         assert!(status.success(), "docker {action} {id} failed: {status}");
     }
-    struct UnpauseOnDrop(String);
+    struct UnpauseOnDrop {
+        container_id: String,
+        paused: bool,
+    }
     impl Drop for UnpauseOnDrop {
         fn drop(&mut self) {
-            let _ = Command::new("docker").args(["unpause", &self.0]).status();
+            if self.paused {
+                let _ = Command::new("docker")
+                    .args(["unpause", &self.container_id])
+                    .status();
+            }
         }
     }
     docker_action("pause", &container_id);
-    let unpause = UnpauseOnDrop(container_id);
+    let mut unpause = UnpauseOnDrop {
+        container_id,
+        paused: true,
+    };
     let failure = runtime
         .commit_epoch(&owner, 1, token.clone(), m3(1))
         .await
@@ -291,8 +301,8 @@ async fn real_broker_ack_outage_after_m3_recovers_with_no_new_input_in_same_proc
         Some(b"materialized-once".as_slice()),
     );
     assert!(runtime.poll_delta(1024, 1).await.is_err());
-    docker_action("unpause", &unpause.0);
-    std::mem::forget(unpause); // Already resumed; do not run a second unpause.
+    docker_action("unpause", &unpause.container_id);
+    unpause.paused = false;
 
     let retry_deadline = Instant::now() + Duration::from_secs(90);
     loop {
