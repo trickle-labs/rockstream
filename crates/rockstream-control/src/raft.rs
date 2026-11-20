@@ -855,7 +855,12 @@ async fn send_heartbeats(
     }
     while let Some(result) = responses.next().await {
         if let Ok(resp) = result {
-            highest = highest.max(resp.term);
+            if resp.term > term {
+                // Do not wait for other peers before honoring evidence of a
+                // newer term. Drop outstanding old-term RPCs and step down.
+                highest = resp.term;
+                break;
+            }
             if resp.term == term {
                 acknowledgements += 1;
                 if acknowledgements == majority && highest == term {
