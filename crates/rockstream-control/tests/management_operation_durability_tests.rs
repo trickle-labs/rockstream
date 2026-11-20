@@ -153,6 +153,59 @@ async fn management_operation_store_upgrades_v2_records_without_losing_requests(
     assert_eq!(recovered.request(), Some(&json!({"worker_id": 7})));
 }
 
+#[tokio::test]
+async fn management_operation_store_upgrades_v3_records_and_preserves_results() {
+    let backing = Arc::new(InMemory::new());
+    backing
+        .put(
+            &Path::from(format!(
+                "control/management-operations/{}.json",
+                hex::encode("op_v3".as_bytes())
+            )),
+            serde_json::to_vec(&json!({
+                "record_version": 3,
+                "operation_id": "op_v3",
+                "kind": "create_backup",
+                "status": "succeeded",
+                "started_at": 1000,
+                "updated_at": 2000,
+                "progress": 100,
+                "phase": "completed",
+                "error_code": null,
+                "next_steps": [],
+                "request": {"backup": "nightly"},
+                "result": {"committed": true}
+            }))
+            .unwrap()
+            .into(),
+        )
+        .await
+        .unwrap();
+
+    let recovered = ManagementOperationStore::new(backing)
+        .get("op_v3")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        exact_record(&recovered),
+        json!({
+            "record_version": 4,
+            "operation_id": "op_v3",
+            "kind": "create_backup",
+            "status": "succeeded",
+            "started_at": 1000,
+            "updated_at": 2000,
+            "progress": 100,
+            "phase": "completed",
+            "error_code": null,
+            "next_steps": [],
+            "request": {"backup": "nightly"},
+            "result": {"committed": true}
+        })
+    );
+}
+
 #[test]
 fn management_operation_lifecycle_has_exact_state_records() {
     let mut succeeded = OperationRecord::accepted("op_01ABC", OperationKind::MigrateShard, 1_000);

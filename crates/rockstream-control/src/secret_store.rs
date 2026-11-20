@@ -5,11 +5,15 @@ use crate::kek::{
     envelope_decrypt_secret, envelope_encrypt_secret, rotate_secret_kek, KekError, KekProvider,
     RetainedKekProvider,
 };
+use crate::management_store::{
+    ManagementOperationStore, OperationKind, OperationRecord, OperationStatus, OperationStoreError,
+    OperationUpdate, SecretRotationOperationRequest,
+};
 use parking_lot::RwLock;
 use rockstream_storage::catalog::{CatalogMutation, CatalogStore, CatalogTxn};
 use rockstream_types::authorization::{
-    AuditCorrelation, AuditField, AuditIdentity, SecurityAuditClass, SecurityAuditOutcome,
-    SecurityAuditRecord, SECURITY_AUDIT_FORMAT_VERSION,
+    AuditCorrelation, AuditField, AuditIdentity, PolicyScope, SecurityAuditClass,
+    SecurityAuditOutcome, SecurityAuditRecord, SECURITY_AUDIT_FORMAT_VERSION,
 };
 use rockstream_types::error_code::{
     ErrorCode, RS_2420, RS_2421, RS_2422, RS_2423, RS_2424, RS_2425, RS_2426, RS_3601,
@@ -18,7 +22,7 @@ use rockstream_types::secret::{
     EncryptedSecret, Secret, SecretMetadata, SecretRotation, SecretToken, SecretType,
 };
 use slatedb::{Db, WriteBatch};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
@@ -115,6 +119,22 @@ pub enum SecretStoreError {
         "[{code}] secret.storage_unavailable: {message}. Next steps: verify catalog storage health and retry."
     )]
     Storage { code: ErrorCode, message: String },
+}
+
+#[derive(Debug, Error)]
+pub enum SecretRotationOperationError {
+    #[error(transparent)]
+    Operation(#[from] OperationStoreError),
+    #[error(transparent)]
+    Secret(#[from] SecretStoreError),
+}
+
+/// Actor, scope, operation identity, and audit binding for one secret rotation.
+pub struct SecretRotationOperationContext {
+    pub actor_id: Option<u64>,
+    pub scope: PolicyScope,
+    pub operation_id: String,
+    pub audit: SecurityAuditRecord,
 }
 
 impl SecretStoreError {
@@ -233,6 +253,8 @@ pub struct SecretStore {
     rotation_lock: Arc<AsyncRwLock<()>>,
     audit_log: Option<Arc<FileAuditLog>>,
     security_audit_catalog: Option<Arc<dyn CatalogStore>>,
+    management_operations: Option<ManagementOperationStore>,
+    operation_deployment_id: Option<String>,
     security_audit_lock: tokio::sync::Mutex<()>,
     in_memory: Arc<RwLock<HashMap<(u128, String), EncryptedSecret>>>,
     references: Arc<RwLock<SecretReferences>>,
@@ -251,6 +273,8 @@ impl SecretStore {
             rotation_lock: Arc::new(AsyncRwLock::new(())),
             audit_log: None,
             security_audit_catalog: None,
+            management_operations: None,
+            operation_deployment_id: None,
             security_audit_lock: tokio::sync::Mutex::new(()),
             in_memory: Arc::new(RwLock::new(HashMap::new())),
             references: Arc::new(RwLock::new(HashMap::new())),
@@ -285,6 +309,17 @@ impl SecretStore {
     /// Require structured secret-rotation audit records in the durable catalog.
     pub fn with_security_audit_catalog(mut self, catalog: Arc<dyn CatalogStore>) -> Self {
         self.security_audit_catalog = Some(catalog);
+        self
+    }
+
+    /// Attach the operation store and deployment identity used by secret-rotation retries.
+    pub fn with_management_operation_store(
+        mut self,
+        operations: ManagementOperationStore,
+        deployment_id: String,
+    ) -> Self {
+        self.management_operations = Some(operations);
+        self.operation_deployment_id = Some(deployment_id);
         self
     }
 
@@ -800,8 +835,11 @@ impl SecretStore {
         payload: HashMap<String, String>,
         actor: &str,
     ) -> Result<SecretMetadata, SecretStoreError> {
-        self.alter_secret_inner(namespace_id, name, payload, actor, None)
-            .await
+        self.alter_secret_inner(namespace_id, name, payload, actor, None, None)
+            .await?
+            .ok_or_else(|| {
+                SecretStoreError::storage("secret rotation replay requires an operation")
+            })
     }
 
     /// Alter a secret and durably audit the rotation before acknowledging it.
@@ -813,8 +851,164 @@ impl SecretStore {
         actor: &str,
         audit: SecurityAuditRecord,
     ) -> Result<SecretMetadata, SecretStoreError> {
-        self.alter_secret_inner(namespace_id, name, payload, actor, Some(audit))
+        self.alter_secret_inner(namespace_id, name, payload, actor, Some(audit), None)
+            .await?
+            .ok_or_else(|| {
+                SecretStoreError::storage("secret rotation replay requires an operation")
+            })
+    }
+
+    /// Apply or reconcile a secret rotation under its client-generated operation UUID.
+    pub async fn alter_secret_with_operation(
+        &self,
+        namespace_id: u128,
+        name: &str,
+        payload: HashMap<String, String>,
+        actor: &str,
+        context: SecretRotationOperationContext,
+    ) -> Result<OperationRecord, SecretRotationOperationError> {
+        let SecretRotationOperationContext {
+            actor_id,
+            scope,
+            operation_id,
+            audit,
+        } = context;
+        let operations = self.management_operations.as_ref().ok_or_else(|| {
+            SecretStoreError::storage("durable security operation store is unavailable")
+        })?;
+        let deployment_id = self.operation_deployment_id.as_ref().ok_or_else(|| {
+            SecretStoreError::storage("security operation deployment identity is unavailable")
+        })?;
+        let canonical_payload = payload.iter().collect::<BTreeMap<_, _>>();
+        let payload_digest = ManagementOperationStore::canonical_request_digest(
+            rockstream_management_proto::PROTOCOL_VERSION as u16,
+            &canonical_payload,
+        )?;
+        let request = SecretRotationOperationRequest {
+            deployment_id: deployment_id.clone(),
+            actor_id,
+            scope,
+            payload_digest,
+        };
+        let now_ms = chrono::Utc::now().timestamp_millis().max(1);
+        let mut operation = operations
+            .accept_idempotent(
+                &operation_id,
+                rockstream_management_proto::PROTOCOL_VERSION as u16,
+                &request,
+                operation_id.clone(),
+                OperationKind::SecretRotation,
+                now_ms,
+            )
+            .await?;
+
+        match operation.status() {
+            OperationStatus::Pending | OperationStatus::Waiting => {
+                operation = match operations
+                    .transition_if(
+                        &operation_id,
+                        operation.status(),
+                        operation.phase(),
+                        OperationUpdate {
+                            status: OperationStatus::Running,
+                            updated_at_ms: chrono::Utc::now().timestamp_millis().max(1),
+                            progress: None,
+                            phase: Some("rotating_secret".to_owned()),
+                            error_code: None,
+                            next_steps: Vec::new(),
+                        },
+                    )
+                    .await
+                {
+                    Ok(operation) => operation,
+                    Err(OperationStoreError::TransitionConflict(_)) => operations
+                        .get(&operation_id)
+                        .await?
+                        .ok_or_else(|| OperationStoreError::NotFound(operation_id.clone()))?,
+                    Err(error) => return Err(error.into()),
+                };
+            }
+            OperationStatus::Running => {}
+            OperationStatus::Succeeded | OperationStatus::Failed | OperationStatus::Cancelled => {
+                return Ok(operation)
+            }
+        }
+
+        if operation.status() != OperationStatus::Running {
+            return Ok(operation);
+        }
+        if let Err(error) = self
+            .alter_secret_inner(
+                namespace_id,
+                name,
+                payload,
+                actor,
+                Some(audit),
+                Some(&operation_id),
+            )
             .await
+        {
+            if matches!(&error, SecretStoreError::Storage { .. }) {
+                return Err(error.into());
+            }
+            let current = operations
+                .get(&operation_id)
+                .await?
+                .ok_or_else(|| OperationStoreError::NotFound(operation_id.clone()))?;
+            if current.status() != OperationStatus::Running {
+                return Ok(current);
+            }
+            return operations
+                .transition_if_with_result(
+                    &operation_id,
+                    OperationStatus::Running,
+                    current.phase(),
+                    OperationUpdate {
+                        status: OperationStatus::Failed,
+                        updated_at_ms: chrono::Utc::now().timestamp_millis().max(1),
+                        progress: Some(100),
+                        phase: Some("rotation_failed".to_owned()),
+                        error_code: None,
+                        next_steps: Vec::new(),
+                    },
+                    serde_json::json!({"error": error.to_string()}),
+                )
+                .await
+                .map_err(Into::into);
+        }
+
+        let current = operations
+            .get(&operation_id)
+            .await?
+            .ok_or_else(|| OperationStoreError::NotFound(operation_id.clone()))?;
+        if current.status() != OperationStatus::Running {
+            return Ok(current);
+        }
+        match operations
+            .transition_if_with_result(
+                &operation_id,
+                OperationStatus::Running,
+                current.phase(),
+                OperationUpdate {
+                    status: OperationStatus::Succeeded,
+                    updated_at_ms: chrono::Utc::now().timestamp_millis().max(1),
+                    progress: Some(100),
+                    phase: Some("secret_rotation_committed".to_owned()),
+                    error_code: None,
+                    next_steps: Vec::new(),
+                },
+                serde_json::json!({"command_tag": "ALTER SECRET", "rows": 0}),
+            )
+            .await
+        {
+            Ok(operation) => Ok(operation),
+            Err(OperationStoreError::TransitionConflict(_)) => operations
+                .get(&operation_id)
+                .await?
+                .ok_or_else(|| OperationStoreError::NotFound(operation_id.clone()))
+                .map_err(Into::into),
+            Err(error) => Err(error.into()),
+        }
     }
 
     async fn alter_secret_inner(
@@ -824,7 +1018,8 @@ impl SecretStore {
         payload: HashMap<String, String>,
         actor: &str,
         mut audit: Option<SecurityAuditRecord>,
-    ) -> Result<SecretMetadata, SecretStoreError> {
+        operation_id: Option<&str>,
+    ) -> Result<Option<SecretMetadata>, SecretStoreError> {
         let _reference_lock = self.reference_mutation_lock.lock().await;
         let _audit_lock = self.security_audit_lock.lock().await;
         if self.security_audit_catalog.is_some() && audit.is_none() {
@@ -839,6 +1034,34 @@ impl SecretStore {
                 ));
             }
             self.flush_pending_security_audit_outbox_locked().await?;
+        }
+        if let (Some(operation_id), Some(expected), Some(catalog)) = (
+            operation_id,
+            audit.as_ref(),
+            self.security_audit_catalog.as_ref(),
+        ) {
+            if let Some(existing) = catalog
+                .get_security_audit_record(&expected.event_id)
+                .await
+                .map_err(|error| SecretStoreError::storage(error.to_string()))?
+            {
+                if existing.action
+                    == rockstream_types::authorization::SecurityAuditClass::SecretRotation
+                    && existing.outcome
+                        == rockstream_types::authorization::SecurityAuditOutcome::Success
+                    && existing.operation_id
+                        == rockstream_types::authorization::AuditField::Known(
+                            operation_id.to_owned(),
+                        )
+                    && existing.target == expected.target
+                    && existing.scope == expected.scope
+                {
+                    return Ok(None);
+                }
+                return Err(SecretStoreError::storage(
+                    "secret rotation operation identifier is bound to a different audit event",
+                ));
+            }
         }
         let rotation = self.rotation_lock.clone().read_owned().await;
         let trimmed_name = name.trim();
@@ -907,7 +1130,7 @@ impl SecretStore {
         self.metrics.rotation_fill_level.store(1, Ordering::Relaxed);
         self.record_audit(actor, "secret.rotated", trimmed_name, None);
 
-        Ok(metadata)
+        Ok(Some(metadata))
     }
 
     /// Drop a secret from the store using point delete (zero range deletions).

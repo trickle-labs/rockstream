@@ -32,6 +32,15 @@ pub enum OperationKind {
     CreateBackup,
     GenerateSupportArtifact,
     SecurityPrincipalGrants,
+    SecretRotation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretRotationOperationRequest {
+    pub deployment_id: String,
+    pub actor_id: Option<u64>,
+    pub scope: rockstream_types::authorization::PolicyScope,
+    pub payload_digest: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

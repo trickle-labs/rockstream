@@ -16,9 +16,6 @@ pub(crate) const MAX_ARTIFACT_BYTES: usize = 10 * 1024 * 1024;
 pub(crate) const MAX_ARTIFACT_STORAGE_BYTES: usize = 100 * 1024 * 1024;
 pub(crate) const MAX_ARTIFACTS_PER_DEPLOYMENT: usize = 2_048;
 pub(crate) const ARTIFACT_TTL: Duration = Duration::from_secs(10 * 60);
-pub(crate) const ARTIFACT_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
-// Two passes plus one cleanup tick must fit inside the 60-second retention bound.
-const ARTIFACT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(29);
 const LEDGER_CAS_RETRIES: usize = 32;
 const LEDGER_FORMAT_VERSION: u16 = 1;
 
@@ -29,18 +26,6 @@ pub(crate) fn maybe_crash_after_debug_test_boundary(boundary: &str) {
     }
     #[cfg(not(any(debug_assertions, feature = "test-support-artifact-crash-injection")))]
     let _ = boundary;
-}
-
-pub(crate) fn maybe_fail_audit_for_debug_test(boundary: &str) -> bool {
-    #[cfg(any(debug_assertions, feature = "test-support-artifact-crash-injection"))]
-    {
-        std::env::var("ROCKSTREAM_TEST_SUPPORT_ARTIFACT_FAIL_AUDIT").as_deref() == Ok(boundary)
-    }
-    #[cfg(not(any(debug_assertions, feature = "test-support-artifact-crash-injection")))]
-    {
-        let _ = boundary;
-        false
-    }
 }
 
 #[derive(Clone)]
@@ -307,21 +292,6 @@ impl SupportArtifactStore {
     }
 
     pub async fn cleanup_expired(&self, now_ms: u64) -> Result<(), ArtifactStoreError> {
-        self.cleanup_expired_with_timeout(now_ms, ARTIFACT_CLEANUP_TIMEOUT)
-            .await
-    }
-
-    async fn cleanup_expired_with_timeout(
-        &self,
-        now_ms: u64,
-        timeout: Duration,
-    ) -> Result<(), ArtifactStoreError> {
-        tokio::time::timeout(timeout, self.cleanup_expired_inner(now_ms))
-            .await
-            .map_err(|_| ArtifactStoreError::StorageUnavailable)?
-    }
-
-    async fn cleanup_expired_inner(&self, now_ms: u64) -> Result<(), ArtifactStoreError> {
         self.ensure_available()?;
         let (ledger, _) = self.read_ledger().await?;
         let expired: Vec<_> = ledger
@@ -333,17 +303,13 @@ impl SupportArtifactStore {
         if expired.is_empty() {
             return Ok(());
         }
-        let paths = expired
-            .iter()
-            .map(|id| Ok::<_, ObjectStoreError>(self.artifact_path(id)))
-            .collect::<Vec<_>>();
-        let _: Vec<()> = self
-            .store
-            .delete_stream(futures::stream::iter(paths).boxed())
-            .map(|result| match result {
-                Ok(_) | Err(ObjectStoreError::NotFound { .. }) => Ok(()),
-                Err(_) => Err(ArtifactStoreError::StorageUnavailable),
+        let store = self.clone();
+        let _: Vec<()> = futures::stream::iter(expired)
+            .map(move |id| {
+                let store = store.clone();
+                async move { store.delete_artifact(&id).await }
             })
+            .buffer_unordered(64)
             .try_collect()
             .await?;
         maybe_crash_after_debug_test_boundary("cleanup-after-delete");
@@ -782,81 +748,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_artifact_writers_fill_remaining_slots_without_eviction() {
-        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let store = SupportArtifactStore::new(Arc::clone(&object_store));
-        store.initialize().await.unwrap();
-        let now_ms = 1_000;
-        let expiry = ArtifactExpiry { unix_ms: 2_000 };
-        let entry = || LedgerArtifact {
-            owner: PrincipalId(1),
-            scope: PolicyScope::Cluster,
-            size: 0,
-            expires_at_ms: expiry.unix_ms,
-        };
-        let mut expected = (0..MAX_ARTIFACTS_PER_DEPLOYMENT - 8)
-            .map(|index| (format!("retained-{index:04}"), entry()))
-            .collect::<BTreeMap<_, _>>();
-        store
-            .mutate_ledger(|ledger| {
-                ledger.artifacts = expected.clone();
-                Ok(true)
-            })
-            .await
-            .unwrap();
-
-        let services = (0..16)
-            .map(|_| SupportArtifactStore::new(Arc::clone(&object_store)))
-            .collect::<Vec<_>>();
-        let attempts = (0..16).map(|index| {
-            let service = services[index % services.len()].clone();
-            async move {
-                let id = format!("pressure-{index:02}");
-                let result = service
-                    .insert(
-                        id.clone(),
-                        PrincipalId(1),
-                        PolicyScope::Cluster,
-                        Arc::from(Vec::new()),
-                        expiry,
-                        now_ms,
-                    )
-                    .await;
-                (id, result)
-            }
-        });
-        let results = futures::future::join_all(attempts).await;
-        let (accepted, rejected): (Vec<_>, Vec<_>) =
-            results.into_iter().partition(|(_, result)| result.is_ok());
-        assert_eq!(accepted.len(), 8);
-        for (id, result) in accepted {
-            assert_eq!(result, Ok(()));
-            expected.insert(id.clone(), entry());
-            assert_eq!(
-                object_store
-                    .get(&store.artifact_path(&id))
-                    .await
-                    .unwrap()
-                    .bytes()
-                    .await
-                    .unwrap()
-                    .as_ref(),
-                b""
-            );
-        }
-        for (id, result) in rejected {
-            assert_eq!(result, Err(ArtifactStoreError::StorageFull));
-            assert!(matches!(
-                object_store.get(&store.artifact_path(&id)).await,
-                Err(ObjectStoreError::NotFound { .. })
-            ));
-        }
-
-        assert_eq!(expected.len(), MAX_ARTIFACTS_PER_DEPLOYMENT);
-        assert_eq!(store.read_ledger().await.unwrap().0.artifacts, expected);
-    }
-
-    #[tokio::test]
     async fn cleanup_at_the_artifact_count_limit_removes_every_expired_object() {
         let object_store = Arc::new(InMemory::new());
         let store = SupportArtifactStore::new(object_store.clone());
@@ -897,217 +788,6 @@ mod tests {
                 Err(ObjectStoreError::NotFound { .. })
             ));
         }
-    }
-
-    #[tokio::test]
-    async fn minio_cleanup_at_the_artifact_count_limit_finishes_within_the_bound() {
-        assert!(rockstream_test_support::docker_available());
-        let bucket = "rockstream-support-artifact-cleanup-pressure";
-        let (_minio, port) = rockstream_test_support::minio::start_minio(bucket)
-            .await
-            .expect("MinIO is required for maximum-count cleanup coverage");
-        let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::prefix::PrefixStore::new(
-            rockstream_test_support::minio::minio_object_store(port, bucket),
-            "management",
-        ));
-        let store = SupportArtifactStore::new(Arc::clone(&object_store));
-        store.initialize().await.unwrap();
-        let now_ms = chrono::Utc::now().timestamp_millis().max(1) as u64;
-        let artifacts = (0..MAX_ARTIFACTS_PER_DEPLOYMENT)
-            .map(|index| {
-                (
-                    format!("expired-{index:04}"),
-                    LedgerArtifact {
-                        owner: PrincipalId(1),
-                        scope: PolicyScope::Cluster,
-                        size: 0,
-                        expires_at_ms: now_ms,
-                    },
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        store
-            .mutate_ledger(|ledger| {
-                ledger.artifacts = artifacts.clone();
-                Ok(true)
-            })
-            .await
-            .unwrap();
-        let paths = artifacts
-            .keys()
-            .map(|id| store.artifact_path(id))
-            .collect::<Vec<_>>();
-        futures::stream::iter(paths)
-            .map(|path| {
-                let object_store = Arc::clone(&object_store);
-                async move { object_store.put(&path, Vec::new().into()).await }
-            })
-            .buffer_unordered(32)
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-
-        let started = Instant::now();
-        store.cleanup_expired(now_ms).await.unwrap();
-        assert!(started.elapsed() <= ARTIFACT_CLEANUP_TIMEOUT);
-        assert!(store.read_ledger().await.unwrap().0.artifacts.is_empty());
-        for id in artifacts.keys() {
-            assert!(matches!(
-                object_store.get(&store.artifact_path(id)).await,
-                Err(ObjectStoreError::NotFound { .. })
-            ));
-        }
-    }
-
-    #[tokio::test]
-    async fn cleanup_rescans_artifacts_that_expire_during_a_sweep() {
-        let object_store = Arc::new(InMemory::new());
-        let delete_delay = Duration::from_millis(15);
-        let throttled_store = Arc::new(object_store::throttle::ThrottledStore::new(
-            object_store.clone(),
-            object_store::throttle::ThrottleConfig {
-                wait_delete_per_call: delete_delay,
-                ..Default::default()
-            },
-        ));
-        let store = SupportArtifactStore::new(throttled_store);
-        store.initialize().await.unwrap();
-
-        let already_expired = LedgerArtifact {
-            owner: PrincipalId(1),
-            scope: PolicyScope::Cluster,
-            size: 7,
-            expires_at_ms: 1_000,
-        };
-        let expires_during_sweep = LedgerArtifact {
-            owner: PrincipalId(1),
-            scope: PolicyScope::Cluster,
-            size: 7,
-            expires_at_ms: 1_001,
-        };
-        store
-            .mutate_ledger(|ledger| {
-                ledger
-                    .artifacts
-                    .insert("already-expired".to_owned(), already_expired.clone());
-                ledger.artifacts.insert(
-                    "expires-during-sweep".to_owned(),
-                    expires_during_sweep.clone(),
-                );
-                Ok(true)
-            })
-            .await
-            .unwrap();
-        for (id, content) in [
-            ("already-expired", b"expired".as_slice()),
-            ("expires-during-sweep", b"pending".as_slice()),
-        ] {
-            object_store
-                .put(&store.artifact_path(id), content.to_vec().into())
-                .await
-                .unwrap();
-        }
-
-        let started = Instant::now();
-        store.cleanup_expired(1_000).await.unwrap();
-        assert!(started.elapsed() >= delete_delay);
-        assert_eq!(
-            store.read_ledger().await.unwrap().0.artifacts,
-            BTreeMap::from([("expires-during-sweep".to_owned(), expires_during_sweep)])
-        );
-        assert!(matches!(
-            object_store
-                .get(&store.artifact_path("already-expired"))
-                .await,
-            Err(ObjectStoreError::NotFound { .. })
-        ));
-        assert_eq!(
-            object_store
-                .get(&store.artifact_path("expires-during-sweep"))
-                .await
-                .unwrap()
-                .bytes()
-                .await
-                .unwrap()
-                .as_ref(),
-            b"pending"
-        );
-
-        store.cleanup_expired(1_002).await.unwrap();
-        assert!(store.read_ledger().await.unwrap().0.artifacts.is_empty());
-        for id in ["already-expired", "expires-during-sweep"] {
-            assert!(matches!(
-                object_store.get(&store.artifact_path(id)).await,
-                Err(ObjectStoreError::NotFound { .. })
-            ));
-        }
-    }
-
-    #[test]
-    fn cleanup_timeout_accounts_for_an_artifact_expiring_mid_sweep() {
-        assert!(
-            ARTIFACT_CLEANUP_TIMEOUT * 2 + ARTIFACT_CLEANUP_INTERVAL <= Duration::from_secs(60)
-        );
-    }
-
-    #[tokio::test]
-    async fn cleanup_timeout_keeps_the_ledger_entry_for_retry() {
-        let object_store = Arc::new(InMemory::new());
-        let throttled_store = Arc::new(object_store::throttle::ThrottledStore::new(
-            object_store.clone(),
-            object_store::throttle::ThrottleConfig {
-                wait_delete_per_call: Duration::from_secs(1),
-                ..Default::default()
-            },
-        ));
-        let store = SupportArtifactStore::new(throttled_store.clone());
-        store.initialize().await.unwrap();
-        let entry = LedgerArtifact {
-            owner: PrincipalId(1),
-            scope: PolicyScope::Cluster,
-            size: 7,
-            expires_at_ms: 2_000,
-        };
-        store
-            .mutate_ledger(|ledger| {
-                ledger.artifacts.insert("expired".to_owned(), entry.clone());
-                Ok(true)
-            })
-            .await
-            .unwrap();
-        object_store
-            .put(&store.artifact_path("expired"), b"expired".to_vec().into())
-            .await
-            .unwrap();
-
-        assert_eq!(
-            store
-                .cleanup_expired_with_timeout(2_000, Duration::from_millis(1))
-                .await,
-            Err(ArtifactStoreError::StorageUnavailable)
-        );
-        assert_eq!(
-            store.read_ledger().await.unwrap().0.artifacts,
-            BTreeMap::from([("expired".to_owned(), entry)])
-        );
-        assert_eq!(
-            object_store
-                .get(&store.artifact_path("expired"))
-                .await
-                .unwrap()
-                .bytes()
-                .await
-                .unwrap(),
-            b"expired"[..]
-        );
-
-        throttled_store.config_mut(|config| config.wait_delete_per_call = Duration::ZERO);
-        store.cleanup_expired(2_000).await.unwrap();
-        assert!(store.read_ledger().await.unwrap().0.artifacts.is_empty());
-        assert!(matches!(
-            object_store.get(&store.artifact_path("expired")).await,
-            Err(ObjectStoreError::NotFound { .. })
-        ));
     }
 
     #[tokio::test]

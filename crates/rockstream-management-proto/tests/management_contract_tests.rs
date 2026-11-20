@@ -95,6 +95,9 @@ fn every_request_and_response_carries_protocol_version() {
         v1::CreateBackupResponse,
         v1::CancelOperationRequest,
         v1::CancelOperationResponse,
+        v1::GenerateSupportArtifactRequest,
+        v1::GenerateSupportArtifactResponse,
+        v1::DownloadSupportArtifactRequest,
     );
 }
 
@@ -120,9 +123,8 @@ struct TestService;
 
 #[tonic::async_trait]
 impl v1::management_service_server::ManagementService for TestService {
-    type DownloadSupportArtifactStream = tonic::codegen::tokio_stream::wrappers::ReceiverStream<
-        Result<v1::DownloadSupportArtifactChunk, tonic::Status>,
-    >;
+    type DownloadSupportArtifactStream =
+        futures::stream::Empty<Result<v1::DownloadSupportArtifactChunk, tonic::Status>>;
 
     async fn get_cluster_status(
         &self,

@@ -3166,6 +3166,102 @@ impl GatewayHandler {
             .map_err(|error| error.to_string())
     }
 
+    async fn refresh_kafka_secret_at_epoch(
+        &self,
+        runtime: &mut SourceRuntimeCoordinator<KafkaSource>,
+        lease: &SourceOwnerLease,
+        source: &CatalogSourceEntry,
+    ) -> Result<bool, GatewayError> {
+        let (bound_name, active_version) = runtime
+            .kafka_secret_binding(lease)
+            .map_err(source_backfill_error)?;
+        let Some(bound_name) = bound_name.map(str::to_string) else {
+            if source.options.contains_key("secret") {
+                return Err(GatewayError::QueryTimeExecutionFailed {
+                    detail: "Kafka source secret binding is unavailable".to_string(),
+                });
+            }
+            return Ok(false);
+        };
+        let reference =
+            source
+                .options
+                .get("secret")
+                .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                    detail: "Kafka source secret reference is unavailable".to_string(),
+                })?;
+        let secret_name = self
+            .authorize_source_secret_use(source, reference)
+            .await
+            .map_err(|detail| GatewayError::QueryTimeExecutionFailed { detail })?;
+        if secret_name != bound_name {
+            return Err(GatewayError::QueryTimeExecutionFailed {
+                detail: "Kafka source secret binding changed".to_string(),
+            });
+        }
+        let namespace = source.secret_namespace.as_deref().ok_or_else(|| {
+            GatewayError::QueryTimeExecutionFailed {
+                detail: "source secret reference has no durable namespace".to_string(),
+            }
+        })?;
+        let namespace_id = self
+            .secret_namespace_id(namespace)
+            .await
+            .map_err(|detail| GatewayError::QueryTimeExecutionFailed { detail })?;
+        let metadata = self
+            .secret_store
+            .get_secret_metadata(namespace_id, &secret_name)
+            .await
+            .map_err(|error| GatewayError::QueryTimeExecutionFailed {
+                detail: error.to_string(),
+            })?;
+        if metadata.version < active_version {
+            return Err(GatewayError::QueryTimeExecutionFailed {
+                detail: "Kafka source secret version moved backwards".to_string(),
+            });
+        }
+        if metadata.version == active_version {
+            return Ok(false);
+        }
+        let secret = self
+            .resolve_source_secret(source, reference)
+            .await
+            .map_err(|detail| GatewayError::QueryTimeExecutionFailed { detail })?;
+        if secret.metadata.version < metadata.version {
+            return Err(GatewayError::QueryTimeExecutionFailed {
+                detail: "Kafka source secret changed during credential resolution".to_string(),
+            });
+        }
+        if secret.secret_type != rockstream_types::secret::SecretType::SaslPlain {
+            return Err(GatewayError::QueryTimeExecutionFailed {
+                detail: "Kafka source secret must use type sasl_plain".to_string(),
+            });
+        }
+        let username = secret
+            .payload
+            .get("username")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                detail: "Kafka source secret has no username".to_string(),
+            })?;
+        let password = secret
+            .payload
+            .get("password")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                detail: "Kafka source secret has no password".to_string(),
+            })?;
+        runtime
+            .rotate_kafka_secret_at_epoch(
+                lease,
+                &secret_name,
+                secret.metadata.version,
+                username,
+                password,
+            )
+            .map_err(source_backfill_error)
+    }
+
     async fn refresh_pgoutput_secret_at_epoch(
         &self,
         coordinator: &mut SharedPgOutputCoordinator,
@@ -4565,21 +4661,72 @@ impl GatewayHandler {
             .or_else(|| source.options.get("group_id"))
             .map(|configured| format!("{configured}-{connector_id}"))
             .unwrap_or_else(|| format!("rockstream-{connector_id}"));
-        let mut runtime = KafkaSource::connect(
-            connector_id,
-            catalog_columns_to_schema(&table.columns),
-            bootstrap,
-            topic,
-            &group_id,
-        )
-        .map_err(source_backfill_error)?;
-        if let Some(secret_reference) = source.options.get("secret") {
-            let secret_name = self
-                .authorize_source_secret_use(source, secret_reference)
+        let schema = catalog_columns_to_schema(&table.columns);
+        let runtime = if let Some(secret_reference) = source.options.get("secret") {
+            let secret = self
+                .resolve_source_secret(source, secret_reference)
                 .await
                 .map_err(|detail| GatewayError::QueryTimeExecutionFailed { detail })?;
-            runtime.bind_secret(secret_name);
+            if secret.secret_type != rockstream_types::secret::SecretType::SaslPlain {
+                return Err(GatewayError::QueryTimeExecutionFailed {
+                    detail: "Kafka source secret must use type sasl_plain".to_string(),
+                });
+            }
+            let security_protocol = match source
+                .options
+                .get("security.protocol")
+                .or_else(|| source.options.get("security_protocol"))
+                .map(String::as_str)
+            {
+                Some(protocol) if protocol.eq_ignore_ascii_case("SASL_SSL") => "SASL_SSL",
+                Some(protocol) if protocol.eq_ignore_ascii_case("SASL_PLAINTEXT") => {
+                    "SASL_PLAINTEXT"
+                }
+                _ => {
+                    return Err(GatewayError::QueryTimeExecutionFailed {
+                        detail: "Kafka secret sources require security.protocol SASL_SSL or SASL_PLAINTEXT"
+                            .to_string(),
+                    });
+                }
+            };
+            let username = secret
+                .payload
+                .get("username")
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                    detail: "Kafka source secret has no username".to_string(),
+                })?;
+            let password = secret
+                .payload
+                .get("password")
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                    detail: "Kafka source secret has no password".to_string(),
+                })?;
+            KafkaSource::connect_with_sasl_plain(
+                connector_id,
+                schema,
+                bootstrap,
+                topic,
+                &group_id,
+                security_protocol,
+                &secret.name,
+                secret.metadata.version,
+                username,
+                password,
+            )
+        } else {
+            if source.options.contains_key("security.protocol")
+                || source.options.contains_key("security_protocol")
+            {
+                return Err(GatewayError::QueryTimeExecutionFailed {
+                    detail: "Kafka SASL security.protocol requires a bound sasl_plain secret"
+                        .to_string(),
+                });
+            }
+            KafkaSource::connect(connector_id, schema, bootstrap, topic, &group_id)
         }
+        .map_err(source_backfill_error)?;
         Ok((table, connector_id, runtime))
     }
 
@@ -5582,7 +5729,7 @@ impl GatewayHandler {
     fn pgoutput_source_aliases(&self, connector_id: ConnectorId) -> Vec<CatalogSourceEntry> {
         self.pgoutput_registered_aliases(connector_id)
             .into_iter()
-            .filter(|source| source.status == "OK")
+            .filter(|source| matches!(source.status.as_str(), "OK" | "RUNNING"))
             .collect()
     }
 
@@ -6140,12 +6287,12 @@ impl GatewayHandler {
         Ok(())
     }
 
-    async fn run_live_source_worker<S: SourceConnector>(
+    async fn run_live_source_worker(
         weak: Weak<GatewayHandler>,
         source: CatalogSourceEntry,
         view_name: String,
         table: CatalogTable,
-        mut runtime: SourceRuntimeCoordinator<S>,
+        mut runtime: SourceRuntimeCoordinator<KafkaSource>,
         shard_db: Arc<rockstream_storage::ShardDb>,
     ) {
         if runtime.recover().await.is_err() {
@@ -6183,6 +6330,17 @@ impl GatewayHandler {
                     continue;
                 }
             };
+            let Some(handler) = weak.upgrade() else {
+                break;
+            };
+            if let Err(error) = handler
+                .refresh_kafka_secret_at_epoch(&mut runtime, &lease, &source)
+                .await
+            {
+                tracing::warn!(view = %view_name, %error, "Kafka source credential refresh failed");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
             if delta.batches.is_empty() {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
@@ -6218,9 +6376,6 @@ impl GatewayHandler {
                 continue;
             }
             let Ok(epoch) = runtime.next_epoch() else {
-                break;
-            };
-            let Some(handler) = weak.upgrade() else {
                 break;
             };
             if let Err(error) = handler
@@ -11350,6 +11505,14 @@ impl GatewayHandler {
             Ok(parsed) => parsed,
             Err(message) => return Ok(vec![secret_error_response(message)]),
         };
+        let operation_id = conn_id.and_then(|id| {
+            self.sessions
+                .get(id)
+                .and_then(|session| session.idempotency_operation_id.clone())
+        });
+        let Some(operation_id) = operation_id else {
+            return Err(GatewayError::IdempotencyKeyRequired.into());
+        };
 
         let ns = match self.secret_namespace_id(namespace).await {
             Ok(namespace_id) => namespace_id,
@@ -11389,7 +11552,7 @@ impl GatewayHandler {
             name: parsed.name.clone(),
             consumer: None,
         };
-        let scope = match serde_json::to_string(&scope) {
+        let scope_json = match serde_json::to_string(&scope) {
             Ok(scope) => scope,
             Err(_) => {
                 return Ok(vec![secret_error_response(
@@ -11399,17 +11562,17 @@ impl GatewayHandler {
         };
         let audit = SecurityAuditRecord {
             format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
-            event_id: format!("gateway-secret-rotation-{:032x}", rand::random::<u128>()),
+            event_id: format!("gateway-secret-rotation-{operation_id}"),
             timestamp_ms: current_time_ms().max(1),
             actor,
             target: AuditField::Known(format!("secret:{namespace}/{}", parsed.name)),
-            scope: AuditField::Known(scope),
+            scope: AuditField::Known(scope_json),
             action: SecurityAuditClass::SecretRotation,
             outcome: SecurityAuditOutcome::Success,
             correlation: conn_id.map_or(AuditCorrelation::Unknown, |id| {
                 AuditCorrelation::Observed(id.to_string())
             }),
-            operation_id: AuditField::Unknown,
+            operation_id: AuditField::Known(operation_id.clone()),
             policy_revision: durable_principal
                 .as_ref()
                 .map_or(AuditField::Unknown, |principal| {
@@ -11418,12 +11581,49 @@ impl GatewayHandler {
             before_state: AuditField::Unknown,
             after_state: AuditField::Unknown,
         };
-        if let Err(err) = self
+        let operation = match self
             .secret_store
-            .alter_secret_with_security_audit(ns, &parsed.name, parsed.payload, "pgwire", audit)
+            .alter_secret_with_operation(
+                ns,
+                &parsed.name,
+                parsed.payload,
+                "pgwire",
+                rockstream_control::secret_store::SecretRotationOperationContext {
+                    actor_id: durable_principal.as_ref().map(|principal| principal.id.0),
+                    scope,
+                    operation_id: operation_id.clone(),
+                    audit,
+                },
+            )
             .await
         {
-            return Ok(vec![secret_error_response(err.to_string())]);
+            Ok(operation) => operation,
+            Err(error) => return Ok(vec![secret_error_response(error.to_string())]),
+        };
+        match operation.status() {
+            rockstream_control::OperationStatus::Succeeded => {}
+            rockstream_control::OperationStatus::Failed => {
+                return Ok(vec![secret_error_response(
+                    operation
+                        .result()
+                        .and_then(|result| result.get("error"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("secret rotation failed")
+                        .to_owned(),
+                )]);
+            }
+            rockstream_control::OperationStatus::Cancelled => {
+                return Ok(vec![secret_error_response(
+                    "secret rotation operation was cancelled before it started".to_owned(),
+                )]);
+            }
+            rockstream_control::OperationStatus::Pending
+            | rockstream_control::OperationStatus::Running
+            | rockstream_control::OperationStatus::Waiting => {
+                return Ok(vec![secret_error_response(
+                    "secret rotation operation is still in progress; retry using the same idempotency UUID".to_owned(),
+                )]);
+            }
         }
 
         Ok(vec![Response::Execution(
@@ -12251,11 +12451,16 @@ impl GatewayHandler {
             "idempotency_key" => {
                 if val_raw == "default" || val_raw == "null" || val_raw == "''" {
                     session.idempotency_key = None;
+                    session.idempotency_operation_id = None;
                 } else {
                     // Strip surrounding single quotes
                     let key_str = val_raw.trim_matches('\'');
                     let hash = sha256_16(key_str.as_bytes());
                     session.idempotency_key = Some(hash);
+                    session.idempotency_operation_id = uuid::Uuid::parse_str(key_str)
+                        .ok()
+                        .filter(|key| key.hyphenated().to_string() == key_str)
+                        .map(|key| key.hyphenated().to_string());
                 }
             }
             "source_epoch" => {
@@ -12740,6 +12945,7 @@ impl GatewayHandler {
             if let Some(mut session) = self.sessions.get_mut(id) {
                 session.cursors.clear();
                 session.idempotency_key = None;
+                session.idempotency_operation_id = None;
                 session.source_epoch_envelope = None;
                 session.wait_for_token = None;
                 session.last_written_epoch = None;

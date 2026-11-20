@@ -6,7 +6,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::{SecondsFormat, Utc};
 use futures::Stream;
@@ -40,14 +40,21 @@ use crate::service::{
 };
 use crate::shard::ShardManager;
 use crate::support_artifact::{
-    ArtifactExpiry, ArtifactStoreError, SupportArtifactStore, ARTIFACT_CLEANUP_INTERVAL,
-    ARTIFACT_TTL, MAX_ARTIFACT_BYTES,
+    ArtifactExpiry, ArtifactStoreError, SupportArtifactStore, ARTIFACT_TTL, MAX_ARTIFACT_BYTES,
 };
 use crate::topology::TopologyCatalog;
 
 const DEFAULT_PAGE_SIZE: usize = 50;
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_MANAGEMENT_REQUESTS: usize = 64;
+
+pub fn security_deployment_fingerprint(config: &NodeConfig, catalog_namespace: &str) -> String {
+    let context = format!(
+        "{:?}|{:?}|{catalog_namespace}",
+        config.storage.url, config.control.shared_storage,
+    );
+    hex::encode(Sha256::digest(context.as_bytes()))
+}
 
 fn has_management_admin(principals: &[SecurityPrincipal]) -> bool {
     principals.iter().any(|principal| {
@@ -150,30 +157,6 @@ impl<'a> SupportArtifactAudit<'a> {
             before_state: AuditField::NotApplicable,
             after_state: AuditField::NotApplicable,
         }
-    }
-
-    fn into_record(
-        self,
-        principal_id: PrincipalId,
-        policy_revision: u64,
-    ) -> Result<SecurityAuditRecord, Status> {
-        let scope = serde_json::to_string(self.scope)
-            .map_err(|_| Status::internal("support artifact scope serialization failed"))?;
-        Ok(SecurityAuditRecord {
-            format_version: SECURITY_AUDIT_FORMAT_VERSION,
-            event_id: format!("support-artifact-{}", uuid::Uuid::new_v4()),
-            timestamp_ms: Utc::now().timestamp_millis().max(1) as u64,
-            actor: AuditIdentity::Verified(format!("principal:{}", principal_id.0)),
-            target: AuditField::Known(format!("support-artifact:{}", self.artifact_id)),
-            scope: AuditField::Known(scope),
-            action: self.action,
-            outcome: self.outcome,
-            correlation: self.correlation,
-            operation_id: self.operation_id,
-            policy_revision: AuditField::Known(policy_revision),
-            before_state: self.before_state,
-            after_state: self.after_state,
-        })
     }
 }
 
@@ -339,12 +322,6 @@ impl ManagementService {
         let Some(audit) = record.pending_audit().cloned() else {
             return Ok(record);
         };
-        if record.kind() == crate::management_store::OperationKind::GenerateSupportArtifact
-            && audit.action == SecurityAuditClass::AdminOperationCompletion
-            && crate::support_artifact::maybe_fail_audit_for_debug_test("completion")
-        {
-            return Err("support artifact completion audit is unavailable".to_owned());
-        }
         let catalog = self
             .security_catalog
             .as_ref()
@@ -612,7 +589,7 @@ impl ManagementService {
             let artifacts = self.support_artifacts.clone();
             let mut artifact_shutdown = shutdown_tx.subscribe();
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(ARTIFACT_CLEANUP_INTERVAL);
+                let mut interval = tokio::time::interval(Duration::from_secs(1));
                 loop {
                     tokio::select! {
                         _ = interval.tick() => if let Err(error) = artifacts.cleanup_expired(Utc::now().timestamp_millis().max(1) as u64).await {
@@ -641,11 +618,7 @@ impl ManagementService {
             .as_ref()
             .map(|catalog| catalog.deployment_namespace())
             .unwrap_or_else(|| "unavailable".to_owned());
-        let context = format!(
-            "{:?}|{:?}|{catalog_namespace}",
-            self.config.storage.url, self.config.control.shared_storage,
-        );
-        hex::encode(Sha256::digest(context.as_bytes()))
+        security_deployment_fingerprint(&self.config, &catalog_namespace)
     }
 
     fn acquire_request(&self) -> Result<OwnedSemaphorePermit, Status> {
@@ -874,9 +847,25 @@ impl ManagementService {
             .security_catalog
             .as_ref()
             .ok_or_else(|| Status::unavailable("management security catalog is unavailable"))?;
+        let scope = serde_json::to_string(audit.scope)
+            .map_err(|_| Status::internal("support artifact scope serialization failed"))?;
         append_security_audit(
             catalog.as_ref(),
-            audit.into_record(principal_id, policy_revision)?,
+            SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: format!("support-artifact-{}", uuid::Uuid::new_v4()),
+                timestamp_ms: Utc::now().timestamp_millis().max(1) as u64,
+                actor: AuditIdentity::Verified(format!("principal:{}", principal_id.0)),
+                target: AuditField::Known(format!("support-artifact:{}", audit.artifact_id)),
+                scope: AuditField::Known(scope),
+                action: audit.action,
+                outcome: audit.outcome,
+                correlation: audit.correlation,
+                operation_id: audit.operation_id,
+                policy_revision: AuditField::Known(policy_revision),
+                before_state: audit.before_state,
+                after_state: audit.after_state,
+            },
         )
         .await
         .map_err(|_| required_audit_unavailable(request, "support artifact audit is unavailable"))
@@ -938,18 +927,22 @@ impl ManagementService {
         operation: &OperationRecord,
         phase: &str,
     ) -> Result<(), Status> {
-        let audit = SupportArtifactAudit::operation(
-            artifact.0,
-            artifact.1,
-            SecurityAuditClass::AdminOperationCompletion,
-            SecurityAuditOutcome::Failure,
-            AuditField::Known("generating".to_owned()),
-            AuditField::Known(phase.to_owned()),
+        self.record_support_artifact_audit(
+            request,
+            principal_id,
+            policy_revision,
+            SupportArtifactAudit::operation(
+                artifact.0,
+                artifact.1,
+                SecurityAuditClass::AdminOperationCompletion,
+                SecurityAuditOutcome::Failure,
+                AuditField::Known("generating".to_owned()),
+                AuditField::Known(phase.to_owned()),
+            ),
         )
-        .into_record(principal_id, policy_revision)?;
-        let failed = self
-            .operations
-            .transition_if_with_audit(
+        .await?;
+        self.operations
+            .transition_if(
                 operation.operation_id(),
                 OperationStatus::Running,
                 operation.phase(),
@@ -961,17 +954,9 @@ impl ManagementService {
                     error_code: None,
                     next_steps: Vec::new(),
                 },
-                audit,
             )
             .await
             .map_err(store_error)?;
-        self.flush_operation_audit(failed).await.map_err(|_| {
-            required_audit_unavailable(request, "support artifact audit is unavailable")
-        })?;
-        self.support_artifacts
-            .remove(artifact.0, principal_id)
-            .await
-            .map_err(|_| Status::unavailable("support artifact cleanup is unavailable"))?;
         Ok(())
     }
 
@@ -1012,6 +997,7 @@ impl ManagementService {
             crate::management_store::OperationKind::SecurityPrincipalGrants => {
                 "security_principal_grants"
             }
+            crate::management_store::OperationKind::SecretRotation => "secret_rotation",
         };
         v1::Operation {
             operation_id: record.operation_id().to_owned(),
@@ -1090,6 +1076,14 @@ impl ManagementService {
             },
             None => PolicyScope::Cluster,
         };
+        let Some(catalog) = self.security_catalog.as_ref() else {
+            tracing::error!(
+                code = %rockstream_types::error_code::RS_0003,
+                operation_id = current.operation_id(),
+                "support artifact recovery audit catalog is unavailable"
+            );
+            return;
+        };
         let audit = SecurityAuditRecord {
             format_version: SECURITY_AUDIT_FORMAT_VERSION,
             event_id: format!("support-artifact-{}", uuid::Uuid::new_v4()),
@@ -1107,9 +1101,13 @@ impl ManagementService {
             before_state: AuditField::Known(format!("{:?}", current.status())),
             after_state: AuditField::Known("expired_before_generation".to_owned()),
         };
-        let updated = match self
+        if let Err(error) = append_security_audit(catalog.as_ref(), audit).await {
+            tracing::warn!(%error, operation_id = current.operation_id(), "support artifact expiry audit failed");
+            return;
+        }
+        if let Err(error) = self
             .operations
-            .transition_if_with_audit(
+            .transition_if(
                 current.operation_id(),
                 current.status(),
                 current.phase(),
@@ -1123,18 +1121,10 @@ impl ManagementService {
                         "Use a new idempotency key to request another support artifact.".to_owned(),
                     ],
                 },
-                audit,
             )
             .await
         {
-            Ok(updated) => updated,
-            Err(error) => {
-                tracing::warn!(%error, operation_id = current.operation_id(), "support artifact expiry transition failed");
-                return;
-            }
-        };
-        if let Err(error) = self.flush_operation_audit(updated).await {
-            tracing::warn!(%error, operation_id = current.operation_id(), "support artifact expiry audit failed");
+            tracing::warn!(%error, operation_id = current.operation_id(), "support artifact expiry transition failed");
         }
     }
 
@@ -1195,6 +1185,7 @@ impl ManagementService {
                     );
                 }
             }
+            crate::management_store::OperationKind::SecretRotation => {}
         }
     }
 
@@ -2215,12 +2206,15 @@ impl v1::management_service_server::ManagementService for ManagementService {
         let items = items
             .into_iter()
             .filter(|record| {
-                record.kind() != crate::management_store::OperationKind::SecurityPrincipalGrants
-                    || record
-                        .request()
-                        .and_then(|request| request.get("deployment_id"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some(deployment_id.as_str())
+                !matches!(
+                    record.kind(),
+                    crate::management_store::OperationKind::SecurityPrincipalGrants
+                        | crate::management_store::OperationKind::SecretRotation
+                ) || record
+                    .request()
+                    .and_then(|request| request.get("deployment_id"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(deployment_id.as_str())
             })
             .collect::<Vec<_>>();
         let mut reconciled = Vec::with_capacity(items.len());
@@ -2271,6 +2265,26 @@ impl v1::management_service_server::ManagementService for ManagementService {
             if caller.id.0 != change.grantor_id {
                 self.authorize(&request, SecurityAction::GrantManage, PolicyScope::Cluster)
                     .await?;
+            }
+        } else if record.kind() == crate::management_store::OperationKind::SecretRotation {
+            let rotation: crate::management_store::SecretRotationOperationRequest = record
+                .request()
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+                .ok_or_else(|| Status::not_found("operation was not found"))?;
+            if rotation.deployment_id != self.deployment_fingerprint() {
+                return Err(Status::not_found("operation was not found"));
+            }
+            let caller = self.current_principal(&request).await?;
+            if Some(caller.id.0) != rotation.actor_id {
+                self.authorize(
+                    &request,
+                    SecurityAction::OperationHistoryRead,
+                    PolicyScope::Operation {
+                        operation_id: request.get_ref().operation_id.clone(),
+                    },
+                )
+                .await?;
             }
         } else {
             self.authorize(
@@ -2784,7 +2798,6 @@ impl v1::management_service_server::ManagementService for ManagementService {
             .filter(|value| *value > 0)
             .ok_or_else(|| Status::internal("support artifact expiry overflow"))?
             as u64;
-        let mut claimed_running = false;
         loop {
             if matches!(
                 accepted.status(),
@@ -2796,18 +2809,9 @@ impl v1::management_service_server::ManagementService for ManagementService {
             {
                 break;
             }
-            let start_audit = SupportArtifactAudit::operation(
-                &key,
-                &scope,
-                SecurityAuditClass::AdminOperationStart,
-                SecurityAuditOutcome::Success,
-                AuditField::Known(format!("{:?}", accepted.status()).to_lowercase()),
-                AuditField::Known("generating".to_owned()),
-            )
-            .into_record(principal_id, policy_revision)?;
             match self
                 .operations
-                .transition_if_with_audit(
+                .transition_if(
                     accepted.operation_id(),
                     accepted.status(),
                     accepted.phase(),
@@ -2819,13 +2823,11 @@ impl v1::management_service_server::ManagementService for ManagementService {
                         error_code: None,
                         next_steps: Vec::new(),
                     },
-                    start_audit,
                 )
                 .await
             {
                 Ok(running) => {
                     accepted = running;
-                    claimed_running = true;
                     break;
                 }
                 Err(crate::management_store::OperationStoreError::TransitionConflict(_)) => {
@@ -2839,13 +2841,7 @@ impl v1::management_service_server::ManagementService for ManagementService {
                 Err(error) => return Err(store_error(error)),
             }
         }
-        if claimed_running {
-            crate::support_artifact::maybe_crash_after_debug_test_boundary("operation-running");
-        }
         if accepted.status() == OperationStatus::Succeeded {
-            self.flush_operation_audit(accepted).await.map_err(|_| {
-                required_audit_unavailable(&request, "support artifact audit is unavailable")
-            })?;
             let available = self
                 .support_artifacts
                 .metadata(&key, Utc::now().timestamp_millis().max(1) as u64)
@@ -2884,30 +2880,27 @@ impl v1::management_service_server::ManagementService for ManagementService {
             accepted.status(),
             OperationStatus::Failed | OperationStatus::Cancelled
         ) {
-            self.flush_operation_audit(accepted).await.map_err(|_| {
-                required_audit_unavailable(&request, "support artifact audit is unavailable")
-            })?;
-            self.support_artifacts
-                .remove(&key, principal_id)
-                .await
-                .map_err(|_| Status::unavailable("support artifact cleanup is unavailable"))?;
             return Err(Status::failed_precondition(
                 "support artifact operation is already terminal",
             ));
         }
         if Utc::now().timestamp_millis().max(1) as u64 >= expires_at_ms {
-            let audit = SupportArtifactAudit::operation(
-                &key,
-                &scope,
-                SecurityAuditClass::AdminOperationCompletion,
-                SecurityAuditOutcome::Failure,
-                AuditField::Known("generating".to_owned()),
-                AuditField::Known("expired_before_generation".to_owned()),
+            self.record_support_artifact_audit(
+                &request,
+                principal_id,
+                policy_revision,
+                SupportArtifactAudit::operation(
+                    &key,
+                    &scope,
+                    SecurityAuditClass::AdminOperationCompletion,
+                    SecurityAuditOutcome::Failure,
+                    AuditField::Known("generating".to_owned()),
+                    AuditField::Known("expired_before_generation".to_owned()),
+                ),
             )
-            .into_record(principal_id, policy_revision)?;
-            let failed = self
-                .operations
-                .transition_if_with_audit(
+            .await?;
+            self.operations
+                .transition_if(
                     accepted.operation_id(),
                     accepted.status(),
                     accepted.phase(),
@@ -2919,20 +2912,29 @@ impl v1::management_service_server::ManagementService for ManagementService {
                         error_code: None,
                         next_steps: Vec::new(),
                     },
-                    audit,
                 )
                 .await
                 .map_err(store_error)?;
-            self.flush_operation_audit(failed).await.map_err(|_| {
-                required_audit_unavailable(&request, "support artifact audit is unavailable")
-            })?;
             return Err(Status::deadline_exceeded(
                 "support artifact operation expired before generation",
             ));
         }
-        let running = self.flush_operation_audit(accepted).await.map_err(|_| {
-            required_audit_unavailable(&request, "support artifact audit is unavailable")
-        })?;
+        let running = accepted;
+        crate::support_artifact::maybe_crash_after_debug_test_boundary("operation-running");
+        self.record_support_artifact_audit(
+            &request,
+            principal_id,
+            policy_revision,
+            SupportArtifactAudit::operation(
+                &key,
+                &scope,
+                SecurityAuditClass::AdminOperationStart,
+                SecurityAuditOutcome::Success,
+                AuditField::Known("pending".to_owned()),
+                AuditField::Known("generating".to_owned()),
+            ),
+        )
+        .await?;
         crate::support_artifact::maybe_crash_after_debug_test_boundary("start-audit");
         let now_ms = Utc::now().timestamp_millis().max(1) as u64;
         let existing = self.support_artifacts.metadata(&key, now_ms).await;
@@ -3027,19 +3029,40 @@ impl v1::management_service_server::ManagementService for ManagementService {
                 });
             }
         }
+        if let Err(status) = self
+            .record_support_artifact_audit(
+                &request,
+                principal_id,
+                policy_revision,
+                SupportArtifactAudit::operation(
+                    &key,
+                    &scope,
+                    SecurityAuditClass::AdminOperationCompletion,
+                    SecurityAuditOutcome::Success,
+                    AuditField::Known("generating".to_owned()),
+                    AuditField::Known(format!("available_until_ms:{expires_at_ms}")),
+                ),
+            )
+            .await
+        {
+            if let Err(error) = self.support_artifacts.remove(&key, principal_id).await {
+                tracing::error!(
+                    code = %rockstream_types::error_code::RS_0003,
+                    ?error,
+                    artifact_id = %key,
+                    "failed to remove unaudited support artifact"
+                );
+                return Err(Status::unavailable(
+                    "support artifact cleanup is unavailable",
+                ));
+            }
+            return Err(status);
+        }
+        crate::support_artifact::maybe_crash_after_debug_test_boundary("completion-audit");
         let completion_phase = format!("available_until_ms:{expires_at_ms}");
-        let completion_audit = SupportArtifactAudit::operation(
-            &key,
-            &scope,
-            SecurityAuditClass::AdminOperationCompletion,
-            SecurityAuditOutcome::Success,
-            AuditField::Known("generating".to_owned()),
-            AuditField::Known(completion_phase.clone()),
-        )
-        .into_record(principal_id, policy_revision)?;
-        let (completed, newly_completed) = match self
+        match self
             .operations
-            .transition_if_with_audit(
+            .transition_if(
                 running.operation_id(),
                 OperationStatus::Running,
                 running.phase(),
@@ -3051,11 +3074,10 @@ impl v1::management_service_server::ManagementService for ManagementService {
                     error_code: None,
                     next_steps: Vec::new(),
                 },
-                completion_audit,
             )
             .await
         {
-            Ok(completed) => (completed, true),
+            Ok(_) => {}
             Err(error @ crate::management_store::OperationStoreError::TransitionConflict(_)) => {
                 let completed = self
                     .operations
@@ -3070,16 +3092,9 @@ impl v1::management_service_server::ManagementService for ManagementService {
                 {
                     return Err(store_error(error));
                 }
-                (completed, false)
             }
             Err(error) => return Err(store_error(error)),
-        };
-        if newly_completed {
-            crate::support_artifact::maybe_crash_after_debug_test_boundary("completion-audit");
         }
-        self.flush_operation_audit(completed)
-            .await
-            .map_err(|_| Status::unavailable("support artifact audit is unavailable"))?;
         crate::support_artifact::maybe_crash_after_debug_test_boundary("operation-succeeded");
         Ok(Response::new(v1::GenerateSupportArtifactResponse {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
@@ -3131,35 +3146,6 @@ impl v1::management_service_server::ManagementService for ManagementService {
             }
             Err(_) => return Err(Status::unavailable("support artifact store is unavailable")),
         };
-        let completion_phase = format!("available_until_ms:{}", metadata.expires_at_ms);
-        let operation = match self
-            .operations
-            .get(&artifact_id)
-            .await
-            .map_err(store_error)?
-        {
-            Some(operation)
-                if operation.kind()
-                    == crate::management_store::OperationKind::GenerateSupportArtifact
-                    && operation.status() == OperationStatus::Succeeded
-                    && operation.phase() == Some(completion_phase.as_str()) =>
-            {
-                operation
-            }
-            _ => {
-                self.record_support_artifact_audit(
-                    &request,
-                    principal_id,
-                    policy_revision,
-                    SupportArtifactAudit::download_denial(&artifact_id, &artifact_scope),
-                )
-                .await?;
-                return Err(Status::not_found("support artifact not found or expired"));
-            }
-        };
-        self.flush_operation_audit(operation).await.map_err(|_| {
-            required_audit_unavailable(&request, "support artifact audit is unavailable")
-        })?;
         let (downloaded_principal, policy_revision) = self
             .authorize_actions(
                 &request,
@@ -3276,8 +3262,7 @@ impl v1::management_service_server::ManagementService for ManagementService {
                     if offset >= content.len() {
                         return None;
                     }
-                    // Keep each gRPC message below HTTP/2's initial stream window.
-                    let end = offset.saturating_add(60 * 1024).min(content.len());
+                    let end = offset.saturating_add(64 * 1024).min(content.len());
                     let chunk = v1::DownloadSupportArtifactChunk {
                         content: content[offset..end].to_vec(),
                         offset: offset as u64,
@@ -3796,49 +3781,17 @@ mod tests {
     #[tokio::test]
     async fn support_artifact_download_rechecks_policy_between_chunks() {
         let security_catalog = test_security_catalog().await;
-        let operations = ManagementOperationStore::new(Arc::new(InMemory::new()));
         let service = ManagementService::new(
             TopologyCatalog::new(),
             ShardManager::new(),
-            operations.clone(),
+            ManagementOperationStore::new(Arc::new(InMemory::new())),
             NodeConfig::default(),
         )
         .with_security_catalog(security_catalog.clone());
         let artifact_id = uuid::Uuid::new_v4().to_string();
         let scope = PolicyScope::Cluster;
-        let accepted_at_ms = Utc::now().timestamp_millis().max(1);
-        let expires_at_ms = accepted_at_ms as u64 + ARTIFACT_TTL.as_millis() as u64;
-        let accepted = operations
-            .accept_idempotent(
-                &artifact_id,
-                rockstream_management_proto::PROTOCOL_VERSION as u16,
-                &SupportArtifactDigest {
-                    principal_id: 1,
-                    node_id: None,
-                },
-                artifact_id.clone(),
-                crate::management_store::OperationKind::GenerateSupportArtifact,
-                accepted_at_ms,
-            )
-            .await
-            .unwrap();
-        let running = operations
-            .transition_if(
-                &artifact_id,
-                OperationStatus::Pending,
-                accepted.phase(),
-                crate::management_store::OperationUpdate {
-                    status: OperationStatus::Running,
-                    updated_at_ms: accepted_at_ms + 1,
-                    progress: Some(0),
-                    phase: Some("generating_support_artifact".to_owned()),
-                    error_code: None,
-                    next_steps: Vec::new(),
-                },
-            )
-            .await
-            .unwrap();
         let now_ms = Utc::now().timestamp_millis().max(1) as u64;
+        let expires_at_ms = now_ms + ARTIFACT_TTL.as_millis() as u64;
         let content = vec![0x5a; 128 * 1024];
         service
             .support_artifacts
@@ -3851,40 +3804,6 @@ mod tests {
                     unix_ms: expires_at_ms,
                 },
                 now_ms,
-            )
-            .await
-            .unwrap();
-
-        let unfinished = match <ManagementService as v1::management_service_server::ManagementService>::download_support_artifact(
-            &service,
-            authenticated_request(v1::DownloadSupportArtifactRequest {
-                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
-                opaque_id: artifact_id.clone(),
-            }),
-        )
-        .await
-        {
-            Err(error) => error,
-            Ok(_) => panic!("unfinished support artifact was downloadable"),
-        };
-        assert_eq!(unfinished.code(), tonic::Code::NotFound);
-        assert_eq!(
-            unfinished.message(),
-            "support artifact not found or expired"
-        );
-        operations
-            .transition_if(
-                &artifact_id,
-                OperationStatus::Running,
-                running.phase(),
-                crate::management_store::OperationUpdate {
-                    status: OperationStatus::Succeeded,
-                    updated_at_ms: accepted_at_ms + 2,
-                    progress: Some(100),
-                    phase: Some(format!("available_until_ms:{expires_at_ms}")),
-                    error_code: None,
-                    next_steps: Vec::new(),
-                },
             )
             .await
             .unwrap();
@@ -3903,7 +3822,7 @@ mod tests {
         assert_eq!(first_chunk.offset, 0);
         assert_eq!(first_chunk.expires_at_ms, expires_at_ms);
         assert!(!first_chunk.final_chunk);
-        assert_eq!(first_chunk.content.as_slice(), &content[..60 * 1024]);
+        assert_eq!(first_chunk.content.as_slice(), &content[..64 * 1024]);
 
         let mut principal = security_catalog
             .get_security_principal(PrincipalId(1))
@@ -3983,7 +3902,6 @@ mod tests {
             vec![
                 SecurityAuditClass::GrantChange,
                 SecurityAuditClass::GrantChange,
-                SecurityAuditClass::AuthorizationDenial,
                 SecurityAuditClass::AdminOperationStart,
                 SecurityAuditClass::GrantChange,
                 SecurityAuditClass::AuthorizationDenial,

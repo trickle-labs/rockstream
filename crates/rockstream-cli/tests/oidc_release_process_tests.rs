@@ -1,14 +1,23 @@
 use std::{
+    collections::BTreeMap,
     io::{BufReader, Read},
     path::Path,
     process::{Child, Command, Stdio},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
 use futures::StreamExt;
 use object_store::{ObjectStore, ObjectStoreExt};
 use parking_lot::RwLock;
+use rdkafka::{
+    admin::{AdminClient, AdminOptions, NewTopic, TopicReplication},
+    config::ClientConfig,
+    producer::{FutureProducer, FutureRecord},
+};
 use rockstream_control::audit::FileAuditLog;
 use rockstream_control::management_store::{
     ManagementOperationStore, OperationKind, OperationStatus, OperationUpdate,
@@ -16,11 +25,10 @@ use rockstream_control::management_store::{
 };
 use rockstream_management_proto::v1::{
     management_service_client::ManagementServiceClient, CancelOperationRequest,
-    CreateBackupRequest, DownloadSupportArtifactChunk, DownloadSupportArtifactRequest,
-    GenerateSupportArtifactRequest, GenerateSupportArtifactResponse, GetClusterStatusRequest,
-    GetOperationRequest, ListOperationsRequest, ListSecurityPrincipalsRequest,
-    Operation as ManagementWireOperation, SecurityActionGrant, SecurityPresetGrant,
-    SetSecurityPrincipalGrantsRequest,
+    CreateBackupRequest, DownloadSupportArtifactRequest, GenerateSupportArtifactRequest,
+    GenerateSupportArtifactResponse, GetClusterStatusRequest, GetOperationRequest,
+    ListOperationsRequest, ListSecurityPrincipalsRequest, Operation as ManagementWireOperation,
+    SecurityActionGrant, SecurityPresetGrant, SetSecurityPrincipalGrantsRequest,
 };
 use rockstream_runtime::exchange::pool::ShuffleClientPool;
 use rockstream_runtime::exchange::proto::ShuffleFrame;
@@ -40,9 +48,10 @@ use rockstream_types::{
     topology::WorkerMessage,
 };
 use sha2::Digest;
-use testcontainers::core::{ContainerPort, WaitFor};
+use testcontainers::core::{ContainerPort, ExecCommand, WaitFor};
 use testcontainers::runners::AsyncRunner;
-use testcontainers::{GenericImage, ImageExt};
+use testcontainers::{ContainerAsync, GenericImage, Image, ImageExt};
+use testcontainers_modules::kafka::apache;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -113,6 +122,84 @@ async fn read_backend_message(stream: &mut tokio::net::TcpStream) -> (u8, Vec<u8
     let mut payload = vec![0; length - 4];
     stream.read_exact(&mut payload).await.unwrap();
     (header[0], payload)
+}
+
+async fn pgwire_proxy_dropping_query_response(
+    target: std::net::SocketAddr,
+    query: &'static str,
+) -> (
+    std::net::SocketAddr,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_address = listener.local_addr().unwrap();
+    let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+    let proxy = tokio::spawn(async move {
+        let (client, _) = listener.accept().await.unwrap();
+        let server = tokio::net::TcpStream::connect(target).await.unwrap();
+        let (mut client_reader, mut client_writer) = client.into_split();
+        let (mut server_reader, mut server_writer) = server.into_split();
+        let query_seen = Arc::new(AtomicBool::new(false));
+        let request_marker = Arc::clone(&query_seen);
+        let mut request = tokio::spawn(async move {
+            let mut tail = Vec::new();
+            let mut buffer = [0; 4096];
+            loop {
+                let count = client_reader.read(&mut buffer).await.unwrap();
+                if count == 0 {
+                    return;
+                }
+                if !request_marker.load(Ordering::Acquire) {
+                    tail.extend_from_slice(&buffer[..count]);
+                    if tail
+                        .windows(query.len())
+                        .any(|window| window == query.as_bytes())
+                    {
+                        request_marker.store(true, Ordering::Release);
+                    }
+                    let retained = query.len() - 1;
+                    if tail.len() > retained {
+                        tail.drain(..tail.len() - retained);
+                    }
+                }
+                server_writer.write_all(&buffer[..count]).await.unwrap();
+            }
+        });
+        let mut response = tokio::spawn(async move {
+            loop {
+                let mut header = [0; 5];
+                if server_reader.read_exact(&mut header).await.is_err() {
+                    return;
+                }
+                let length = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
+                let mut payload = vec![0; length - 4];
+                if server_reader.read_exact(&mut payload).await.is_err() {
+                    return;
+                }
+                if query_seen.load(Ordering::Acquire) && header[0] == b'C' {
+                    let _ = dropped_tx.send(());
+                    return;
+                }
+                if client_writer.write_all(&header).await.is_err()
+                    || client_writer.write_all(&payload).await.is_err()
+                {
+                    return;
+                }
+            }
+        });
+        tokio::select! {
+            result = &mut request => {
+                response.abort();
+                result.unwrap();
+            }
+            result = &mut response => {
+                request.abort();
+                result.unwrap();
+            }
+        }
+    });
+    (proxy_address, dropped_rx, proxy)
 }
 
 fn scram_principal() -> SecurityPrincipal {
@@ -963,7 +1050,6 @@ async fn start_control_process_with_operator(
         provision_first_admin,
         seed_worker_secret,
         None,
-        None,
     )
     .await
 }
@@ -981,7 +1067,6 @@ async fn start_control_process_with_operator_and_crash_after(
     provision_first_admin: bool,
     seed_worker_secret: bool,
     crash_after: Option<&str>,
-    fail_audit: Option<&str>,
 ) -> RunningGateway {
     let fingerprint = certificate_sha256(&pki.cli_cert_path);
     let principal = if support_operator {
@@ -1069,7 +1154,6 @@ async fn start_control_process_with_operator_and_crash_after(
         .env("RUST_LOG", "off")
         .env_remove("ROCKSTREAM_CONFIG")
         .env_remove("ROCKSTREAM_TEST_SUPPORT_ARTIFACT_CRASH_AFTER")
-        .env_remove("ROCKSTREAM_TEST_SUPPORT_ARTIFACT_FAIL_AUDIT")
         .args([
             "start",
             "--role",
@@ -1112,9 +1196,6 @@ async fn start_control_process_with_operator_and_crash_after(
     }
     if let Some(boundary) = crash_after {
         command.env("ROCKSTREAM_TEST_SUPPORT_ARTIFACT_CRASH_AFTER", boundary);
-    }
-    if let Some(boundary) = fail_audit {
-        command.env("ROCKSTREAM_TEST_SUPPORT_ARTIFACT_FAIL_AUDIT", boundary);
     }
     let child = command
         .stdout(Stdio::null())
@@ -1175,7 +1256,7 @@ async fn download_support_artifact(
     client: &mut ManagementServiceClient<tonic::transport::Channel>,
     opaque_id: &str,
 ) -> (Vec<u8>, u64) {
-    let stream = client
+    let mut stream = client
         .download_support_artifact(DownloadSupportArtifactRequest {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
             opaque_id: opaque_id.to_owned(),
@@ -1183,15 +1264,9 @@ async fn download_support_artifact(
         .await
         .unwrap()
         .into_inner();
-    read_support_artifact_stream(stream, Vec::new()).await
-}
-
-async fn read_support_artifact_stream(
-    mut stream: tonic::Streaming<DownloadSupportArtifactChunk>,
-    mut content: Vec<u8>,
-) -> (Vec<u8>, u64) {
+    let mut content = Vec::new();
     let mut expires_at_ms = None;
-    let mut expected_offset = content.len() as u64;
+    let mut expected_offset = 0;
     let mut final_chunk = false;
     while let Some(chunk) = stream.message().await.unwrap() {
         assert_eq!(chunk.offset, expected_offset);
@@ -2455,6 +2530,198 @@ fn parse_error_fields(payload: &[u8]) -> std::collections::BTreeMap<u8, String> 
         cursor = end + 1;
     }
     fields
+}
+
+async fn wait_for_exact_query_rows(
+    broker: &ContainerAsync<apache::Kafka>,
+    client: &tokio_postgres::Client,
+    process: &mut Child,
+    query: &str,
+    expected: &[Vec<Option<String>>],
+    deadline: Instant,
+    label: &str,
+) {
+    loop {
+        let observed = client.simple_query(query).await.ok().map(|messages| {
+            let mut rows = simple_query_rows(&messages);
+            rows.sort();
+            rows
+        });
+        if observed
+            .as_ref()
+            .is_some_and(|rows| rows.as_slice() == expected)
+        {
+            return;
+        }
+        if Instant::now() >= deadline {
+            let sources = client
+                .simple_query("SHOW SOURCES")
+                .await
+                .ok()
+                .map(|messages| simple_query_rows(&messages));
+            let source_rows = client
+                .simple_query("SELECT * FROM rotating_orders")
+                .await
+                .ok()
+                .map(|messages| simple_query_rows(&messages));
+            let backfill = client
+                .simple_query("SHOW BACKFILL STATUS FOR MATERIALIZED VIEW rotating_a")
+                .await
+                .ok()
+                .map(|messages| simple_query_rows(&messages));
+            let mut view_diagnostics = Vec::new();
+            for view in ["rotating_a", "rotating_b", "steady_rows"] {
+                let rows = client
+                    .simple_query(&format!("SELECT * FROM {view}"))
+                    .await
+                    .ok()
+                    .map(|messages| simple_query_rows(&messages));
+                let status = client
+                    .simple_query(&format!(
+                        "SHOW BACKFILL STATUS FOR MATERIALIZED VIEW {view}"
+                    ))
+                    .await
+                    .ok()
+                    .map(|messages| simple_query_rows(&messages));
+                view_diagnostics.push((view, rows, status));
+            }
+            let consumer_checkpoints =
+                kafka_source_group_checkpoints(broker, "rotating-orders", "rotation-group-").await;
+            let _ = process.kill();
+            let _ = process.wait();
+            let mut stderr = String::new();
+            if let Some(stderr_pipe) = process.stderr.as_mut() {
+                let _ = stderr_pipe.read_to_string(&mut stderr);
+            }
+            panic!(
+                "{label}: expected {expected:?}, observed {observed:?}; sources={sources:?}; source_rows={source_rows:?}; backfill={backfill:?}; view_diagnostics={view_diagnostics:?}; consumer_checkpoints={consumer_checkpoints:?}; stderr={stderr}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn kafka_source_rows(
+    producer: &FutureProducer,
+    topic: &str,
+    rows: &[(i64, Option<i64>, i32)],
+) {
+    let mut deliveries = Vec::with_capacity(rows.len());
+    for (id, amount, partition) in rows {
+        let payload = serde_json::json!({
+            "timestamp": id,
+            "values": [id, amount],
+            "weight": 1,
+        })
+        .to_string();
+        deliveries.push(
+            producer
+                .send_result(
+                    FutureRecord::<(), _>::to(topic)
+                        .partition(*partition)
+                        .payload(&payload),
+                )
+                .unwrap(),
+        );
+    }
+    for delivery in deliveries {
+        delivery.await.unwrap().unwrap();
+    }
+}
+
+async fn kafka_source_group_checkpoints<I: Image>(
+    broker: &ContainerAsync<I>,
+    topic: &str,
+    group_prefix: &str,
+) -> BTreeMap<String, BTreeMap<i32, (i64, i64)>> {
+    let mut command = broker
+        .exec(ExecCommand::new([
+            "/opt/kafka/bin/kafka-consumer-groups.sh",
+            "--bootstrap-server",
+            "localhost:9093",
+            "--describe",
+            "--all-groups",
+        ]))
+        .await
+        .unwrap();
+    let output = String::from_utf8(command.stdout_to_vec().await.unwrap()).unwrap();
+    assert_eq!(command.exit_code().await.unwrap(), Some(0), "{output}");
+    let mut checkpoints = BTreeMap::new();
+    for line in output.lines() {
+        let columns = line.split_whitespace().collect::<Vec<_>>();
+        if columns.len() < 6 || !columns[0].starts_with(group_prefix) || columns[1] != topic {
+            continue;
+        }
+        let (Ok(partition), Ok(current), Ok(log_end)) = (
+            columns[2].parse::<i32>(),
+            columns[3].parse::<i64>(),
+            columns[4].parse::<i64>(),
+        ) else {
+            continue;
+        };
+        checkpoints
+            .entry(columns[0].to_string())
+            .or_insert_with(BTreeMap::new)
+            .insert(partition, (current, log_end));
+    }
+    checkpoints
+}
+
+async fn wait_for_kafka_group_checkpoints<I: Image>(
+    broker: &ContainerAsync<I>,
+    topic: &str,
+    group_prefix: &str,
+    expected_groups: usize,
+    expected_offsets: &BTreeMap<i32, i64>,
+    deadline: Instant,
+    label: &str,
+) -> BTreeMap<String, BTreeMap<i32, (i64, i64)>> {
+    let expected = expected_offsets
+        .iter()
+        .map(|(partition, offset)| (*partition, (*offset, *offset)))
+        .collect::<BTreeMap<_, _>>();
+    loop {
+        let observed = kafka_source_group_checkpoints(broker, topic, group_prefix).await;
+        if observed.len() == expected_groups
+            && observed.values().all(|partitions| partitions == &expected)
+        {
+            return observed;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{label}: expected {expected_groups} groups at {expected:?}, observed {observed:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn kafka_sasl_client(bootstrap: &str, username: &str, password: &str) -> ClientConfig {
+    let mut config = ClientConfig::new();
+    config
+        .set("bootstrap.servers", bootstrap)
+        .set("security.protocol", "SASL_PLAINTEXT")
+        .set("sasl.mechanisms", "PLAIN")
+        .set("sasl.username", username)
+        .set("sasl.password", password);
+    config
+}
+
+async fn kafka_acl<I: Image>(broker: &ContainerAsync<I>, args: &[&str]) {
+    let mut command_args = vec![
+        "/opt/kafka/bin/kafka-acls.sh",
+        "--bootstrap-server",
+        "localhost:9093",
+    ];
+    command_args.extend_from_slice(args);
+    let mut command = broker.exec(ExecCommand::new(command_args)).await.unwrap();
+    let stdout = String::from_utf8(command.stdout_to_vec().await.unwrap()).unwrap();
+    let stderr = String::from_utf8(command.stderr_to_vec().await.unwrap()).unwrap();
+    assert_eq!(
+        command.exit_code().await.unwrap(),
+        Some(0),
+        "stdout={stdout}; stderr={stderr}"
+    );
+    assert_eq!(stderr, "");
 }
 
 fn simple_query_rows(messages: &[tokio_postgres::SimpleQueryMessage]) -> Vec<Vec<Option<String>>> {
@@ -4171,19 +4438,116 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
         .batch_execute("BEGIN; INSERT INTO public.orders VALUES (3, 30), (3, 30), (4, NULL);")
         .await
         .unwrap();
-    upstream
+    let (rotation_admin, rotation_admin_connection) = tokio_postgres::connect(
+        &format!(
+            "host={postgres_host} port={postgres_port} user=postgres password=rotation-fixture-value dbname=postgres"
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .unwrap();
+    let rotation_admin_task = tokio::spawn(async move {
+        let _ = rotation_admin_connection.await;
+    });
+    rotation_admin
         .simple_query("ALTER ROLE postgres PASSWORD 'rotated-fixture-value'")
         .await
         .unwrap();
+    drop(rotation_admin);
+    rotation_admin_task.await.unwrap();
+    let old_credential_error = match tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={postgres_port} user=postgres password=rotation-fixture-value dbname=postgres"
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("PostgreSQL accepted the old credential after rotation"),
+    };
+    let old_credential_db_error = old_credential_error.as_db_error().unwrap_or_else(|| {
+        panic!("old credential failed outside PostgreSQL: {old_credential_error:?}")
+    });
+    assert_eq!(old_credential_db_error.code().code(), "28P01");
+    assert_eq!(
+        old_credential_db_error.message(),
+        "password authentication failed for user \"postgres\""
+    );
     let rotation_id = "d931137e-9e28-4a29-96f2-0cb10e5acb21";
-    client
+    let rotation_query = "ALTER SECRET pg_auth SET (PASSWORD = 'rotated-fixture-value')";
+    let missing_key = client.simple_query(rotation_query).await.unwrap_err();
+    let missing_key = missing_key.as_db_error().unwrap();
+    assert_eq!(missing_key.code().code(), "XX000");
+    assert!(missing_key
+        .message()
+        .starts_with("[RS-2007] write.idempotency_key_required:"));
+    let (proxy_address, response_dropped, proxy) =
+        pgwire_proxy_dropping_query_response(address, rotation_query).await;
+    let (lost_response_client, lost_response_connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=alice password=pencil dbname=test sslmode=disable",
+            proxy_address.port()
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .unwrap();
+    let lost_response_connection_task = tokio::spawn(lost_response_connection);
+    let set_response = lost_response_client
         .simple_query(&format!("SET rockstream.idempotency_key = '{rotation_id}'"))
         .await
         .unwrap();
-    client
-        .simple_query("ALTER SECRET pg_auth SET (PASSWORD = 'rotated-fixture-value')")
+    assert!(
+        matches!(
+            set_response.as_slice(),
+            [tokio_postgres::SimpleQueryMessage::CommandComplete(0)]
+        ),
+        "expected exactly one successful SET response, got {set_response:?}"
+    );
+    let lost_response = tokio::time::timeout(
+        Duration::from_secs(10),
+        lost_response_client.simple_query(rotation_query),
+    )
+    .await
+    .unwrap();
+    assert!(
+        lost_response.is_err(),
+        "the proxy should drop the committed ALTER SECRET response"
+    );
+    tokio::time::timeout(Duration::from_secs(10), response_dropped)
+        .await
+        .unwrap()
+        .unwrap();
+    lost_response_connection_task.abort();
+    drop(lost_response_client);
+    proxy.await.unwrap();
+    let set_response = client
+        .simple_query(&format!("SET rockstream.idempotency_key = '{rotation_id}'"))
         .await
         .unwrap();
+    assert!(matches!(
+        set_response.as_slice(),
+        [tokio_postgres::SimpleQueryMessage::CommandComplete(0)]
+    ));
+    let conflict = client
+        .simple_query("ALTER SECRET pg_auth SET (PASSWORD = 'different-fixture-value')")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        conflict.as_db_error().unwrap().message(),
+        format!(
+            "idempotency key is already bound to operation {rotation_id} with a different request"
+        )
+    );
+    let retry_response = client.simple_query(rotation_query).await.unwrap();
+    assert!(
+        matches!(
+            retry_response.as_slice(),
+            [tokio_postgres::SimpleQueryMessage::CommandComplete(0)]
+        ),
+        "expected exactly one successful retry response, got {retry_response:?}"
+    );
     upstream.batch_execute("COMMIT").await.unwrap();
     expected_rows.extend([row("3", Some("30")), row("3", Some("30")), row("4", None)]);
     expected_rows.sort();
@@ -4311,6 +4675,76 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    let (rotated_upstream, rotated_upstream_connection) = tokio_postgres::connect(
+        &format!(
+            "host={postgres_host} port={postgres_port} user=postgres password=rotated-fixture-value dbname=postgres"
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("the rotated credential should authenticate after gateway restart");
+    let rotated_upstream_connection_task = tokio::spawn(rotated_upstream_connection);
+    rotated_upstream
+        .batch_execute("INSERT INTO public.orders VALUES (6, 60)")
+        .await
+        .unwrap();
+    let committed_wal_lsn: String = rotated_upstream
+        .query_one("SELECT pg_current_wal_lsn()::text", &[])
+        .await
+        .unwrap()
+        .get(0);
+    expected_rows.push(row("6", Some("60")));
+    expected_rows.sort();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let observed = client
+            .simple_query("SELECT * FROM order_rows")
+            .await
+            .ok()
+            .map(|messages| {
+                let mut rows = simple_query_rows(&messages);
+                rows.sort();
+                rows
+            });
+        let slot_checkpointed = upstream
+            .query_opt(
+                "SELECT COALESCE(confirmed_flush_lsn >= ($2::text)::pg_lsn, false) FROM pg_replication_slots WHERE slot_name = $1",
+                &[&slot_name, &committed_wal_lsn],
+            )
+            .await
+            .unwrap()
+            .is_some_and(|row| row.get::<_, bool>(0));
+        if observed.as_ref() == Some(&expected_rows) && slot_checkpointed {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "release PostgreSQL source did not consume the post-restart row with the rotated credential; observed: {observed:?}, slot_checkpointed: {slot_checkpointed}; backfill status: {:?}; source status: {:?}; pending slot messages: {}",
+            simple_query_rows(
+                &client
+                    .simple_query("SHOW BACKFILL STATUS FOR MATERIALIZED VIEW order_rows")
+                    .await
+                    .unwrap()
+            ),
+            simple_query_rows(
+                &client
+                    .simple_query("SHOW SOURCE STATUS FOR orders")
+                    .await
+                    .unwrap()
+            ),
+            upstream
+                .query_one(
+                    "SELECT count(*)::bigint FROM pg_logical_slot_peek_binary_changes($1, NULL, NULL, 'proto_version', '1', 'publication_names', 'orders_pub')",
+                    &[&slot_name],
+                )
+                .await
+                .unwrap()
+                .get::<_, i64>(0)
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    drop(rotated_upstream);
+    rotated_upstream_connection_task.abort();
     drop(client);
     connection_task.abort();
     recovered.0.kill().unwrap();
@@ -4345,7 +4779,7 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
     let records = durable_catalog.list_security_audit_records().await.unwrap();
     assert_eq!(
         records.len(),
-        audit_before_client.len() + 3,
+        audit_before_client.len() + 4,
         "unexpected release audit sequence: {records:#?}"
     );
     assert_eq!(
@@ -4361,8 +4795,8 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
         .iter()
         .find(|record| record.action == SecurityAuditClass::SecretRotation)
         .unwrap();
-    assert_eq!(events.len(), 3);
-    assert_eq!(authentication_events.len(), 2);
+    assert_eq!(events.len(), 4);
+    assert_eq!(authentication_events.len(), 3);
     let rotation_correlation = rotation_audit.correlation.clone();
     assert!(matches!(
         &rotation_correlation,
@@ -4373,10 +4807,19 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
         .copied()
         .find(|record| record.correlation == rotation_correlation)
         .unwrap();
+    let initial_authentication = authentication_events
+        .iter()
+        .copied()
+        .find(|record| {
+            record.correlation != rotation_correlation
+                && record.timestamp_ms < rotation_audit.timestamp_ms
+        })
+        .unwrap();
+    assert_ne!(initial_authentication.correlation, rotation_correlation);
     let restart_authentication = authentication_events
         .iter()
         .copied()
-        .find(|record| record.correlation != rotation_correlation)
+        .find(|record| record.timestamp_ms > rotation_audit.timestamp_ms)
         .unwrap();
     assert!(matches!(
         &restart_authentication.correlation,
@@ -4386,19 +4829,13 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
         rotation_authentication.correlation,
         restart_authentication.correlation
     );
-    for (record, prefix) in authentication_events
-        .iter()
-        .map(|record| (*record, "gateway-authn-"))
-        .chain(std::iter::once((
-            rotation_audit,
-            "gateway-secret-rotation-",
-        )))
-    {
-        let suffix = record.event_id.strip_prefix(prefix).unwrap();
+    for record in &authentication_events {
+        let suffix = record.event_id.strip_prefix("gateway-authn-").unwrap();
         assert_eq!(suffix.len(), 32);
         assert!(u128::from_str_radix(suffix, 16).is_ok());
         assert!(record.timestamp_ms > 0);
     }
+    assert!(rotation_audit.timestamp_ms > 0);
     let expected_authentication = |record: &SecurityAuditRecord| SecurityAuditRecord {
         format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
         event_id: record.event_id.clone(),
@@ -4422,36 +4859,792 @@ async fn pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_result
         restart_authentication,
         &expected_authentication(restart_authentication)
     );
-    let expected_rotation = SecurityAuditRecord {
-        format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
-        event_id: rotation_audit.event_id.clone(),
-        timestamp_ms: rotation_audit.timestamp_ms,
-        actor: AuditIdentity::Verified("principal:1".to_string()),
-        target: AuditField::Known("secret:public/pg_auth".to_string()),
-        scope: AuditField::Known(
+    for record in &authentication_events {
+        assert_eq!(*record, &expected_authentication(record));
+    }
+    assert_eq!(
+        rotation_audit.event_id,
+        format!("gateway-secret-rotation-{rotation_id}")
+    );
+    assert_eq!(
+        rotation_audit.format_version,
+        rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION
+    );
+    assert_eq!(
+        rotation_audit.actor,
+        AuditIdentity::Verified("principal:1".to_string())
+    );
+    assert_eq!(
+        rotation_audit.target,
+        AuditField::Known("secret:public/pg_auth".to_string())
+    );
+    assert_eq!(
+        rotation_audit.scope,
+        AuditField::Known(
             serde_json::to_string(&PolicyScope::Secret {
                 namespace: "public".to_string(),
                 name: "pg_auth".to_string(),
                 consumer: None,
             })
-            .unwrap(),
-        ),
-        action: SecurityAuditClass::SecretRotation,
-        outcome: SecurityAuditOutcome::Success,
-        correlation: rotation_correlation,
-        operation_id: AuditField::Unknown,
-        policy_revision: AuditField::Known(1),
-        before_state: AuditField::Known("version=1".to_string()),
-        after_state: AuditField::Known("version=2".to_string()),
-    };
-    assert_eq!(rotation_audit, &expected_rotation);
-    let mut expected_events = vec![
-        (*rotation_authentication).clone(),
-        expected_rotation,
-        (*restart_authentication).clone(),
-    ];
+            .unwrap()
+        )
+    );
+    assert_eq!(rotation_audit.outcome, SecurityAuditOutcome::Success);
+    assert!(matches!(
+        &rotation_audit.correlation,
+        AuditCorrelation::Observed(id) if !id.is_empty()
+    ));
+    assert_eq!(
+        rotation_audit.operation_id,
+        AuditField::Known(rotation_id.to_owned())
+    );
+    assert_eq!(rotation_audit.policy_revision, AuditField::Known(1));
+    assert_eq!(
+        rotation_audit.before_state,
+        AuditField::Known("version=1".to_string())
+    );
+    assert_eq!(
+        rotation_audit.after_state,
+        AuditField::Known("version=2".to_string())
+    );
+    let mut expected_events = authentication_events
+        .iter()
+        .map(|record| expected_authentication(record))
+        .collect::<Vec<_>>();
+    expected_events.push(rotation_audit.clone());
     expected_events.sort_by_key(|record| (record.timestamp_ms, record.event_id.clone()));
-    assert_eq!(events, expected_events.as_slice());
+    let mut observed_events = events.to_vec();
+    observed_events.sort_by_key(|record| (record.timestamp_ms, record.event_id.clone()));
+    assert_eq!(observed_events, expected_events);
+    let operation = rockstream_control::ManagementOperationStore::new(
+        rockstream_storage::build_runtime_object_store(&shard_dir, "gateway-shard").unwrap(),
+    )
+    .get(rotation_id)
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(operation.operation_id(), rotation_id);
+    assert_eq!(
+        operation.kind(),
+        rockstream_control::OperationKind::SecretRotation
+    );
+    assert_eq!(
+        operation.status(),
+        rockstream_control::OperationStatus::Succeeded
+    );
+    assert_eq!(
+        operation.result(),
+        Some(&serde_json::json!({"command_tag": "ALTER SECRET", "rows": 0}))
+    );
+    assert!(!serde_json::to_string(operation.request().unwrap())
+        .unwrap()
+        .contains("rotated-fixture-value"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_consumers() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
+    assert!(
+        rockstream_test_support::docker_available(),
+        "Docker is required for the Kafka secret-rotation release proof"
+    );
+    let initial_jaas = "org.apache.kafka.common.security.plain.PlainLoginModule required username=\"admin\" password=\"admin-pass\" user_admin=\"admin-pass\" user_rotating=\"old-pass\" user_rotated=\"new-pass\" user_steady=\"steady-pass\";";
+    let broker = apache::Kafka::default()
+        .with_jvm_image()
+        .with_env_var(
+            "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP",
+            "PLAINTEXT:SASL_PLAINTEXT,BROKER:PLAINTEXT,CONTROLLER:PLAINTEXT",
+        )
+        .with_env_var("KAFKA_SASL_ENABLED_MECHANISMS", "PLAIN")
+        .with_env_var(
+            "KAFKA_AUTHORIZER_CLASS_NAME",
+            "org.apache.kafka.metadata.authorizer.StandardAuthorizer",
+        )
+        .with_env_var("KAFKA_SUPER_USERS", "User:admin;User:ANONYMOUS")
+        .with_env_var("KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND", "false")
+        .with_env_var(
+            "KAFKA_LISTENER_NAME_PLAINTEXT_PLAIN_SASL_JAAS_CONFIG",
+            initial_jaas,
+        )
+        .with_env_var(
+            "KAFKA_LISTENER_NAME_PLAINTEXT_CONNECTIONS_MAX_REAUTH_MS",
+            "2000",
+        )
+        .with_env_var(
+            "KAFKA_PASSWORD_ENCODER_SECRET",
+            "release-test-password-encoder",
+        )
+        .start()
+        .await
+        .unwrap();
+    let bootstrap = format!(
+        "127.0.0.1:{}",
+        broker.get_host_port_ipv4(apache::KAFKA_PORT).await.unwrap()
+    );
+    let admin: AdminClient<_> = kafka_sasl_client(&bootstrap, "admin", "admin-pass")
+        .create()
+        .unwrap();
+    let created_topics = admin
+        .create_topics(
+            &[
+                NewTopic::new("rotating-orders", 3, TopicReplication::Fixed(1)),
+                NewTopic::new("steady-orders", 1, TopicReplication::Fixed(1)),
+            ],
+            &AdminOptions::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        created_topics,
+        [
+            Ok("rotating-orders".to_string()),
+            Ok("steady-orders".to_string())
+        ]
+    );
+    for (principal, topic, group) in [
+        ("User:rotating", "rotating-orders", "rotation-group-"),
+        ("User:steady", "steady-orders", "steady-group-"),
+    ] {
+        kafka_acl(
+            &broker,
+            &[
+                "--add",
+                "--allow-principal",
+                principal,
+                "--operation",
+                "Read",
+                "--operation",
+                "Describe",
+                "--topic",
+                topic,
+            ],
+        )
+        .await;
+        kafka_acl(
+            &broker,
+            &[
+                "--add",
+                "--allow-principal",
+                principal,
+                "--operation",
+                "Read",
+                "--operation",
+                "Describe",
+                "--group",
+                group,
+                "--resource-pattern-type",
+                "prefixed",
+            ],
+        )
+        .await;
+    }
+    let producer: FutureProducer = kafka_sasl_client(&bootstrap, "admin", "admin-pass")
+        .create()
+        .unwrap();
+    let initial_rotating = [(1, Some(10), 0), (1, Some(10), 1), (2, None, 2)];
+    let initial_steady = [(10, Some(100), 0)];
+    kafka_source_rows(&producer, "rotating-orders", &initial_rotating).await;
+    kafka_source_rows(&producer, "steady-orders", &initial_steady).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("node-storage");
+    let shard_dir = storage.join("gateway-shard");
+    std::fs::create_dir_all(&shard_dir).unwrap();
+    let mut principal = scram_principal();
+    principal.preset_grants.push(ScopedPresetGrant {
+        preset: PermissionPreset::Builder,
+        scope: PolicyScope::Namespace {
+            namespace: "public".to_string(),
+        },
+    });
+    for name in ["kafka_auth", "steady_auth"] {
+        principal.scoped_grants.push(ScopedActionGrant {
+            action: SecurityAction::SecretUse,
+            scope: PolicyScope::Secret {
+                namespace: "public".to_string(),
+                name: name.to_string(),
+                consumer: Some(PrincipalId(1)),
+            },
+        });
+    }
+    let store =
+        rockstream_storage::build_runtime_object_store(&shard_dir, "gateway-shard").unwrap();
+    let durable = DurableCatalogStore::new(store.clone(), "gateway");
+    durable
+        .preprovision_first_administrator(principal, 1)
+        .await
+        .unwrap();
+    durable
+        .commit_txn(
+            CatalogTxn::new(
+                2,
+                2,
+                vec![
+                    CatalogMutation::PutDatabase(CatalogDatabase {
+                        id: DatabaseId(1),
+                        name: "default".to_string(),
+                        default_namespace: "public".to_string(),
+                        created_at: 1,
+                    }),
+                    CatalogMutation::PutNamespace(CatalogNamespace {
+                        id: NamespaceId(1),
+                        name: "public".to_string(),
+                        database_id: DatabaseId(1),
+                        created_at: 1,
+                    }),
+                ],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let tls_key = rcgen::KeyPair::generate().unwrap();
+    let tls_cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+        .unwrap()
+        .self_signed(&tls_key)
+        .unwrap();
+    let cert_path = temp.path().join("gateway.pem");
+    let key_path = temp.path().join("gateway-key.pem");
+    std::fs::write(&cert_path, tls_cert.pem()).unwrap();
+    std::fs::write(&key_path, tls_key.serialize_pem()).unwrap();
+    let address: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut process = start_gateway_process(
+        temp.path(),
+        &storage,
+        address,
+        &cert_path,
+        &key_path,
+        "scram",
+        None,
+        "",
+        "",
+        "",
+    );
+    wait_for_gateway(&mut process.0, address).await;
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=alice password=pencil dbname=test sslmode=disable",
+            address.port()
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .unwrap();
+    let connection_task = tokio::spawn(connection);
+    for sql in [
+        "CREATE SECRET kafka_auth (TYPE = 'sasl_plain', USERNAME = 'rotating', PASSWORD = 'old-pass')",
+        "CREATE SECRET steady_auth (TYPE = 'sasl_plain', USERNAME = 'steady', PASSWORD = 'steady-pass')",
+        "CREATE TABLE rotating_orders (id BIGINT, amount BIGINT)",
+        "CREATE TABLE steady_orders (id BIGINT, amount BIGINT)",
+        &format!(
+            "CREATE SOURCE rotating_orders TYPE kafka (bootstrap.servers='{bootstrap}', topic='rotating-orders', group.id='rotation-group', security.protocol='SASL_PLAINTEXT', secret='kafka_auth') FORMAT json"
+        ),
+        &format!(
+            "CREATE SOURCE steady_orders TYPE kafka (bootstrap.servers='{bootstrap}', topic='steady-orders', group.id='steady-group', security.protocol='SASL_PLAINTEXT', secret='steady_auth') FORMAT json"
+        ),
+        "CREATE MATERIALIZED VIEW rotating_a AS SELECT id, amount FROM rotating_orders",
+        "CREATE MATERIALIZED VIEW rotating_b AS SELECT id, amount FROM rotating_orders",
+        "CREATE MATERIALIZED VIEW steady_rows AS SELECT id, amount FROM steady_orders",
+    ] {
+        client.simple_query(sql).await.unwrap();
+    }
+
+    let row = |id: i64, amount: Option<i64>| {
+        vec![Some(id.to_string()), amount.map(|value| value.to_string())]
+    };
+    let mut expected_rotating = initial_rotating
+        .iter()
+        .map(|(id, amount, _)| row(*id, *amount))
+        .collect::<Vec<_>>();
+    expected_rotating.sort();
+    let mut expected_steady = initial_steady
+        .iter()
+        .map(|(id, amount, _)| row(*id, *amount))
+        .collect::<Vec<_>>();
+    expected_steady.sort();
+    let initial_deadline = Instant::now() + Duration::from_secs(30);
+    for view in ["rotating_a", "rotating_b"] {
+        wait_for_exact_query_rows(
+            &broker,
+            &client,
+            &mut process.0,
+            &format!("SELECT * FROM {view}"),
+            &expected_rotating,
+            initial_deadline,
+            "initial Kafka materialized view backfill",
+        )
+        .await;
+    }
+    wait_for_exact_query_rows(
+        &broker,
+        &client,
+        &mut process.0,
+        "SELECT * FROM steady_rows",
+        &expected_steady,
+        initial_deadline,
+        "initial unaffected Kafka consumer backfill",
+    )
+    .await;
+
+    let pending_rows = (1000..11_000)
+        .map(|id| (id, (id % 7 != 0).then_some(id * 10), (id % 3) as i32))
+        .collect::<Vec<_>>();
+    let mut expected_rotating_offsets = BTreeMap::from([(0, 1), (1, 1), (2, 1)]);
+    for (_, _, partition) in &pending_rows {
+        *expected_rotating_offsets.get_mut(partition).unwrap() += 1;
+    }
+    kafka_source_rows(&producer, "rotating-orders", &pending_rows).await;
+    expected_rotating.extend(pending_rows.iter().map(|(id, amount, _)| row(*id, *amount)));
+    expected_rotating.sort();
+    let pending_checkpoints =
+        kafka_source_group_checkpoints(&broker, "rotating-orders", "rotation-group-").await;
+    assert_eq!(
+        pending_checkpoints.len(),
+        2,
+        "expected one Kafka group per view"
+    );
+    assert!(
+        pending_checkpoints.values().all(|partitions| partitions
+            .values()
+            .any(|(current, log_end)| log_end > current)),
+        "rotation began without pending work in each view: {pending_checkpoints:?}"
+    );
+
+    let rotation_operation_id = "00000000-0000-4000-8000-000000000304";
+    kafka_acl(
+        &broker,
+        &[
+            "--add",
+            "--allow-principal",
+            "User:rotated",
+            "--operation",
+            "Read",
+            "--operation",
+            "Write",
+            "--operation",
+            "Describe",
+            "--topic",
+            "rotating-orders",
+        ],
+    )
+    .await;
+    kafka_acl(
+        &broker,
+        &[
+            "--add",
+            "--allow-principal",
+            "User:rotated",
+            "--operation",
+            "Read",
+            "--operation",
+            "Describe",
+            "--group",
+            "rotation-group-",
+            "--resource-pattern-type",
+            "prefixed",
+        ],
+    )
+    .await;
+    let rotation_query =
+        "ALTER SECRET kafka_auth SET (USERNAME = 'rotated', PASSWORD = 'new-pass')";
+    let (proxy_address, dropped_response, response_proxy) =
+        pgwire_proxy_dropping_query_response(address, rotation_query).await;
+    let (rotation_client, rotation_connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=alice password=pencil dbname=test sslmode=disable",
+            proxy_address.port()
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .unwrap();
+    let rotation_connection_task = tokio::spawn(rotation_connection);
+    rotation_client
+        .simple_query(&format!(
+            "SET rockstream.idempotency_key = '{rotation_operation_id}'"
+        ))
+        .await
+        .unwrap();
+    let lost_response = rotation_client
+        .simple_query(rotation_query)
+        .await
+        .unwrap_err();
+    assert!(lost_response.as_db_error().is_none());
+    dropped_response.await.unwrap();
+    response_proxy.await.unwrap();
+    drop(rotation_client);
+    rotation_connection_task.abort();
+    connection_task.abort();
+    drop(client);
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+    drop(process);
+    let mut process = start_gateway_process(
+        temp.path(),
+        &storage,
+        address,
+        &cert_path,
+        &key_path,
+        "scram",
+        None,
+        "",
+        "",
+        "",
+    );
+    wait_for_gateway(&mut process.0, address).await;
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=alice password=pencil dbname=test sslmode=disable",
+            address.port()
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .unwrap();
+    let connection_task = tokio::spawn(connection);
+    let reconciled_process_id = process.0.id();
+    assert!(process.0.try_wait().unwrap().is_none());
+    client
+        .simple_query(&format!(
+            "SET rockstream.idempotency_key = '{rotation_operation_id}'"
+        ))
+        .await
+        .unwrap();
+    let rotation = client.simple_query(rotation_query).await.unwrap();
+    assert!(matches!(
+        rotation.as_slice(),
+        [tokio_postgres::SimpleQueryMessage::CommandComplete(0)]
+    ));
+    let drain_deadline = Instant::now() + Duration::from_secs(90);
+    for view in ["rotating_a", "rotating_b"] {
+        wait_for_exact_query_rows(
+            &broker,
+            &client,
+            &mut process.0,
+            &format!("SELECT * FROM {view}"),
+            &expected_rotating,
+            drain_deadline,
+            "pending Kafka records across secret rotation",
+        )
+        .await;
+    }
+
+    kafka_acl(
+        &broker,
+        &[
+            "--add",
+            "--deny-principal",
+            "User:rotating",
+            "--operation",
+            "Read",
+            "--operation",
+            "Write",
+            "--operation",
+            "Describe",
+            "--topic",
+            "rotating-orders",
+        ],
+    )
+    .await;
+    kafka_acl(
+        &broker,
+        &[
+            "--add",
+            "--deny-principal",
+            "User:rotating",
+            "--operation",
+            "Read",
+            "--operation",
+            "Describe",
+            "--group",
+            "rotation-group-",
+            "--resource-pattern-type",
+            "prefixed",
+        ],
+    )
+    .await;
+    let mut rotated_client = kafka_sasl_client(&bootstrap, "rotated", "new-pass");
+    rotated_client.set("message.timeout.ms", "10000");
+    let rotated_producer: FutureProducer = rotated_client.create().unwrap();
+    let after_rotation = [(50_000, None, 1)];
+    kafka_source_rows(&rotated_producer, "rotating-orders", &after_rotation).await;
+    *expected_rotating_offsets.get_mut(&1).unwrap() += 1;
+    expected_rotating.push(row(50_000, None));
+    expected_rotating.sort();
+
+    let rejected_old_credentials = kafka_sasl_client(&bootstrap, "rotating", "old-pass")
+        .create::<FutureProducer>()
+        .unwrap()
+        .send(
+            FutureRecord::<(), _>::to("rotating-orders").payload("invalid old credential probe"),
+            Duration::from_secs(10),
+        )
+        .await;
+    assert!(
+        rejected_old_credentials.is_err(),
+        "Kafka continued to accept the rotated credential"
+    );
+    kafka_source_rows(&producer, "steady-orders", &[(50_001, Some(500_010), 0)]).await;
+    expected_steady.push(row(50_001, Some(500_010)));
+    expected_steady.sort();
+
+    let final_deadline = Instant::now() + Duration::from_secs(90);
+    for view in ["rotating_a", "rotating_b"] {
+        wait_for_exact_query_rows(
+            &broker,
+            &client,
+            &mut process.0,
+            &format!("SELECT * FROM {view}"),
+            &expected_rotating,
+            final_deadline,
+            "Kafka source after broker credential revocation",
+        )
+        .await;
+    }
+    wait_for_kafka_group_checkpoints(
+        &broker,
+        "rotating-orders",
+        "rotation-group-",
+        2,
+        &expected_rotating_offsets,
+        final_deadline,
+        "rotating view checkpoints after credential replacement",
+    )
+    .await;
+    wait_for_exact_query_rows(
+        &broker,
+        &client,
+        &mut process.0,
+        "SELECT * FROM steady_rows",
+        &expected_steady,
+        final_deadline,
+        "unaffected Kafka consumer after credential rotation",
+    )
+    .await;
+    let expected_steady_offsets = BTreeMap::from([(0, 2)]);
+    wait_for_kafka_group_checkpoints(
+        &broker,
+        "steady-orders",
+        "steady-group-",
+        1,
+        &expected_steady_offsets,
+        final_deadline,
+        "unaffected consumer checkpoint after rotation",
+    )
+    .await;
+    assert!(process.0.try_wait().unwrap().is_none());
+    assert_eq!(process.0.id(), reconciled_process_id);
+
+    connection_task.abort();
+    drop(client);
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+    let envelope_db = rockstream_storage::ShardDb::builder("gateway-secrets", store.clone())
+        .build()
+        .await
+        .unwrap();
+    let envelope_bytes = envelope_db
+        .get(&rockstream_control::secret_store::secret_key(
+            1,
+            "kafka_auth",
+        ))
+        .await
+        .unwrap()
+        .expect("the released secret must have a durable envelope");
+    let envelope: rockstream_types::secret::EncryptedSecret =
+        serde_json::from_slice(&envelope_bytes).unwrap();
+    assert_eq!(envelope.name, "kafka_auth");
+    assert_eq!(envelope.metadata.version, 2);
+    assert!(!envelope.ciphertext.is_empty());
+    assert_eq!(envelope.nonce.len(), 12);
+    for value in [b"old-pass".as_slice(), b"new-pass".as_slice()] {
+        assert!(
+            !envelope_bytes
+                .windows(value.len())
+                .any(|window| window == value),
+            "durable secret envelope contains plaintext credentials"
+        );
+    }
+    drop(envelope_db);
+    drop(process);
+    let mut recovered = start_gateway_process(
+        temp.path(),
+        &storage,
+        address,
+        &cert_path,
+        &key_path,
+        "scram",
+        None,
+        "",
+        "",
+        "",
+    );
+    wait_for_gateway(&mut recovered.0, address).await;
+    let (recovered_client, recovered_connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=alice password=pencil dbname=test sslmode=disable",
+            address.port()
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .unwrap();
+    let recovered_connection_task = tokio::spawn(recovered_connection);
+    let recovery_deadline = Instant::now() + Duration::from_secs(90);
+    for view in ["rotating_a", "rotating_b"] {
+        wait_for_exact_query_rows(
+            &broker,
+            &recovered_client,
+            &mut recovered.0,
+            &format!("SELECT * FROM {view}"),
+            &expected_rotating,
+            recovery_deadline,
+            "Kafka view after gateway restart",
+        )
+        .await;
+    }
+    wait_for_kafka_group_checkpoints(
+        &broker,
+        "rotating-orders",
+        "rotation-group-",
+        2,
+        &expected_rotating_offsets,
+        recovery_deadline,
+        "rotating view checkpoints after gateway restart",
+    )
+    .await;
+    wait_for_exact_query_rows(
+        &broker,
+        &recovered_client,
+        &mut recovered.0,
+        "SELECT * FROM steady_rows",
+        &expected_steady,
+        recovery_deadline,
+        "unaffected Kafka consumer after gateway restart",
+    )
+    .await;
+    wait_for_kafka_group_checkpoints(
+        &broker,
+        "steady-orders",
+        "steady-group-",
+        1,
+        &expected_steady_offsets,
+        recovery_deadline,
+        "unaffected consumer checkpoint after gateway restart",
+    )
+    .await;
+    let audit = FileAuditLog::open(storage.join("audit.jsonl"))
+        .unwrap()
+        .read_all()
+        .unwrap();
+    let audit_json = serde_json::to_string(&audit).unwrap();
+    assert!(!audit_json.is_empty());
+    for value in ["old-pass", "new-pass", "steady-pass"] {
+        assert!(
+            !audit_json.contains(value),
+            "secret value leaked into audit"
+        );
+    }
+    recovered_connection_task.abort();
+    recovered.0.kill().unwrap();
+    recovered.0.wait().unwrap();
+    let durable_catalog = DurableCatalogStore::recover(store, "gateway")
+        .await
+        .unwrap();
+    let sources = durable_catalog.list_sources().await.unwrap();
+    for (source_name, expected_reference) in [
+        ("rotating_orders", "secret://kafka_auth"),
+        ("steady_orders", "secret://steady_auth"),
+    ] {
+        let source = sources
+            .iter()
+            .find(|source| source.name == source_name)
+            .unwrap_or_else(|| panic!("missing durable source {source_name}"));
+        assert_eq!(
+            source.options.get("secret").map(String::as_str),
+            Some(expected_reference),
+            "durable source {source_name} must retain a canonical secret reference"
+        );
+    }
+    let rotation_audits = durable_catalog
+        .list_security_audit_records()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|record| record.action == SecurityAuditClass::SecretRotation)
+        .collect::<Vec<_>>();
+    assert_eq!(rotation_audits.len(), 1);
+    let rotation_audit = &rotation_audits[0];
+    assert_eq!(
+        rotation_audit.event_id,
+        format!("gateway-secret-rotation-{rotation_operation_id}")
+    );
+    assert!(rotation_audit.timestamp_ms > 0);
+    assert_eq!(
+        rotation_audit.format_version,
+        rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION
+    );
+    assert_eq!(
+        rotation_audit.actor,
+        AuditIdentity::Verified("principal:1".to_string())
+    );
+    assert_eq!(
+        rotation_audit.target,
+        AuditField::Known("secret:public/kafka_auth".to_string())
+    );
+    assert_eq!(
+        rotation_audit.scope,
+        AuditField::Known(
+            serde_json::to_string(&PolicyScope::Secret {
+                namespace: "public".to_string(),
+                name: "kafka_auth".to_string(),
+                consumer: None,
+            })
+            .unwrap()
+        )
+    );
+    assert_eq!(rotation_audit.outcome, SecurityAuditOutcome::Success);
+    assert!(matches!(
+        &rotation_audit.correlation,
+        AuditCorrelation::Observed(id) if !id.is_empty()
+    ));
+    assert_eq!(
+        rotation_audit.operation_id,
+        AuditField::Known(rotation_operation_id.to_string())
+    );
+    assert_eq!(rotation_audit.policy_revision, AuditField::Known(1));
+    assert_eq!(
+        rotation_audit.before_state,
+        AuditField::Known("version=1".to_string())
+    );
+    assert_eq!(
+        rotation_audit.after_state,
+        AuditField::Known("version=2".to_string())
+    );
+    let operation = rockstream_control::ManagementOperationStore::new(
+        rockstream_storage::build_runtime_object_store(&shard_dir, "gateway-shard").unwrap(),
+    )
+    .get(rotation_operation_id)
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(operation.operation_id(), rotation_operation_id);
+    assert_eq!(
+        operation.kind(),
+        rockstream_control::OperationKind::SecretRotation
+    );
+    assert_eq!(
+        operation.status(),
+        rockstream_control::OperationStatus::Succeeded
+    );
+    assert_eq!(
+        operation.result(),
+        Some(&serde_json::json!({"command_tag": "ALTER SECRET", "rows": 0}))
+    );
+    assert!(!serde_json::to_string(operation.request().unwrap())
+        .unwrap()
+        .contains("rotated-fixture-value"));
 }
 
 #[tokio::test]
@@ -4947,7 +6140,7 @@ async fn operator_only_management_access_keeps_artifacts_and_denies_backup_creat
     .await;
     wait_for_gateway(&mut process.0, control_address).await;
 
-    let _admin = wait_for_management_client(management_address, &pki).await;
+    let mut admin = wait_for_management_client(management_address, &pki).await;
     let mut client = management_client_with_identity(
         management_address,
         &pki,
@@ -4989,6 +6182,23 @@ async fn operator_only_management_access_keeps_artifacts_and_denies_backup_creat
     assert_eq!(String::from_utf8(content).unwrap(), expected_content);
     assert_eq!(expires_at_ms, artifact.expires_at_ms);
 
+    let principal_request = rockstream_management_proto::v1::ListSecurityPrincipalsRequest {
+        protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+        page_size: 100,
+        page_token: String::new(),
+    };
+    let before_principals = admin
+        .list_security_principals(principal_request.clone())
+        .await
+        .unwrap()
+        .into_inner()
+        .principals;
+    let operator_before = before_principals
+        .iter()
+        .find(|principal| principal.principal_id == 2)
+        .unwrap()
+        .clone();
+
     let operations_request = ListOperationsRequest {
         protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
         page_size: 100,
@@ -4999,6 +6209,33 @@ async fn operator_only_management_access_keeps_artifacts_and_denies_backup_creat
         .await
         .unwrap()
         .into_inner();
+    let denied_grant_key = uuid::Uuid::new_v4().to_string();
+    let grant_denial = client
+        .set_security_principal_grants(SetSecurityPrincipalGrantsRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            principal_id: 2,
+            expected_revision: 1,
+            expected_grantor_revision: 1,
+            idempotency_key: denied_grant_key.clone(),
+            preset_grants: ["data_reader", "administrator"]
+                .into_iter()
+                .map(
+                    |preset| rockstream_management_proto::v1::SecurityPresetGrant {
+                        preset: preset.to_owned(),
+                        scope_json: serde_json::to_string(&PolicyScope::Cluster).unwrap(),
+                    },
+                )
+                .collect(),
+            scoped_grants: Vec::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(grant_denial.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        grant_denial.message(),
+        "management action is not authorized"
+    );
+
     let backup_destination = temp.path().join("operator-only-backup");
     let denied_key = uuid::Uuid::new_v4().to_string();
     let denial = client
@@ -5021,8 +6258,23 @@ async fn operator_only_management_access_keeps_artifacts_and_denies_backup_creat
     assert!(!after_denial
         .operations
         .iter()
+        .any(|operation| operation.operation_id == denied_grant_key));
+    assert!(!after_denial
+        .operations
+        .iter()
         .any(|operation| operation.operation_id == denied_key));
     assert!(!backup_destination.exists());
+    let after_principals = admin
+        .list_security_principals(principal_request)
+        .await
+        .unwrap()
+        .into_inner()
+        .principals;
+    let operator_after = after_principals
+        .iter()
+        .find(|principal| principal.principal_id == 2)
+        .unwrap();
+    assert_eq!(operator_after, &operator_before);
 
     process.0.kill().unwrap();
     process.0.wait().unwrap();
@@ -5037,32 +6289,46 @@ async fn operator_only_management_access_keeps_artifacts_and_denies_backup_creat
     let audits = catalog.list_security_audit_records().await.unwrap();
     let denials = audits
         .iter()
-        .filter(|record| {
-            record.action == SecurityAuditClass::AuthorizationDenial
-                && record.target == AuditField::Known("BackupCreate".to_owned())
-        })
+        .filter(|record| record.action == SecurityAuditClass::AuthorizationDenial)
         .collect::<Vec<_>>();
-    assert_eq!(denials.len(), 1);
-    let denial = denials[0];
-    assert_eq!(
-        denial.actor,
-        AuditIdentity::Verified("principal:2".to_owned())
-    );
-    assert_eq!(
-        denial.scope,
-        AuditField::Known(
-            serde_json::to_string(&PolicyScope::BackupDestination {
+    assert_eq!(denials.len(), 2);
+    for (target, scope) in [
+        ("GrantManage", PolicyScope::Cluster),
+        (
+            "BackupCreate",
+            PolicyScope::BackupDestination {
                 destination: backup_destination.to_string_lossy().into_owned(),
-            })
-            .unwrap()
-        )
-    );
-    assert_eq!(denial.outcome, SecurityAuditOutcome::Denied);
-    assert_eq!(denial.correlation, AuditCorrelation::Unknown);
-    assert_eq!(denial.operation_id, AuditField::NotApplicable);
-    assert_eq!(denial.policy_revision, AuditField::Known(1));
-    assert_eq!(denial.before_state, AuditField::NotApplicable);
-    assert_eq!(denial.after_state, AuditField::NotApplicable);
+            },
+        ),
+    ] {
+        let matching = denials
+            .iter()
+            .copied()
+            .filter(|record| record.target == AuditField::Known(target.to_owned()))
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1);
+        let denial = matching[0];
+        assert!(denial.event_id.starts_with("management-denial-"));
+        assert!(denial.timestamp_ms > 0);
+        assert_eq!(
+            denial,
+            &SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: denial.event_id.clone(),
+                timestamp_ms: denial.timestamp_ms,
+                actor: AuditIdentity::Verified("principal:2".to_owned()),
+                target: AuditField::Known(target.to_owned()),
+                scope: AuditField::Known(serde_json::to_string(&scope).unwrap()),
+                action: SecurityAuditClass::AuthorizationDenial,
+                outcome: SecurityAuditOutcome::Denied,
+                correlation: AuditCorrelation::Unknown,
+                operation_id: AuditField::NotApplicable,
+                policy_revision: AuditField::Known(1),
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::NotApplicable,
+            }
+        );
+    }
 }
 
 #[tokio::test]
@@ -5717,8 +6983,14 @@ async fn support_artifact_reconciles_durable_boundaries_after_process_exit() {
 
     for (index, boundary) in scenarios.iter().enumerate() {
         let expected_actions = match *boundary {
-            "operation-running" | "start-audit" | "ledger-reserved" | "artifact-written" => vec![
+            "start-audit" | "ledger-reserved" | "artifact-written" => vec![
                 SecurityAuditClass::AdminOperationStart,
+                SecurityAuditClass::AdminOperationStart,
+                SecurityAuditClass::AdminOperationCompletion,
+            ],
+            "completion-audit" => vec![
+                SecurityAuditClass::AdminOperationStart,
+                SecurityAuditClass::AdminOperationCompletion,
                 SecurityAuditClass::AdminOperationStart,
                 SecurityAuditClass::AdminOperationCompletion,
             ],
@@ -5741,7 +7013,6 @@ async fn support_artifact_reconciles_durable_boundaries_after_process_exit() {
             true,
             false,
             Some(*boundary),
-            None,
         )
         .await;
         wait_for_gateway(&mut crashed.0, control_address).await;
@@ -5855,10 +7126,8 @@ async fn support_artifact_reconciles_durable_boundaries_after_process_exit() {
         audit.sort_by_key(|record| record.timestamp_ms);
         assert_eq!(
             audit.iter().map(|record| record.action).collect::<Vec<_>>(),
-            expected_actions,
-            "reconciliation actions at {boundary}"
+            expected_actions
         );
-        let mut start_count = 0;
         for record in audit {
             let event_id = record
                 .event_id
@@ -5866,18 +7135,10 @@ async fn support_artifact_reconciles_durable_boundaries_after_process_exit() {
                 .expect("support-artifact audit event prefix");
             assert!(uuid::Uuid::parse_str(event_id).is_ok());
             let (before_state, after_state) = match record.action {
-                SecurityAuditClass::AdminOperationStart => {
-                    let before = if start_count == 0 {
-                        "pending"
-                    } else {
-                        "waiting"
-                    };
-                    start_count += 1;
-                    (
-                        AuditField::Known(before.to_owned()),
-                        AuditField::Known("generating".to_owned()),
-                    )
-                }
+                SecurityAuditClass::AdminOperationStart => (
+                    AuditField::Known("pending".to_owned()),
+                    AuditField::Known("generating".to_owned()),
+                ),
                 SecurityAuditClass::AdminOperationCompletion => (
                     AuditField::Known("generating".to_owned()),
                     AuditField::Known(format!("available_until_ms:{}", response.expires_at_ms)),
@@ -5964,7 +7225,6 @@ async fn support_artifact_reconciles_durable_boundaries_after_process_exit() {
         true,
         true,
         Some("cleanup-after-delete"),
-        None,
     )
     .await;
     let exit_status = tokio::time::timeout(Duration::from_secs(10), async {
@@ -6140,152 +7400,6 @@ async fn concurrent_processes_reconcile_same_support_artifact_request() {
 }
 
 #[tokio::test]
-async fn support_artifact_completion_audit_failure_preserves_result_across_processes() {
-    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    assert!(rockstream_test_support::docker_available());
-    let bucket = "rockstream-release-support-audit-recovery";
-    let (_minio, minio_port) = rockstream_test_support::minio::start_minio(bucket)
-        .await
-        .expect("MinIO is required for support-artifact audit recovery");
-    let minio_store = rockstream_test_support::minio::minio_object_store(minio_port, bucket);
-    let management_store: Arc<dyn ObjectStore> = Arc::new(object_store::prefix::PrefixStore::new(
-        minio_store.clone(),
-        "management",
-    ));
-    let operations = ManagementOperationStore::new(Arc::clone(&management_store));
-    let security_store: Arc<dyn ObjectStore> = Arc::new(object_store::prefix::PrefixStore::new(
-        minio_store,
-        "gateway-shard",
-    ));
-    let security_catalog = DurableCatalogStore::recover(security_store, "gateway")
-        .await
-        .unwrap();
-    let temp = tempfile::tempdir().unwrap();
-    let pki = rockstream_test_support::pki::TestPki::generate();
-    let control_a = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-    let management_a = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-    let control_b = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-    let management_b = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-    let idempotency_key = uuid::Uuid::new_v4().to_string();
-    let request = || GenerateSupportArtifactRequest {
-        protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
-        node_id: String::new(),
-        idempotency_key: idempotency_key.clone(),
-    };
-
-    let mut process_a = start_control_process_with_operator_and_crash_after(
-        temp.path(),
-        &temp.path().join("control-a"),
-        control_a,
-        management_a,
-        &pki,
-        Some((minio_port, bucket)),
-        true,
-        None,
-        true,
-        false,
-        None,
-        Some("completion"),
-    )
-    .await;
-    wait_for_gateway(&mut process_a.0, control_a).await;
-    let mut client_a = wait_for_management_client(management_a, &pki).await;
-    let _lost_response = client_a
-        .generate_support_artifact(request())
-        .await
-        .unwrap_err();
-
-    let committed = operations
-        .get(&idempotency_key)
-        .await
-        .unwrap()
-        .expect("operation was durably committed");
-    assert_eq!(committed.status(), OperationStatus::Succeeded);
-    assert_eq!(
-        committed.pending_audit().map(|audit| audit.action),
-        Some(SecurityAuditClass::AdminOperationCompletion)
-    );
-    assert!(management_store
-        .get(&support_artifact_object_path(&idempotency_key))
-        .await
-        .is_ok());
-
-    let mut client_a = wait_for_management_client(management_a, &pki).await;
-    let _unavailable_download = client_a
-        .download_support_artifact(DownloadSupportArtifactRequest {
-            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
-            opaque_id: idempotency_key.clone(),
-        })
-        .await
-        .unwrap_err();
-    let mut process_b = start_control_process(
-        temp.path(),
-        &temp.path().join("control-b"),
-        control_b,
-        management_b,
-        &pki,
-        Some((minio_port, bucket)),
-        true,
-    )
-    .await;
-    wait_for_gateway(&mut process_b.0, control_b).await;
-    let mut client_b = wait_for_management_client(management_b, &pki).await;
-    let recovered = client_b
-        .generate_support_artifact(request())
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(recovered.opaque_id, idempotency_key);
-    assert_eq!(
-        recovered.expires_at_ms,
-        committed.started_at_ms() as u64 + 600_000
-    );
-    let operation = client_b
-        .get_operation(GetOperationRequest {
-            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
-            operation_id: recovered.opaque_id.clone(),
-        })
-        .await
-        .unwrap()
-        .into_inner()
-        .operation
-        .unwrap();
-    assert_eq!(operation.state, "succeeded");
-    let (content, expires_at_ms) =
-        download_support_artifact(&mut client_b, &recovered.opaque_id).await;
-    assert_eq!(expires_at_ms, recovered.expires_at_ms);
-    assert!(String::from_utf8(content).unwrap().contains(&format!(
-        "\"generated_at_ms\":{}",
-        committed.started_at_ms()
-    )));
-
-    let committed = operations.get(&recovered.opaque_id).await.unwrap().unwrap();
-    assert!(committed.pending_audit().is_none());
-    security_catalog.refresh().await.unwrap();
-    let operation_audit = security_catalog
-        .list_security_audit_records()
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|record| record.operation_id == AuditField::Known(recovered.opaque_id.clone()))
-        .map(|record| record.action)
-        .collect::<Vec<_>>();
-    assert_eq!(
-        operation_audit,
-        vec![
-            SecurityAuditClass::AdminOperationStart,
-            SecurityAuditClass::AdminOperationCompletion,
-        ]
-    );
-
-    process_a.0.kill().unwrap();
-    process_a.0.wait().unwrap();
-    process_b.0.kill().unwrap();
-    process_b.0.wait().unwrap();
-}
-
-#[tokio::test]
 async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
     let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -6342,9 +7456,10 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
         "management",
     );
     let ledger_path = object_store::path::Path::from("control/support-artifacts/ledger.json");
-    let pressure_blob_path = support_artifact_object_path(&first.opaque_id);
-    let mut pressure_payload = expected_content.as_bytes().to_vec();
-    pressure_payload.resize(10 * 1024 * 1024, b' ');
+    let pressure_id = uuid::Uuid::new_v4().to_string();
+    let pressure_blob_path = support_artifact_object_path(&pressure_id);
+    let pressure_size = 10 * 1024 * 1024;
+    let pressure_payload = vec![0u8; pressure_size];
     let ledger_bytes = management_store
         .get(&ledger_path)
         .await
@@ -6353,7 +7468,12 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
         .await
         .unwrap();
     let mut ledger: serde_json::Value = serde_json::from_slice(&ledger_bytes).unwrap();
-    ledger["artifacts"][&first.opaque_id]["size"] = serde_json::json!(pressure_payload.len());
+    ledger["artifacts"][&pressure_id] = serde_json::json!({
+        "owner": PrincipalId(1),
+        "scope": PolicyScope::Cluster,
+        "size": pressure_payload.len(),
+        "expires_at_ms": first.expires_at_ms,
+    });
     management_store
         .put(&pressure_blob_path, pressure_payload.into())
         .await
@@ -6365,7 +7485,7 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
 
     let download_request = || DownloadSupportArtifactRequest {
         protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
-        opaque_id: first.opaque_id.clone(),
+        opaque_id: pressure_id.clone(),
     };
     let mut open_downloads = Vec::new();
     for _ in 0..8 {
@@ -6386,14 +7506,51 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
         over_limit.message(),
         "support artifact download limit reached"
     );
+    let mut full_stream = open_downloads
+        .pop()
+        .expect("one admitted stream remains open");
     drop(open_downloads);
-    management_store
-        .put(
-            &pressure_blob_path,
-            expected_content.as_bytes().to_vec().into(),
-        )
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let recovered_stream = loop {
+        match client.download_support_artifact(download_request()).await {
+            Ok(response) => break response.into_inner(),
+            Err(error)
+                if error.code() == tonic::Code::ResourceExhausted && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => panic!("download capacity did not recover after stream close: {error}"),
+        }
+    };
+    drop(recovered_stream);
+
+    let mut downloaded = Vec::new();
+    let mut expected_offset = 0;
+    let mut expires_at_ms = None;
+    let mut final_chunk = false;
+    while let Some(chunk) = full_stream.message().await.unwrap() {
+        assert_eq!(chunk.offset, expected_offset);
+        expected_offset += chunk.content.len() as u64;
+        expires_at_ms = Some(chunk.expires_at_ms);
+        downloaded.extend_from_slice(&chunk.content);
+        final_chunk = chunk.final_chunk;
+        if final_chunk {
+            break;
+        }
+    }
+    assert!(final_chunk);
+    assert!(full_stream.message().await.unwrap().is_none());
+    assert_eq!(downloaded.len(), pressure_size);
+    assert!(downloaded.iter().all(|byte| *byte == 0));
+    assert_eq!(expires_at_ms, Some(first.expires_at_ms));
+    let completed_stream = client
+        .download_support_artifact(download_request())
         .await
-        .unwrap();
+        .expect("completed download should release its permit")
+        .into_inner();
+    drop(completed_stream);
+
+    management_store.delete(&pressure_blob_path).await.unwrap();
     let ledger_bytes = management_store
         .get(&ledger_path)
         .await
@@ -6402,7 +7559,10 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
         .await
         .unwrap();
     let mut ledger: serde_json::Value = serde_json::from_slice(&ledger_bytes).unwrap();
-    ledger["artifacts"][&first.opaque_id]["size"] = serde_json::json!(expected_content.len());
+    ledger["artifacts"]
+        .as_object_mut()
+        .unwrap()
+        .remove(&pressure_id);
     management_store
         .put(&ledger_path, serde_json::to_vec(&ledger).unwrap().into())
         .await
@@ -6601,33 +7761,16 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
             .unwrap(),
     )
     .unwrap();
-    let retained_before_cleanup = ledger["artifacts"].as_object().unwrap().len();
-    assert_eq!(retained_before_cleanup, 2);
-    let expired_ids = std::iter::once(expired_id.clone())
-        .chain((0..(2_048 - retained_before_cleanup - 1)).map(|_| uuid::Uuid::new_v4().to_string()))
-        .collect::<Vec<_>>();
-    for id in &expired_ids {
-        ledger["artifacts"][id] = serde_json::json!({
-            "owner": PrincipalId(1),
-            "scope": PolicyScope::Cluster,
-            "size": expired_content.len(),
-            "expires_at_ms": expired_at_ms,
-        });
-    }
-    assert_eq!(ledger["artifacts"].as_object().unwrap().len(), 2_048);
-    let mut uploads = tokio::task::JoinSet::new();
-    for id in &expired_ids {
-        let store = management_store.clone();
-        let path = support_artifact_object_path(id);
-        let content = expired_content.to_vec();
-        uploads.spawn(async move { store.put(&path, content.into()).await });
-        if uploads.len() == 64 {
-            uploads.join_next().await.unwrap().unwrap().unwrap();
-        }
-    }
-    while let Some(result) = uploads.join_next().await {
-        result.unwrap().unwrap();
-    }
+    management_store
+        .put(&expired_blob_path, expired_content.to_vec().into())
+        .await
+        .unwrap();
+    ledger["artifacts"][&expired_id] = serde_json::json!({
+        "owner": PrincipalId(1),
+        "scope": PolicyScope::Cluster,
+        "size": expired_content.len(),
+        "expires_at_ms": expired_at_ms,
+    });
     management_store
         .put(&ledger_path, serde_json::to_vec(&ledger).unwrap().into())
         .await
@@ -6643,7 +7786,6 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
             .as_ref(),
         expired_content
     );
-    let cleanup_started = Instant::now();
     let mut restarted = start_control_process(
         temp.path(),
         &storage,
@@ -6654,15 +7796,8 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
         true,
     )
     .await;
-    let mut client = tokio::time::timeout(Duration::from_secs(60), async {
-        wait_for_gateway(&mut restarted.0, control_address).await;
-        wait_for_management_client(management_address, &pki).await
-    })
-    .await
-    .expect(
-        "startup cleanup of 2,048 retained artifacts must finish before management accepts clients",
-    );
-    assert!(cleanup_started.elapsed() < Duration::from_secs(60));
+    wait_for_gateway(&mut restarted.0, control_address).await;
+    let mut client = wait_for_management_client(management_address, &pki).await;
     let retry = client
         .generate_support_artifact(GenerateSupportArtifactRequest {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
@@ -6687,32 +7822,16 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
         .bytes()
         .await
         .unwrap();
-    let mut expected_artifacts = serde_json::Map::new();
-    expected_artifacts.insert(
-        idempotency_key.clone(),
-        serde_json::json!({
-            "owner": PrincipalId(1),
-            "scope": PolicyScope::Cluster,
-            "size": expected_content.len(),
-            "expires_at_ms": first.expires_at_ms,
-        }),
-    );
-    expected_artifacts.insert(
-        foreign_id.clone(),
-        serde_json::json!({
-            "owner": PrincipalId(2),
-            "scope": PolicyScope::Cluster,
-            "size": foreign_content.len(),
-            "expires_at_ms": first.expires_at_ms,
-        }),
-    );
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&recovered_ledger).unwrap(),
-        serde_json::json!({
-            "format_version": 1,
-            "artifacts": expected_artifacts,
-        })
-    );
+    let recovered_ids = serde_json::from_slice::<serde_json::Value>(&recovered_ledger).unwrap()
+        ["artifacts"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut expected_recovered_ids = vec![idempotency_key.clone(), foreign_id.clone()];
+    expected_recovered_ids.sort();
+    assert_eq!(recovered_ids, expected_recovered_ids);
     assert_eq!(
         management_store
             .get(&foreign_blob_path)
@@ -6724,15 +7843,10 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
             .as_ref(),
         foreign_content
     );
-    for id in &expired_ids {
-        match management_store
-            .get(&support_artifact_object_path(id))
-            .await
-        {
-            Err(object_store::Error::NotFound { .. }) => {}
-            Err(error) => panic!("expired artifact {id} lookup failed: {error:?}"),
-            Ok(_) => panic!("expired artifact {id} remained after startup cleanup"),
-        }
+    match management_store.get(&expired_blob_path).await {
+        Err(object_store::Error::NotFound { .. }) => {}
+        Err(error) => panic!("expired artifact lookup failed unexpectedly: {error:?}"),
+        Ok(_) => panic!("expired artifact bytes remained after startup cleanup"),
     }
     assert_eq!(
         client
@@ -6769,7 +7883,7 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
     })
     .unwrap();
     let pressure_scope = serde_json::to_string(&PolicyScope::Artifact {
-        opaque_id: idempotency_key.clone(),
+        opaque_id: pressure_id.clone(),
     })
     .unwrap();
     let live_expiry_scope = serde_json::to_string(&PolicyScope::Artifact {
@@ -6946,7 +8060,7 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
                 event_id: "support-artifact".to_owned(),
                 timestamp_ms: 0,
                 actor: AuditIdentity::Verified("principal:1".to_owned()),
-                target: AuditField::Known(format!("support-artifact:{idempotency_key}")),
+                target: AuditField::Known(format!("support-artifact:{pressure_id}")),
                 scope: AuditField::Known(pressure_scope),
                 action: SecurityAuditClass::AdminOperationStart,
                 outcome: SecurityAuditOutcome::Success,
@@ -6956,7 +8070,7 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
                 before_state: AuditField::NotApplicable,
                 after_state: AuditField::NotApplicable,
             },
-            8,
+            10,
         ),
     );
     let security_store: Arc<dyn object_store::ObjectStore> =
@@ -7165,7 +8279,6 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
     let retry_start_audit = SecurityAuditRecord {
         event_id: "support-artifact".to_owned(),
         timestamp_ms: 0,
-        before_state: AuditField::Known("waiting".to_owned()),
         ..recovery_start_audit.clone()
     };
     let completion_audit = SecurityAuditRecord {
@@ -7686,6 +8799,60 @@ async fn support_artifact_budget_is_shared_between_release_processes_once() {
         deployment_budget as u64
     );
 
+    let pressure_ids = (0..16)
+        .map(|_| uuid::Uuid::new_v4().to_string())
+        .collect::<Vec<_>>();
+    let mut pressure_operation_ids = Vec::new();
+    let mut pressure_busy_ids = Vec::new();
+    let mut pressure = tokio::task::JoinSet::new();
+    for (index, id) in pressure_ids.iter().cloned().enumerate() {
+        let mut client = if index % 2 == 0 {
+            first_client.clone()
+        } else {
+            second_client.clone()
+        };
+        pressure.spawn(async move {
+            let result = client
+                .generate_support_artifact(GenerateSupportArtifactRequest {
+                    protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                    node_id: String::new(),
+                    idempotency_key: id.clone(),
+                })
+                .await;
+            (id, result)
+        });
+    }
+    while let Some(joined) = pressure.join_next().await {
+        let (id, result) = joined.expect("support-artifact pressure request task should finish");
+        let error = result.expect_err("full deployment budget must reject each pressure request");
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted, "request {id}");
+        match error.message() {
+            "support artifact generation is busy" => pressure_busy_ids.push(id.clone()),
+            "support artifact storage budget is full" => pressure_operation_ids.push(id.clone()),
+            message => panic!("unexpected pressure response for {id}: {message}"),
+        }
+        assert!(matches!(
+            management_store
+                .get(&support_artifact_object_path(&id))
+                .await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+    }
+    assert!(!pressure_busy_ids.is_empty());
+    assert!(!pressure_operation_ids.is_empty());
+    assert_eq!(
+        pressure_busy_ids.len() + pressure_operation_ids.len(),
+        pressure_ids.len()
+    );
+    let ledger_after_pressure = management_store
+        .get(&ledger_path)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(ledger_after_pressure.as_ref(), ledger_bytes.as_ref());
+
     let operations = first_client
         .list_operations(ListOperationsRequest {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
@@ -7709,9 +8876,13 @@ async fn support_artifact_budget_is_shared_between_release_processes_once() {
     operation_ids.sort();
     let mut expected_operation_ids =
         vec![seed.opaque_id.clone(), winner_id.clone(), loser_id.clone()];
+    expected_operation_ids.extend(pressure_operation_ids.iter().cloned());
     expected_operation_ids.sort();
     assert_eq!(operation_ids, expected_operation_ids);
-    for (id, state, phase) in [
+    for id in &pressure_busy_ids {
+        assert!(operation_ids.binary_search(id).is_err());
+    }
+    let mut expected_operations = vec![
         (
             seed.opaque_id.as_str(),
             "succeeded",
@@ -7723,7 +8894,13 @@ async fn support_artifact_budget_is_shared_between_release_processes_once() {
             format!("available_until_ms:{}", winner.expires_at_ms),
         ),
         (loser_id.as_str(), "failed", "generation_failed".to_owned()),
-    ] {
+    ];
+    expected_operations.extend(
+        pressure_operation_ids
+            .iter()
+            .map(|id| (id.as_str(), "failed", "generation_failed".to_owned())),
+    );
+    for (id, state, phase) in expected_operations {
         let matching = operations
             .operations
             .iter()
@@ -7758,11 +8935,22 @@ async fn support_artifact_budget_is_shared_between_release_processes_once() {
             record.event_id = "support-artifact".to_owned();
         }
     }
+    for id in &pressure_busy_ids {
+        assert!(!actual_audit
+            .iter()
+            .any(|record| record.operation_id == AuditField::Known(id.clone())));
+    }
     let cluster_scope = serde_json::to_string(&PolicyScope::Cluster).unwrap();
-    for (id, successful, expiry_ms) in [
+    let mut audit_operations = vec![
         (winner_id.as_str(), true, winner.expires_at_ms),
         (loser_id.as_str(), false, 0),
-    ] {
+    ];
+    audit_operations.extend(
+        pressure_operation_ids
+            .iter()
+            .map(|id| (id.as_str(), false, 0)),
+    );
+    for (id, successful, expiry_ms) in audit_operations {
         let expected_audit = vec![
             SecurityAuditRecord {
                 format_version: SECURITY_AUDIT_FORMAT_VERSION,
@@ -7810,293 +8998,6 @@ async fn support_artifact_budget_is_shared_between_release_processes_once() {
             .collect::<Vec<_>>();
         assert_eq!(actual, expected_audit);
     }
-}
-
-#[tokio::test]
-async fn support_artifact_download_limit_holds_under_release_process_pressure() {
-    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    assert!(rockstream_test_support::docker_available());
-    let bucket = "rockstream-release-support-download-pressure";
-    let (_minio, minio_port) = rockstream_test_support::minio::start_minio(bucket)
-        .await
-        .expect("MinIO is required for support-artifact download pressure qualification");
-    let temp = tempfile::tempdir().unwrap();
-    let storage = temp.path().join("control-storage");
-    let pki = rockstream_test_support::pki::TestPki::generate();
-    let control_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-    let management_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-    let mut process = start_control_process(
-        temp.path(),
-        &storage,
-        control_address,
-        management_address,
-        &pki,
-        Some((minio_port, bucket)),
-        true,
-    )
-    .await;
-    wait_for_gateway(&mut process.0, control_address).await;
-    let mut client = wait_for_management_client(management_address, &pki).await;
-
-    let artifact_id = uuid::Uuid::new_v4().to_string();
-    let generated = client
-        .generate_support_artifact(GenerateSupportArtifactRequest {
-            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
-            node_id: String::new(),
-            idempotency_key: artifact_id.clone(),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(generated.opaque_id, artifact_id);
-    let expires_at_ms = generated.expires_at_ms;
-    let management_store = object_store::prefix::PrefixStore::new(
-        rockstream_test_support::minio::minio_object_store(minio_port, bucket),
-        "management",
-    );
-    let ledger_path = object_store::path::Path::from("control/support-artifacts/ledger.json");
-    let artifact_path = support_artifact_object_path(&artifact_id);
-    let mut content = management_store
-        .get(&artifact_path)
-        .await
-        .unwrap()
-        .bytes()
-        .await
-        .unwrap()
-        .to_vec();
-    content.resize(10 * 1024 * 1024, b' ');
-    let mut ledger: serde_json::Value = serde_json::from_slice(
-        &management_store
-            .get(&ledger_path)
-            .await
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    ledger["artifacts"][&artifact_id]["size"] = serde_json::json!(content.len());
-    let ledger_bytes = serde_json::to_vec(&ledger).unwrap();
-    management_store
-        .put(&artifact_path, content.clone().into())
-        .await
-        .unwrap();
-    management_store
-        .put(&ledger_path, ledger_bytes.clone().into())
-        .await
-        .unwrap();
-
-    let security_store: Arc<dyn ObjectStore> = Arc::new(object_store::prefix::PrefixStore::new(
-        rockstream_test_support::minio::minio_object_store(minio_port, bucket),
-        "gateway-shard",
-    ));
-    let catalog = DurableCatalogStore::recover(security_store, "gateway")
-        .await
-        .unwrap();
-    let operations_before = client
-        .list_operations(ListOperationsRequest {
-            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
-            page_size: 100,
-            page_token: String::new(),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(
-        operations_before.protocol_version,
-        rockstream_management_proto::PROTOCOL_VERSION
-    );
-    assert_eq!(
-        operations_before.source_version,
-        "management-operation-records:v1"
-    );
-    assert_eq!(operations_before.operations.len(), 1);
-    let operation = operations_before.operations.first().unwrap();
-    let started_at = operation.started_at.clone();
-    let updated_at = operation.updated_at.clone();
-    assert_eq!(
-        operations_before.operations,
-        vec![rockstream_management_proto::v1::Operation {
-            operation_id: artifact_id.clone(),
-            kind: "generate_support_artifact".to_owned(),
-            state: "succeeded".to_owned(),
-            started_at: started_at.clone(),
-            updated_at: updated_at.clone(),
-            progress: "100%".to_owned(),
-            phase: format!("available_until_ms:{expires_at_ms}"),
-            error_code: String::new(),
-            next_steps: Vec::new(),
-            source_version: format!("operation-record:{MANAGEMENT_OPERATION_RECORD_VERSION}"),
-            result_json: String::new(),
-        }]
-    );
-    assert!(chrono::DateTime::parse_from_rfc3339(&started_at).is_ok());
-    assert!(chrono::DateTime::parse_from_rfc3339(&updated_at).is_ok());
-    assert!(operations_before.next_page_token.is_empty());
-    catalog.refresh().await.unwrap();
-    let audit_before = catalog.list_security_audit_records().await.unwrap();
-
-    let mut streams = Vec::new();
-    for _ in 0..8 {
-        let stream = client
-            .download_support_artifact(DownloadSupportArtifactRequest {
-                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
-                opaque_id: artifact_id.clone(),
-            })
-            .await
-            .expect("the first eight concurrent release downloads should be admitted")
-            .into_inner();
-        streams.push(stream);
-    }
-
-    let rejected = match client
-        .download_support_artifact(DownloadSupportArtifactRequest {
-            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
-            opaque_id: artifact_id.clone(),
-        })
-        .await
-    {
-        Ok(_) => panic!("the ninth concurrent release download was admitted"),
-        Err(error) => error,
-    };
-    assert_eq!(rejected.code(), tonic::Code::ResourceExhausted);
-    assert_eq!(
-        rejected.message(),
-        "support artifact download limit reached"
-    );
-
-    let full_stream = streams.pop().expect("one admitted stream remains open");
-    drop(streams);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let recovered_stream = loop {
-        match client
-            .download_support_artifact(DownloadSupportArtifactRequest {
-                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
-                opaque_id: artifact_id.clone(),
-            })
-            .await
-        {
-            Ok(response) => break response.into_inner(),
-            Err(error)
-                if error.code() == tonic::Code::ResourceExhausted && Instant::now() < deadline =>
-            {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            Err(error) => panic!("download capacity did not recover after stream close: {error}"),
-        }
-    };
-    drop(recovered_stream);
-    let (full_bytes, full_expiry) = tokio::time::timeout(
-        Duration::from_secs(120),
-        read_support_artifact_stream(full_stream, Vec::new()),
-    )
-    .await
-    .expect("one admitted download did not drain");
-    assert_eq!(full_bytes, content);
-    assert_eq!(full_expiry, expires_at_ms);
-    let completed_stream = client
-        .download_support_artifact(DownloadSupportArtifactRequest {
-            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
-            opaque_id: artifact_id.clone(),
-        })
-        .await
-        .expect("a completed download should release its permit")
-        .into_inner();
-    drop(completed_stream);
-
-    let operations_after = client
-        .list_operations(ListOperationsRequest {
-            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
-            page_size: 100,
-            page_token: String::new(),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(operations_after.operations, operations_before.operations);
-    assert_eq!(
-        operations_after.source_version,
-        operations_before.source_version
-    );
-    assert_eq!(
-        operations_after.next_page_token,
-        operations_before.next_page_token
-    );
-    assert_eq!(
-        management_store
-            .get(&ledger_path)
-            .await
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap()
-            .as_ref(),
-        ledger_bytes.as_slice()
-    );
-    assert_eq!(
-        management_store
-            .get(&support_artifact_object_path(&artifact_id))
-            .await
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap()
-            .as_ref(),
-        content.as_slice()
-    );
-
-    process.0.kill().unwrap();
-    process.0.wait().unwrap();
-    let security_store: Arc<dyn ObjectStore> = Arc::new(object_store::prefix::PrefixStore::new(
-        rockstream_test_support::minio::minio_object_store(minio_port, bucket),
-        "gateway-shard",
-    ));
-    let recovered_catalog = DurableCatalogStore::recover(security_store, "gateway")
-        .await
-        .unwrap();
-    let records = recovered_catalog
-        .list_security_audit_records()
-        .await
-        .unwrap();
-    assert_eq!(records.len(), audit_before.len() + 10);
-    assert_eq!(&records[..audit_before.len()], audit_before.as_slice());
-    let expected_scope = serde_json::to_string(&PolicyScope::Artifact {
-        opaque_id: artifact_id.clone(),
-    })
-    .unwrap();
-    let mut downloads = records[audit_before.len()..].to_vec();
-    let mut event_ids = Vec::new();
-    for record in &mut downloads {
-        assert!(record.timestamp_ms > 0);
-        assert!(record.event_id.starts_with("support-artifact-"));
-        event_ids.push(record.event_id.clone());
-        record.timestamp_ms = 0;
-        record.event_id = "support-artifact".to_owned();
-    }
-    event_ids.sort();
-    assert!(event_ids.windows(2).all(|pair| pair[0] != pair[1]));
-    assert_eq!(
-        downloads,
-        vec![
-            SecurityAuditRecord {
-                format_version: SECURITY_AUDIT_FORMAT_VERSION,
-                event_id: "support-artifact".to_owned(),
-                timestamp_ms: 0,
-                actor: AuditIdentity::Verified("principal:1".to_owned()),
-                target: AuditField::Known(format!("support-artifact:{artifact_id}")),
-                scope: AuditField::Known(expected_scope),
-                action: SecurityAuditClass::AdminOperationStart,
-                outcome: SecurityAuditOutcome::Success,
-                correlation: AuditCorrelation::Unknown,
-                operation_id: AuditField::NotApplicable,
-                policy_revision: AuditField::Known(1),
-                before_state: AuditField::NotApplicable,
-                after_state: AuditField::NotApplicable,
-            };
-            10
-        ]
-    );
 }
 
 #[cfg(unix)]
@@ -8477,34 +9378,91 @@ async fn worker_shuffle_mtls_rollover_preserves_release_process_stream() {
         "exchange:100:source:10:target:20:epoch:1:sequence:1".to_owned(),
     );
     let deadline = Instant::now() + Duration::from_secs(5);
+    let mut observed_count = audit_before.len();
+    let mut stable_since = None;
     let audit_after = loop {
         security_catalog.refresh().await.unwrap();
         let records = security_catalog
             .list_security_audit_records()
             .await
             .unwrap();
-        if records.iter().any(|record| {
-            record.event_id.starts_with("shuffle-authorization:")
-                && record.correlation.eq(&expected_correlation)
-        }) {
-            break records;
+        let has_denial = records
+            .iter()
+            .skip(audit_before.len())
+            .any(|record| record.event_id.starts_with("shuffle-authorization:"));
+        if has_denial {
+            if records.len() == observed_count {
+                if stable_since
+                    .is_some_and(|since: Instant| since.elapsed() >= Duration::from_millis(200))
+                {
+                    break records;
+                }
+            } else {
+                observed_count = records.len();
+                stable_since = Some(Instant::now());
+            }
+        } else {
+            observed_count = records.len();
+            stable_since = None;
         }
-        assert!(Instant::now() < deadline, "shuffle denial was not audited");
+        assert!(
+            Instant::now() < deadline,
+            "shuffle denial was not audited: records grew from {} to {} ({:?})",
+            audit_before.len(),
+            records.len(),
+            records
+                .iter()
+                .skip(audit_before.len())
+                .map(|record| &record.event_id)
+                .collect::<Vec<_>>()
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
-    assert!(!audit_before.iter().any(|record| {
-        record.event_id.starts_with("shuffle-authorization:")
-            && record.correlation.eq(&expected_correlation)
-    }));
-    let rejections = audit_after
+    let new_records = &audit_after[audit_before.len()..];
+    let denials = new_records
         .iter()
-        .filter(|record| {
-            record.event_id.starts_with("shuffle-authorization:")
-                && record.correlation.eq(&expected_correlation)
-        })
+        .filter(|record| record.event_id.starts_with("shuffle-authorization:"))
         .collect::<Vec<_>>();
-    assert_eq!(rejections.len(), 1);
-    let rejection = rejections[0];
+    assert_eq!(denials.len(), 1, "expected one audited shuffle denial");
+    let handshake_rejections = new_records
+        .iter()
+        .filter(|record| record.event_id.starts_with("shuffle-tls-handshake:"))
+        .collect::<Vec<_>>();
+    for handshake in &handshake_rejections {
+        let AuditCorrelation::Observed(peer) = &handshake.correlation else {
+            panic!("handshake audit must use the listener-observed peer address");
+        };
+        assert!(peer
+            .strip_prefix("peer=")
+            .unwrap()
+            .parse::<std::net::SocketAddr>()
+            .is_ok());
+        assert_eq!(
+            *handshake,
+            &SecurityAuditRecord {
+                format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: handshake.event_id.clone(),
+                timestamp_ms: handshake.timestamp_ms,
+                actor: AuditIdentity::Unknown,
+                target: AuditField::Unknown,
+                scope: AuditField::Known("worker_shuffle".to_owned()),
+                action: SecurityAuditClass::NodeIdentityRejection,
+                outcome: SecurityAuditOutcome::Denied,
+                correlation: AuditCorrelation::Observed(peer.clone()),
+                operation_id: AuditField::NotApplicable,
+                policy_revision: AuditField::NotApplicable,
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::NotApplicable,
+            }
+        );
+    }
+    assert_eq!(
+        new_records.len(),
+        denials.len() + handshake_rejections.len(),
+        "unexpected security audit during worker certificate rollover: {new_records:?}"
+    );
+    let rejection = denials[0];
+    assert!(rejection.event_id.starts_with("shuffle-authorization:"));
     assert_eq!(
         rejection,
         &SecurityAuditRecord {
