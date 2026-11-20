@@ -395,6 +395,19 @@ impl RaftConfig {
                 ),
             ));
         }
+        let lease = self.leader_quorum_timeout();
+        // Each heartbeat starts at least once per interval, or immediately
+        // when a peer timeout exceeds it. Both must fit inside the lease
+        // lifetime for a healthy quorum to be continuously available.
+        if self.heartbeat_interval >= lease || self.rpc_timeout >= lease {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "RS-1731: Raft heartbeat ({:?}) and RPC timeout ({:?}) must both be shorter than the quorum lease ({lease:?})",
+                    self.heartbeat_interval, self.rpc_timeout,
+                ),
+            ));
+        }
         Ok(())
     }
 
@@ -682,9 +695,15 @@ async fn driver_loop(
         let role = inner.read().role;
         match role {
             RaftRole::Leader => {
+                // The interval is between round STARTS. Sleeping an entire
+                // interval *after* join_all can add rpc_timeout to every
+                // round, letting a healthy leader's safely anchored lease
+                // expire while waiting for an unrelated slow peer.
+                let started = Instant::now();
                 send_heartbeats(&config, &inner, &store).await;
+                let until_next = config.heartbeat_interval.saturating_sub(started.elapsed());
                 tokio::select! {
-                    _ = tokio::time::sleep(config.heartbeat_interval) => {},
+                    _ = tokio::time::sleep(until_next) => {},
                     _ = shutdown.recv() => break,
                 }
             }
