@@ -3,7 +3,7 @@ use std::sync::Arc;
 use object_store::memory::InMemory;
 use rockstream_control::{
     ManagementOperationStore, ManagementService, OperationKind, OperationStatus, OperationUpdate,
-    ShardManager, TopologyCatalog,
+    SecretRotationOperationRequest, ShardManager, TopologyCatalog,
 };
 use rockstream_management_proto::v1::{
     CancelOperationRequest, CreateBackupRequest, DrainWorkerRequest, GetCapabilitiesRequest,
@@ -713,6 +713,106 @@ async fn management_grant_mutation_is_idempotent_and_audits_the_complete_result(
 }
 
 #[tokio::test]
+async fn secret_rotation_operation_is_listed_and_reconciled_by_its_owner() {
+    let auth = ManagementAuth::new(&[]).await;
+    let operations = ManagementOperationStore::new(Arc::new(InMemory::new()));
+    let operation_id = "00000000-0000-4000-8000-000000000305";
+    let request = SecretRotationOperationRequest {
+        deployment_id: rockstream_control::management::security_deployment_fingerprint(
+            &NodeConfig::default(),
+            "management-security",
+        ),
+        actor_id: Some(1),
+        scope: PolicyScope::Secret {
+            namespace: "sales".to_owned(),
+            name: "warehouse".to_owned(),
+            consumer: None,
+        },
+        payload_digest: "sha256:payload-digest".to_owned(),
+    };
+    operations
+        .accept_idempotent(
+            operation_id,
+            1,
+            &request,
+            operation_id,
+            OperationKind::SecretRotation,
+            1_000,
+        )
+        .await
+        .unwrap();
+    operations
+        .transition(
+            operation_id,
+            OperationUpdate {
+                status: OperationStatus::Running,
+                updated_at_ms: 2_000,
+                progress: None,
+                phase: Some("rotating_secret".to_owned()),
+                error_code: None,
+                next_steps: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    operations
+        .transition_with_result(
+            operation_id,
+            OperationUpdate {
+                status: OperationStatus::Succeeded,
+                updated_at_ms: 3_000,
+                progress: Some(100),
+                phase: Some("secret_rotation_committed".to_owned()),
+                error_code: None,
+                next_steps: Vec::new(),
+            },
+            serde_json::json!({"command_tag": "ALTER SECRET", "rows": 0}),
+        )
+        .await
+        .unwrap();
+
+    let service = ManagementService::new(
+        TopologyCatalog::new(),
+        ShardManager::new(),
+        operations,
+        NodeConfig::default(),
+    );
+    let server = auth.start_management(service).await;
+    let mut client = auth.client(server.addr).await;
+    let listed = client
+        .list_operations(ListOperationsRequest {
+            protocol_version: 1,
+            page_size: 10,
+            page_token: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed.operations.len(), 1);
+    assert_eq!(listed.operations[0].operation_id, operation_id);
+    assert_eq!(listed.operations[0].kind, "secret_rotation");
+
+    let recovered = client
+        .get_operation(GetOperationRequest {
+            protocol_version: 1,
+            operation_id: operation_id.to_owned(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .operation
+        .unwrap();
+    assert_eq!(recovered.operation_id, operation_id);
+    assert_eq!(recovered.kind, "secret_rotation");
+    assert_eq!(recovered.state, "succeeded");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&recovered.result_json).unwrap(),
+        serde_json::json!({"command_tag": "ALTER SECRET", "rows": 0})
+    );
+    server.shutdown();
+}
+
+#[tokio::test]
 async fn grantor_can_reconcile_its_self_revocation_without_removing_last_admin() {
     let auth = ManagementAuth::with_presets(
         &[],
@@ -1277,7 +1377,7 @@ async fn management_start_recovers_running_operation_with_exact_phase() {
             next_steps: vec![
                 "Management restarted; reconcile this operation before retrying.".to_owned(),
             ],
-            source_version: "operation-record:3".to_owned(),
+            source_version: "operation-record:4".to_owned(),
             result_json: String::new(),
         }
     );
@@ -1360,7 +1460,7 @@ async fn management_cancellation_obeys_the_safe_boundary() {
             phase: "cancelled_before_start".to_owned(),
             error_code: String::new(),
             next_steps: Vec::new(),
-            source_version: "operation-record:3".to_owned(),
+            source_version: "operation-record:4".to_owned(),
             result_json: String::new(),
         }
     );
@@ -1399,10 +1499,137 @@ async fn management_cancellation_obeys_the_safe_boundary() {
             phase: "worker_handoff_started".to_owned(),
             error_code: String::new(),
             next_steps: Vec::new(),
-            source_version: "operation-record:3".to_owned(),
+            source_version: "operation-record:4".to_owned(),
             result_json: String::new(),
         }
     );
+    let cancellation_audits = auth
+        .catalog
+        .list_security_audit_records()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|record| record.operation_id == AuditField::Known("op_cancel_late".to_owned()))
+        .collect::<Vec<_>>();
+    assert_eq!(cancellation_audits.len(), 1);
+    let denial = &cancellation_audits[0];
+    assert!(denial
+        .event_id
+        .strip_prefix("management-operation-cancel-denied:")
+        .and_then(|suffix| uuid::Uuid::parse_str(suffix).ok())
+        .is_some());
+    assert_eq!(
+        denial,
+        &SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: denial.event_id.clone(),
+            timestamp_ms: denial.timestamp_ms,
+            actor: AuditIdentity::Verified("principal:1".to_owned()),
+            target: AuditField::Known("operation:op_cancel_late".to_owned()),
+            scope: AuditField::Known(
+                serde_json::to_string(&PolicyScope::Operation {
+                    operation_id: "op_cancel_late".to_owned(),
+                })
+                .unwrap(),
+            ),
+            action: SecurityAuditClass::AdminOperationCompletion,
+            outcome: SecurityAuditOutcome::Failure,
+            correlation: AuditCorrelation::Observed("op_cancel_late".to_owned()),
+            operation_id: AuditField::Known("op_cancel_late".to_owned()),
+            policy_revision: AuditField::Known(1),
+            before_state: AuditField::Known("waiting:worker_handoff_started".to_owned()),
+            after_state: AuditField::Known("waiting:worker_handoff_started".to_owned()),
+        }
+    );
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn management_start_replays_pending_operation_audit_before_listening() {
+    let auth = ManagementAuth::new(&[]).await;
+    let object_store = Arc::new(InMemory::new());
+    let operations = ManagementOperationStore::new(object_store.clone());
+    let operation_id = "op_cancel_audit_recovery";
+    let now_ms = chrono::Utc::now().timestamp_millis().max(1);
+    operations
+        .accept_idempotent(
+            operation_id,
+            1,
+            &serde_json::json!({"worker_id": 11}),
+            operation_id,
+            OperationKind::DrainWorker,
+            now_ms,
+        )
+        .await
+        .unwrap();
+    let audit = SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: format!("management-operation-cancel:{operation_id}"),
+        timestamp_ms: (now_ms + 1) as u64,
+        actor: AuditIdentity::Verified("principal:1".to_owned()),
+        target: AuditField::Known(format!("operation:{operation_id}")),
+        scope: AuditField::Known(
+            serde_json::to_string(&PolicyScope::Operation {
+                operation_id: operation_id.to_owned(),
+            })
+            .unwrap(),
+        ),
+        action: SecurityAuditClass::AdminOperationCompletion,
+        outcome: SecurityAuditOutcome::Success,
+        correlation: AuditCorrelation::Observed(operation_id.to_owned()),
+        operation_id: AuditField::Known(operation_id.to_owned()),
+        policy_revision: AuditField::Known(1),
+        before_state: AuditField::Known("pending".to_owned()),
+        after_state: AuditField::Known("cancelled_before_start".to_owned()),
+    };
+    operations
+        .transition_if_with_audit(
+            operation_id,
+            OperationStatus::Pending,
+            None,
+            OperationUpdate {
+                status: OperationStatus::Cancelled,
+                updated_at_ms: now_ms + 1,
+                progress: None,
+                phase: Some("cancelled_before_start".to_owned()),
+                error_code: None,
+                next_steps: Vec::new(),
+            },
+            audit.clone(),
+        )
+        .await
+        .unwrap();
+
+    let recovered_operations = ManagementOperationStore::new(object_store);
+    assert_eq!(
+        recovered_operations
+            .pending_audit_records()
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let service = ManagementService::new(
+        TopologyCatalog::new(),
+        ShardManager::new(),
+        recovered_operations.clone(),
+        NodeConfig::default(),
+    );
+    let server = auth.start_management(service).await;
+
+    assert!(recovered_operations
+        .get(operation_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .pending_audit()
+        .is_none());
+    assert!(auth
+        .catalog
+        .list_security_audit_records()
+        .await
+        .unwrap()
+        .contains(&audit));
     server.shutdown();
 }
 
@@ -1573,7 +1800,7 @@ async fn management_drain_is_idempotent_and_transfers_the_owned_shard() {
     assert_eq!(completed.phase, "completed");
     assert!(completed.error_code.is_empty());
     assert!(completed.next_steps.is_empty());
-    assert_eq!(completed.source_version, "operation-record:3");
+    assert_eq!(completed.source_version, "operation-record:4");
     assert_eq!(
         shard_manager.get(ShardId(77)).unwrap().worker_id,
         WorkerId(2)
@@ -1716,7 +1943,7 @@ async fn management_migrate_moves_a_real_shard_once() {
     assert_eq!(completed.phase, "completed");
     assert_eq!(completed.error_code, "");
     assert_eq!(completed.next_steps, Vec::<String>::new());
-    assert_eq!(completed.source_version, "operation-record:3");
+    assert_eq!(completed.source_version, "operation-record:4");
     assert_eq!(shard_manager.get(ShardId(77)), Some(new_lease));
     control.shutdown();
 }

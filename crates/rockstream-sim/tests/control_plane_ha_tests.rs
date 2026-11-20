@@ -372,6 +372,7 @@ async fn leader_crash_composed_with_shard_fence_no_split_brain() {
 // gracefully (rather than failing, and rather than `#[ignore]`, which has
 // no precedent anywhere in this codebase) when Docker is not present.
 mod tc {
+    use super::management_security::preprovision_management_catalog;
     use std::net::SocketAddr;
     use std::path::Path;
     use std::time::{Duration, Instant};
@@ -484,6 +485,26 @@ mod tc {
             ] {
                 std::fs::copy(source, shared_dir.path().join(name))
                     .unwrap_or_else(|error| panic!("copy test TLS file {name}: {error}"));
+            }
+            for i in 0..3 {
+                let node_storage = shared_dir.path().join(format!("node-storage-{i}"));
+                preprovision_management_catalog(&node_storage, &pki).await;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+
+                    let catalog_root = node_storage.join("gateway-shard");
+                    for path in [
+                        node_storage.clone(),
+                        catalog_root.clone(),
+                        catalog_root.join("gateway"),
+                        catalog_root.join("gateway/catalog"),
+                        catalog_root.join("gateway/catalog/log"),
+                    ] {
+                        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777))
+                            .unwrap();
+                    }
+                }
             }
             #[cfg(unix)]
             {
@@ -617,14 +638,15 @@ mod tc {
             }
         }
 
-        /// Poll every node (skipping unreachable ones) until exactly one
-        /// reachable node reports itself as `Leader`, or `timeout` elapses.
-        /// Panics if at any observed instant *more than one* node reports
-        /// `Leader` (split-brain — must never happen, checked on every
-        /// poll, not just the final one).
+        /// Poll every node (skipping unreachable ones) until the same node
+        /// and term remain the sole reported leader for three election windows,
+        /// or `timeout` elapses. Panics if at any observed instant *more than
+        /// one* node reports `Leader` (split-brain — checked on every poll).
         pub async fn wait_for_single_leader(&self, timeout: Duration) -> (usize, u64) {
             let deadline = Instant::now() + timeout;
             let mut stable_leader = None;
+            let mut stable_since = None;
+            let stability_window = rockstream_control::raft::DEFAULT_ELECTION_TIMEOUT_MAX * 3;
             loop {
                 let mut statuses = Vec::new();
                 for node in &self.nodes {
@@ -647,11 +669,18 @@ mod tc {
                         None => unreachable!(),
                     };
                     if stable_leader == Some((idx, term)) {
-                        return (idx, term);
+                        if stable_since
+                            .is_some_and(|since: Instant| since.elapsed() >= stability_window)
+                        {
+                            return (idx, term);
+                        }
+                    } else {
+                        stable_leader = Some((idx, term));
+                        stable_since = Some(Instant::now());
                     }
-                    stable_leader = Some((idx, term));
                 } else {
                     stable_leader = None;
+                    stable_since = None;
                 }
                 if Instant::now() > deadline {
                     if std::env::var("RS_TC_DEBUG").is_ok() {
@@ -991,6 +1020,9 @@ mod tc {
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 }
+
+#[path = "common/management_security.rs"]
+mod management_security;
 
 /// **S1 (closing the item deferred from Phase 3a) / S4 precondition** —
 /// `three_node_tc_cluster_boots_and_elects_leader`: a real 3-container
