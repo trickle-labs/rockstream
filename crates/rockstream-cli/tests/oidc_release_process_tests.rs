@@ -7093,12 +7093,6 @@ async fn support_artifact_reconciles_durable_boundaries_after_process_exit() {
                 SecurityAuditClass::AdminOperationStart,
                 SecurityAuditClass::AdminOperationCompletion,
             ],
-            "completion-audit" => vec![
-                SecurityAuditClass::AdminOperationStart,
-                SecurityAuditClass::AdminOperationCompletion,
-                SecurityAuditClass::AdminOperationStart,
-                SecurityAuditClass::AdminOperationCompletion,
-            ],
             _ => vec![
                 SecurityAuditClass::AdminOperationStart,
                 SecurityAuditClass::AdminOperationCompletion,

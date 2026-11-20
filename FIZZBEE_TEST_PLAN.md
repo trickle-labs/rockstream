@@ -872,7 +872,9 @@ appended before success or artifact bytes are returned. Restart reconciliation
 reuses that operation and pending audit, while bounded cleanup removes expired
 artifacts. If completion loses a transition race to failure or cancellation, the
 request removes its late artifact write; storage-generation checks preserve a
-concurrent replacement. `support_artifact_reconciles_durable_boundaries_after_process_exit`,
+concurrent replacement. Terminal state and its pending completion audit are
+persisted atomically; retries flush pending audit before returning an artifact.
+`support_artifact_reconciles_durable_boundaries_after_process_exit`,
 `support_artifact_completion_audit_failure_preserves_result_across_processes`,
 and `support_artifact_runs_in_release_process_and_recovers_after_restart` check
 the complete operation, audit, and artifact state across crash and restart
