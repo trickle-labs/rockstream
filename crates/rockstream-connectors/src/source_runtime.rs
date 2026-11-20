@@ -45,6 +45,8 @@ pub struct SourceRuntimeCoordinator<S: SourceConnector> {
     active_lease: Option<SourceOwnerLease>,
     next_fence_token: u64,
     in_flight_epochs: usize,
+    /// The latest durable checkpoint must be ACKed before accepting more input.
+    pending_ack: bool,
     blocked_reason: Option<String>,
 }
 
@@ -65,6 +67,7 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
             active_lease: None,
             next_fence_token: 0,
             in_flight_epochs: 0,
+            pending_ack: false,
             blocked_reason: None,
         }
     }
@@ -75,6 +78,7 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
     pub async fn capture_snapshot_delta_fence(
         &mut self,
     ) -> Result<SnapshotDeltaFence, SourceError> {
+        self.require_unblocked()?;
         self.source.capture_snapshot_delta_fence(None).await
     }
 
@@ -85,6 +89,7 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
         after: Option<OffsetToken>,
         max_rows: usize,
     ) -> Result<SnapshotStream, SourceError> {
+        self.require_unblocked()?;
         self.source
             .start_snapshot_bounded(fence, after, None, max_rows)
             .await
@@ -108,6 +113,7 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
         max_bytes: usize,
         credits_available: usize,
     ) -> Result<PollDeltaResult, SourceError> {
+        self.require_unblocked()?;
         self.source
             .poll_delta(after, max_bytes, credits_available, None)
             .await
@@ -139,6 +145,10 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
                 BTreeMap::from([(0, checkpoint.token.clone())]),
             );
         }
+        // Even a previously ACKed checkpoint is safe to acknowledge again; on
+        // recovery we cannot infer whether the broker observed the old ACK.
+        self.pending_ack = checkpoint.is_some();
+        self.in_flight_epochs = usize::from(self.pending_ack);
         self.recovered = true;
         Ok(checkpoint)
     }
@@ -161,6 +171,7 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
         &self,
         lifecycle: &BackfillLifecycle,
     ) -> Result<(), SourceError> {
+        self.require_unblocked()?;
         let mut batch = WriteBatch::new();
         self.checkpoint_store
             .append_backfill_lifecycle(&mut batch, lifecycle)
@@ -188,7 +199,8 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
             fence_token: self.next_fence_token,
         };
         self.active_lease = Some(lease.clone());
-        self.blocked_reason = None;
+        // Acquiring another lease must not silently clear a pending ACK or a
+        // blocked reason; only explicit recovery can unblock this source.
         Ok(lease)
     }
 
@@ -207,8 +219,8 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
     pub async fn pause(&mut self, reason: impl Into<String>) -> Result<(), SourceError> {
         self.active_lease = None;
         let reason = reason.into();
-        self.source.pause(reason.clone()).await?;
-        self.blocked_reason = Some(reason);
+        self.blocked_reason = Some(reason.clone());
+        self.source.pause(reason).await?;
         Ok(())
     }
 
@@ -216,7 +228,9 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
     pub async fn resume(&mut self) -> Result<Option<SourceCheckpoint>, SourceError> {
         let checkpoint = self.recover().await?;
         self.source.resume().await?;
-        self.blocked_reason = None;
+        if !self.pending_ack {
+            self.blocked_reason = None;
+        }
         Ok(checkpoint)
     }
 
@@ -250,10 +264,10 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
         if self.in_flight_epochs >= SOURCE_RUNTIME_MAX_IN_FLIGHT_EPOCHS {
             return self.block(
                 "RS-4014: source_runtime_in_flight_epochs reached SOURCE_RUNTIME_MAX_IN_FLIGHT_EPOCHS; next steps: wait for upstream acknowledgements before polling more input",
-            );
+            ).await;
         }
         let Some(next_epoch) = persistence::next_epoch(self.source_epochs.current_epoch()) else {
-            return self.block("RS-4018: source epoch exhausted; next_steps: create a new connector before retrying");
+            return self.block("RS-4018: source epoch exhausted; next_steps: create a new connector before retrying").await;
         };
         if !persistence::epoch_is_admissible(
             self.source_epochs.current_epoch(),
@@ -265,7 +279,7 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
             return self.block(&format!(
                 "RS-4015: source epoch {epoch} is not the next fenced epoch {}; next steps: recover the committed checkpoint and retry",
                 next_epoch
-            ));
+            )).await;
         }
 
         let prepared = SourceCheckpoint::prepared(self.connector_id, epoch, offset.clone());
@@ -282,13 +296,13 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
             Ok(committed) => committed,
             Err(error) => {
                 self.in_flight_epochs -= 1;
-                return self.block(&storage_error(error).to_string());
+                return self.block(&storage_error(error).to_string()).await;
             }
         };
         self.add_progress_state(&mut m3_input, epoch);
         if let Err(error) = self.checkpoint_store.commit_m3(m3_input).await {
             self.in_flight_epochs -= 1;
-            return self.block(&storage_error(error).to_string());
+            return self.block(&storage_error(error).to_string()).await;
         }
 
         self.source_epochs
@@ -299,13 +313,15 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
             )
             .map_err(|error| SourceError::Io(error.to_string()))?;
         self.committed_offset = committed.token.clone();
+        self.pending_ack = true;
 
         if let Err(error) = self.source.commit_offset(epoch, committed.token).await {
             return self.block(&format!(
                 "RS-4016: M3 source input committed but upstream acknowledgement failed: {error}; next steps: recover the checkpoint and retry acknowledgement"
-            ));
+            )).await;
         }
-        self.in_flight_epochs -= 1;
+        self.in_flight_epochs = 0;
+        self.pending_ack = false;
         Ok(())
     }
 
@@ -330,15 +346,15 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
         {
             return self.block(
                 "RS-4019: backfill.cursor_limit_exceeded: lifecycle does not match its M3 epoch; next_steps: recover the committed cursor and retry",
-            );
+            ).await;
         }
         if self.in_flight_epochs >= SOURCE_RUNTIME_MAX_IN_FLIGHT_EPOCHS {
             return self.block(
                 "RS-4014: source_runtime_in_flight_epochs reached SOURCE_RUNTIME_MAX_IN_FLIGHT_EPOCHS; next_steps: wait for upstream acknowledgements before polling more input",
-            );
+            ).await;
         }
         let Some(next_epoch) = persistence::next_epoch(self.source_epochs.current_epoch()) else {
-            return self.block("RS-4018: source epoch exhausted; next_steps: create a new connector before retrying");
+            return self.block("RS-4018: source epoch exhausted; next_steps: create a new connector before retrying").await;
         };
         if !persistence::epoch_is_admissible(
             self.source_epochs.current_epoch(),
@@ -350,7 +366,7 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
             return self.block(&format!(
                 "RS-4015: source epoch {epoch} is not the next fenced epoch {}; next steps: recover the committed checkpoint and retry",
                 next_epoch
-            ));
+            )).await;
         }
 
         let prepared = SourceCheckpoint::prepared(self.connector_id, epoch, offset);
@@ -366,7 +382,7 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
             Ok(committed) => committed,
             Err(error) => {
                 self.in_flight_epochs -= 1;
-                return self.block(&storage_error(error).to_string());
+                return self.block(&storage_error(error).to_string()).await;
             }
         };
         if let Err(error) = self
@@ -374,12 +390,12 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
             .append_backfill_lifecycle(&mut m3_input, &lifecycle)
         {
             self.in_flight_epochs -= 1;
-            return self.block(&storage_error(error).to_string());
+            return self.block(&storage_error(error).to_string()).await;
         }
         self.add_progress_state(&mut m3_input, epoch);
         if let Err(error) = self.checkpoint_store.commit_m3(m3_input).await {
             self.in_flight_epochs -= 1;
-            return self.block(&storage_error(error).to_string());
+            return self.block(&storage_error(error).to_string()).await;
         }
 
         self.source_epochs
@@ -390,12 +406,14 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
             )
             .map_err(|error| SourceError::Io(error.to_string()))?;
         self.committed_offset = committed.token.clone();
+        self.pending_ack = true;
         if let Err(error) = self.source.commit_offset(epoch, committed.token).await {
             return self.block(&format!(
                 "RS-4016: M3 source input committed but upstream acknowledgement failed: {error}; next_steps: recover the checkpoint and retry acknowledgement"
-            ));
+            )).await;
         }
-        self.in_flight_epochs -= 1;
+        self.in_flight_epochs = 0;
+        self.pending_ack = false;
         Ok(())
     }
 
@@ -414,7 +432,7 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
         if self.in_flight_epochs != 0 {
             return self.block(
                 "RS-4014: replayable source already has an unacknowledged M3 epoch; next steps: recover and acknowledge it before polling",
-            );
+            ).await;
         }
         let entry = self
             .source_epochs
@@ -430,7 +448,7 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
             {
                 return self.block(
                     "RS-4019: replayable source lifecycle coverage is duplicate or mismatched; next_steps: restore attachments from the committed source checkpoint",
-                );
+                ).await;
             }
             self.checkpoint_store
                 .append_backfill_lifecycle(&mut m3_input, lifecycle)
@@ -444,19 +462,21 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
         self.in_flight_epochs = 1;
         if let Err(error) = self.checkpoint_store.commit_m3(m3_input).await {
             self.in_flight_epochs = 0;
-            return self.block(&storage_error(error).to_string());
+            return self.block(&storage_error(error).to_string()).await;
         }
 
         self.source_epochs
             .commit_epoch_monotonic(entry)
             .map_err(|error| SourceError::Io(error.to_string()))?;
         self.committed_offset = committed.token.clone();
+        self.pending_ack = true;
         if let Err(error) = self.source.commit_offset(epoch, committed.token).await {
             return self.block(&format!(
                 "RS-4016: M3 source transaction committed but upstream acknowledgement failed: {error}; next_steps: recover and acknowledge the durable checkpoint"
-            ));
+            )).await;
         }
         self.in_flight_epochs = 0;
+        self.pending_ack = false;
         Ok(())
     }
 
@@ -475,7 +495,7 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
         {
             return self.block(
                 "RS-4019: pgoutput attachment cursor does not match the current source checkpoint",
-            );
+            ).await;
         }
         self.checkpoint_store
             .append_backfill_lifecycle(&mut m3_input, lifecycle)
@@ -487,28 +507,49 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
             .map_err(storage_error)
     }
 
-    /// Retry the upstream acknowledgement for the checkpoint recovered after a
-    /// crash between M3 commit and acknowledgement. This never writes input.
+    /// Reconcile the latest durable M3 checkpoint with the upstream source.
+    /// This is safe to call with no new records: it only ACKs the exact durable
+    /// token, then resumes a paused source. It never replays view effects.
     pub async fn acknowledge_recovered(
         &mut self,
         lease: &SourceOwnerLease,
     ) -> Result<(), SourceError> {
-        self.require_active_lease(lease)?;
-        let epoch = self.source_epochs.current_epoch();
-        if epoch == 0 {
+        // Recovery is the one operation allowed through the blocked gate, but
+        // the owner fence must still hold.
+        self.require_owner_lease(lease)?;
+        if !self.pending_ack {
             return Ok(());
         }
-        if let Err(error) = self
-            .source
-            .commit_offset(epoch, self.committed_offset.clone())
-            .await
-        {
-            return self.block(&format!(
-                "RS-4016: recovered source checkpoint acknowledgement failed: {error}; next steps: retain ownership and retry acknowledgement"
-            ));
+        let epoch = self.source_epochs.current_epoch();
+        if epoch != 0 {
+            if let Err(error) = self
+                .source
+                .commit_offset(epoch, self.committed_offset.clone())
+                .await
+            {
+                return self.block(&format!(
+                    "RS-4016: recovered source checkpoint acknowledgement failed: {error}; next steps: retain ownership and retry acknowledgement"
+                )).await;
+            }
+        }
+        if self.blocked_reason.is_some() {
+            // A successful ACK is not enough when the connector is still
+            // paused. Keep the gate closed if the asynchronous resume fails.
+            self.source.resume().await.map_err(|error| {
+                SourceError::Io(format!(
+                    "RS-4016: durable source ACK succeeded but resume failed: {error}; next steps: retry recovery"
+                ))
+            })?;
         }
         self.in_flight_epochs = 0;
+        self.pending_ack = false;
+        self.blocked_reason = None;
         Ok(())
+    }
+
+    /// Whether polling must wait for the durable checkpoint's broker ACK.
+    pub fn has_pending_ack(&self) -> bool {
+        self.pending_ack
     }
 
     pub fn committed_offset(&self) -> &OffsetToken {
@@ -539,7 +580,7 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
         self.source
     }
 
-    fn require_active_lease(&self, lease: &SourceOwnerLease) -> Result<(), SourceError> {
+    fn require_owner_lease(&self, lease: &SourceOwnerLease) -> Result<(), SourceError> {
         if self.active_lease.as_ref() != Some(lease) {
             return Err(SourceError::Io(
                 "RS-4013: source owner lease is fenced or inactive; next steps: recover the checkpoint and acquire a new owner lease".to_string(),
@@ -548,9 +589,32 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
         Ok(())
     }
 
-    fn block<T>(&mut self, reason: &str) -> Result<T, SourceError> {
+    fn require_unblocked(&self) -> Result<(), SourceError> {
+        if let Some(reason) = &self.blocked_reason {
+            return Err(SourceError::Io(format!(
+                "RS-4016: source is blocked pending recovery: {reason}"
+            )));
+        }
+        if self.pending_ack {
+            return Err(SourceError::Io(
+                "RS-4016: durable checkpoint requires upstream acknowledgement before more input; next steps: acknowledge_recovered".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_active_lease(&self, lease: &SourceOwnerLease) -> Result<(), SourceError> {
+        self.require_owner_lease(lease)?;
+        self.require_unblocked()
+    }
+
+    async fn block<T>(&mut self, reason: &str) -> Result<T, SourceError> {
         self.blocked_reason = Some(reason.to_string());
-        drop(self.source.pause(reason.to_string()));
+        if let Err(error) = self.source.pause(reason.to_string()).await {
+            // The coordinator gate remains closed even when the connector
+            // cannot pause its partitions (e.g. during a Kafka rebalance).
+            self.blocked_reason = Some(format!("{reason}; upstream pause failed: {error}"));
+        }
         Err(SourceError::Io(reason.to_string()))
     }
 }
