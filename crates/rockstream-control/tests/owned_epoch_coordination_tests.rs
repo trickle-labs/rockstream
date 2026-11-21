@@ -256,6 +256,37 @@ async fn owned_epoch_is_prepared_before_dispatch_and_finished_before_reply() {
             },
         )
         .await;
+        match receive(&mut worker_read).await {
+            ControlMessage::ReadWorkload {
+                version,
+                request_id: read_request_id,
+                workload_id: read_workload_id,
+                shard_ids,
+            } => {
+                assert_eq!(read_workload_id, workload_id);
+                send(
+                    &mut worker_write,
+                    &WorkerMessage::WorkloadReadReport {
+                        version,
+                        request_id: read_request_id,
+                        workload_id: read_workload_id,
+                        worker_id,
+                        available: true,
+                        shards: shard_ids
+                            .into_iter()
+                            .map(|shard_id| rockstream_types::data_plane::ShardOutput {
+                                shard_id,
+                                lease_token: Some(descriptor.shard.lease_token),
+                                deltas: Vec::new(),
+                                rows: Vec::new(),
+                            })
+                            .collect(),
+                    },
+                )
+                .await;
+            }
+            other => panic!("unexpected worker read request: {other:?}"),
+        }
         match receive(&mut observer_read).await {
             ControlMessage::WorkloadSnapshot { snapshot } => assert_eq!(snapshot.deployment.workload_id, workload_id),
             other => panic!("unexpected completed read response: {other:?}"),
