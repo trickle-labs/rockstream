@@ -290,3 +290,234 @@ async fn test_upstream_transaction_atomicity_and_overflow_rejection() {
     }
     assert!(overflow_source.replication_read_paused());
 }
+
+#[tokio::test]
+async fn pgoutput_gateway_synchronized_snapshot_handoff_multi_relation_and_restart_exact() {
+    if !rockstream_test_support::docker_available() {
+        eprintln!("SKIP gateway synchronized snapshot handoff: Docker not available");
+        return;
+    }
+    let postgres = GenericImage::new("postgres", "11-alpine")
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(["postgres", "-c", "wal_level=logical"])
+        .start()
+        .await
+        .unwrap();
+    let host = postgres.get_host().await.unwrap();
+    let port = postgres.get_host_port_ipv4(5432).await.unwrap();
+    let (upstream, upstream_connection) = tokio_postgres::connect(
+        &format!("host={host} port={port} user=postgres dbname=postgres"),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = upstream_connection.await;
+    });
+    upstream
+        .batch_execute(
+            "CREATE TABLE a (id BIGINT PRIMARY KEY, val BIGINT NOT NULL); \
+             CREATE TABLE b (id BIGINT PRIMARY KEY, val BIGINT NOT NULL); \
+             ALTER TABLE a REPLICA IDENTITY FULL; \
+             ALTER TABLE b REPLICA IDENTITY FULL; \
+             CREATE PUBLICATION shared_pub FOR TABLE a, b; \
+             INSERT INTO a VALUES (1, 10); \
+             INSERT INTO b VALUES (1, 100);",
+        )
+        .await
+        .unwrap();
+
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let db = Arc::new(
+        ShardDb::builder("gw-sync-handoff", Arc::clone(&store))
+            .build()
+            .await
+            .unwrap(),
+    );
+    let catalog = Arc::new(CatalogStubs::new());
+    let server = GatewayServer::with_shard_db(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::clone(&catalog),
+        Arc::new(NoopViewReader),
+        Arc::clone(&db),
+    );
+    let (address, handle) = server.serve_background().await.unwrap();
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=test dbname=test",
+            address.port()
+        ),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    for sql in [
+        "CREATE TABLE a (id BIGINT, val BIGINT)",
+        "CREATE TABLE b (id BIGINT, val BIGINT)",
+        &format!("CREATE SOURCE a TYPE postgres_cdc (credential_ref='none://trusted', host='{host}', port='{port}', database='postgres', user='postgres', publication='shared_pub', slot='shared_sync_slot', table='a') FORMAT pgoutput"),
+        &format!("CREATE SOURCE b TYPE postgres_cdc (credential_ref='none://trusted', host='{host}', port='{port}', database='postgres', user='postgres', publication='shared_pub', slot='shared_sync_slot', table='b') FORMAT pgoutput"),
+    ] {
+        client.execute(sql, &[]).await.unwrap();
+    }
+
+    let (bound_tx, bound_rx) = tokio::sync::oneshot::channel::<()>();
+    let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel::<()>();
+    let bound_tx = Arc::new(tokio::sync::Mutex::new(Some(bound_tx)));
+    let proceed_rx = Arc::new(tokio::sync::Mutex::new(Some(proceed_rx)));
+    rockstream_connectors::PostgresCdcSource::register_snapshot_sync_hook(
+        "shared_sync_slot",
+        Arc::new(move || {
+            let bound_tx = Arc::clone(&bound_tx);
+            let proceed_rx = Arc::clone(&proceed_rx);
+            Box::pin(async move {
+                if let Some(tx) = bound_tx.lock().await.take() {
+                    let _ = tx.send(());
+                }
+                if let Some(rx) = proceed_rx.lock().await.take() {
+                    let _ = rx.await;
+                }
+            })
+        }),
+    );
+
+    let create_view_task = tokio::spawn(async move {
+        client
+            .execute(
+                "CREATE MATERIALIZED VIEW a_view AS SELECT id, val FROM a",
+                &[],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(
+                "CREATE MATERIALIZED VIEW b_view AS SELECT id, val FROM b",
+                &[],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(
+                "CREATE MATERIALIZED VIEW ab_view AS SELECT a.id, a.val AS a_val, b.val AS b_val FROM a JOIN b ON a.id = b.id",
+                &[],
+            )
+            .await
+            .unwrap();
+        client
+    });
+
+    bound_rx.await.unwrap();
+
+    // Commit a multi-relation transaction plus concurrent INSERT/UPDATE/DELETE
+    // while the snapshot transaction holds its exported MVCC snapshot.
+    upstream
+        .batch_execute(
+            "BEGIN; INSERT INTO a VALUES (2, 20); INSERT INTO b VALUES (2, 200); COMMIT; \
+             INSERT INTO a VALUES (3, 30); \
+             UPDATE a SET val = 15 WHERE id = 1; \
+             DELETE FROM a WHERE id = 3; \
+             SELECT pg_switch_wal();",
+        )
+        .await
+        .unwrap();
+
+    proceed_tx.send(()).unwrap();
+    let client = create_view_task.await.unwrap();
+
+    let expected_a = vec![
+        vec!["1".to_string(), "15".to_string()],
+        vec!["2".to_string(), "20".to_string()],
+    ];
+    let expected_b = vec![
+        vec!["1".to_string(), "100".to_string()],
+        vec!["2".to_string(), "200".to_string()],
+    ];
+    let expected_ab = vec![
+        vec!["1".to_string(), "15".to_string(), "100".to_string()],
+        vec!["2".to_string(), "20".to_string(), "200".to_string()],
+    ];
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        if rows(&client, "a_view").await == expected_a
+            && rows(&client, "b_view").await == expected_b
+            && rows(&client, "ab_view").await == expected_ab
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(rows(&client, "a").await, expected_a);
+    assert_eq!(rows(&client, "b").await, expected_b);
+    assert_eq!(rows(&client, "a_view").await, expected_a);
+    assert_eq!(rows(&client, "b_view").await, expected_b);
+    assert_eq!(rows(&client, "ab_view").await, expected_ab);
+
+    // Restart GatewayServer from the same durable ShardDb and verify state
+    // and continued live CDC without duplicates or gaps.
+    handle.abort();
+    drop(client);
+    drop(db);
+    let restarted_db = Arc::new(
+        ShardDb::builder("gw-sync-handoff", Arc::clone(&store))
+            .build()
+            .await
+            .unwrap(),
+    );
+    let restarted_server = GatewayServer::with_shard_db(
+        "127.0.0.1:0".parse().unwrap(),
+        catalog,
+        Arc::new(NoopViewReader),
+        Arc::clone(&restarted_db),
+    );
+    let (restarted_addr, restarted_handle) = restarted_server.serve_background().await.unwrap();
+    let (restarted_client, restarted_conn) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=test dbname=test",
+            restarted_addr.port()
+        ),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = restarted_conn.await;
+    });
+
+    assert_eq!(rows(&restarted_client, "a").await, expected_a);
+    assert_eq!(rows(&restarted_client, "b").await, expected_b);
+    assert_eq!(rows(&restarted_client, "a_view").await, expected_a);
+    assert_eq!(rows(&restarted_client, "b_view").await, expected_b);
+    assert_eq!(rows(&restarted_client, "ab_view").await, expected_ab);
+
+    upstream
+        .batch_execute(
+            "BEGIN; INSERT INTO a VALUES (4, 40); INSERT INTO b VALUES (4, 400); COMMIT;",
+        )
+        .await
+        .unwrap();
+    let expected_ab_after = vec![
+        vec!["1".to_string(), "15".to_string(), "100".to_string()],
+        vec!["2".to_string(), "20".to_string(), "200".to_string()],
+        vec!["4".to_string(), "40".to_string(), "400".to_string()],
+    ];
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        if rows(&restarted_client, "ab_view").await == expected_ab_after {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(rows(&restarted_client, "ab_view").await, expected_ab_after);
+    restarted_handle.abort();
+}

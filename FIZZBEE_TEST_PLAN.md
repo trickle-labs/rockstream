@@ -1299,6 +1299,35 @@ guarantee matrix covered by
 `crates/rockstream-connectors/tests/postgres_cdc_guarantee_matrix_tests.rs` and
 `crates/rockstream-gateway/tests/source_ddl_postgres_kafka_tests.rs`.
 
+Issue #347 refines the **PostgreSQL CDC initial snapshot-to-WAL handoff**:
+`capture_source_snapshot` and `capture_pgoutput_snapshot` now create a
+`pgoutput` logical replication slot through a replication-mode connection with
+an exported snapshot. Before scanning any relation, the read-only
+repeatable-read SQL transaction binds that exported MVCC snapshot via
+`SET TRANSACTION SNAPSHOT`, and the source records the slot's atomic
+`consistent_point` as the snapshot LSN. This replaces the non-atomic pairing
+of an independently opened snapshot transaction and
+`pg_current_wal_lsn()`. All imported relations share the same snapshot and
+fence; changes committed before slot creation appear in the snapshot, while
+subsequent commits are consumed from WAL after the fence, rather than being
+missed or replayed twice.
+
+**Safety / recovery boundary:** an active slot is rejected rather than
+replaced (RS-4013), and a missing checkpointed slot remains fail-closed
+(RS-4011). Snapshot capture must complete before normal CDC processing;
+a checkpointed restart resumes from durable source progress rather than
+creating a new bootstrap snapshot. This refines M3's source progress and
+checkpoint-coupled commit assumptions but does not extend the M1–M7 FizzBee
+models to PostgreSQL MVCC snapshots, replication slots, or WAL records.
+The exact-once handoff obligation is checked against real PostgreSQL by
+`postgres_cdc_synchronized_snapshot_handoff_is_exact_across_restart`
+in `crates/rockstream-connectors/tests/postgres_cdc_guarantee_matrix_tests.rs`
+and `pgoutput_gateway_synchronized_snapshot_handoff_multi_relation_and_restart_exact`
+in `crates/rockstream-gateway/tests/cdc_transaction_atomicity_tests.rs`.
+Together they exercise in-flight commits at slot creation, concurrent
+INSERT/UPDATE/DELETE after snapshot binding, multi-relation gateway/view
+materialization, and checkpointed restart without gaps or duplicates.
+
 Issue #339 extends that **external PostgreSQL pgoutput boundary** with
 transactional `TRUNCATE` semantics. A decoded `T` message retains the enclosing
 XID, relation IDs, and CASCADE / RESTART IDENTITY flags; the source-wide gateway
