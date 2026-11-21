@@ -6353,7 +6353,7 @@ impl GatewayHandler {
                 handler.refresh_backfill_progress(&view_name).await;
             }
             if let Some(reason) = runtime.blocked_reason() {
-                tracing::error!(view = %view_name, %reason, "live source remains blocked without a retryable ACK");
+                tracing::error!(code = "RS-4016", view = %view_name, %reason, "live source remains blocked without a retryable ACK");
                 break;
             }
             drop(handler);
