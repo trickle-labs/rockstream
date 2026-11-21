@@ -5269,6 +5269,63 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
     )
     .await;
 
+    kafka_acl(
+        &broker,
+        &[
+            "--add",
+            "--allow-principal",
+            "User:rotated",
+            "--operation",
+            "Read",
+            "--operation",
+            "Write",
+            "--operation",
+            "Describe",
+            "--topic",
+            "rotating-orders",
+        ],
+    )
+    .await;
+    kafka_acl(
+        &broker,
+        &[
+            "--add",
+            "--allow-principal",
+            "User:rotated",
+            "--operation",
+            "Read",
+            "--operation",
+            "Describe",
+            "--group",
+            "rotation-group-",
+            "--resource-pattern-type",
+            "prefixed",
+        ],
+    )
+    .await;
+    for (resource, name) in [
+        ("--topic", "rotating-orders"),
+        ("--group", "rotation-group-"),
+    ] {
+        let mut args = vec![
+            "--add",
+            "--deny-principal",
+            "User:rotating",
+            "--operation",
+            "Read",
+            "--operation",
+            "Describe",
+            resource,
+            name,
+        ];
+        if resource == "--topic" {
+            args.extend(["--operation", "Write"]);
+        } else {
+            args.extend(["--resource-pattern-type", "prefixed"]);
+        }
+        kafka_acl(&broker, &args).await;
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
     let pending_rows = (1000..11_000)
         .map(|id| (id, (id % 7 != 0).then_some(id * 10), (id % 3) as i32))
         .collect::<Vec<_>>();
@@ -5294,40 +5351,6 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
     );
 
     let rotation_operation_id = "00000000-0000-4000-8000-000000000304";
-    kafka_acl(
-        &broker,
-        &[
-            "--add",
-            "--allow-principal",
-            "User:rotated",
-            "--operation",
-            "Read",
-            "--operation",
-            "Write",
-            "--operation",
-            "Describe",
-            "--topic",
-            "rotating-orders",
-        ],
-    )
-    .await;
-    kafka_acl(
-        &broker,
-        &[
-            "--add",
-            "--allow-principal",
-            "User:rotated",
-            "--operation",
-            "Read",
-            "--operation",
-            "Describe",
-            "--group",
-            "rotation-group-",
-            "--resource-pattern-type",
-            "prefixed",
-        ],
-    )
-    .await;
     let live_rotation_operation_id = "00000000-0000-4000-8000-000000000305";
     let live_process_id = process.0.id();
     client
@@ -5336,6 +5359,17 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
         ))
         .await
         .unwrap();
+    let immediately_before_rotation =
+        kafka_source_group_checkpoints(&broker, "rotating-orders", "rotation-group-").await;
+    assert_eq!(immediately_before_rotation.len(), 2);
+    assert!(
+        immediately_before_rotation
+            .values()
+            .all(|partitions| partitions
+                .values()
+                .any(|(current, log_end)| log_end > current)),
+        "live rotation requires pending work in each view: {immediately_before_rotation:?}"
+    );
     let live_rotation = client
         .simple_query("ALTER SECRET kafka_auth SET (USERNAME = 'live', PASSWORD = 'live-pass')")
         .await
@@ -5344,40 +5378,6 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
         live_rotation.as_slice(),
         [tokio_postgres::SimpleQueryMessage::CommandComplete(0)]
     ));
-    kafka_acl(
-        &broker,
-        &[
-            "--add",
-            "--deny-principal",
-            "User:rotating",
-            "--operation",
-            "Read",
-            "--operation",
-            "Write",
-            "--operation",
-            "Describe",
-            "--topic",
-            "rotating-orders",
-        ],
-    )
-    .await;
-    kafka_acl(
-        &broker,
-        &[
-            "--add",
-            "--deny-principal",
-            "User:rotating",
-            "--operation",
-            "Read",
-            "--operation",
-            "Describe",
-            "--group",
-            "rotation-group-",
-            "--resource-pattern-type",
-            "prefixed",
-        ],
-    )
-    .await;
     let live_deadline = Instant::now() + Duration::from_secs(90);
     for view in ["rotating_a", "rotating_b"] {
         wait_for_exact_query_rows(
