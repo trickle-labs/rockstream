@@ -13,9 +13,16 @@ use uuid::Uuid;
 /// The export copy path is deliberately sequential: there is no queue behind
 /// the single permit.
 pub const MAX_CHECKPOINT_EXPORT_OBJECTS_IN_FLIGHT: usize = 1;
-/// Maximum number of object names retained while scanning a source prefix.
+/// Per-page scan window size used to bound resident scan progress metrics while
+/// paginating across arbitrarily large object inventories.
 pub const MAX_CHECKPOINT_EXPORT_SCAN_WINDOW: usize = 1024;
-/// Maximum size of one object held by the object-store put API.
+/// Streaming chunk size (8 MiB) used for bounded-memory multipart upload/copy
+/// and streaming SHA-256 verification. Satisfies S3's 5 MiB minimum part size
+/// while supporting arbitrarily large SSTables beyond 64 MiB.
+pub const CHECKPOINT_EXPORT_STREAM_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+/// Legacy single-buffer object threshold retained for API compatibility; objects
+/// larger than [`CHECKPOINT_EXPORT_STREAM_CHUNK_BYTES`] are streamed in bounded
+/// chunks rather than rejected.
 pub const MAX_CHECKPOINT_EXPORT_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CHECKPOINT_EXPORT_RECORD_BYTES: u64 = 1024 * 1024;
 const EXPORT_PREFIX: &str = "checkpoint-exports";
@@ -219,9 +226,17 @@ impl CheckpointExportService {
         prefix: &Path,
     ) -> Result<Vec<Path>, CheckpointExportError> {
         let mut objects = Self::list_export_objects(source, prefix).await?;
-        objects.retain(|path| !is_shard_path(path) && !is_uncheckpointed_operational_path(path));
+        objects.retain(|path| {
+            !is_shard_path(path)
+                && !is_workload_shard_path(path)
+                && !is_uncheckpointed_operational_path(path)
+                && !is_newer_control_checkpoint_path(path, checkpoint.checkpoint_id)
+        });
         for (shard_id, shard_checkpoint) in &checkpoint.shards {
-            let shard_path = format!("shards/{}", shard_id.0);
+            let shard_path = shard_checkpoint
+                .shard_path
+                .clone()
+                .unwrap_or_else(|| format!("shards/{}", shard_id.0));
             let shard_objects = match shard_checkpoint.snapshot_id.as_deref() {
                 Some(snapshot_id) => {
                     snapshot_object_paths(source.clone(), &shard_path, snapshot_id).await?
@@ -236,11 +251,6 @@ impl CheckpointExportService {
                 }
             };
             objects.extend(shard_objects);
-            if objects.len() > MAX_CHECKPOINT_EXPORT_SCAN_WINDOW {
-                return Err(CheckpointExportError::Integrity(format!(
-                    "checkpoint object inventory exceeded MAX_CHECKPOINT_EXPORT_SCAN_WINDOW={MAX_CHECKPOINT_EXPORT_SCAN_WINDOW}"
-                )));
-            }
         }
         objects.sort();
         objects.dedup();
@@ -253,6 +263,7 @@ impl CheckpointExportService {
     ) -> Result<Vec<Path>, CheckpointExportError> {
         let mut listing = source.list(Some(prefix));
         let mut objects = Vec::new();
+        let mut page_fill = 0_usize;
         while let Some(entry) = listing.next().await {
             let meta = match entry {
                 Ok(meta) => meta,
@@ -268,15 +279,10 @@ impl CheckpointExportService {
             {
                 continue;
             }
-            if objects.len() == MAX_CHECKPOINT_EXPORT_SCAN_WINDOW {
-                rockstream_types::metrics::set_checkpoint_export_scan_window_fill_level(0);
-                return Err(CheckpointExportError::Integrity(format!(
-                    "source prefix scan exceeded MAX_CHECKPOINT_EXPORT_SCAN_WINDOW={MAX_CHECKPOINT_EXPORT_SCAN_WINDOW}"
-                )));
-            }
             objects.push(meta.location);
+            page_fill = (page_fill % MAX_CHECKPOINT_EXPORT_SCAN_WINDOW) + 1;
             rockstream_types::metrics::set_checkpoint_export_scan_window_fill_level(
-                objects.len() as u64
+                page_fill as u64,
             );
         }
         rockstream_types::metrics::set_checkpoint_export_scan_window_fill_level(0);
@@ -328,6 +334,10 @@ impl CheckpointExportService {
 
         let mut digest = Sha256::new();
         let mut byte_count = 0_u64;
+        let mut saw_any_control_manifest = false;
+        let mut saw_selected_control_manifest = false;
+        let selected_manifest_path =
+            format!("control/checkpoints/{}", generation_record.checkpoint_id.0);
         for index in 0..outcome.object_count {
             let record = self
                 .read_json::<InventoryRecord>(&destination, &inventory_path(generation, index))
@@ -340,11 +350,23 @@ impl CheckpointExportService {
                     "inventory record {index} points outside the generation"
                 )));
             }
-            let bytes = self
-                .read_bytes(&destination, &Path::from(record.destination.clone()))
+            let source_path = Path::from(record.source.as_str());
+            if is_newer_control_checkpoint_path(&source_path, generation_record.checkpoint_id) {
+                return Err(CheckpointExportError::Integrity(format!(
+                    "inventory record {index} contains control checkpoint metadata `{}` newer than exported checkpoint {}",
+                    record.source, generation_record.checkpoint_id.0
+                )));
+            }
+            if record.source.starts_with("control/checkpoints/") {
+                saw_any_control_manifest = true;
+                if record.source == selected_manifest_path {
+                    saw_selected_control_manifest = true;
+                }
+            }
+            let (actual_len, actual_digest) = self
+                .stream_hash_and_size(&destination, &Path::from(record.destination.clone()))
                 .await?;
-            let actual_digest = digest_bytes(&bytes);
-            if bytes.len() as u64 != record.byte_len || actual_digest != record.sha256 {
+            if actual_len != record.byte_len || actual_digest != record.sha256 {
                 return Err(CheckpointExportError::Integrity(format!(
                     "destination object {} failed validation",
                     record.destination
@@ -354,6 +376,12 @@ impl CheckpointExportService {
                 CheckpointExportError::Integrity("export byte count overflowed".to_string())
             })?;
             update_digest(&mut digest, &record)?;
+        }
+        if saw_any_control_manifest && !saw_selected_control_manifest {
+            return Err(CheckpointExportError::Integrity(format!(
+                "exported control manifests omit the selected checkpoint {}",
+                generation_record.checkpoint_id.0
+            )));
         }
         if byte_count != outcome.byte_count
             || hex::encode(digest.finalize()) != outcome.inventory_digest
@@ -371,16 +399,9 @@ impl CheckpointExportService {
     ) -> Result<String, CheckpointExportError> {
         let mut listing = source.list(Some(&Path::from(EXPORT_PREFIX)));
         let mut latest: Option<(u64, String)> = None;
-        let mut scanned = 0_usize;
         while let Some(entry) = listing.next().await {
             let meta =
                 entry.map_err(|error| CheckpointExportError::ObjectStore(error.to_string()))?;
-            scanned += 1;
-            if scanned > MAX_CHECKPOINT_EXPORT_SCAN_WINDOW {
-                return Err(CheckpointExportError::Integrity(format!(
-                    "export generation scan exceeded MAX_CHECKPOINT_EXPORT_SCAN_WINDOW={MAX_CHECKPOINT_EXPORT_SCAN_WINDOW}"
-                )));
-            }
             let name = meta.location.as_ref();
             let Some(generation) = name
                 .strip_prefix("checkpoint-exports/")
@@ -470,18 +491,23 @@ impl CheckpointExportService {
                 .ok_or_else(|| {
                     CheckpointExportError::Integrity(format!("inventory record {index} is missing"))
                 })?;
-            let bytes = self
-                .read_bytes(&source, &Path::from(record.destination.clone()))
-                .await?;
             let staged = restore_object_path(generation, index);
-            target
-                .put(&staged, bytes.clone().into())
-                .await
-                .map_err(|error| CheckpointExportError::ObjectStore(error.to_string()))?;
-            let staged_bytes = self.read_bytes(&target, &staged).await?;
-            if staged_bytes.len() as u64 != record.byte_len
-                || digest_bytes(&staged_bytes) != record.sha256
-            {
+            let (copied_len, copied_digest) = self
+                .stream_copy_and_hash(
+                    &source,
+                    &Path::from(record.destination.clone()),
+                    &target,
+                    &staged,
+                )
+                .await?;
+            if copied_len != record.byte_len || copied_digest != record.sha256 {
+                return Err(CheckpointExportError::Integrity(format!(
+                    "source object {} failed validation during restore staging",
+                    record.destination
+                )));
+            }
+            let (staged_len, staged_digest) = self.stream_hash_and_size(&target, &staged).await?;
+            if staged_len != record.byte_len || staged_digest != record.sha256 {
                 return Err(CheckpointExportError::Integrity(format!(
                     "staged restore object {index} failed validation"
                 )));
@@ -496,16 +522,12 @@ impl CheckpointExportService {
                     CheckpointExportError::Integrity(format!("inventory record {index} is missing"))
                 })?;
             let staged = restore_object_path(generation, index);
-            let bytes = self.read_bytes(&target, &staged).await?;
-            target
-                .put(&Path::from(record.source.clone()), bytes.into())
-                .await
-                .map_err(|error| CheckpointExportError::ObjectStore(error.to_string()))?;
-            let restored = self
-                .read_bytes(&target, &Path::from(record.source.clone()))
+            let target_path = Path::from(record.source.clone());
+            self.stream_copy_and_hash(&target, &staged, &target, &target_path)
                 .await?;
-            if restored.len() as u64 != record.byte_len || digest_bytes(&restored) != record.sha256
-            {
+            let (restored_len, restored_digest) =
+                self.stream_hash_and_size(&target, &target_path).await?;
+            if restored_len != record.byte_len || restored_digest != record.sha256 {
                 return Err(CheckpointExportError::Integrity(format!(
                     "restored target object {} failed validation",
                     record.source
@@ -608,56 +630,60 @@ impl CheckpointExportService {
         let mut inventory_digest = Sha256::new();
         rockstream_types::metrics::set_checkpoint_export_copy_progress(0, total);
         for (index, source_path) in objects.enumerate() {
-            let source_bytes = self.read_bytes(&source, &source_path).await?;
             let source_name = source_path.to_string();
-            let destination_name = object_path(&generation, index as u64).to_string();
-            let record = InventoryRecord {
-                source: source_name,
-                destination: destination_name,
-                byte_len: source_bytes.len() as u64,
-                sha256: digest_bytes(&source_bytes),
-            };
+            let dest_path = object_path(&generation, index as u64);
+            let destination_name = dest_path.to_string();
             let record_path = inventory_path(&generation, index as u64);
 
-            if let Some(existing) = self
+            let record = if let Some(existing) = self
                 .read_json::<InventoryRecord>(&destination, &record_path)
                 .await?
             {
-                if existing != record {
+                let (source_len, source_sha) =
+                    self.stream_hash_and_size(&source, &source_path).await?;
+                let expected = InventoryRecord {
+                    source: source_name,
+                    destination: destination_name,
+                    byte_len: source_len,
+                    sha256: source_sha,
+                };
+                if existing != expected {
                     return Err(CheckpointExportError::Integrity(format!(
                         "inventory record {index} for source {} does not match the selected checkpoint",
-                        record.source
+                        expected.source
                     )));
                 }
-                let existing_bytes = self
-                    .read_bytes(&destination, &Path::from(existing.destination.clone()))
+                let (existing_len, existing_sha) = self
+                    .stream_hash_and_size(&destination, &Path::from(existing.destination.clone()))
                     .await?;
-                if existing_bytes.len() as u64 != existing.byte_len
-                    || digest_bytes(&existing_bytes) != existing.sha256
-                {
+                if existing_len != existing.byte_len || existing_sha != existing.sha256 {
                     return Err(CheckpointExportError::Integrity(format!(
                         "destination object {} failed validation during resume",
                         existing.destination
                     )));
                 }
+                existing
             } else {
-                destination
-                    .put(&Path::from(record.destination.clone()), source_bytes.into())
-                    .await
-                    .map_err(|error| CheckpointExportError::ObjectStore(error.to_string()))?;
-                let written = self
-                    .read_bytes(&destination, &Path::from(record.destination.clone()))
+                let (copied_len, copied_sha) = self
+                    .stream_copy_and_hash(&source, &source_path, &destination, &dest_path)
                     .await?;
-                if written.len() as u64 != record.byte_len
-                    || digest_bytes(&written) != record.sha256
-                {
+                let record = InventoryRecord {
+                    source: source_name,
+                    destination: destination_name,
+                    byte_len: copied_len,
+                    sha256: copied_sha,
+                };
+                let (written_len, written_sha) =
+                    self.stream_hash_and_size(&destination, &dest_path).await?;
+                if written_len != record.byte_len || written_sha != record.sha256 {
                     return Err(CheckpointExportError::Integrity(format!(
                         "destination object {} failed post-copy validation",
                         record.destination
                     )));
                 }
                 self.put_json(&destination, &record_path, &record).await?;
-            }
+                record
+            };
             byte_count = byte_count.checked_add(record.byte_len).ok_or_else(|| {
                 CheckpointExportError::Integrity("export byte count overflowed".to_string())
             })?;
@@ -690,27 +716,141 @@ impl CheckpointExportService {
         Ok(outcome)
     }
 
-    async fn read_bytes(
+    async fn stream_hash_and_size(
         &self,
         store: &Arc<dyn ObjectStore>,
         path: &Path,
-    ) -> Result<bytes::Bytes, CheckpointExportError> {
+    ) -> Result<(u64, String), CheckpointExportError> {
         let result = store
             .get(path)
             .await
             .map_err(|error| CheckpointExportError::ObjectStore(error.to_string()))?;
-        if result.meta.size > MAX_CHECKPOINT_EXPORT_OBJECT_BYTES {
-            return Err(CheckpointExportError::Integrity(format!(
-                "object {path} exceeds MAX_CHECKPOINT_EXPORT_OBJECT_BYTES={MAX_CHECKPOINT_EXPORT_OBJECT_BYTES}"
-            )));
+        let mut stream = result.into_stream();
+        let mut hasher = Sha256::new();
+        let mut total_bytes = 0_u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    rockstream_types::metrics::set_checkpoint_export_object_buffer_fill_level(0);
+                    return Err(CheckpointExportError::ObjectStore(error.to_string()));
+                }
+            };
+            let chunk_len = chunk.len() as u64;
+            rockstream_types::metrics::set_checkpoint_export_object_buffer_fill_level(chunk_len);
+            hasher.update(&chunk);
+            total_bytes = total_bytes.checked_add(chunk_len).ok_or_else(|| {
+                rockstream_types::metrics::set_checkpoint_export_object_buffer_fill_level(0);
+                CheckpointExportError::Integrity("object byte length overflowed".to_string())
+            })?;
         }
-        rockstream_types::metrics::set_checkpoint_export_object_buffer_fill_level(result.meta.size);
-        let bytes = result
-            .bytes()
-            .await
-            .map_err(|error| CheckpointExportError::ObjectStore(error.to_string()));
         rockstream_types::metrics::set_checkpoint_export_object_buffer_fill_level(0);
-        bytes
+        Ok((total_bytes, hex::encode(hasher.finalize())))
+    }
+
+    async fn stream_copy_and_hash(
+        &self,
+        source: &Arc<dyn ObjectStore>,
+        source_path: &Path,
+        destination: &Arc<dyn ObjectStore>,
+        dest_path: &Path,
+    ) -> Result<(u64, String), CheckpointExportError> {
+        let result = source
+            .get(source_path)
+            .await
+            .map_err(|error| CheckpointExportError::ObjectStore(error.to_string()))?;
+        if result.meta.size <= CHECKPOINT_EXPORT_STREAM_CHUNK_BYTES as u64 {
+            rockstream_types::metrics::set_checkpoint_export_object_buffer_fill_level(
+                result.meta.size,
+            );
+            let bytes = match result.bytes().await {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    rockstream_types::metrics::set_checkpoint_export_object_buffer_fill_level(0);
+                    return Err(CheckpointExportError::ObjectStore(error.to_string()));
+                }
+            };
+            let byte_len = bytes.len() as u64;
+            let sha = digest_bytes(&bytes);
+            let put_result = destination
+                .put(dest_path, bytes.into())
+                .await
+                .map(|_| ())
+                .map_err(|error| CheckpointExportError::ObjectStore(error.to_string()));
+            rockstream_types::metrics::set_checkpoint_export_object_buffer_fill_level(0);
+            put_result?;
+            return Ok((byte_len, sha));
+        }
+
+        let mut upload = destination
+            .put_multipart(dest_path)
+            .await
+            .map_err(|error| CheckpointExportError::ObjectStore(error.to_string()))?;
+        let mut stream = result.into_stream();
+        let mut hasher = Sha256::new();
+        let mut total_bytes = 0_u64;
+        let mut buffer = Vec::with_capacity(CHECKPOINT_EXPORT_STREAM_CHUNK_BYTES);
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    let _ = upload.abort().await;
+                    rockstream_types::metrics::set_checkpoint_export_object_buffer_fill_level(0);
+                    return Err(CheckpointExportError::ObjectStore(error.to_string()));
+                }
+            };
+            let mut slice = chunk.as_ref();
+            while !slice.is_empty() {
+                let remaining = CHECKPOINT_EXPORT_STREAM_CHUNK_BYTES - buffer.len();
+                let take = remaining.min(slice.len());
+                buffer.extend_from_slice(&slice[..take]);
+                hasher.update(&slice[..take]);
+                total_bytes = match total_bytes.checked_add(take as u64) {
+                    Some(total) => total,
+                    None => {
+                        let _ = upload.abort().await;
+                        rockstream_types::metrics::set_checkpoint_export_object_buffer_fill_level(
+                            0,
+                        );
+                        return Err(CheckpointExportError::Integrity(
+                            "object byte length overflowed".to_string(),
+                        ));
+                    }
+                };
+                slice = &slice[take..];
+                rockstream_types::metrics::set_checkpoint_export_object_buffer_fill_level(
+                    buffer.len() as u64,
+                );
+                if buffer.len() == CHECKPOINT_EXPORT_STREAM_CHUNK_BYTES {
+                    let part = std::mem::replace(
+                        &mut buffer,
+                        Vec::with_capacity(CHECKPOINT_EXPORT_STREAM_CHUNK_BYTES),
+                    );
+                    if let Err(error) = upload.put_part(part.into()).await {
+                        let _ = upload.abort().await;
+                        rockstream_types::metrics::set_checkpoint_export_object_buffer_fill_level(
+                            0,
+                        );
+                        return Err(CheckpointExportError::ObjectStore(error.to_string()));
+                    }
+                    rockstream_types::metrics::set_checkpoint_export_object_buffer_fill_level(0);
+                }
+            }
+        }
+        if !buffer.is_empty() {
+            if let Err(error) = upload.put_part(buffer.into()).await {
+                let _ = upload.abort().await;
+                rockstream_types::metrics::set_checkpoint_export_object_buffer_fill_level(0);
+                return Err(CheckpointExportError::ObjectStore(error.to_string()));
+            }
+        }
+        rockstream_types::metrics::set_checkpoint_export_object_buffer_fill_level(0);
+        if let Err(error) = upload.complete().await {
+            let _ = upload.abort().await;
+            return Err(CheckpointExportError::ObjectStore(error.to_string()));
+        }
+        Ok((total_bytes, hex::encode(hasher.finalize())))
     }
 
     async fn read_json<T: for<'de> Deserialize<'de>>(
@@ -770,11 +910,38 @@ fn is_shard_path(path: &Path) -> bool {
     parts.next() == Some("shards") && parts.next().is_some()
 }
 
+fn is_workload_shard_path(path: &Path) -> bool {
+    let mut parts = path.as_ref().split('/');
+    matches!(
+        (parts.next(), parts.next()),
+        (Some(workload), Some(shard))
+            if workload.starts_with("workload-") && shard.starts_with("shard-")
+    )
+}
+
 fn is_uncheckpointed_operational_path(path: &Path) -> bool {
     let path = path.as_ref();
     path == "audit.jsonl"
         || path.starts_with("control/management-operations/")
+        || path.starts_with("control/gc-pins/")
         || path.starts_with("topology/workers/")
+}
+
+fn is_newer_control_checkpoint_path(path: &Path, selected: CheckpointId) -> bool {
+    let raw = path.as_ref();
+    if let Some(rest) = raw.strip_prefix("control/checkpoints/") {
+        if let Ok(id) = rest.parse::<u64>() {
+            return id > selected.0;
+        }
+    }
+    if let Some(rest) = raw.strip_prefix("control/changelog-checkpoints/") {
+        if let Some((checkpoint, _)) = rest.split_once('-') {
+            if let Ok(id) = checkpoint.parse::<u64>() {
+                return id > selected.0;
+            }
+        }
+    }
+    false
 }
 
 async fn snapshot_object_paths(
@@ -906,15 +1073,17 @@ async fn manifest_object_paths_at(
     let mut wal_objects = source.list(Some(&wal_prefix));
     let first_wal_id = manifest.replay_after_wal_id().saturating_add(1);
     let next_wal_id = manifest.next_wal_sst_id();
-    let mut scanned_wal_objects = 0;
+    let mut page_fill = 0_usize;
     while let Some(meta) = wal_objects.next().await {
-        let meta = meta.map_err(|error| CheckpointExportError::ObjectStore(error.to_string()))?;
-        scanned_wal_objects += 1;
-        if scanned_wal_objects > MAX_CHECKPOINT_EXPORT_SCAN_WINDOW {
-            return Err(CheckpointExportError::Integrity(format!(
-                "checkpoint WAL scan exceeded MAX_CHECKPOINT_EXPORT_SCAN_WINDOW={MAX_CHECKPOINT_EXPORT_SCAN_WINDOW}"
-            )));
-        }
+        let meta = match meta {
+            Ok(meta) => meta,
+            Err(error) => {
+                rockstream_types::metrics::set_checkpoint_export_scan_window_fill_level(0);
+                return Err(CheckpointExportError::ObjectStore(error.to_string()));
+            }
+        };
+        page_fill = (page_fill % MAX_CHECKPOINT_EXPORT_SCAN_WINDOW) + 1;
+        rockstream_types::metrics::set_checkpoint_export_scan_window_fill_level(page_fill as u64);
         let Some(wal_id) = meta
             .location
             .filename()
@@ -927,6 +1096,7 @@ async fn manifest_object_paths_at(
             objects.insert(meta.location);
         }
     }
+    rockstream_types::metrics::set_checkpoint_export_scan_window_fill_level(0);
     Ok(objects.into_iter().collect())
 }
 
@@ -1214,43 +1384,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_export_prefix_rejects_an_unbounded_scan() {
+    async fn checkpoint_export_prefix_paginates_beyond_legacy_scan_window() {
         let source: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let destination: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        for index in 0..=MAX_CHECKPOINT_EXPORT_SCAN_WINDOW {
+        let total = MAX_CHECKPOINT_EXPORT_SCAN_WINDOW + 128;
+        for index in 0..total {
             source
                 .put(
-                    &Path::from(format!("shards/1/{index}")),
+                    &Path::from(format!("control/meta/{index:05}")),
                     bytes::Bytes::from_static(b"x").into(),
                 )
                 .await
                 .unwrap();
         }
 
-        let error = CheckpointExportService::new()
+        let outcome = CheckpointExportService::new()
             .export_prefix(
                 source,
-                destination,
+                destination.clone(),
                 checkpoint(),
                 "generation-c",
-                &Path::from("shards/1"),
+                &Path::from("control/meta"),
             )
             .await
-            .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "RS-3614: checkpoint export integrity validation failed: source prefix scan exceeded MAX_CHECKPOINT_EXPORT_SCAN_WINDOW=1024; next_steps: discard the incomplete generation and retry from the same committed checkpoint"
-        );
+            .unwrap();
+        assert_eq!(outcome.checkpoint_id, 7);
+        assert_eq!(outcome.generation, "generation-c");
+        assert_eq!(outcome.object_count, total as u64);
+        assert_eq!(outcome.byte_count, total as u64);
+        assert_eq!(outcome.status, "SUCCESS");
         assert_eq!(
             rockstream_types::metrics::read_checkpoint_export_scan_window_fill_level(),
             0
         );
+        let validated = CheckpointExportService::new()
+            .validate_generation(destination, "generation-c")
+            .await
+            .unwrap();
+        assert_eq!(validated, outcome);
     }
 
     #[test]
     fn checkpoint_export_limits_are_named_and_exact() {
         assert_eq!(MAX_CHECKPOINT_EXPORT_OBJECTS_IN_FLIGHT, 1);
         assert_eq!(MAX_CHECKPOINT_EXPORT_SCAN_WINDOW, 1024);
+        assert_eq!(CHECKPOINT_EXPORT_STREAM_CHUNK_BYTES, 8 * 1024 * 1024);
         assert_eq!(MAX_CHECKPOINT_EXPORT_OBJECT_BYTES, 64 * 1024 * 1024);
     }
 

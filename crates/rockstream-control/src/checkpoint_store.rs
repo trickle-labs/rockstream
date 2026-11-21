@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -6,12 +7,133 @@ use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 use rockstream_types::checkpoint::{CheckpointId, ClusterCheckpoint};
 use rockstream_types::error_code::RS_3022;
 use rockstream_types::ids::ShardId;
+use serde::{Deserialize, Serialize};
 
 use crate::audit::{AuditEvent, FileAuditLog};
 use crate::checkpoint::ChangelogCheckpointContribution;
 
 const MANIFEST_MAGIC: &[u8; 4] = b"RSC1";
 const MANIFEST_HEADER_LEN: usize = 4 + 1 + 1 + 8;
+const GC_PINS_PREFIX: &str = "control/gc-pins";
+
+/// Category of an active GC/compaction pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GcPinKind {
+    Backup,
+    Migration,
+    SnapshotReader,
+    ReplayHorizon,
+}
+
+/// Durable pin record that prevents GC and compaction from reclaiming
+/// referenced checkpoint manifests, SlateDB snapshots, or epochs below
+/// `min_epoch` while an online operation is in flight.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GcPin {
+    pub pin_id: String,
+    pub kind: GcPinKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_id: Option<CheckpointId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shard_snapshots: Vec<(ShardId, String)>,
+    pub created_at_ms: i64,
+}
+
+/// Durable object-store-backed registry for active GC/compaction pins.
+#[derive(Debug, Clone)]
+pub struct GcPinStore {
+    store: Arc<dyn ObjectStore>,
+    prefix: Path,
+}
+
+impl GcPinStore {
+    pub fn new(store: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            store,
+            prefix: Path::from(GC_PINS_PREFIX),
+        }
+    }
+
+    fn pin_path(&self, pin_id: &str) -> Result<Path, String> {
+        if pin_id.is_empty()
+            || pin_id == "."
+            || pin_id == ".."
+            || pin_id.contains('/')
+            || pin_id.contains('\\')
+        {
+            return Err(format!("invalid gc pin id `{pin_id}`"));
+        }
+        Ok(self.prefix.clone().join(pin_id))
+    }
+
+    /// Persist (or idempotently update) an active GC pin.
+    pub async fn acquire_pin(&self, pin: &GcPin) -> Result<(), String> {
+        let path = self.pin_path(&pin.pin_id)?;
+        let payload =
+            serde_json::to_vec(pin).map_err(|error| format!("serialize gc pin: {error}"))?;
+        self.store
+            .put(&path, payload.into())
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("persist gc pin {}: {error}", pin.pin_id))
+    }
+
+    /// Release an active GC pin. Missing pins are treated as already released.
+    pub async fn release_pin(&self, pin_id: &str) -> Result<(), String> {
+        let path = self.pin_path(pin_id)?;
+        match self.store.delete(&path).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(error) => Err(format!("delete gc pin {pin_id}: {error}")),
+        }
+    }
+
+    /// List all currently active GC pins.
+    pub async fn list_active_pins(&self) -> Result<Vec<GcPin>, String> {
+        let mut listing = self.store.list(Some(&self.prefix));
+        let mut pins = Vec::new();
+        while let Some(entry) = listing.next().await {
+            let meta = entry.map_err(|error| format!("list gc pins: {error}"))?;
+            let bytes = match self.store.get(&meta.location).await {
+                Ok(result) => result
+                    .bytes()
+                    .await
+                    .map_err(|error| format!("read gc pin {}: {error}", meta.location))?,
+                Err(object_store::Error::NotFound { .. }) => continue,
+                Err(error) => return Err(format!("get gc pin {}: {error}", meta.location)),
+            };
+            let pin: GcPin = serde_json::from_slice(&bytes)
+                .map_err(|error| format!("decode gc pin {}: {error}", meta.location))?;
+            pins.push(pin);
+        }
+        pins.sort_by(|a, b| a.pin_id.cmp(&b.pin_id));
+        Ok(pins)
+    }
+
+    /// Return all checkpoint IDs currently pinned by active operations.
+    pub async fn pinned_checkpoint_ids(&self) -> Result<BTreeSet<CheckpointId>, String> {
+        let pins = self.list_active_pins().await?;
+        Ok(pins
+            .into_iter()
+            .filter_map(|pin| pin.checkpoint_id)
+            .collect())
+    }
+
+    /// Compute the safe compaction frontier bounded by all active pins'
+    /// `min_epoch` horizons. Never exceeds `candidate_horizon`.
+    pub async fn effective_compaction_horizon(
+        &self,
+        candidate_horizon: u64,
+    ) -> Result<u64, String> {
+        let pins = self.list_active_pins().await?;
+        Ok(pins
+            .into_iter()
+            .filter_map(|pin| pin.min_epoch)
+            .fold(candidate_horizon, u64::min))
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct CheckpointManifestStore {
@@ -84,6 +206,7 @@ impl CheckpointManifestStore {
 
     /// Delete expired changelog objects one at a time. This deliberately uses
     /// object listing plus point deletion, never SlateDB range deletion.
+    /// Checkpoints pinned by an active [`GcPin`] are never deleted.
     pub async fn gc_old_changelog_contributions(
         &self,
         latest_checkpoint_id: CheckpointId,
@@ -92,6 +215,9 @@ impl CheckpointManifestStore {
         if latest_checkpoint_id.0 <= retention_horizon {
             return Ok(Vec::new());
         }
+        let pinned = GcPinStore::new(self.store.clone())
+            .pinned_checkpoint_ids()
+            .await?;
         let cutoff = latest_checkpoint_id.0 - retention_horizon;
         let prefix = Path::from("control/changelog-checkpoints");
         let mut listing = self.store.list(Some(&prefix));
@@ -107,7 +233,7 @@ impl CheckpointManifestStore {
             let (Ok(checkpoint_id), Ok(shard_id)) = (checkpoint.parse(), shard.parse()) else {
                 continue;
             };
-            if checkpoint_id < cutoff {
+            if checkpoint_id < cutoff && !pinned.contains(&CheckpointId(checkpoint_id)) {
                 self.store
                     .delete(&entry.location)
                     .await
@@ -227,10 +353,13 @@ impl CheckpointManifestStore {
         if latest_checkpoint_id.0 <= retention_horizon {
             return Ok(Vec::new());
         }
+        let pinned = GcPinStore::new(self.store.clone())
+            .pinned_checkpoint_ids()
+            .await?;
         let cutoff = latest_checkpoint_id.0 - retention_horizon;
         let mut deleted = Vec::new();
         for checkpoint_id in self.list_manifest_ids().await? {
-            if checkpoint_id.0 < cutoff {
+            if checkpoint_id.0 < cutoff && !pinned.contains(&checkpoint_id) {
                 self.store
                     .delete(&self.manifest_path(checkpoint_id))
                     .await

@@ -1020,34 +1020,10 @@ impl MigrationCoordinator {
         let mut verification_started = record.clone();
         verification_started.record_verification_progress(0);
         self.save_record(record, verification_started).await?;
-        let donor_entries = filtered_entries(donor, &record.buckets).await?;
-        let recipient_entries = filtered_entries(recipient, &record.buckets).await?;
-        let scanned = donor_entries.len().max(recipient_entries.len());
-        if scanned > MAX_VERIFY_SCAN_KEYS {
-            return Err(MigrationError::VerifyWindowFull {
-                code: "RS-5031",
-                used: scanned,
-                max: MAX_VERIFY_SCAN_KEYS,
-                next_steps: "reduce verify_sample_rate, split the migration into fewer buckets, or increase the verify scan bound if memory headroom allows",
-            });
-        }
         let _sample_rate = self.verify_sample_rate;
-        if donor_entries != recipient_entries {
+        if let Some(key_hex) = stream_verify_buckets(donor, recipient, &record.buckets).await? {
             self.transition_record_durable(record, MigrationState::DualWriting, audit)
                 .await?;
-            let key_hex = donor_entries
-                .iter()
-                .zip(recipient_entries.iter())
-                .find_map(|(left, right)| {
-                    if left != right {
-                        Some(hex_key(&left.0))
-                    } else {
-                        None
-                    }
-                })
-                .or_else(|| donor_entries.first().map(|(k, _)| hex_key(k)))
-                .or_else(|| recipient_entries.first().map(|(k, _)| hex_key(k)))
-                .unwrap_or_else(|| "none".to_string());
             return Err(MigrationError::VerificationDiverged { key_hex });
         }
         let mut verification_completed = record.clone();
@@ -1217,49 +1193,138 @@ fn assert_single_authoritative(record: &MigrationRecord) {
     );
 }
 
-async fn filtered_entries(
-    shard: &MigrationShard,
-    buckets: &BucketSet,
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>, MigrationError> {
-    let mut filtered = Vec::new();
-    for bucket in &buckets.buckets {
-        let prefix = bucket_key_prefix(*bucket);
-        let reader = ShardReader::open(shard.path.clone(), shard.object_store.clone())
-            .await
-            .map_err(|e| MigrationError::Storage(format!("open shard verifier: {e}")))?;
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
-        let producer = tokio::spawn({
-            async move {
-                reader
-                    .scan_prefix_pages(&prefix, MAX_COPY_CHUNK_ROWS, MAX_COPY_CHUNK_BYTES, sender)
-                    .await;
-            }
-        });
-        while let Some(page) = receiver.recv().await {
-            let entries =
-                page.map_err(|e| MigrationError::Storage(format!("scan shard entries: {e}")))?;
-            if filtered.len() + entries.len() > MAX_VERIFY_SCAN_KEYS {
-                producer.abort();
-                let _ = producer.await;
-                return Err(MigrationError::VerifyWindowFull {
-                    code: "RS-5031",
-                    used: MAX_VERIFY_SCAN_KEYS + 1,
-                    max: MAX_VERIFY_SCAN_KEYS,
-                    next_steps: "reduce verify_sample_rate, split the migration into fewer buckets, or increase the verify scan bound if memory headroom allows",
-                });
-            }
-            filtered.extend(
-                entries
-                    .into_iter()
-                    .map(|(key, value)| (key.to_vec(), value.to_vec())),
-            );
+struct StreamingPageCursor {
+    receiver: tokio::sync::mpsc::Receiver<
+        Result<Vec<(bytes::Bytes, bytes::Bytes)>, rockstream_storage::StorageError>,
+    >,
+    current: std::collections::VecDeque<(bytes::Bytes, bytes::Bytes)>,
+}
+
+impl StreamingPageCursor {
+    fn new(
+        receiver: tokio::sync::mpsc::Receiver<
+            Result<Vec<(bytes::Bytes, bytes::Bytes)>, rockstream_storage::StorageError>,
+        >,
+    ) -> Self {
+        Self {
+            receiver,
+            current: std::collections::VecDeque::new(),
         }
-        producer
-            .await
-            .map_err(|e| MigrationError::Storage(format!("scan shard page task: {e}")))?;
     }
-    filtered.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(filtered)
+
+    async fn next_entry(&mut self) -> Result<Option<(bytes::Bytes, bytes::Bytes)>, MigrationError> {
+        loop {
+            if let Some(entry) = self.current.pop_front() {
+                return Ok(Some(entry));
+            }
+            match self.receiver.recv().await {
+                Some(Ok(page)) => {
+                    if page.is_empty() {
+                        continue;
+                    }
+                    self.current = page.into();
+                }
+                Some(Err(error)) => {
+                    return Err(MigrationError::Storage(format!(
+                        "scan shard entries: {error}"
+                    )));
+                }
+                None => return Ok(None),
+            }
+        }
+    }
+}
+
+/// Stream donor and recipient buckets page-by-page in lockstep with bounded
+/// resident memory. Returns `Ok(None)` if identical, or `Ok(Some(key_hex))`
+/// for the first diverging key.
+async fn stream_verify_buckets(
+    donor: &MigrationShard,
+    recipient: &MigrationShard,
+    buckets: &BucketSet,
+) -> Result<Option<String>, MigrationError> {
+    for &bucket in &buckets.buckets {
+        let prefix = bucket_key_prefix(bucket);
+        let donor_reader = ShardReader::open(donor.path.clone(), donor.object_store.clone())
+            .await
+            .map_err(|e| MigrationError::Storage(format!("open donor verifier: {e}")))?;
+        let recipient_reader =
+            ShardReader::open(recipient.path.clone(), recipient.object_store.clone())
+                .await
+                .map_err(|e| MigrationError::Storage(format!("open recipient verifier: {e}")))?;
+
+        let (donor_tx, donor_rx) = tokio::sync::mpsc::channel(1);
+        let (recipient_tx, recipient_rx) = tokio::sync::mpsc::channel(1);
+        let donor_prefix = prefix.clone();
+        let donor_producer = tokio::spawn(async move {
+            donor_reader
+                .scan_prefix_pages(
+                    &donor_prefix,
+                    MAX_COPY_CHUNK_ROWS,
+                    MAX_COPY_CHUNK_BYTES,
+                    donor_tx,
+                )
+                .await;
+        });
+        let recipient_producer = tokio::spawn(async move {
+            recipient_reader
+                .scan_prefix_pages(
+                    &prefix,
+                    MAX_COPY_CHUNK_ROWS,
+                    MAX_COPY_CHUNK_BYTES,
+                    recipient_tx,
+                )
+                .await;
+        });
+
+        let mut donor_cursor = StreamingPageCursor::new(donor_rx);
+        let mut recipient_cursor = StreamingPageCursor::new(recipient_rx);
+        let mut diverged_key = None;
+
+        loop {
+            let left = donor_cursor.next_entry().await;
+            let right = recipient_cursor.next_entry().await;
+            match (left, right) {
+                (Ok(None), Ok(None)) => break,
+                (Ok(Some((lk, lv))), Ok(Some((rk, rv)))) if lk == rk && lv == rv => continue,
+                (Ok(Some((lk, _))), Ok(Some((rk, _)))) => {
+                    diverged_key = Some(hex_key(if lk <= rk { &lk } else { &rk }));
+                    break;
+                }
+                (Ok(Some((lk, _))), Ok(None)) => {
+                    diverged_key = Some(hex_key(&lk));
+                    break;
+                }
+                (Ok(None), Ok(Some((rk, _)))) => {
+                    diverged_key = Some(hex_key(&rk));
+                    break;
+                }
+                (Err(err), _) | (_, Err(err)) => {
+                    donor_producer.abort();
+                    recipient_producer.abort();
+                    let _ = donor_producer.await;
+                    let _ = recipient_producer.await;
+                    return Err(err);
+                }
+            }
+        }
+
+        if diverged_key.is_some() {
+            donor_producer.abort();
+            recipient_producer.abort();
+            let _ = donor_producer.await;
+            let _ = recipient_producer.await;
+            return Ok(diverged_key);
+        }
+
+        donor_producer
+            .await
+            .map_err(|e| MigrationError::Storage(format!("scan donor verifier task: {e}")))?;
+        recipient_producer
+            .await
+            .map_err(|e| MigrationError::Storage(format!("scan recipient verifier task: {e}")))?;
+    }
+    Ok(None)
 }
 
 async fn cleanup_donor_buckets(
