@@ -1,0 +1,85 @@
+diff --git a/crates/rockstream-runtime/tests/fast_path_wal_elision_tests.rs b/crates/rockstream-runtime/tests/fast_path_wal_elision_tests.rs
+index 03d9a7ae..fede53c0 100644
+--- a/crates/rockstream-runtime/tests/fast_path_wal_elision_tests.rs
++++ b/crates/rockstream-runtime/tests/fast_path_wal_elision_tests.rs
+@@ -517,0 +518,80 @@ async fn exercise_durable_catch_up_survives_restart(
++#[tokio::test]
++async fn issue_321_durable_catch_up_retries_after_closed_inlet() {
++    let dir = tempfile::tempdir().unwrap();
++    let store: Arc<dyn ObjectStore> =
++        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
++    let target = reopen_db("rejected-dst", store.clone()).await;
++    let (registry, inlet_rx) = make_receiver_registry(target.clone());
++    drop(inlet_rx);
++
++    let payload = serialize_zset(&ArrowZSet::from_ab_rows(&[(5, 50), (6, 60)], 1)).unwrap();
++    let mut writer = rockstream_runtime::exchange::durable::DurableShuffleWriter::new();
++    writer.add_frame(0, 1, 1, &payload).unwrap();
++    writer
++        .finish(
++            store.as_ref(),
++            &object_store::path::Path::from("shuffle/100/1/811/812"),
++        )
++        .await
++        .unwrap();
++    let mux = WorkerStreamMultiplexer::new(ShuffleClientPool::default(), FlowController::new());
++    assert_eq!(
++        rockstream_runtime::exchange::persistence::committed_frontier(&target)
++            .await
++            .unwrap(),
++        0
++    );
++
++    let rejected = mux
++        .catch_up_durable(
++            100,
++            1,
++            WorkerId(811),
++            WorkerId(812),
++            &registry,
++            store.as_ref(),
++        )
++        .await;
++    target.close().await.unwrap();
++
++    let reopened = reopen_db("rejected-dst", store.clone()).await;
++    assert_eq!(
++        rockstream_runtime::exchange::persistence::committed_frontier(&reopened)
++            .await
++            .unwrap(),
++        0
++    );
++    let (registry, mut inlet_rx) = make_receiver_registry(reopened.clone());
++    let resumed = mux
++        .catch_up_durable(
++            100,
++            1,
++            WorkerId(811),
++            WorkerId(812),
++            &registry,
++            store.as_ref(),
++        )
++        .await;
++    let rows =
++        match tokio::time::timeout(std::time::Duration::from_millis(150), inlet_rx.recv()).await {
++            Ok(Some(zset)) => Some(zset.positive_ab_rows()),
++            Ok(None) => panic!("reopened inlet closed"),
++            Err(_) => None,
++        };
++    let repeated = mux
++        .catch_up_durable(
++            100,
++            1,
++            WorkerId(811),
++            WorkerId(812),
++            &registry,
++            store.as_ref(),
++        )
++        .await;
++    let no_duplicate = matches!(inlet_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));
++    assert_eq!(
++        (rejected.is_err(), resumed, rows, repeated, no_duplicate),
++        (true, Ok(()), Some(vec![(5, 50), (6, 60)]), Ok(()), true)
++    );
++}
++

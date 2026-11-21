@@ -25,10 +25,11 @@ use rockstream_control::management_store::{
 };
 use rockstream_management_proto::v1::{
     management_service_client::ManagementServiceClient, CancelOperationRequest,
-    CreateBackupRequest, DownloadSupportArtifactRequest, GenerateSupportArtifactRequest,
-    GenerateSupportArtifactResponse, GetClusterStatusRequest, GetOperationRequest,
-    ListOperationsRequest, ListSecurityPrincipalsRequest, Operation as ManagementWireOperation,
-    SecurityActionGrant, SecurityPresetGrant, SetSecurityPrincipalGrantsRequest,
+    CreateBackupRequest, DownloadSupportArtifactChunk, DownloadSupportArtifactRequest,
+    GenerateSupportArtifactRequest, GenerateSupportArtifactResponse, GetClusterStatusRequest,
+    GetOperationRequest, ListOperationsRequest, ListSecurityPrincipalsRequest,
+    Operation as ManagementWireOperation, SecurityActionGrant, SecurityPresetGrant,
+    SetSecurityPrincipalGrantsRequest,
 };
 use rockstream_runtime::exchange::pool::ShuffleClientPool;
 use rockstream_runtime::exchange::proto::ShuffleFrame;
@@ -1252,21 +1253,12 @@ async fn wait_for_management_client(
     }
 }
 
-async fn download_support_artifact(
-    client: &mut ManagementServiceClient<tonic::transport::Channel>,
-    opaque_id: &str,
+async fn read_support_artifact_stream(
+    mut stream: tonic::Streaming<DownloadSupportArtifactChunk>,
+    mut content: Vec<u8>,
 ) -> (Vec<u8>, u64) {
-    let mut stream = client
-        .download_support_artifact(DownloadSupportArtifactRequest {
-            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
-            opaque_id: opaque_id.to_owned(),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    let mut content = Vec::new();
     let mut expires_at_ms = None;
-    let mut expected_offset = 0;
+    let mut expected_offset = content.len() as u64;
     let mut final_chunk = false;
     while let Some(chunk) = stream.message().await.unwrap() {
         assert_eq!(chunk.offset, expected_offset);
@@ -1286,14 +1278,45 @@ async fn download_support_artifact(
     )
 }
 
-fn support_artifact_object_path(id: &str) -> object_store::path::Path {
+async fn download_support_artifact(
+    client: &mut ManagementServiceClient<tonic::transport::Channel>,
+    opaque_id: &str,
+) -> (Vec<u8>, u64) {
+    let stream = client
+        .download_support_artifact(DownloadSupportArtifactRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            opaque_id: opaque_id.to_owned(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    read_support_artifact_stream(stream, Vec::new()).await
+}
+
+async fn support_artifact_object_path(
+    store: &dyn object_store::ObjectStore,
+    id: &str,
+) -> object_store::path::Path {
     let encoded_id = id
         .as_bytes()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
+    let ledger_path = object_store::path::Path::from("control/support-artifacts/ledger.json");
+    let generation = match store.get(&ledger_path).await {
+        Ok(ledger) => {
+            let bytes = ledger.bytes().await.unwrap();
+            let ledger: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            ledger["object_generations"][id]
+                .as_str()
+                .map(|generation| format!("-{generation}"))
+                .unwrap_or_default()
+        }
+        Err(object_store::Error::NotFound { .. }) => String::new(),
+        Err(error) => panic!("failed to read support-artifact ledger: {error}"),
+    };
     object_store::path::Path::from("control/support-artifacts")
-        .join(format!("artifacts/{encoded_id}.json"))
+        .join(format!("artifacts/{encoded_id}{generation}.json"))
 }
 
 #[tokio::test]
@@ -6788,7 +6811,7 @@ async fn operator_can_cancel_pending_support_artifact_over_release_management_ap
     assert_eq!(retry.code(), tonic::Code::FailedPrecondition);
     assert!(matches!(
         management_store
-            .get(&support_artifact_object_path(&operation_id))
+            .get(&support_artifact_object_path(&management_store, &operation_id).await)
             .await,
         Err(object_store::Error::NotFound { .. })
     ));
@@ -6921,7 +6944,7 @@ async fn support_artifact_generation_and_cancellation_race_has_one_durable_winne
             assert_eq!(operation, cancelled);
             assert!(matches!(
                 management_store
-                    .get(&support_artifact_object_path(&operation_id))
+                    .get(&support_artifact_object_path(&management_store, &operation_id).await)
                     .await,
                 Err(object_store::Error::NotFound { .. })
             ));
@@ -7067,12 +7090,6 @@ async fn support_artifact_reconciles_durable_boundaries_after_process_exit() {
         let expected_actions = match *boundary {
             "start-audit" | "ledger-reserved" | "artifact-written" => vec![
                 SecurityAuditClass::AdminOperationStart,
-                SecurityAuditClass::AdminOperationStart,
-                SecurityAuditClass::AdminOperationCompletion,
-            ],
-            "completion-audit" => vec![
-                SecurityAuditClass::AdminOperationStart,
-                SecurityAuditClass::AdminOperationCompletion,
                 SecurityAuditClass::AdminOperationStart,
                 SecurityAuditClass::AdminOperationCompletion,
             ],
@@ -7271,9 +7288,9 @@ async fn support_artifact_reconciles_durable_boundaries_after_process_exit() {
     assert_eq!(actual_ids, operation_ids);
 
     let expired_id = operation_ids[0].clone();
-    let expired_path = support_artifact_object_path(&expired_id);
+    let expired_path = support_artifact_object_path(&management_store, &expired_id).await;
     let survivor_id = operation_ids[1].clone();
-    let survivor_path = support_artifact_object_path(&survivor_id);
+    let survivor_path = support_artifact_object_path(&management_store, &survivor_id).await;
     let survivor_bytes = management_store
         .get(&survivor_path)
         .await
@@ -7539,7 +7556,7 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
     );
     let ledger_path = object_store::path::Path::from("control/support-artifacts/ledger.json");
     let pressure_id = uuid::Uuid::new_v4().to_string();
-    let pressure_blob_path = support_artifact_object_path(&pressure_id);
+    let pressure_blob_path = support_artifact_object_path(&management_store, &pressure_id).await;
     let pressure_size = 10 * 1024 * 1024;
     let pressure_payload = vec![0u8; pressure_size];
     let ledger_bytes = management_store
@@ -7652,11 +7669,11 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
 
     let expired_id = uuid::Uuid::new_v4().to_string();
     let expired_content = b"{\"format_version\":1,\"safe\":\"expired fixture\"}";
-    let expired_blob_path = support_artifact_object_path(&expired_id);
+    let expired_blob_path = support_artifact_object_path(&management_store, &expired_id).await;
     let foreign_id = uuid::Uuid::new_v4().to_string();
     let foreign_content = b"{\"format_version\":1,\"safe\":\"foreign fixture\"}";
-    let foreign_blob_path = support_artifact_object_path(&foreign_id);
-    let first_blob_path = support_artifact_object_path(&first.opaque_id);
+    let foreign_blob_path = support_artifact_object_path(&management_store, &foreign_id).await;
+    let first_blob_path = support_artifact_object_path(&management_store, &first.opaque_id).await;
     let stored_artifacts = management_store
         .list_with_delimiter(Some(&object_store::path::Path::from(
             "control/support-artifacts",
@@ -7743,7 +7760,8 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
     );
     let live_expiry_id = uuid::Uuid::new_v4().to_string();
     let live_expiry_content = b"{\"format_version\":1,\"safe\":\"live expiry fixture\"}";
-    let live_expiry_blob_path = support_artifact_object_path(&live_expiry_id);
+    let live_expiry_blob_path =
+        support_artifact_object_path(&management_store, &live_expiry_id).await;
     let live_expiry_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -8260,7 +8278,7 @@ async fn support_artifact_runs_in_release_process_and_recovers_after_restart() {
         )
         .await
         .unwrap();
-    let recovery_blob_path = support_artifact_object_path(&recovery_id);
+    let recovery_blob_path = support_artifact_object_path(&management_store, &recovery_id).await;
     let ledger_bytes = management_store
         .get(&ledger_path)
         .await
@@ -8482,7 +8500,7 @@ async fn support_artifact_generation_rejects_full_deployment_budget() {
     assert_eq!(actual_ids, expected_ids);
     assert!(matches!(
         management_store
-            .get(&support_artifact_object_path(&idempotency_key))
+            .get(&support_artifact_object_path(&management_store, &idempotency_key).await)
             .await,
         Err(object_store::Error::NotFound { .. })
     ));
@@ -8534,7 +8552,7 @@ async fn support_artifact_generation_rejects_full_deployment_budget() {
     );
     assert!(matches!(
         management_store
-            .get(&support_artifact_object_path(&count_key))
+            .get(&support_artifact_object_path(&management_store, &count_key).await)
             .await,
         Err(object_store::Error::NotFound { .. })
     ));
@@ -8833,7 +8851,7 @@ async fn support_artifact_budget_is_shared_between_release_processes_once() {
         "unexpected complete artifact: {actual_content}"
     );
     let stored_winner = management_store
-        .get(&support_artifact_object_path(&winner_id))
+        .get(&support_artifact_object_path(&management_store, &winner_id).await)
         .await
         .unwrap()
         .bytes()
@@ -8842,7 +8860,7 @@ async fn support_artifact_budget_is_shared_between_release_processes_once() {
     assert_eq!(stored_winner.as_ref(), downloaded.as_slice());
     assert!(matches!(
         management_store
-            .get(&support_artifact_object_path(&loser_id))
+            .get(&support_artifact_object_path(&management_store, &loser_id).await)
             .await,
         Err(object_store::Error::NotFound { .. })
     ));
@@ -8915,7 +8933,7 @@ async fn support_artifact_budget_is_shared_between_release_processes_once() {
         }
         assert!(matches!(
             management_store
-                .get(&support_artifact_object_path(&id))
+                .get(&support_artifact_object_path(&management_store, &id).await)
                 .await,
             Err(object_store::Error::NotFound { .. })
         ));
@@ -9080,6 +9098,389 @@ async fn support_artifact_budget_is_shared_between_release_processes_once() {
             .collect::<Vec<_>>();
         assert_eq!(actual, expected_audit);
     }
+}
+
+#[tokio::test]
+async fn support_artifact_download_limit_holds_under_release_process_pressure() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    assert!(rockstream_test_support::docker_available());
+    let bucket = "rockstream-release-support-download-pressure";
+    let (_minio, minio_port) = rockstream_test_support::minio::start_minio(bucket)
+        .await
+        .expect("MinIO is required for support-artifact download pressure qualification");
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("control-storage");
+    let pki = rockstream_test_support::pki::TestPki::generate();
+    let control_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let management_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut process = start_control_process(
+        temp.path(),
+        &storage,
+        control_address,
+        management_address,
+        &pki,
+        Some((minio_port, bucket)),
+        true,
+    )
+    .await;
+    wait_for_gateway(&mut process.0, control_address).await;
+    let mut client = wait_for_management_client(management_address, &pki).await;
+
+    let artifact_id = uuid::Uuid::new_v4().to_string();
+    let generated = client
+        .generate_support_artifact(GenerateSupportArtifactRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            node_id: String::new(),
+            idempotency_key: artifact_id.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(generated.opaque_id, artifact_id);
+    let expires_at_ms = generated.expires_at_ms;
+    let management_store = object_store::prefix::PrefixStore::new(
+        rockstream_test_support::minio::minio_object_store(minio_port, bucket),
+        "management",
+    );
+    let ledger_path = object_store::path::Path::from("control/support-artifacts/ledger.json");
+    let artifact_path = support_artifact_object_path(&management_store, &artifact_id).await;
+    let mut content = management_store
+        .get(&artifact_path)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap()
+        .to_vec();
+    content.resize(10 * 1024 * 1024, b' ');
+    let mut ledger: serde_json::Value = serde_json::from_slice(
+        &management_store
+            .get(&ledger_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    ledger["artifacts"][&artifact_id]["size"] = serde_json::json!(content.len());
+    let ledger_bytes = serde_json::to_vec(&ledger).unwrap();
+    management_store
+        .put(&artifact_path, content.clone().into())
+        .await
+        .unwrap();
+    management_store
+        .put(&ledger_path, ledger_bytes.clone().into())
+        .await
+        .unwrap();
+
+    let second_control_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let second_management_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut second_process = start_control_process(
+        temp.path(),
+        &temp.path().join("control-two"),
+        second_control_address,
+        second_management_address,
+        &pki,
+        Some((minio_port, bucket)),
+        true,
+    )
+    .await;
+    wait_for_gateway(&mut second_process.0, second_control_address).await;
+    let mut second_client = wait_for_management_client(second_management_address, &pki).await;
+
+    let security_store: Arc<dyn ObjectStore> = Arc::new(object_store::prefix::PrefixStore::new(
+        rockstream_test_support::minio::minio_object_store(minio_port, bucket),
+        "gateway-shard",
+    ));
+    let catalog = DurableCatalogStore::recover(security_store, "gateway")
+        .await
+        .unwrap();
+    let operations_before = client
+        .list_operations(ListOperationsRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            page_size: 100,
+            page_token: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        operations_before.protocol_version,
+        rockstream_management_proto::PROTOCOL_VERSION
+    );
+    assert_eq!(
+        operations_before.source_version,
+        "management-operation-records:v1"
+    );
+    assert_eq!(operations_before.operations.len(), 1);
+    let operation = operations_before.operations.first().unwrap();
+    let started_at = operation.started_at.clone();
+    let updated_at = operation.updated_at.clone();
+    assert_eq!(
+        operations_before.operations,
+        vec![rockstream_management_proto::v1::Operation {
+            operation_id: artifact_id.clone(),
+            kind: "generate_support_artifact".to_owned(),
+            state: "succeeded".to_owned(),
+            started_at: started_at.clone(),
+            updated_at: updated_at.clone(),
+            progress: "100%".to_owned(),
+            phase: format!("available_until_ms:{expires_at_ms}"),
+            error_code: String::new(),
+            next_steps: Vec::new(),
+            source_version: format!("operation-record:{MANAGEMENT_OPERATION_RECORD_VERSION}"),
+            result_json: String::new(),
+        }]
+    );
+    assert!(chrono::DateTime::parse_from_rfc3339(&started_at).is_ok());
+    assert!(chrono::DateTime::parse_from_rfc3339(&updated_at).is_ok());
+    assert!(operations_before.next_page_token.is_empty());
+    catalog.refresh().await.unwrap();
+    let audit_before = catalog.list_security_audit_records().await.unwrap();
+
+    let mut first_streams = Vec::new();
+    for _ in 0..8 {
+        let stream = client
+            .download_support_artifact(DownloadSupportArtifactRequest {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                opaque_id: artifact_id.clone(),
+            })
+            .await
+            .expect("the first process should admit its first eight concurrent downloads")
+            .into_inner();
+        first_streams.push(stream);
+    }
+
+    let mut second_streams = Vec::new();
+    for _ in 0..8 {
+        let stream = second_client
+            .download_support_artifact(DownloadSupportArtifactRequest {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                opaque_id: artifact_id.clone(),
+            })
+            .await
+            .expect("the second process should admit its first eight concurrent downloads")
+            .into_inner();
+        second_streams.push(stream);
+    }
+
+    let first_rejected = match client
+        .download_support_artifact(DownloadSupportArtifactRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            opaque_id: artifact_id.clone(),
+        })
+        .await
+    {
+        Ok(_) => panic!("the ninth concurrent release download was admitted"),
+        Err(error) => error,
+    };
+    assert_eq!(first_rejected.code(), tonic::Code::ResourceExhausted);
+    assert_eq!(
+        first_rejected.message(),
+        "support artifact download limit reached"
+    );
+
+    let second_rejected = match second_client
+        .download_support_artifact(DownloadSupportArtifactRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            opaque_id: artifact_id.clone(),
+        })
+        .await
+    {
+        Ok(_) => panic!("the ninth concurrent release download was admitted"),
+        Err(error) => error,
+    };
+    assert_eq!(second_rejected.code(), tonic::Code::ResourceExhausted);
+    assert_eq!(
+        second_rejected.message(),
+        "support artifact download limit reached"
+    );
+
+    let first_full_stream = first_streams
+        .pop()
+        .expect("one admitted stream remains open");
+    let second_full_stream = second_streams
+        .pop()
+        .expect("one admitted stream remains open");
+    drop(first_streams);
+    drop(second_streams);
+    let first_deadline = Instant::now() + Duration::from_secs(5);
+    let first_recovered_stream = loop {
+        match client
+            .download_support_artifact(DownloadSupportArtifactRequest {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                opaque_id: artifact_id.clone(),
+            })
+            .await
+        {
+            Ok(response) => break response.into_inner(),
+            Err(error)
+                if error.code() == tonic::Code::ResourceExhausted
+                    && Instant::now() < first_deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => panic!(
+                "first-process download capacity did not recover after stream close: {error}"
+            ),
+        }
+    };
+    let second_deadline = Instant::now() + Duration::from_secs(5);
+    let second_recovered_stream = loop {
+        match second_client
+            .download_support_artifact(DownloadSupportArtifactRequest {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                opaque_id: artifact_id.clone(),
+            })
+            .await
+        {
+            Ok(response) => break response.into_inner(),
+            Err(error)
+                if error.code() == tonic::Code::ResourceExhausted
+                    && Instant::now() < second_deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => panic!(
+                "second-process download capacity did not recover after stream close: {error}"
+            ),
+        }
+    };
+    drop(first_recovered_stream);
+    drop(second_recovered_stream);
+    let (first_full, second_full) = tokio::join!(
+        tokio::time::timeout(
+            Duration::from_secs(120),
+            read_support_artifact_stream(first_full_stream, Vec::new()),
+        ),
+        tokio::time::timeout(
+            Duration::from_secs(120),
+            read_support_artifact_stream(second_full_stream, Vec::new()),
+        ),
+    );
+    let (first_bytes, first_expiry) = first_full.expect("first-process download did not drain");
+    let (second_bytes, second_expiry) = second_full.expect("second-process download did not drain");
+    assert_eq!(first_bytes, content);
+    assert_eq!(first_expiry, expires_at_ms);
+    assert_eq!(second_bytes, content);
+    assert_eq!(second_expiry, expires_at_ms);
+    let first_completed_stream = client
+        .download_support_artifact(DownloadSupportArtifactRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            opaque_id: artifact_id.clone(),
+        })
+        .await
+        .expect("a completed first-process download should release its permit")
+        .into_inner();
+    drop(first_completed_stream);
+    let second_completed_stream = second_client
+        .download_support_artifact(DownloadSupportArtifactRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            opaque_id: artifact_id.clone(),
+        })
+        .await
+        .expect("a completed second-process download should release its permit")
+        .into_inner();
+    drop(second_completed_stream);
+
+    let operations_after = client
+        .list_operations(ListOperationsRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            page_size: 100,
+            page_token: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(operations_after.operations, operations_before.operations);
+    assert_eq!(
+        operations_after.source_version,
+        operations_before.source_version
+    );
+    assert_eq!(
+        operations_after.next_page_token,
+        operations_before.next_page_token
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(
+            &management_store
+                .get(&ledger_path)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+        )
+        .unwrap(),
+        ledger
+    );
+    assert_eq!(
+        management_store
+            .get(&support_artifact_object_path(&management_store, &artifact_id).await)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .as_ref(),
+        content.as_slice()
+    );
+
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+    second_process.0.kill().unwrap();
+    second_process.0.wait().unwrap();
+    let security_store: Arc<dyn ObjectStore> = Arc::new(object_store::prefix::PrefixStore::new(
+        rockstream_test_support::minio::minio_object_store(minio_port, bucket),
+        "gateway-shard",
+    ));
+    let recovered_catalog = DurableCatalogStore::recover(security_store, "gateway")
+        .await
+        .unwrap();
+    let records = recovered_catalog
+        .list_security_audit_records()
+        .await
+        .unwrap();
+    assert_eq!(records.len(), audit_before.len() + 20);
+    assert_eq!(&records[..audit_before.len()], audit_before.as_slice());
+    let expected_scope = serde_json::to_string(&PolicyScope::Artifact {
+        opaque_id: artifact_id.clone(),
+    })
+    .unwrap();
+    let mut downloads = records[audit_before.len()..].to_vec();
+    let mut event_ids = Vec::new();
+    for record in &mut downloads {
+        assert!(record.timestamp_ms > 0);
+        assert!(record.event_id.starts_with("support-artifact-"));
+        event_ids.push(record.event_id.clone());
+        record.timestamp_ms = 0;
+        record.event_id = "support-artifact".to_owned();
+    }
+    event_ids.sort();
+    assert!(event_ids.windows(2).all(|pair| pair[0] != pair[1]));
+    assert_eq!(
+        downloads,
+        vec![
+            SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: "support-artifact".to_owned(),
+                timestamp_ms: 0,
+                actor: AuditIdentity::Verified("principal:1".to_owned()),
+                target: AuditField::Known(format!("support-artifact:{artifact_id}")),
+                scope: AuditField::Known(expected_scope),
+                action: SecurityAuditClass::AdminOperationStart,
+                outcome: SecurityAuditOutcome::Success,
+                correlation: AuditCorrelation::Unknown,
+                operation_id: AuditField::NotApplicable,
+                policy_revision: AuditField::Known(1),
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::NotApplicable,
+            };
+            20
+        ]
+    );
 }
 
 #[cfg(unix)]

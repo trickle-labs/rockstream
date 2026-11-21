@@ -414,6 +414,194 @@ async fn test_client_retry_deduplicated_post_recovery() {
     handle2.abort();
 }
 
+/// Issue #344 regression B:
+/// Two independent connections concurrently commit the exact same idempotency key
+/// into a heap table without a primary key, synchronized at a deterministic barrier
+/// right before `shard_commit_lock`. Exactly one transaction must apply; the other
+/// must take the replay path without duplicating rows, view state, frontier/idempotency
+/// state, subscription changes, or transactional notifications, and restart replay
+/// must remain unchanged.
+#[tokio::test]
+async fn test_concurrent_identical_idempotency_key_race_applies_once() {
+    use sha2::{Digest, Sha256};
+
+    fn key_hash(s: &str) -> [u8; 16] {
+        let digest = Sha256::digest(s.as_bytes());
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&digest[..16]);
+        out
+    }
+
+    let dir = tempdir().unwrap();
+    let store =
+        Arc::new(object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let shard_path = "idempotency-race-shard";
+    let prefix = "catalog-idempotency-race";
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let (port1, handle1, shard_db1, subscribe_registry) = {
+        let shard_db = Arc::new(
+            ShardDb::builder(shard_path, store.clone())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let durable = Arc::new(DurableCatalogStore::new(store.clone(), prefix));
+        let catalog = Arc::new(CatalogStubs::new());
+        catalog.set_durable_store(durable);
+
+        let view_reader = Arc::new(NoopViewReader);
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = GatewayServer::with_shard_db(addr, catalog, view_reader, shard_db.clone())
+            .with_commit_lock_barrier_for_test(barrier);
+        let subscribe_registry = server.subscribe_registry().clone();
+        let (local_addr, handle) = server.serve_background().await.unwrap();
+        (local_addr.port(), handle, shard_db, subscribe_registry)
+    };
+
+    let setup = connect_port(port1).await;
+    setup
+        .simple_query("CREATE TABLE t_race (v BIGINT);")
+        .await
+        .unwrap();
+    setup
+        .simple_query("CREATE MATERIALIZED VIEW mv_race AS SELECT SUM(v) AS total FROM t_race;")
+        .await
+        .unwrap();
+
+    // Dedicated listener to verify transactional NOTIFY is delivered once and not leaked on replay.
+    let (listener, mut listener_conn) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port1} user=test dbname=test"),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        while let Some(msg) = futures::future::poll_fn(|cx| listener_conn.poll_message(cx)).await {
+            if let Ok(tokio_postgres::AsyncMessage::Notification(n)) = msg {
+                let _ = notify_tx.send(n.payload().to_string());
+            }
+        }
+    });
+    listener.simple_query("LISTEN race_ch;").await.unwrap();
+
+    let c1 = connect_port(port1).await;
+    let c2 = connect_port(port1).await;
+
+    for c in [&c1, &c2] {
+        c.simple_query("SET rockstream.idempotency_key = 'race-key-001';")
+            .await
+            .unwrap();
+        c.simple_query("BEGIN;").await.unwrap();
+        c.simple_query("INSERT INTO t_race VALUES (10);")
+            .await
+            .unwrap();
+        c.simple_query("NOTIFY race_ch, 'committed';")
+            .await
+            .unwrap();
+    }
+
+    let (r1, r2) = tokio::join!(c1.simple_query("COMMIT;"), c2.simple_query("COMMIT;"));
+    r1.expect("c1 COMMIT failed");
+    r2.expect("c2 COMMIT failed");
+
+    shard_db1.flush().await.unwrap();
+
+    // Exact row multiset: only 1 row.
+    let table_rows = rows(&setup, "SELECT v FROM t_race;").await;
+    assert_eq!(table_rows, vec![vec!["10".to_string()]]);
+
+    // Dependent materialized view output.
+    let mv_rows = rows(&setup, "SELECT total FROM mv_race;").await;
+    assert_eq!(mv_rows, vec![vec!["10".to_string()]]);
+
+    // Frontier and durable idempotency outcome: only 1 epoch committed.
+    assert_eq!(shard_db1.last_epoch().load(Ordering::SeqCst), 1);
+    assert_eq!(
+        shard_db1
+            .get_idempotency_epoch(0, key_hash("race-key-001"))
+            .await
+            .unwrap(),
+        Some(1)
+    );
+
+    // Subscription changes: exactly 1 logical insert change.
+    let sub_changes = subscribe_registry
+        .since_epoch("t_race", 0)
+        .expect("expected subscription changes for t_race");
+    assert_eq!(sub_changes.len(), 1);
+    assert_eq!(sub_changes[0].epoch, 1);
+    assert_eq!(sub_changes[0].mz_diff, 1);
+    assert_eq!(sub_changes[0].encoded_row.as_ref(), b"10");
+
+    // Transactional NOTIFY delivered once; follow-up empty commits on both connections emit nothing.
+    c1.simple_query("BEGIN; COMMIT;").await.unwrap();
+    c2.simple_query("BEGIN; COMMIT;").await.unwrap();
+    listener.simple_query("SELECT 1;").await.unwrap();
+    let first_notify = tokio::time::timeout(Duration::from_secs(2), notify_rx.recv())
+        .await
+        .expect("expected 1 notification")
+        .expect("notify channel closed");
+    assert_eq!(first_notify, "committed");
+    let extra_notify = tokio::time::timeout(Duration::from_millis(100), notify_rx.recv()).await;
+    assert!(
+        extra_notify.is_err(),
+        "expected no duplicate or leaked notification, got {extra_notify:?}"
+    );
+
+    handle1.abort();
+
+    // Phase 2: reopen storage and retry with the same key; state must remain unchanged.
+    let (port2, handle2, shard_db2) = {
+        let shard_db = Arc::new(
+            ShardDb::builder(shard_path, store.clone())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let durable = Arc::new(
+            DurableCatalogStore::recover(store.clone(), prefix)
+                .await
+                .unwrap(),
+        );
+        let catalog = Arc::new(CatalogStubs::new());
+        catalog.set_durable_store(durable);
+        catalog.sync_from_durable_store().await.unwrap();
+
+        let view_reader = Arc::new(NoopViewReader);
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = GatewayServer::with_shard_db(addr, catalog, view_reader, shard_db.clone());
+        let (local_addr, handle) = server.serve_background().await.unwrap();
+        (local_addr.port(), handle, shard_db)
+    };
+
+    let c3 = connect_port(port2).await;
+    c3.simple_query("SET rockstream.idempotency_key = 'race-key-001';")
+        .await
+        .unwrap();
+    c3.simple_query("INSERT INTO t_race VALUES (10);")
+        .await
+        .unwrap();
+    c3.simple_query("COMMIT;").await.unwrap();
+
+    let table_rows_after = rows(&c3, "SELECT v FROM t_race;").await;
+    assert_eq!(table_rows_after, vec![vec!["10".to_string()]]);
+
+    let mv_rows_after = rows(&c3, "SELECT total FROM mv_race;").await;
+    assert_eq!(mv_rows_after, vec![vec!["10".to_string()]]);
+
+    assert_eq!(
+        shard_db2
+            .get_idempotency_epoch(0, key_hash("race-key-001"))
+            .await
+            .unwrap(),
+        Some(1)
+    );
+
+    handle2.abort();
+}
+
 /// Matrix D: Slow dependency branch blocks epoch publication.
 /// Downstream dependent view awaits completion of upstream slow branch.
 /// Failure or cancel in any branch prevents publication of the entire epoch.
