@@ -5,7 +5,7 @@ use futures::StreamExt;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 use rockstream_types::checkpoint::{CheckpointId, ClusterCheckpoint};
-use rockstream_types::error_code::RS_3022;
+use rockstream_types::error_code::{RS_0002, RS_0003, RS_3022};
 use rockstream_types::ids::ShardId;
 use serde::{Deserialize, Serialize};
 
@@ -64,7 +64,7 @@ impl GcPinStore {
             || pin_id.contains('/')
             || pin_id.contains('\\')
         {
-            return Err(format!("invalid gc pin id `{pin_id}`"));
+            return Err(format!("[{RS_0002}] invalid gc pin id `{pin_id}`"));
         }
         Ok(self.prefix.clone().join(pin_id))
     }
@@ -86,7 +86,7 @@ impl GcPinStore {
         let path = self.pin_path(pin_id)?;
         match self.store.delete(&path).await {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
-            Err(error) => Err(format!("delete gc pin {pin_id}: {error}")),
+            Err(error) => Err(format!("[{RS_0003}] delete gc pin {pin_id}: {error}")),
         }
     }
 
@@ -102,7 +102,7 @@ impl GcPinStore {
                     .await
                     .map_err(|error| format!("read gc pin {}: {error}", meta.location))?,
                 Err(object_store::Error::NotFound { .. }) => continue,
-                Err(error) => return Err(format!("get gc pin {}: {error}", meta.location)),
+                Err(error) => return Err(format!("[{RS_0003}] get gc pin {}: {error}", meta.location)),
             };
             let pin: GcPin = serde_json::from_slice(&bytes)
                 .map_err(|error| format!("decode gc pin {}: {error}", meta.location))?;
