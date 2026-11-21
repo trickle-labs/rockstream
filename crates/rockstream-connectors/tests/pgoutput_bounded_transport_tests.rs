@@ -154,14 +154,16 @@ async fn pgoutput_bounded_copy_preserves_complete_ordered_thousand_row_transcrip
     let actual = first_transaction(&mut source).await;
     assert_eq!(actual, expected, "full ordered pgoutput transcript");
     let transport = source.pgoutput_transport_stats();
-    assert_eq!(transport.peek_queries, 1, "never replay a transaction prefix");
+    assert_eq!(
+        transport.peek_queries, 1,
+        "never replay a transaction prefix"
+    );
     assert_eq!(transport.frames_received, frame_count);
     assert_eq!(transport.payload_bytes_received, byte_count);
     assert_eq!(frame_count, expected.len() as u64);
     assert!(transport.peak_chunk_bytes <= 8 * 1024);
     assert_eq!(
-        transport.peak_frame_buffered_bytes,
-        max_frame,
+        transport.peak_frame_buffered_bytes, max_frame,
         "peak buffered payload must match PostgreSQL's measured largest frame"
     );
     assert!(transport.peak_frame_buffered_bytes <= POSTGRES_CDC_MAX_TRANSACTION_BYTES);
@@ -185,7 +187,10 @@ async fn pgoutput_bounded_copy_preserves_complete_ordered_thousand_row_transcrip
         .await
         .unwrap()
         .get(0);
-    assert_eq!(remaining, 0, "the committed transaction was acknowledged exactly once");
+    assert_eq!(
+        remaining, 0,
+        "the committed transaction was acknowledged exactly once"
+    );
 }
 
 #[tokio::test]
@@ -240,7 +245,11 @@ async fn pgoutput_copy_rejects_oversized_frame_before_buffer_or_checkpoint_advan
     })
     .await
     .expect("oversized pgoutput transaction did not reject");
-    assert_eq!(received.len(), 2, "BEGIN and Relation precede oversized INSERT");
+    assert_eq!(
+        received.len(),
+        2,
+        "BEGIN and Relation precede oversized INSERT"
+    );
     assert!(matches!(received[0], PgOutputEvent::Begin { .. }));
     assert!(matches!(received[1], PgOutputEvent::Relation { .. }));
     assert!(error.to_string().contains("RS-4014"), "{error}");
@@ -263,8 +272,16 @@ async fn pgoutput_copy_rejects_oversized_frame_before_buffer_or_checkpoint_advan
 
     // An erroneous retry or direct attempt to ACK cannot skip the rejected
     // frame, and must not issue another peek or GET on the PostgreSQL slot.
-    assert!(source.poll_pgoutput_event(1).await.unwrap_err().to_string().contains("RS-4014"));
-    assert!(source.commit_offset(1, end_lsn.to_offset_token()).await.is_err());
+    assert!(source
+        .poll_pgoutput_event(1)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("RS-4014"));
+    assert!(source
+        .commit_offset(1, end_lsn.to_offset_token())
+        .await
+        .is_err());
     assert_eq!(source.pgoutput_transport_stats().peek_queries, 1);
     assert_eq!(source.confirmed_flush_lsn().await.unwrap(), before_ack);
 
@@ -292,8 +309,16 @@ async fn pgoutput_copy_rejects_oversized_frame_before_buffer_or_checkpoint_advan
         .collect::<Vec<_>>();
     assert_eq!(batches.len(), 1);
     let data = &batches[0].batch;
-    let ids = data.column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap();
-    let payloads = data.column(1).as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
+    let ids = data
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap();
+    let payloads = data
+        .column(1)
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .unwrap();
     assert_eq!(ids.values().as_ref(), &[1]);
     assert_eq!(payloads.value(0), "repaired");
 }
