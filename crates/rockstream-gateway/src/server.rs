@@ -23835,6 +23835,10 @@ fn parse_value_list(s: &str) -> Vec<String> {
 mod malformed_bind_tests;
 
 #[cfg(test)]
+#[path = "../tests/common/fail_catalog_log_writes.rs"]
+mod fail_catalog_log_writes;
+
+#[cfg(test)]
 // These legacy parser tests intentionally use unwrap/expect for concise fixture assertions.
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod s4_tests {
@@ -23934,8 +23938,12 @@ mod s4_tests {
         };
         use rockstream_types::ids::PrincipalId;
 
-        let object_store: Arc<dyn object_store::ObjectStore> =
-            Arc::new(object_store::memory::InMemory::new());
+        let fault_store = Arc::new(super::fail_catalog_log_writes::FailCatalogLogWrites {
+            inner: object_store::memory::InMemory::new(),
+            fail: std::sync::atomic::AtomicBool::new(false),
+            failed_appends: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let object_store: Arc<dyn object_store::ObjectStore> = fault_store.clone();
         let prefix = "gateway-policy-refresh";
         let writer = Arc::new(DurableCatalogStore::new(object_store.clone(), prefix));
         let principal = SecurityPrincipal {
@@ -24047,6 +24055,32 @@ mod s4_tests {
         };
         let mut removed_rows = second_query.data_rows();
         assert!(removed_rows.next().await.unwrap().is_ok());
+        let failed_audit_session = "failed-audit-subscription".to_string();
+        reader_handler
+            .sessions
+            .entry(failed_audit_session.clone())
+            .or_default()
+            .principal = previous_identity.clone();
+        let failed_audit_response = reader_handler
+            .handle_subscribe(
+                "SUBSCRIBE private_view AS OF NOW WITH SNAPSHOT",
+                Some(&failed_audit_session),
+            )
+            .await
+            .unwrap();
+        let Response::Query(failed_audit_query) = failed_audit_response.into_iter().next().unwrap()
+        else {
+            panic!("third authorized subscription returns a row stream");
+        };
+        let mut failed_audit_rows = failed_audit_query.data_rows();
+        assert_eq!(
+            decode_pgwire_row(&failed_audit_rows.next().await.unwrap().unwrap()),
+            vec![
+                Some("value".to_string()),
+                Some("0".to_string()),
+                Some("1".to_string())
+            ]
+        );
         let first = subscription_rows.next().await.unwrap().unwrap();
         assert_eq!(
             decode_pgwire_row(&first),
@@ -24270,6 +24304,23 @@ mod s4_tests {
             SecurityAuditClass::AuthorizationDenial
         );
         assert_eq!(removal_denial.outcome, SecurityAuditOutcome::Denied);
+
+        fault_store.fail.store(true, Ordering::SeqCst);
+        let Err(PgWireError::UserError(error)) = failed_audit_rows.next().await.unwrap() else {
+            panic!("an unavailable denial audit must fail the subscription");
+        };
+        assert_eq!(error.severity, "FATAL");
+        assert_eq!(error.code, "42501");
+        assert_eq!(error.message, "[RS-2401] auth.permission_denied: durable policy could not be revalidated or the denial could not be audited; this session's authorization state was invalidated.");
+        assert!(failed_audit_rows.next().await.is_none());
+        assert!(!reader_handler.sessions.contains_key(&failed_audit_session));
+        assert!(fault_store.failed_appends.load(Ordering::SeqCst) > 0);
+        fault_store.fail.store(false, Ordering::SeqCst);
+        reader.refresh().await.unwrap();
+        assert_eq!(
+            reader.list_security_audit_records().await.unwrap(),
+            after_removal
+        );
     }
 
     async fn make_handler_with_admin() -> (Arc<GatewayHandler>, String) {
