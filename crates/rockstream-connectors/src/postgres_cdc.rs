@@ -629,7 +629,8 @@ impl PostgresCdcSource {
             .host(&config.host)
             .port(config.port)
             .dbname(&config.database)
-            .user(&config.user);
+            .user(&config.user)
+            .application_name(format!("rockstream-pgoutput-{}", config.slot));
         if let Some(password) = &config.password {
             connection_config.password(password);
         }
@@ -1742,8 +1743,8 @@ impl PostgresCdcSource {
                 .stream_client
                 .copy_out(&pgoutput.event_copy_sql)
                 .await
-                .map_err(|error| SourceError::PollDeltaFailed {
-                    reason: format!("start bounded pgoutput COPY: {error}"),
+                .map_err(|error| {
+                    map_pgoutput_transport_error("start bounded pgoutput COPY", error)
                 })?;
             pgoutput.event_stream = Some(Box::pin(BinaryCopyOutStream::new(
                 stream,
@@ -1772,8 +1773,8 @@ impl PostgresCdcSource {
                 }
                 return Ok(None);
             };
-            let row = row.map_err(|error| SourceError::PollDeltaFailed {
-                reason: format!("read bounded pgoutput COPY: {error}"),
+            let row = row.map_err(|error| {
+                map_pgoutput_transport_error("read bounded pgoutput COPY", error)
             })?;
             let frame_len: Option<i32> = row.try_get(0).map_err(|error| {
                 pgoutput_transport_error(&format!("decode COPY frame length: {error}"))
@@ -1816,6 +1817,24 @@ impl PostgresCdcSource {
                 pgoutput.event_frame.transaction_bytes = 0;
             }
             return Ok(Some(payload));
+        }
+    }
+}
+
+fn map_pgoutput_transport_error(context: &str, error: tokio_postgres::Error) -> SourceError {
+    // Network disconnects are retryable at the durable slot LSN.
+    // Protocol, schema and decoding failures must still block.
+    if error.is_closed()
+        || error
+            .as_db_error()
+            .is_some_and(|db| db.code().code() == "57P01")
+    {
+        SourceError::Io(format!(
+            "RS-4017: pgoutput connection disconnected: {error}"
+        ))
+    } else {
+        SourceError::PollDeltaFailed {
+            reason: format!("{context}: {error}"),
         }
     }
 }
