@@ -1566,6 +1566,7 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
     .unwrap();
     let control_storage = gateway_storage.clone();
     let control_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+
     let control_store = rockstream_storage::build_runtime_object_store(
         &control_storage.join("gateway-shard"),
         "gateway-shard",
@@ -9455,6 +9456,9 @@ async fn worker_shuffle_mtls_rollover_preserves_release_process_stream() {
     assert!(server.0.try_wait().unwrap().is_none());
     assert!(client_worker.0.try_wait().unwrap().is_none());
 
+    let expected_correlation = AuditCorrelation::Observed(
+        "exchange:100:source:10:target:20:epoch:1:sequence:1".to_owned(),
+    );
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut observed_count = audit_before.len();
     let mut stable_since = None;
@@ -9552,9 +9556,7 @@ async fn worker_shuffle_mtls_rollover_preserves_release_process_stream() {
             scope: AuditField::Known("worker_shuffle".to_owned()),
             action: SecurityAuditClass::AuthorizationDenial,
             outcome: SecurityAuditOutcome::Denied,
-            correlation: AuditCorrelation::Observed(
-                "exchange:100:source:10:target:20:epoch:1:sequence:1".to_owned(),
-            ),
+            correlation: expected_correlation,
             operation_id: AuditField::NotApplicable,
             policy_revision: AuditField::NotApplicable,
             before_state: AuditField::NotApplicable,
