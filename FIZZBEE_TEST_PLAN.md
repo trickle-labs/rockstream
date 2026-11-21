@@ -865,6 +865,30 @@ state; this change adds no worker, epoch, lease, or sink transition. Release
 endpoint, concurrency, and bounded-retention qualification remains separate
 evidence.
 
+Issue #306 adds the management support-artifact lifecycle. The durable operation
+record binds the client idempotency key to one generation; its reservation and
+payload are persisted before terminal success, and the completion audit must be
+appended before success or artifact bytes are returned. Restart reconciliation
+reuses that operation and pending audit, while bounded cleanup removes expired
+artifacts. If completion loses a transition race to failure or cancellation, the
+request removes its late artifact write; storage-generation checks preserve a
+concurrent replacement. Terminal state and its pending completion audit are
+persisted atomically; retries flush pending audit before returning an artifact.
+`support_artifact_reconciles_durable_boundaries_after_process_exit`,
+`support_artifact_completion_audit_failure_preserves_result_across_processes`,
+and `support_artifact_runs_in_release_process_and_recovers_after_restart` check
+the complete operation, audit, and artifact state across crash and restart
+boundaries. Cleanup runs every second and caps each sweep at 29 seconds, leaving
+time for two passes and a cleanup tick within the 60-second deletion bound;
+`minio_cleanup_at_the_artifact_count_limit_finishes_within_the_bound` exercises
+the maximum count, and `cleanup_rescans_artifacts_that_expire_during_a_sweep`
+checks expiry during cleanup. Each reservation records an object generation in
+ledger format v2; legacy format-v1 entries keep their original object path.
+Retries use a fresh generation path, so expiry and orphan cleanup delete only
+the generation they observed and cannot remove a concurrent retry's object;
+restart cleanup removes unreferenced late writes. M1–M7 do not model this
+management workflow; these tests are implementation evidence, not formal proof.
+
 PR #388 (issue #302) hardens the durable catalog audit-append retry
 boundary against concurrent writers. The secret-store rotation audit writer
 and the gateway authentication and authorization audit writers refresh their
@@ -1274,6 +1298,35 @@ coordination and acknowledgment barrier protocols adhere to the end-to-end
 guarantee matrix covered by
 `crates/rockstream-connectors/tests/postgres_cdc_guarantee_matrix_tests.rs` and
 `crates/rockstream-gateway/tests/source_ddl_postgres_kafka_tests.rs`.
+
+Issue #347 refines the **PostgreSQL CDC initial snapshot-to-WAL handoff**:
+`capture_source_snapshot` and `capture_pgoutput_snapshot` now create a
+`pgoutput` logical replication slot through a replication-mode connection with
+an exported snapshot. Before scanning any relation, the read-only
+repeatable-read SQL transaction binds that exported MVCC snapshot via
+`SET TRANSACTION SNAPSHOT`, and the source records the slot's atomic
+`consistent_point` as the snapshot LSN. This replaces the non-atomic pairing
+of an independently opened snapshot transaction and
+`pg_current_wal_lsn()`. All imported relations share the same snapshot and
+fence; changes committed before slot creation appear in the snapshot, while
+subsequent commits are consumed from WAL after the fence, rather than being
+missed or replayed twice.
+
+**Safety / recovery boundary:** an active slot is rejected rather than
+replaced (RS-4013), and a missing checkpointed slot remains fail-closed
+(RS-4011). Snapshot capture must complete before normal CDC processing;
+a checkpointed restart resumes from durable source progress rather than
+creating a new bootstrap snapshot. This refines M3's source progress and
+checkpoint-coupled commit assumptions but does not extend the M1–M7 FizzBee
+models to PostgreSQL MVCC snapshots, replication slots, or WAL records.
+The exact-once handoff obligation is checked against real PostgreSQL by
+`postgres_cdc_synchronized_snapshot_handoff_is_exact_across_restart`
+in `crates/rockstream-connectors/tests/postgres_cdc_guarantee_matrix_tests.rs`
+and `pgoutput_gateway_synchronized_snapshot_handoff_multi_relation_and_restart_exact`
+in `crates/rockstream-gateway/tests/cdc_transaction_atomicity_tests.rs`.
+Together they exercise in-flight commits at slot creation, concurrent
+INSERT/UPDATE/DELETE after snapshot binding, multi-relation gateway/view
+materialization, and checkpointed restart without gaps or duplicates.
 
 Issue #339 extends that **external PostgreSQL pgoutput boundary** with
 transactional `TRUNCATE` semantics. A decoded `T` message retains the enclosing

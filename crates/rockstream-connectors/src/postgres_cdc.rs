@@ -8,12 +8,12 @@
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio_postgres::binary_copy::BinaryCopyOutStream;
 use tokio_postgres::types::Type;
-
-use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Decimal128Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, SchemaRef};
@@ -466,6 +466,8 @@ struct PgOutputTextChange {
     new_values: Option<Vec<String>>,
 }
 
+type SnapshotSyncHook = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
 struct QueuedChange {
     change: CdcChange,
     bytes: usize,
@@ -833,58 +835,117 @@ impl PostgresCdcSource {
             .transpose()
     }
 
-    /// Capture all imported relations through one repeatable-read transaction
-    /// and one source-wide WAL fence.
-    pub async fn capture_source_snapshot(
-        &mut self,
-        relations: &[(String, SchemaRef)],
-    ) -> Result<PgOutputSourceSnapshot, SourceError> {
+    /// Test-only synchronization hook invoked right after a snapshot transaction's
+    /// MVCC snapshot is bound and before relations are scanned.
+    #[doc(hidden)]
+    pub fn register_snapshot_sync_hook(slot: &str, hook: SnapshotSyncHook) {
+        if let Ok(mut hooks) = Self::snapshot_sync_hooks().lock() {
+            hooks.insert(slot.to_string(), hook);
+        }
+    }
+
+    fn snapshot_sync_hooks() -> &'static Mutex<HashMap<String, SnapshotSyncHook>> {
+        static HOOKS: OnceLock<Mutex<HashMap<String, SnapshotSyncHook>>> = OnceLock::new();
+        HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Create a logical slot via the replication protocol and bind the SQL
+    /// connection's `REPEATABLE READ` transaction to its exported snapshot so
+    /// the returned `consistent_point` matches the MVCC snapshot atomically.
+    async fn begin_exported_snapshot(&mut self) -> Result<PgLsn, SourceError> {
+        let config = self.pgoutput_config.as_ref().ok_or_else(|| {
+            SourceError::Io("native pgoutput configuration is unavailable".to_string())
+        })?;
         let pgoutput = self.pgoutput.as_mut().ok_or_else(|| {
             SourceError::Io("native pgoutput connection is unavailable".to_string())
         })?;
-        if pgoutput
+        if let Some(existing) = pgoutput
             .client
             .query_opt(
-                "SELECT 1 FROM pg_replication_slots WHERE slot_name = $1",
+                "SELECT active FROM pg_replication_slots WHERE slot_name = $1",
                 &[&pgoutput.slot],
             )
             .await
             .map_err(|error| SourceError::StartSnapshotFailed {
                 reason: format!("inspect pgoutput slot: {error}"),
             })?
-            .is_none()
         {
+            if existing.get::<_, bool>(0) {
+                return Err(SourceError::StartSnapshotFailed {
+                    reason: format!(
+                        "RS-4013: pgoutput slot '{}' is active elsewhere; next_steps: stop the existing owner before capturing a snapshot",
+                        pgoutput.slot
+                    ),
+                });
+            }
             pgoutput
                 .client
-                .query_one(
-                    "SELECT lsn::text FROM pg_create_logical_replication_slot($1, 'pgoutput')",
-                    &[&pgoutput.slot],
-                )
+                .query_one("SELECT pg_drop_replication_slot($1)", &[&pgoutput.slot])
                 .await
                 .map_err(|error| SourceError::StartSnapshotFailed {
-                    reason: format!("create pgoutput slot '{}': {error}", pgoutput.slot),
+                    reason: format!("drop inactive pgoutput slot '{}': {error}", pgoutput.slot),
                 })?;
         }
-        for (table, _) in relations {
-            Self::validate_partitioned_publication(&pgoutput.client, table, &pgoutput.publication)
-                .await?;
+
+        if pgoutput.slot.contains('\0') {
+            return Err(SourceError::StartSnapshotFailed {
+                reason: "pgoutput slot name contains NUL".to_string(),
+            });
         }
-        pgoutput
+        let (repl_stream, consistent_point, snapshot_name) =
+            create_logical_slot_and_export_snapshot(config, &pgoutput.slot).await?;
+
+        let begin_result = pgoutput
             .client
-            .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            .await
-            .map_err(|error| SourceError::StartSnapshotFailed {
-                reason: format!("begin source-wide PostgreSQL snapshot: {error}"),
+            .batch_execute(&format!(
+                "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET TRANSACTION SNAPSHOT '{}'",
+                snapshot_name.replace('\'', "''")
+            ))
+            .await;
+
+        drop(repl_stream);
+
+        if let Err(error) = begin_result {
+            let _ = pgoutput.client.batch_execute("ROLLBACK").await;
+            return Err(SourceError::StartSnapshotFailed {
+                reason: format!("bind PostgreSQL exported snapshot: {error}"),
+            });
+        }
+
+        let hook = Self::snapshot_sync_hooks()
+            .lock()
+            .ok()
+            .and_then(|mut hooks| hooks.remove(&pgoutput.slot));
+        if let Some(hook) = hook {
+            hook().await;
+        }
+        Ok(consistent_point)
+    }
+
+    /// Capture all imported relations through one repeatable-read transaction
+    /// bound to a logical replication slot's exported snapshot and consistent point.
+    pub async fn capture_source_snapshot(
+        &mut self,
+        relations: &[(String, SchemaRef)],
+    ) -> Result<PgOutputSourceSnapshot, SourceError> {
+        {
+            let pgoutput = self.pgoutput.as_ref().ok_or_else(|| {
+                SourceError::Io("native pgoutput connection is unavailable".to_string())
             })?;
+            for (table, _) in relations {
+                Self::validate_partitioned_publication(
+                    &pgoutput.client,
+                    table,
+                    &pgoutput.publication,
+                )
+                .await?;
+            }
+        }
+        let snapshot_lsn = self.begin_exported_snapshot().await?;
+        let pgoutput = self.pgoutput.as_mut().ok_or_else(|| {
+            SourceError::Io("native pgoutput connection is unavailable".to_string())
+        })?;
         let result = async {
-            let snapshot_lsn: String = pgoutput
-                .client
-                .query_one("SELECT pg_current_wal_lsn()::text", &[])
-                .await
-                .map_err(|error| SourceError::StartSnapshotFailed {
-                    reason: format!("capture source-wide PostgreSQL LSN: {error}"),
-                })?
-                .get(0);
             let mut snapshots = Vec::with_capacity(relations.len());
             for (table, schema) in relations {
                 let metadata = pgoutput
@@ -985,7 +1046,7 @@ impl PostgresCdcSource {
                 });
             }
             Ok::<_, SourceError>(PgOutputSourceSnapshot {
-                lsn: PgLsn::parse(&snapshot_lsn)?,
+                lsn: snapshot_lsn,
                 relations: snapshots,
             })
         }
@@ -1457,47 +1518,11 @@ impl PostgresCdcSource {
     }
 
     async fn capture_pgoutput_snapshot(&mut self) -> Result<SnapshotDeltaFence, SourceError> {
+        let snapshot_lsn = self.begin_exported_snapshot().await?;
         let pgoutput = self.pgoutput.as_mut().ok_or_else(|| {
             SourceError::Io("native pgoutput connection is unavailable".to_string())
         })?;
-        let existing = pgoutput
-            .client
-            .query_opt(
-                "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
-                &[&pgoutput.slot],
-            )
-            .await
-            .map_err(|error| SourceError::StartSnapshotFailed {
-                reason: format!("inspect pgoutput slot: {error}"),
-            })?;
-        if existing.is_none() {
-            pgoutput
-                .client
-                .query_one(
-                    "SELECT lsn::text FROM pg_create_logical_replication_slot($1, 'pgoutput')",
-                    &[&pgoutput.slot],
-                )
-                .await
-                .map_err(|error| SourceError::StartSnapshotFailed {
-                    reason: format!("create pgoutput slot '{}': {error}", pgoutput.slot),
-                })?;
-        }
-        pgoutput
-            .client
-            .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            .await
-            .map_err(|error| SourceError::StartSnapshotFailed {
-                reason: format!("begin PostgreSQL snapshot: {error}"),
-            })?;
         let result = async {
-            let snapshot_lsn: String = pgoutput
-                .client
-                .query_one("SELECT pg_current_wal_lsn()::text", &[])
-                .await
-                .map_err(|error| SourceError::StartSnapshotFailed {
-                    reason: format!("capture PostgreSQL snapshot LSN: {error}"),
-                })?
-                .get(0);
             let projection = self
                 .schema
                 .fields()
@@ -1528,11 +1553,11 @@ impl PostgresCdcSource {
                         .collect::<Result<Vec<_>, _>>()
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok::<_, SourceError>((PgLsn::parse(&snapshot_lsn)?, rows))
+            Ok::<_, SourceError>(rows)
         }
         .await;
         let rollback = pgoutput.client.batch_execute("ROLLBACK").await;
-        let (snapshot_lsn, rows) = result?;
+        let rows = result?;
         rollback.map_err(|error| SourceError::StartSnapshotFailed {
             reason: format!("finish PostgreSQL snapshot: {error}"),
         })?;
@@ -2010,6 +2035,263 @@ impl SourceConnector for PostgresCdcSource {
     fn watermark_capability(&self) -> WatermarkCapability {
         WatermarkCapability::Native
     }
+}
+
+async fn read_pg_backend_message(
+    stream: &mut tokio::net::TcpStream,
+    buf: &mut bytes::BytesMut,
+) -> Result<postgres_protocol::message::backend::Message, SourceError> {
+    use tokio::io::AsyncReadExt;
+    loop {
+        if let Some(message) =
+            postgres_protocol::message::backend::Message::parse(buf).map_err(|error| {
+                SourceError::StartSnapshotFailed {
+                    reason: format!("parse PostgreSQL replication message: {error}"),
+                }
+            })?
+        {
+            return Ok(message);
+        }
+        let n = stream
+            .read_buf(buf)
+            .await
+            .map_err(|error| SourceError::StartSnapshotFailed {
+                reason: format!("read PostgreSQL replication stream: {error}"),
+            })?;
+        if n == 0 {
+            return Err(SourceError::StartSnapshotFailed {
+                reason: "PostgreSQL replication connection closed unexpectedly".to_string(),
+            });
+        }
+    }
+}
+
+fn pg_error_detail(body: &postgres_protocol::message::backend::ErrorResponseBody) -> String {
+    use tokio_postgres::fallible_iterator::FallibleIterator;
+    let mut fields = body.fields();
+    while let Ok(Some(field)) = fields.next() {
+        if field.type_() == b'M' {
+            return String::from_utf8_lossy(field.value_bytes()).into_owned();
+        }
+    }
+    "unknown PostgreSQL error".to_string()
+}
+
+async fn create_logical_slot_and_export_snapshot(
+    config: &PgOutputConfig,
+    slot: &str,
+) -> Result<(tokio::net::TcpStream, PgLsn, String), SourceError> {
+    use postgres_protocol::authentication::{md5_hash, sasl};
+    use postgres_protocol::message::{backend::Message, frontend};
+    use tokio::io::AsyncWriteExt;
+    use tokio_postgres::fallible_iterator::FallibleIterator;
+
+    let mut stream = tokio::net::TcpStream::connect((config.host.as_str(), config.port))
+        .await
+        .map_err(|error| SourceError::StartSnapshotFailed {
+            reason: format!("connect PostgreSQL replication session: {error}"),
+        })?;
+    let mut out = bytes::BytesMut::new();
+    frontend::startup_message(
+        [
+            ("user", config.user.as_str()),
+            ("database", config.database.as_str()),
+            ("replication", "database"),
+        ],
+        &mut out,
+    )
+    .map_err(|error| SourceError::StartSnapshotFailed {
+        reason: format!("encode replication startup message: {error}"),
+    })?;
+    stream
+        .write_all(&out)
+        .await
+        .map_err(|error| SourceError::StartSnapshotFailed {
+            reason: format!("send replication startup message: {error}"),
+        })?;
+
+    let mut read_buf = bytes::BytesMut::with_capacity(4096);
+    let mut scram: Option<sasl::ScramSha256> = None;
+    loop {
+        match read_pg_backend_message(&mut stream, &mut read_buf).await? {
+            Message::AuthenticationOk => {}
+            Message::AuthenticationCleartextPassword => {
+                let password = config.password.as_deref().unwrap_or("");
+                out.clear();
+                frontend::password_message(password.as_bytes(), &mut out).map_err(|error| {
+                    SourceError::StartSnapshotFailed {
+                        reason: format!("encode cleartext password: {error}"),
+                    }
+                })?;
+                stream
+                    .write_all(&out)
+                    .await
+                    .map_err(|error| SourceError::StartSnapshotFailed {
+                        reason: format!("send cleartext password: {error}"),
+                    })?;
+            }
+            Message::AuthenticationMd5Password(body) => {
+                let password = config.password.as_deref().unwrap_or("");
+                let hashed = md5_hash(config.user.as_bytes(), password.as_bytes(), body.salt());
+                out.clear();
+                frontend::password_message(hashed.as_bytes(), &mut out).map_err(|error| {
+                    SourceError::StartSnapshotFailed {
+                        reason: format!("encode MD5 password: {error}"),
+                    }
+                })?;
+                stream
+                    .write_all(&out)
+                    .await
+                    .map_err(|error| SourceError::StartSnapshotFailed {
+                        reason: format!("send MD5 password: {error}"),
+                    })?;
+            }
+            Message::AuthenticationSasl(body) => {
+                let mut mechanisms = body.mechanisms();
+                let mut has_scram = false;
+                while let Ok(Some(mech)) = mechanisms.next() {
+                    if mech == "SCRAM-SHA-256" {
+                        has_scram = true;
+                        break;
+                    }
+                }
+                if !has_scram {
+                    return Err(SourceError::StartSnapshotFailed {
+                        reason: "unsupported PostgreSQL SASL authentication mechanism".to_string(),
+                    });
+                }
+                let password = config.password.as_deref().unwrap_or("");
+                let state = sasl::ScramSha256::new(
+                    password.as_bytes(),
+                    sasl::ChannelBinding::unsupported(),
+                );
+                out.clear();
+                frontend::sasl_initial_response("SCRAM-SHA-256", state.message(), &mut out)
+                    .map_err(|error| SourceError::StartSnapshotFailed {
+                        reason: format!("encode SASL initial response: {error}"),
+                    })?;
+                stream
+                    .write_all(&out)
+                    .await
+                    .map_err(|error| SourceError::StartSnapshotFailed {
+                        reason: format!("send SASL initial response: {error}"),
+                    })?;
+                scram = Some(state);
+            }
+            Message::AuthenticationSaslContinue(body) => {
+                let state = scram
+                    .as_mut()
+                    .ok_or_else(|| SourceError::StartSnapshotFailed {
+                        reason: "unexpected SCRAM continue message".to_string(),
+                    })?;
+                state
+                    .update(body.data())
+                    .map_err(|error| SourceError::StartSnapshotFailed {
+                        reason: format!("SCRAM update failed: {error}"),
+                    })?;
+                out.clear();
+                frontend::sasl_response(state.message(), &mut out).map_err(|error| {
+                    SourceError::StartSnapshotFailed {
+                        reason: format!("encode SASL response: {error}"),
+                    }
+                })?;
+                stream
+                    .write_all(&out)
+                    .await
+                    .map_err(|error| SourceError::StartSnapshotFailed {
+                        reason: format!("send SASL response: {error}"),
+                    })?;
+            }
+            Message::AuthenticationSaslFinal(body) => {
+                let state = scram
+                    .as_mut()
+                    .ok_or_else(|| SourceError::StartSnapshotFailed {
+                        reason: "unexpected SCRAM final message".to_string(),
+                    })?;
+                state
+                    .finish(body.data())
+                    .map_err(|error| SourceError::StartSnapshotFailed {
+                        reason: format!("SCRAM verification failed: {error}"),
+                    })?;
+            }
+            Message::ParameterStatus(_)
+            | Message::BackendKeyData(_)
+            | Message::NoticeResponse(_) => {}
+            Message::ReadyForQuery(_) => break,
+            Message::ErrorResponse(body) => {
+                return Err(SourceError::StartSnapshotFailed {
+                    reason: format!(
+                        "PostgreSQL replication auth failed: {}",
+                        pg_error_detail(&body)
+                    ),
+                });
+            }
+            _ => {
+                return Err(SourceError::StartSnapshotFailed {
+                    reason: "unexpected PostgreSQL replication startup response".to_string(),
+                });
+            }
+        }
+    }
+
+    let escaped_slot = format!("\"{}\"", slot.replace('"', "\"\""));
+    out.clear();
+    frontend::query(
+        &format!("CREATE_REPLICATION_SLOT {escaped_slot} LOGICAL pgoutput"),
+        &mut out,
+    )
+    .map_err(|error| SourceError::StartSnapshotFailed {
+        reason: format!("encode CREATE_REPLICATION_SLOT: {error}"),
+    })?;
+    stream
+        .write_all(&out)
+        .await
+        .map_err(|error| SourceError::StartSnapshotFailed {
+            reason: format!("send CREATE_REPLICATION_SLOT: {error}"),
+        })?;
+
+    let mut consistent_point: Option<PgLsn> = None;
+    let mut snapshot_name: Option<String> = None;
+    loop {
+        match read_pg_backend_message(&mut stream, &mut read_buf).await? {
+            Message::RowDescription(_)
+            | Message::CommandComplete(_)
+            | Message::NoticeResponse(_)
+            | Message::ParameterStatus(_) => {}
+            Message::DataRow(body) => {
+                let mut cols = Vec::new();
+                let mut ranges = body.ranges();
+                while let Ok(Some(range)) = ranges.next() {
+                    cols.push(
+                        range.map(|r| String::from_utf8_lossy(&body.buffer()[r]).into_owned()),
+                    );
+                }
+                if let Some(Some(lsn_str)) = cols.get(1) {
+                    consistent_point = Some(PgLsn::parse(lsn_str)?);
+                }
+                if let Some(Some(snap)) = cols.get(2) {
+                    if !snap.is_empty() && !snap.contains('\0') {
+                        snapshot_name = Some(snap.clone());
+                    }
+                }
+            }
+            Message::ErrorResponse(body) => {
+                return Err(SourceError::StartSnapshotFailed {
+                    reason: format!("create pgoutput slot '{slot}': {}", pg_error_detail(&body)),
+                });
+            }
+            Message::ReadyForQuery(_) => break,
+            _ => {}
+        }
+    }
+
+    let consistent_point = consistent_point.ok_or_else(|| SourceError::StartSnapshotFailed {
+        reason: format!("CREATE_REPLICATION_SLOT '{slot}' returned no consistent_point"),
+    })?;
+    let snapshot_name = snapshot_name.ok_or_else(|| SourceError::StartSnapshotFailed {
+        reason: format!("CREATE_REPLICATION_SLOT '{slot}' did not export a snapshot"),
+    })?;
+    Ok((stream, consistent_point, snapshot_name))
 }
 
 fn quote_relation(relation: &str) -> Result<String, SourceError> {

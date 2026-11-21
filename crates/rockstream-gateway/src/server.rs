@@ -2191,6 +2191,8 @@ pub struct GatewayHandler {
     pub in_flight_queries: Arc<AtomicUsize>,
     /// Bound concurrent eager cursor producers across all connections.
     cursor_producer_slots: Arc<tokio::sync::Semaphore>,
+    /// Test-only barrier awaited before acquiring `shard_commit_lock` on explicit-key commits.
+    commit_lock_barrier_for_test: Option<Arc<tokio::sync::Barrier>>,
     /// Tables whose persisted primary keys in `shard_db` have been verified/reconciled
     /// to the canonical typed tuple encoding (`__pk1:`).
     reconciled_pk_tables: Arc<DashSet<String>>,
@@ -3645,6 +3647,7 @@ impl GatewayHandler {
             is_draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             in_flight_queries: Arc::new(AtomicUsize::new(0)),
             cursor_producer_slots: Arc::new(tokio::sync::Semaphore::new(4)),
+            commit_lock_barrier_for_test: None,
             reconciled_pk_tables: Arc::new(DashSet::new()),
         }
     }
@@ -3698,6 +3701,7 @@ impl GatewayHandler {
             is_draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             in_flight_queries: Arc::new(AtomicUsize::new(0)),
             cursor_producer_slots: Arc::new(tokio::sync::Semaphore::new(4)),
+            commit_lock_barrier_for_test: None,
             reconciled_pk_tables: Arc::new(DashSet::new()),
         }
     }
@@ -7608,7 +7612,7 @@ impl GatewayHandler {
         // ─────────────────────────────────────────────────────────────────────────
 
         // SET rockstream.* must be intercepted before catalog stubs handle generic SET commands.
-        if ql.starts_with("set rockstream.") || ql.starts_with("set local rockstream.") {
+        if parse_set_rockstream(q).is_some() {
             return self.handle_set_rockstream(q, &ql, conn_id);
         }
 
@@ -12429,70 +12433,66 @@ impl GatewayHandler {
     /// Handle `SET rockstream.<var> = <value>` — update per-connection session state.
     fn handle_set_rockstream(
         &self,
-        _q: &str,
-        ql: &str,
+        q: &str,
+        _ql: &str,
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<Response<'static>>> {
         let Some(id) = conn_id else {
             return Ok(vec![promote_response(Response::Execution(Tag::new("SET")))]);
         };
 
-        // Parse: SET [LOCAL] rockstream.<var> = <value>
-        // ql is already lowercased
-        let after_set = if let Some(rest) = ql.strip_prefix("set local rockstream.") {
-            rest
-        } else {
-            ql.strip_prefix("set rockstream.").unwrap_or(ql)
+        let Some((var_name, val_raw)) = parse_set_rockstream(q) else {
+            return Ok(vec![promote_response(Response::Execution(Tag::new("SET")))]);
         };
-        // after_set: "idempotency_key = 'str'" or "source_epoch = 42"
-        let eq_pos = after_set.find('=').unwrap_or(after_set.len());
-        let var_name = after_set[..eq_pos].trim();
-        let val_raw = after_set[eq_pos + 1..].trim().trim_end_matches(';');
 
         let mut session = self.sessions.entry(id.to_string()).or_default();
 
-        match var_name {
+        match var_name.as_str() {
             "idempotency_key" => {
-                if val_raw == "default" || val_raw == "null" || val_raw == "''" {
+                let key_str = decode_sql_setting_literal(val_raw);
+                if val_raw.eq_ignore_ascii_case("default")
+                    || val_raw.eq_ignore_ascii_case("null")
+                    || key_str.is_empty()
+                {
                     session.idempotency_key = None;
                     session.idempotency_operation_id = None;
                 } else {
-                    // Strip surrounding single quotes
-                    let key_str = val_raw.trim_matches('\'');
-                    let hash = sha256_16(key_str.as_bytes());
-                    session.idempotency_key = Some(hash);
-                    session.idempotency_operation_id = uuid::Uuid::parse_str(key_str)
+                    session.idempotency_key = Some(sha256_16(key_str.as_bytes()));
+                    session.idempotency_operation_id = uuid::Uuid::parse_str(&key_str)
                         .ok()
                         .filter(|key| key.hyphenated().to_string() == key_str)
                         .map(|key| key.hyphenated().to_string());
                 }
             }
             "source_epoch" => {
-                if let Ok(n) = val_raw.trim_matches('\'').parse::<u64>() {
+                if let Ok(n) = decode_sql_setting_literal(val_raw).parse::<u64>() {
                     session.source_epoch_envelope = Some(n);
                 }
             }
             "wait_for" => {
                 // Accepts JSON: {"table_name":"t","source_epoch":42}
-                let json_str = val_raw.trim_matches('\'');
-                if let Ok(token) = serde_json::from_str::<FreshnessToken>(json_str) {
+                let json_str = decode_sql_setting_literal(val_raw);
+                if let Ok(token) = serde_json::from_str::<FreshnessToken>(&json_str) {
                     session.wait_for_token = Some(token);
                     session.max_staleness = None;
                 }
             }
             "session_wait_for" => {
-                session.session_wait_for_enabled = val_raw.trim_matches('\'') != "off";
+                session.session_wait_for_enabled =
+                    !decode_sql_setting_literal(val_raw).eq_ignore_ascii_case("off");
                 if session.session_wait_for_enabled {
                     session.max_staleness = None;
                 }
             }
             "session_wait_for_timeout_ms" => {
-                if let Ok(n) = val_raw.trim_matches('\'').parse::<u64>() {
+                if let Ok(n) = decode_sql_setting_literal(val_raw).parse::<u64>() {
                     session.session_wait_for_timeout_ms = n;
                 }
             }
             "max_staleness" => {
-                let parsed = parse_duration_literal(val_raw.trim_matches('\''));
+                let parsed = parse_duration_literal(
+                    &decode_sql_setting_literal(val_raw).to_ascii_lowercase(),
+                );
                 session.max_staleness = parsed;
                 session.frontier_age_ms = None;
                 session.pending_notice = None;
@@ -12574,16 +12574,69 @@ impl GatewayHandler {
         } else {
             idempotency_key
         };
-        if !server_generated {
+        let ops = entry.drain();
+        drop(entry); // release DashMap entry guard before await
+        self.commit_local_ops(
+            shard_db,
+            ops,
+            idempotency_key,
+            !server_generated,
+            Some(conn_id),
+        )
+        .await
+    }
+
+    async fn commit_local_ops(
+        &self,
+        shard_db: &Arc<rockstream_storage::ShardDb>,
+        ops: Vec<DmlOp>,
+        idempotency_key: Option<[u8; 16]>,
+        check_idempotency: bool,
+        conn_id: Option<&str>,
+    ) -> PgWireResult<Vec<Response<'static>>> {
+        if check_idempotency {
+            if let Some(barrier) = &self.commit_lock_barrier_for_test {
+                barrier.wait().await;
+            }
+        }
+        // Serialize the entire local commit through idempotency admission,
+        // materialized-view refresh, durable flush and subscription publication.
+        // Releasing this guard before flushing allowed a later epoch to publish
+        // out of order; checking idempotency before acquiring it allowed
+        // concurrent identical retries to both pass and double-apply.
+        let _commit_guard = self.shard_commit_lock.lock().await;
+        if check_idempotency {
             if let Some(key_hash) = idempotency_key {
-                // Explicit client key — check for prior commit with this key
-                // (idempotent replay → noop). Server-generated keys skip this
-                // lookup: they are freshly minted per commit and can never
-                // collide with a previous one.
+                // Explicit client key — check under the commit lock so concurrent
+                // identical retries linearize and at most one applies.
                 match shard_db.get_idempotency_epoch(0, key_hash).await {
-                    Ok(Some(_prev_epoch)) => {
-                        // Already committed — discard buffer and return COMMIT noop
-                        entry.clear();
+                    Ok(Some(prev_epoch)) => {
+                        if let Some(conn_id) = conn_id {
+                            // Discard transactional NOTIFYs — a replayed commit must
+                            // not re-deliver or leak buffered notifications.
+                            self.pending_notifies.remove(conn_id);
+                            let table_name = ops
+                                .iter()
+                                .last()
+                                .map(|op| match op {
+                                    DmlOp::Insert { table, .. }
+                                    | DmlOp::Update { table, .. }
+                                    | DmlOp::Delete { table, .. } => table.clone(),
+                                })
+                                .unwrap_or_default();
+                            if !table_name.is_empty() {
+                                if let Some(mut session) = self.sessions.get_mut(conn_id) {
+                                    let should_update = session
+                                        .last_written_epoch
+                                        .as_ref()
+                                        .is_none_or(|tok| prev_epoch > tok.source_epoch);
+                                    if should_update {
+                                        session.last_written_epoch =
+                                            Some(FreshnessToken::new(table_name, prev_epoch));
+                                    }
+                                }
+                            }
+                        }
                         return Ok(vec![promote_response(Response::TransactionEnd(Tag::new(
                             "COMMIT",
                         )))]);
@@ -12597,24 +12650,6 @@ impl GatewayHandler {
                 }
             }
         }
-
-        let ops = entry.drain();
-        drop(entry); // release DashMap entry guard before await
-        self.commit_local_ops(shard_db, ops, idempotency_key, Some(conn_id))
-            .await
-    }
-
-    async fn commit_local_ops(
-        &self,
-        shard_db: &Arc<rockstream_storage::ShardDb>,
-        ops: Vec<DmlOp>,
-        idempotency_key: Option<[u8; 16]>,
-        conn_id: Option<&str>,
-    ) -> PgWireResult<Vec<Response<'static>>> {
-        // Serialize the entire local commit through materialized-view refresh,
-        // durable flush and subscription publication. Releasing this guard
-        // before flushing allowed a later epoch to publish out of order.
-        let _commit_guard = self.shard_commit_lock.lock().await;
         // Reject before view recovery can flush unrelated work for this commit attempt.
         let (ops, conflicted) = committed_dml_ops(shard_db, ops)
             .await
@@ -14851,7 +14886,7 @@ impl GatewayHandler {
         let Some(shard_db) = &self.shard_db else {
             return Ok(rows.len()); // no storage — pretend success
         };
-        self.commit_local_ops(shard_db, rows.to_vec(), None, None)
+        self.commit_local_ops(shard_db, rows.to_vec(), None, false, None)
             .await?;
 
         // Audit: log the flush.
@@ -16906,6 +16941,19 @@ impl GatewayServer {
             h.secret_store = secret_store;
         }
         self
+    }
+
+    #[doc(hidden)]
+    pub fn with_commit_lock_barrier_for_test(mut self, barrier: Arc<tokio::sync::Barrier>) -> Self {
+        if let Some(h) = Arc::get_mut(&mut self.handler) {
+            h.commit_lock_barrier_for_test = Some(barrier);
+        }
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn subscribe_registry(&self) -> &Arc<SubscribeRegistry> {
+        &self.handler.subscribe_registry
     }
 
     /// Create a new gateway server listening on `addr`.
@@ -21352,6 +21400,83 @@ fn parse_sql_single_quoted_string(input: &str) -> Result<(String, usize), String
     Err(format!(
         "[RS-4007] unterminated string literal. Next steps: {CREATE_SINK_NEXT_STEPS}"
     ))
+}
+
+fn strip_ascii_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    if s.len() >= prefix.len()
+        && s.is_char_boundary(prefix.len())
+        && s[..prefix.len()].eq_ignore_ascii_case(prefix)
+    {
+        Some(&s[prefix.len()..])
+    } else {
+        None
+    }
+}
+
+/// Parse `SET [LOCAL] rockstream.<var> = <value>` while preserving the original
+/// case and content of `<value>`.
+fn parse_set_rockstream(q: &str) -> Option<(String, &str)> {
+    let rest = strip_ascii_prefix_ci(q.trim(), "set")?;
+    if !rest.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    let rest = rest.trim_start();
+    let rest = if let Some(after_local) = strip_ascii_prefix_ci(rest, "local") {
+        if after_local.chars().next().is_some_and(char::is_whitespace) {
+            after_local.trim_start()
+        } else {
+            rest
+        }
+    } else {
+        rest
+    };
+    let after_ns = strip_ascii_prefix_ci(rest, "rockstream.")?;
+    let (var_part, val_part) = if let Some(eq_pos) = after_ns.find('=') {
+        (&after_ns[..eq_pos], &after_ns[eq_pos + 1..])
+    } else {
+        let mut ws_idx = None;
+        for (idx, ch) in after_ns.char_indices() {
+            if ch.is_whitespace() {
+                ws_idx = Some(idx);
+                break;
+            }
+        }
+        let idx = ws_idx?;
+        let var_part = &after_ns[..idx];
+        let after_var = after_ns[idx..].trim_start();
+        let after_to = strip_ascii_prefix_ci(after_var, "to")?;
+        if !after_to.chars().next().is_some_and(char::is_whitespace) {
+            return None;
+        }
+        (var_part, after_to)
+    };
+    let var_name = var_part.trim().to_ascii_lowercase();
+    let val_raw = val_part.trim().trim_end_matches(';').trim();
+    Some((var_name, val_raw))
+}
+
+/// Decode a SQL setting value, unescaping doubled single quotes (`''` -> `'`)
+/// while preserving UTF-8 characters and exact case.
+fn decode_sql_setting_literal(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with('\'') {
+        return trimmed.to_string();
+    }
+    let mut out = String::with_capacity(trimmed.len());
+    let mut chars = trimmed[1..].chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\'' {
+            if chars.peek() == Some(&'\'') {
+                chars.next();
+                out.push('\'');
+            } else {
+                return out;
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    trimmed.trim_matches('\'').to_string()
 }
 
 const CREATE_SECRET_NEXT_STEPS: &str =
