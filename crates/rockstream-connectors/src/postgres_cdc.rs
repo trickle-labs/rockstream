@@ -399,7 +399,9 @@ impl PgOutputFrameAssembly {
         }
         if let Some(declared_len) = declared_len {
             if self.expected_len.is_some() {
-                return Err(pgoutput_transport_error("new frame before previous frame ended"));
+                return Err(pgoutput_transport_error(
+                    "new frame before previous frame ended",
+                ));
             }
             let len = usize::try_from(declared_len)
                 .map_err(|_| pgoutput_transport_error("invalid pgoutput frame length"))?;
@@ -417,8 +419,7 @@ impl PgOutputFrameAssembly {
                 ));
             }
             self.transaction_bytes = total;
-            stats.peak_transaction_payload_bytes =
-                stats.peak_transaction_payload_bytes.max(total);
+            stats.peak_transaction_payload_bytes = stats.peak_transaction_payload_bytes.max(total);
             self.expected_len = Some(len);
             self.bytes = Vec::with_capacity(len);
         }
@@ -426,15 +427,16 @@ impl PgOutputFrameAssembly {
             .expected_len
             .ok_or_else(|| pgoutput_transport_error("COPY continuation without a frame"))?;
         if self.bytes.len().saturating_add(chunk.len()) > len {
-            return Err(pgoutput_transport_error("COPY chunk exceeds declared frame length"));
+            return Err(pgoutput_transport_error(
+                "COPY chunk exceeds declared frame length",
+            ));
         }
         self.bytes.extend_from_slice(chunk);
         stats.payload_bytes_received = stats
             .payload_bytes_received
             .saturating_add(chunk.len() as u64);
         stats.peak_chunk_bytes = stats.peak_chunk_bytes.max(chunk.len());
-        stats.peak_frame_buffered_bytes =
-            stats.peak_frame_buffered_bytes.max(self.bytes.len());
+        stats.peak_frame_buffered_bytes = stats.peak_frame_buffered_bytes.max(self.bytes.len());
         if self.bytes.len() == len {
             stats.frames_received = stats.frames_received.saturating_add(1);
             self.expected_len = None;
@@ -1617,9 +1619,10 @@ impl PostgresCdcSource {
                 }
                 Some(b'C') => {
                     let end_lsn = pgoutput_commit_lsn(&payload)?;
-                    let (_, changes, bytes) = self.native_transaction.take().ok_or_else(|| {
-                        pgoutput_transport_error("pgoutput COMMIT without BEGIN")
-                    })?;
+                    let (_, changes, bytes) = self
+                        .native_transaction
+                        .take()
+                        .ok_or_else(|| pgoutput_transport_error("pgoutput COMMIT without BEGIN"))?;
                     if bytes.saturating_add(payload.len()) > max_bytes
                         || changes.len() > credits_available
                     {
@@ -1738,24 +1741,27 @@ impl PostgresCdcSource {
                     || self.native_xid.is_some()
                     || self.native_transaction.is_some()
                 {
-                    return Err(pgoutput_transport_error("pgoutput COPY ended mid-transaction"));
+                    return Err(pgoutput_transport_error(
+                        "pgoutput COPY ended mid-transaction",
+                    ));
                 }
                 return Ok(None);
             };
             let row = row.map_err(|error| SourceError::PollDeltaFailed {
                 reason: format!("read bounded pgoutput COPY: {error}"),
             })?;
-            let frame_len: Option<i32> = row
-                .try_get(0)
-                .map_err(|error| pgoutput_transport_error(&format!("decode COPY frame length: {error}")))?;
-            let chunk: Vec<u8> = row
-                .try_get(1)
-                .map_err(|error| pgoutput_transport_error(&format!("decode COPY frame chunk: {error}")))?;
+            let frame_len: Option<i32> = row.try_get(0).map_err(|error| {
+                pgoutput_transport_error(&format!("decode COPY frame length: {error}"))
+            })?;
+            let chunk: Vec<u8> = row.try_get(1).map_err(|error| {
+                pgoutput_transport_error(&format!("decode COPY frame chunk: {error}"))
+            })?;
             let Some(payload) = pgoutput.event_frame.push_chunk(
                 frame_len,
                 &chunk,
                 &mut self.pgoutput_transport_stats,
-            )? else {
+            )?
+            else {
                 continue;
             };
             if payload.first() == Some(&b'C') {
@@ -1787,7 +1793,6 @@ impl PostgresCdcSource {
             return Ok(Some(payload));
         }
     }
-
 }
 
 #[async_trait]
