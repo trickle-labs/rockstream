@@ -465,6 +465,13 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
             return self.block(&storage_error(error).to_string()).await;
         }
 
+        // The test cut is after the complete coupled batch is durable, but
+        // before either the in-memory epoch or PostgreSQL slot is advanced.
+        // A cancelled owner must recover this checkpoint and ACK it once.
+        self.checkpoint_store
+            .db()
+            .await_source_ack_cut_for_test()
+            .await;
         self.source_epochs
             .commit_epoch_monotonic(entry)
             .map_err(|error| SourceError::Io(error.to_string()))?;
@@ -659,6 +666,20 @@ impl SourceRuntimeCoordinator<PostgresCdcSource> {
                 "RS-4012: pgoutput cannot open before checkpoint recovery".to_string(),
             ));
         }
+        self.source
+            .open_pgoutput(self.source_epochs.current_epoch() != 0)
+            .await
+    }
+
+    /// Reopen a disconnected PostgreSQL transport without surrendering the
+    /// current source owner lease. The slot itself is never advanced here;
+    /// any partial pgoutput transaction must be discarded by the caller.
+    pub async fn reopen_pgoutput_after_disconnect(
+        &mut self,
+        lease: &SourceOwnerLease,
+    ) -> Result<(), SourceError> {
+        self.require_active_lease(lease)?;
+        self.source.close_pgoutput();
         self.source
             .open_pgoutput(self.source_epochs.current_epoch() != 0)
             .await
