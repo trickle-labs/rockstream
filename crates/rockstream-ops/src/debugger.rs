@@ -210,6 +210,11 @@ fn explain_plan_op_ids_scoped(
             Stage::Utf8ColumnPack(_, idx, _) => format!("Utf8ColumnPacker col {}", idx),
             Stage::Utf8ColumnUnpack(_, idx, _) => format!("Utf8ColumnUnpack col {}", idx),
             Stage::MultiAggregate(_) => "MultiAggregatePipeline cascade joined lanes".to_string(),
+            Stage::FusedStateless(k) => format!(
+                "Fused stateless kernel ({} stages -> {} ops)",
+                k.fused_stage_count(),
+                k.physical_op_count()
+            ),
             Stage::Stateless(_) => "Stateless linear transformation".to_string(),
             Stage::Window(_, _) => "Window arrangement".to_string(),
         };

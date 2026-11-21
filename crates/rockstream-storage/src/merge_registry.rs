@@ -22,6 +22,9 @@ pub enum MergeTag {
     MaxRegister = 0x03,
     /// Semilattice MIN: values are i64 (big-endian), merged by `min(a, b)`.
     MinRegister = 0x04,
+    /// Abelian group SumCount/v1: `(sum: i64 BE, count: i64 BE)` (16-byte payload),
+    /// merged by component-wise checked i64 addition per ADR 0004.
+    SumCount = 0x05,
     /// Semilattice LWWRegister: timestamp (u64 BE) + value (i64 BE).
     LWWRegister = 0x22,
     /// PNCounter: positive-negative counter, values are i64 (big-endian).
@@ -36,6 +39,7 @@ impl MergeTag {
             0x02 => Some(Self::Count),
             0x03 => Some(Self::MaxRegister),
             0x04 => Some(Self::MinRegister),
+            0x05 => Some(Self::SumCount),
             0x22 => Some(Self::LWWRegister),
             0x30 => Some(Self::PNCounter),
             _ => None,
@@ -51,7 +55,7 @@ impl MergeTag {
     pub const fn payload_len(self) -> usize {
         match self {
             Self::Sum | Self::Count | Self::MaxRegister | Self::MinRegister | Self::PNCounter => 8,
-            Self::LWWRegister => 16,
+            Self::SumCount | Self::LWWRegister => 16,
         }
     }
 
@@ -92,6 +96,7 @@ impl MergeTag {
                     || base_name.eq_ignore_ascii_case("MinRegister")
                     || base_name.eq_ignore_ascii_case("Min")
             }
+            Self::SumCount => id == 0x0002 || base_name.eq_ignore_ascii_case("SumCount"),
             Self::LWWRegister => {
                 id == 0x0022
                     || base_name.eq_ignore_ascii_case("LWWRegister")
@@ -243,6 +248,19 @@ impl MergeOperator for SumCountMergeOperator {
                 let mut out = Vec::with_capacity(9);
                 out.push(MergeTag::MinRegister as u8);
                 out.extend_from_slice(&encode_i64(result));
+                Ok(Bytes::from(out))
+            }
+            t if t == MergeTag::SumCount as u8 => {
+                let sum_a = decode_i64(&existing[1..9]).map_err(malformed_arithmetic)?;
+                let cnt_a = decode_i64(&existing[9..17]).map_err(malformed_arithmetic)?;
+                let sum_b = decode_i64(&value[1..9]).map_err(malformed_arithmetic)?;
+                let cnt_b = decode_i64(&value[9..17]).map_err(malformed_arithmetic)?;
+                let sum = checked_add_i64(sum_a, sum_b).map_err(|_| arithmetic_overflow())?;
+                let cnt = checked_add_i64(cnt_a, cnt_b).map_err(|_| arithmetic_overflow())?;
+                let mut out = Vec::with_capacity(17);
+                out.push(MergeTag::SumCount as u8);
+                out.extend_from_slice(&encode_i64(sum));
+                out.extend_from_slice(&encode_i64(cnt));
                 Ok(Bytes::from(out))
             }
             t if t == MergeTag::PNCounter as u8 => {
@@ -409,6 +427,25 @@ impl MergeOperatorRegistry {
             return None;
         }
         decode_i64(&data[1..]).ok()
+    }
+
+    /// Encode a combined `SumCount/v1` delta or accumulator (`[0x05][sum:8 BE][count:8 BE]`).
+    pub fn encode_sum_count(sum: i64, count: i64) -> Vec<u8> {
+        let mut out = Vec::with_capacity(17);
+        out.push(MergeTag::SumCount as u8);
+        out.extend_from_slice(&encode_i64(sum));
+        out.extend_from_slice(&encode_i64(count));
+        out
+    }
+
+    /// Decode a combined `SumCount/v1` accumulator from tagged merged bytes.
+    pub fn decode_sum_count(data: &[u8]) -> Option<(i64, i64)> {
+        if data.len() != 17 || data[0] != MergeTag::SumCount as u8 {
+            return None;
+        }
+        let sum = decode_i64(&data[1..9]).ok()?;
+        let count = decode_i64(&data[9..17]).ok()?;
+        Some((sum, count))
     }
 
     /// Encode a LWWRegister value for merge operations.
@@ -580,6 +617,39 @@ mod tests {
 
         assert_eq!(MergeTag::LWWRegister.expected_len(), 17);
         assert_eq!(MergeTag::LWWRegister.payload_len(), 16);
+        assert_eq!(MergeTag::from_u8(0x05), Some(MergeTag::SumCount));
+        assert_eq!(MergeTag::SumCount.expected_len(), 17);
+        assert_eq!(MergeTag::SumCount.payload_len(), 16);
+    }
+
+    #[test]
+    fn sum_count_merge_handles_signed_deltas_identity_and_overflow() {
+        let op = SumCountMergeOperator;
+        let k = key();
+        let a = Bytes::from(MergeOperatorRegistry::encode_sum_count(100, 2));
+        let b = Bytes::from(MergeOperatorRegistry::encode_sum_count(-40, -1));
+        let merged = op.merge(&k, Some(a), b).unwrap();
+        assert_eq!(
+            MergeOperatorRegistry::decode_sum_count(&merged),
+            Some((60, 1))
+        );
+
+        let retract = Bytes::from(MergeOperatorRegistry::encode_sum_count(-60, -1));
+        let identity = op.merge(&k, Some(merged), retract).unwrap();
+        assert_eq!(
+            MergeOperatorRegistry::decode_sum_count(&identity),
+            Some((0, 0))
+        );
+
+        let max_sum = Bytes::from(MergeOperatorRegistry::encode_sum_count(i64::MAX, 1));
+        let plus_one = Bytes::from(MergeOperatorRegistry::encode_sum_count(1, 0));
+        let err = op.merge(&k, Some(max_sum), plus_one).unwrap_err();
+        assert_eq!(err.to_string(), "RS-1002: arithmetic overflow during merge");
+
+        let min_sum = Bytes::from(MergeOperatorRegistry::encode_sum_count(i64::MIN, 1));
+        let minus_one = Bytes::from(MergeOperatorRegistry::encode_sum_count(-1, 0));
+        let err = op.merge(&k, Some(min_sum), minus_one).unwrap_err();
+        assert_eq!(err.to_string(), "RS-1002: arithmetic overflow during merge");
     }
 
     #[test]

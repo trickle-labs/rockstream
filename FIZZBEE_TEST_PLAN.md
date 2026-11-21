@@ -1196,6 +1196,33 @@ sequential and both barrier-synchronized concurrent schedules are asserted by
 in `crates/rockstream-control/src/checkpoint.rs`: exactly one complete callback,
 matching latest committed manifest, and zero remaining alignment credits.
 
+Issue #402 aligns worker execution, storage persistence, and resource control
+with O(affected data) work without altering the abstract M1–M7 coordination
+state machines. In `rockstream-storage`, `MergeTag::SumCount` (`0x05`) extends
+the ADR 0004 merge operator across `ShardDb` and every `ShardReader` path so
+aggregate sum/count deltas persist via blind merge operands within the existing
+M1 atomic `WriteBatch` commit boundary, while `MeteredObjectStore` and
+`PhysicalWriteTracker` on `ShardDb` / `StorageContext` measure physical
+object-store bytes without changing durable prefixes or commit ordering. In
+`rockstream-runtime`, `WorkerResourceController` and RSS-calibrated
+`SourcePressureController` account for process RSS, local disk usage, and
+shared SlateDB cache budgets; `FairChunkScheduler` cooperatively schedules
+`ResumableChunkedOp` tasks (such as `ResumableJoinEpoch`, which commits
+arrangement updates atomically only upon completion and leaves arrangements
+unchanged on cancellation); `ShardActorRegistry::register_owned` runs
+single-owner pipelines without per-batch `Mutex` contention; and
+`partition_batch_by_capsule` reuses pre-encoded `BatchKeyCapsule` hashes for
+exchange routing. Exactness, recovery, blind-merge persistence, budget
+calibration, and cancellation rollback are verified by
+`crates/rockstream-storage/tests/issue_402_adr0004_merge_proof_tests.rs`,
+`crates/rockstream-ops/tests/issue_402_scale_invariance_tests.rs`,
+`crates/rockstream-ops/tests/issue_402_fusion_lock_profile_tests.rs`, and
+`crates/rockstream-runtime/tests/issue_402_rss_fairness_stress_tests.rs`.
+These are worker-local storage, execution, and scheduling refinements under the
+DC.2 coupling rule; epoch-commit atomicity, frontier publication, and fencing
+transitions in `formal/m1_epoch_commit.fizz`–`formal/m7_control_plane_ha.fizz`
+remain unchanged.
+
 The v0.59.9 physical-commit-group extension is modeled by M1-S8 in
 `formal/m1_epoch_commit.fizz`: logical epochs may stage independently, but the
 published physical frontier advances only after a complete group is durable.

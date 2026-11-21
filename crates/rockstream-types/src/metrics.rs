@@ -347,6 +347,28 @@ pub struct R1PersistenceCounters {
     pub full_state_entries_visited: u64,
 }
 
+/// Physical SlateDB / object-store I/O counters tracked separately from logical
+/// `StateMutation` bytes so benchmarks and tests report logical vs. physical write amplification.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PhysicalPersistenceCounters {
+    pub wal_bytes_written: u64,
+    pub sst_bytes_written: u64,
+    pub manifest_bytes_written: u64,
+    pub other_bytes_written: u64,
+    pub put_ops: u64,
+    pub get_ops: u64,
+    pub get_bytes: u64,
+}
+
+impl PhysicalPersistenceCounters {
+    pub const fn total_written_bytes(&self) -> u64 {
+        self.wal_bytes_written
+            .saturating_add(self.sst_bytes_written)
+            .saturating_add(self.manifest_bytes_written)
+            .saturating_add(self.other_bytes_written)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct R1ArrangementCounters {
     pub logical_trace_bytes: u64,
@@ -399,6 +421,7 @@ struct MetricRegistry {
     r1_execution: HashMap<R1ExecutionKey, R1ExecutionCounters>,
     compiled_join_views: [u64; 2],
     r1_persistence: HashMap<OperatorId, R1PersistenceCounters>,
+    physical_persistence: HashMap<String, PhysicalPersistenceCounters>,
     r1_arrangements: HashMap<ArrangementId, R1ArrangementCounters>,
     r1_workers: HashMap<WorkerId, R1WorkerActivity>,
     applied: HashMap<LawMetricKey, Counter>,
@@ -557,6 +580,7 @@ impl MetricRegistry {
             r1_execution: HashMap::new(),
             compiled_join_views: [0; 2],
             r1_persistence: HashMap::new(),
+            physical_persistence: HashMap::new(),
             r1_arrangements: HashMap::new(),
             r1_workers: HashMap::new(),
             applied: HashMap::new(),
@@ -710,6 +734,42 @@ pub fn r1_persistence_snapshot() -> Vec<(OperatorId, R1PersistenceCounters)> {
     with_registry(|reg| {
         let mut snapshot: Vec<_> = reg.r1_persistence.iter().map(|(k, v)| (*k, *v)).collect();
         snapshot.sort_by_key(|(operator_id, _)| *operator_id);
+        snapshot
+    })
+}
+
+pub fn record_physical_persistence(scope: &str, delta: PhysicalPersistenceCounters) {
+    with_registry(|reg| {
+        let entry = reg
+            .physical_persistence
+            .entry(scope.to_string())
+            .or_default();
+        entry.wal_bytes_written = entry
+            .wal_bytes_written
+            .saturating_add(delta.wal_bytes_written);
+        entry.sst_bytes_written = entry
+            .sst_bytes_written
+            .saturating_add(delta.sst_bytes_written);
+        entry.manifest_bytes_written = entry
+            .manifest_bytes_written
+            .saturating_add(delta.manifest_bytes_written);
+        entry.other_bytes_written = entry
+            .other_bytes_written
+            .saturating_add(delta.other_bytes_written);
+        entry.put_ops = entry.put_ops.saturating_add(delta.put_ops);
+        entry.get_ops = entry.get_ops.saturating_add(delta.get_ops);
+        entry.get_bytes = entry.get_bytes.saturating_add(delta.get_bytes);
+    });
+}
+
+pub fn physical_persistence_snapshot() -> Vec<(String, PhysicalPersistenceCounters)> {
+    with_registry(|reg| {
+        let mut snapshot: Vec<_> = reg
+            .physical_persistence
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        snapshot.sort_by(|(a, _), (b, _)| a.cmp(b));
         snapshot
     })
 }
@@ -1262,6 +1322,7 @@ pub fn reset_all() {
         reg.r1_execution.clear();
         reg.compiled_join_views = [0; 2];
         reg.r1_persistence.clear();
+        reg.physical_persistence.clear();
         reg.r1_arrangements.clear();
         reg.r1_workers.clear();
         reg.applied.clear();
