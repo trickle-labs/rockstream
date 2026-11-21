@@ -254,7 +254,12 @@ async fn routed_shuffle_executes_on_worker_before_coordinator_completion() {
     }
     write
         .write_all(
-            (serde_json::to_string(&WorkerMessage::ReadWorkload { workload_id }).unwrap() + "\n")
+            (serde_json::to_string(&WorkerMessage::ReadWorkload {
+                version: rockstream_types::data_plane::WORKLOAD_SNAPSHOT_VERSION,
+                workload_id,
+            })
+            .unwrap()
+                + "\n")
                 .as_bytes(),
         )
         .await

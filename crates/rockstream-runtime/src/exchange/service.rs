@@ -397,7 +397,10 @@ impl ExchangeService {
             exchange_config: ExchangeConfig::default(),
             internal_tls: None,
             tls_reloader: None,
-            protocol_range: SupportedVersionRange::v1_through_v3(),
+            protocol_range: SupportedVersionRange::new(
+                rockstream_types::compatibility::ProtocolVersion::V1,
+                rockstream_types::compatibility::ProtocolVersion::V4,
+            ),
             owned_handler: None,
             insecure_internal_dev: false,
         }
@@ -633,7 +636,10 @@ impl ShuffleServer {
             task_tracker: None,
             cancel_token: None,
             exchange_config: ExchangeConfig::default(),
-            protocol_range: SupportedVersionRange::v1_through_v3(),
+            protocol_range: SupportedVersionRange::new(
+                rockstream_types::compatibility::ProtocolVersion::V1,
+                rockstream_types::compatibility::ProtocolVersion::V4,
+            ),
             require_worker_identity: false,
             owned_handler: None,
         }
@@ -649,7 +655,10 @@ impl ShuffleServer {
             task_tracker,
             cancel_token,
             exchange_config: ExchangeConfig::default(),
-            protocol_range: SupportedVersionRange::v1_through_v3(),
+            protocol_range: SupportedVersionRange::new(
+                rockstream_types::compatibility::ProtocolVersion::V1,
+                rockstream_types::compatibility::ProtocolVersion::V4,
+            ),
             require_worker_identity: false,
             owned_handler: None,
         }

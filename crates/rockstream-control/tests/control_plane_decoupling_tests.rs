@@ -332,7 +332,10 @@ async fn source_delta_waits_for_each_routed_shard() {
         .is_err());
         write_worker_message(
             &mut client_write,
-            &WorkerMessage::ReadWorkload { workload_id },
+            &WorkerMessage::ReadWorkload {
+                version: rockstream_types::data_plane::WORKLOAD_SNAPSHOT_VERSION,
+                workload_id,
+            },
         )
         .await;
         match read_control_message(&mut client_reader).await {
@@ -584,7 +587,7 @@ async fn test_control_plane_retains_zero_row_payloads_or_output_history() {
     worker_reader.read_line(&mut line).await.unwrap();
     let reg_resp: ControlMessage = serde_json::from_str(&line).unwrap();
     assert!(
-        matches!(reg_resp, ControlMessage::Registered { worker_id, protocol_version: rockstream_types::compatibility::ProtocolVersion::V3 } if worker_id == WorkerId(1)),
+        matches!(reg_resp, ControlMessage::Registered { worker_id, protocol_version: rockstream_types::compatibility::ProtocolVersion::V4 } if worker_id == WorkerId(1)),
         "Expected Registered, got {reg_resp:?}"
     );
 
@@ -687,19 +690,68 @@ async fn test_control_plane_retains_zero_row_payloads_or_output_history() {
     worker_write.write_all(wire_prog.as_bytes()).await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // 4. Query ReadWorkload: Assert control plane retains ZERO row output deltas
-    let read_msg = WorkerMessage::ReadWorkload { workload_id };
+    // 4. Query ReadWorkload: the worker returns complete durable rows; control
+    // forwards them without retaining deltas or output history.
+    let read_msg = WorkerMessage::ReadWorkload {
+        version: 1,
+        workload_id,
+    };
     let wire_read = serde_json::to_string(&read_msg).unwrap() + "\n";
     client_write.write_all(wire_read.as_bytes()).await.unwrap();
+    let read_request = match read_worker_command(&mut worker_reader).await {
+        ControlMessage::ReadWorkload {
+            version,
+            request_id,
+            workload_id: requested_workload,
+            shard_ids,
+        } => {
+            assert_eq!(version, 1);
+            assert_eq!(requested_workload, workload_id);
+            assert_eq!(shard_ids, vec![assigned_shard_id]);
+            request_id
+        }
+        other => panic!("expected ReadWorkload command, got {other:?}"),
+    };
+    write_worker_message(
+        &mut worker_write,
+        &WorkerMessage::WorkloadReadReport {
+            version: 1,
+            request_id: read_request,
+            workload_id,
+            worker_id: WorkerId(1),
+            available: true,
+            shards: vec![rockstream_types::data_plane::ShardOutput {
+                shard_id: assigned_shard_id,
+                lease_token: Some(assigned_lease_token),
+                deltas: vec![],
+                rows: vec![RuntimeRow {
+                    values_tsv: "\\N".to_owned(),
+                    weight: 2,
+                }],
+            }],
+        },
+    )
+    .await;
     line.clear();
     client_reader.read_line(&mut line).await.unwrap();
     let resp: ControlMessage = serde_json::from_str(&line).unwrap();
     if let ControlMessage::WorkloadSnapshot { snapshot } = resp {
+        assert_eq!(snapshot.version, 1);
+        assert!(snapshot.complete);
+        assert_eq!(snapshot.shards.len(), 1);
+        assert_eq!(snapshot.shards[0].lease_token, Some(assigned_lease_token));
         for shard in snapshot.shards {
             assert!(
                 shard.deltas.is_empty(),
-                "Control plane must NOT retain row payloads or output history! Found: {:?}",
+                "Control plane must not retain row deltas! Found: {:?}",
                 shard.deltas
+            );
+            assert_eq!(
+                shard.rows,
+                vec![RuntimeRow {
+                    values_tsv: "\\N".to_owned(),
+                    weight: 2,
+                }]
             );
         }
         assert_eq!(snapshot.workers.len(), 1);
@@ -837,7 +889,7 @@ async fn operator_stats_round_trip_is_scoped_to_workload_and_operator_ids() {
         read_control_message(&mut worker_reader).await,
         ControlMessage::Registered {
             worker_id: WorkerId(1),
-            protocol_version: rockstream_types::compatibility::ProtocolVersion::V3,
+            protocol_version: rockstream_types::compatibility::ProtocolVersion::V4,
         }
     ));
     assert!(matches!(

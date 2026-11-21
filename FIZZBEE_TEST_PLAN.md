@@ -935,6 +935,18 @@ clears both spilled and in-memory uncommitted change buffers before
 the same fenced owner lease. This refines the M3 shared-slot recovery boundary
 without altering the abstract FizzBee state machines.
 
+PR #408 (issue #303) upgrades the control-worker data-plane read protocol to
+`ProtocolVersion::V4` (`WORKLOAD_SNAPSHOT_VERSION = 1`). When the gateway reads
+a distributed workload snapshot, `ControlService` verifies that all deployment
+shards are ready, checks each shard's active `ShardManager` lease owner and
+token, and fans `ControlMessage::ReadWorkload` out to the owning workers. Each
+worker verifies its local deployment and active shard lease before materializing
+the durable SlateDB view rows and returning `WorkerMessage::WorkloadReadReport`.
+Control rejects incomplete or lease-mismatched reports and returns the complete
+snapshot to the gateway, preserving duplicate multiplicities and NULL values.
+This read-path coordination does not alter the M1–M7 commit, frontier, sink, or
+lease state machines.
+
 Issue #305 strengthens the file-backed audit append boundary in
 `crates/rockstream-control/src/audit.rs`. `FileAuditLog::append` writes each
 JSONL event and calls `sync_all` on the file before returning success. On Unix,
