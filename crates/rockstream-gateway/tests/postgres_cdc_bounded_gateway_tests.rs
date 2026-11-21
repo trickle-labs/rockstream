@@ -153,7 +153,10 @@ async fn run_gateway_proof() {
         if row.is_some() {
             break slot_lsn(&upstream).await;
         }
-        assert!(Instant::now() < deadline, "gateway never created the logical slot");
+        assert!(
+            Instant::now() < deadline,
+            "gateway never created the logical slot"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
     assert_eq!(view_ids(&gateway).await, Vec::<i64>::new());
@@ -194,10 +197,17 @@ async fn run_gateway_proof() {
         if slot_lsn(&upstream).await != ack_before {
             break;
         }
-        assert!(Instant::now() < deadline, "M3 completed but slot did not acknowledge");
+        assert!(
+            Instant::now() < deadline,
+            "M3 completed but slot did not acknowledge"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert_eq!(view_ids(&gateway).await, expected, "no duplicate publication after ACK");
+    assert_eq!(
+        view_ids(&gateway).await,
+        expected,
+        "no duplicate publication after ACK"
+    );
 
     // A frame larger than the 8 MiB source transport bound must block the
     // source before the router can see a partial row or advance its checkpoint.
