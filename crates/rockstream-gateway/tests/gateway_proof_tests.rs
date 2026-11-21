@@ -2104,6 +2104,138 @@ async fn explicit_idempotency_key_dedupes_multi_statement_transaction_replay() {
     );
 }
 
+/// Issue #344 regression A:
+/// - Setting names (`SET [LOCAL] ROCKSTREAM.IDEMPOTENCY_KEY`) are parsed case-insensitively.
+/// - Exact decoded literal values preserve case and escaped single quotes (`''` -> `'`).
+/// - Distinct keys (`'Request-A'` vs `'request-a'`, `'it''s-A'` vs `'it''s-a'`) do not collide.
+/// - Replaying an exact key is still deduplicated and dependent views / frontier / idempotency
+///   state reflect only the distinct commits.
+#[tokio::test]
+async fn idempotency_key_preserves_case_and_decoded_literal_while_parsing_setting_case_insensitively(
+) {
+    use sha2::{Digest, Sha256};
+
+    fn key_hash(s: &str) -> [u8; 16] {
+        let digest = Sha256::digest(s.as_bytes());
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&digest[..16]);
+        out
+    }
+
+    let (port, _handle, shard_db) = start_gateway_with_shard("s6-case-sensitive-key").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query("CREATE TABLE t (v BIGINT)")
+        .await
+        .expect("CREATE TABLE failed");
+    client
+        .simple_query("CREATE MATERIALIZED VIEW mv AS SELECT SUM(v) AS total FROM t")
+        .await
+        .expect("CREATE MATERIALIZED VIEW failed");
+
+    client
+        .simple_query("SET rockstream.idempotency_key = 'Request-A'")
+        .await
+        .expect("SET Request-A failed");
+    client
+        .simple_query("INSERT INTO t VALUES (10)")
+        .await
+        .expect("INSERT 10 failed");
+
+    client
+        .simple_query("SET ROCKSTREAM.IDEMPOTENCY_KEY = 'request-a'")
+        .await
+        .expect("SET request-a failed");
+    client
+        .simple_query("INSERT INTO t VALUES (20)")
+        .await
+        .expect("INSERT 20 failed");
+
+    client
+        .simple_query("set local rockstream.Idempotency_Key = 'it''s-A'")
+        .await
+        .expect("SET it's-A failed");
+    client
+        .simple_query("INSERT INTO t VALUES (30)")
+        .await
+        .expect("INSERT 30 failed");
+
+    client
+        .simple_query("SET rockstream.idempotency_key = 'it''s-a'")
+        .await
+        .expect("SET it's-a failed");
+    client
+        .simple_query("INSERT INTO t VALUES (40)")
+        .await
+        .expect("INSERT 40 failed");
+
+    // Exact replay of 'Request-A' must still be deduplicated.
+    client
+        .simple_query("SET rockstream.idempotency_key = 'Request-A'")
+        .await
+        .expect("SET replay Request-A failed");
+    client
+        .simple_query("INSERT INTO t VALUES (99)")
+        .await
+        .expect("INSERT replay 99 failed");
+
+    shard_db.flush().await.unwrap();
+
+    let msgs = client
+        .simple_query("SELECT v FROM t ORDER BY v")
+        .await
+        .expect("SELECT t failed");
+    let values: Vec<Option<String>> = data_rows_from(&msgs)
+        .into_iter()
+        .map(|r| r.get("v").map(str::to_string))
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            Some("10".to_string()),
+            Some("20".to_string()),
+            Some("30".to_string()),
+            Some("40".to_string()),
+        ]
+    );
+
+    let mv_msgs = client
+        .simple_query("SELECT total FROM mv")
+        .await
+        .expect("SELECT mv failed");
+    let mv_rows = data_rows_from(&mv_msgs);
+    assert_eq!(mv_rows.len(), 1);
+    assert_eq!(mv_rows[0].get("total"), Some("100"));
+
+    assert_eq!(
+        shard_db
+            .last_epoch()
+            .load(std::sync::atomic::Ordering::SeqCst),
+        4
+    );
+    let ep_upper = shard_db
+        .get_idempotency_epoch(0, key_hash("Request-A"))
+        .await
+        .unwrap();
+    let ep_lower = shard_db
+        .get_idempotency_epoch(0, key_hash("request-a"))
+        .await
+        .unwrap();
+    let ep_quote_upper = shard_db
+        .get_idempotency_epoch(0, key_hash("it's-A"))
+        .await
+        .unwrap();
+    let ep_quote_lower = shard_db
+        .get_idempotency_epoch(0, key_hash("it's-a"))
+        .await
+        .unwrap();
+    assert_eq!(ep_upper, Some(1));
+    assert_eq!(ep_lower, Some(2));
+    assert_eq!(ep_quote_upper, Some(3));
+    assert_eq!(ep_quote_lower, Some(4));
+}
+
 /// S6 green gate: idempotent replay of a committed write is a no-op.
 #[tokio::test]
 async fn idempotent_replay_is_noop() {

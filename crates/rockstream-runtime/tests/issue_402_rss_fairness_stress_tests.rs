@@ -197,14 +197,14 @@ async fn whole_process_rss_and_multi_shard_cache_budget_stress() {
         .acquire_foreground_query(16 * 1024 * 1024)
         .unwrap();
 
-    // Verify ShardActorRegistry::register_owned executes with single-owner &mut state
+    // Verify ShardActorRegistry::register_owned_state executes with single-owner &mut state
     // and accounts exchange buffers on the shared ledger.
     let registry = ShardActorRegistry::new().with_budget_ledger(controller.ledger().clone());
     let (done_tx, done_rx) = tokio::sync::oneshot::channel::<i64>();
     let done_tx = Arc::new(parking_lot::Mutex::new(Some(done_tx)));
     let owned_core = AggregateOp::new(OperatorId(9001)).into_core();
     let done_clone = done_tx.clone();
-    registry.register_owned(
+    registry.register_owned_state(
         ShardId(0),
         LeaseToken(1),
         (owned_core, 0usize),
@@ -230,6 +230,7 @@ async fn whole_process_rss_and_multi_shard_cache_budget_stress() {
     let make_frame = |seq: u64| RuntimeExchangeMessage {
         version: 1,
         request_id: format!("req-{seq}"),
+        attempt_id: None,
         workload_id: WorkloadId(1),
         shard_id: ShardId(0),
         lease_token: LeaseToken(1),
