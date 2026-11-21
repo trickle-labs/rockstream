@@ -5029,7 +5029,7 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
         rockstream_test_support::docker_available(),
         "Docker is required for the Kafka secret-rotation release proof"
     );
-    let initial_jaas = "org.apache.kafka.common.security.plain.PlainLoginModule required username=\"admin\" password=\"admin-pass\" user_admin=\"admin-pass\" user_rotating=\"old-pass\" user_rotated=\"new-pass\" user_steady=\"steady-pass\";";
+    let initial_jaas = "org.apache.kafka.common.security.plain.PlainLoginModule required username=\"admin\" password=\"admin-pass\" user_admin=\"admin-pass\" user_rotating=\"old-pass\" user_live=\"live-pass\" user_rotated=\"new-pass\" user_steady=\"steady-pass\";";
     let broker = apache::Kafka::default()
         .with_jvm_image()
         .with_env_var(
@@ -5084,6 +5084,7 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
     );
     for (principal, topic, group) in [
         ("User:rotating", "rotating-orders", "rotation-group-"),
+        ("User:live", "rotating-orders", "rotation-group-"),
         ("User:steady", "steady-orders", "steady-group-"),
     ] {
         kafka_acl(
@@ -5327,6 +5328,102 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
         ],
     )
     .await;
+    let live_rotation_operation_id = "00000000-0000-4000-8000-000000000305";
+    let live_process_id = process.0.id();
+    client
+        .simple_query(&format!(
+            "SET rockstream.idempotency_key = '{live_rotation_operation_id}'"
+        ))
+        .await
+        .unwrap();
+    let live_rotation = client
+        .simple_query("ALTER SECRET kafka_auth SET (USERNAME = 'live', PASSWORD = 'live-pass')")
+        .await
+        .unwrap();
+    assert!(matches!(
+        live_rotation.as_slice(),
+        [tokio_postgres::SimpleQueryMessage::CommandComplete(0)]
+    ));
+    kafka_acl(
+        &broker,
+        &[
+            "--add",
+            "--deny-principal",
+            "User:rotating",
+            "--operation",
+            "Read",
+            "--operation",
+            "Write",
+            "--operation",
+            "Describe",
+            "--topic",
+            "rotating-orders",
+        ],
+    )
+    .await;
+    kafka_acl(
+        &broker,
+        &[
+            "--add",
+            "--deny-principal",
+            "User:rotating",
+            "--operation",
+            "Read",
+            "--operation",
+            "Describe",
+            "--group",
+            "rotation-group-",
+            "--resource-pattern-type",
+            "prefixed",
+        ],
+    )
+    .await;
+    let live_deadline = Instant::now() + Duration::from_secs(90);
+    for view in ["rotating_a", "rotating_b"] {
+        wait_for_exact_query_rows(
+            &broker,
+            &client,
+            &mut process.0,
+            &format!("SELECT * FROM {view}"),
+            &expected_rotating,
+            live_deadline,
+            "pending Kafka records after live secret rotation",
+        )
+        .await;
+    }
+    wait_for_kafka_group_checkpoints(
+        &broker,
+        "rotating-orders",
+        "rotation-group-",
+        2,
+        &expected_rotating_offsets,
+        live_deadline,
+        "rotating view checkpoints after live rotation",
+    )
+    .await;
+    wait_for_exact_query_rows(
+        &broker,
+        &client,
+        &mut process.0,
+        "SELECT * FROM steady_rows",
+        &expected_steady,
+        live_deadline,
+        "unaffected Kafka view after live rotation",
+    )
+    .await;
+    wait_for_kafka_group_checkpoints(
+        &broker,
+        "steady-orders",
+        "steady-group-",
+        1,
+        &BTreeMap::from([(0, 1)]),
+        live_deadline,
+        "unaffected consumer checkpoint after live rotation",
+    )
+    .await;
+    assert!(process.0.try_wait().unwrap().is_none());
+    assert_eq!(process.0.id(), live_process_id);
+
     let rotation_query =
         "ALTER SECRET kafka_auth SET (USERNAME = 'rotated', PASSWORD = 'new-pass')";
     let (proxy_address, dropped_response, response_proxy) =
@@ -5411,40 +5508,26 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
         .await;
     }
 
-    kafka_acl(
-        &broker,
-        &[
+    for (resource, name) in [
+        ("--topic", "rotating-orders"),
+        ("--group", "rotation-group-"),
+    ] {
+        let mut args = vec![
             "--add",
             "--deny-principal",
-            "User:rotating",
-            "--operation",
-            "Read",
-            "--operation",
-            "Write",
-            "--operation",
-            "Describe",
-            "--topic",
-            "rotating-orders",
-        ],
-    )
-    .await;
-    kafka_acl(
-        &broker,
-        &[
-            "--add",
-            "--deny-principal",
-            "User:rotating",
+            "User:live",
             "--operation",
             "Read",
             "--operation",
             "Describe",
-            "--group",
-            "rotation-group-",
-            "--resource-pattern-type",
-            "prefixed",
-        ],
-    )
-    .await;
+            resource,
+            name,
+        ];
+        if resource == "--group" {
+            args.extend(["--resource-pattern-type", "prefixed"]);
+        }
+        kafka_acl(&broker, &args).await;
+    }
     let mut rotated_client = kafka_sasl_client(&bootstrap, "rotated", "new-pass");
     rotated_client.set("message.timeout.ms", "10000");
     let rotated_producer: FutureProducer = rotated_client.create().unwrap();
@@ -5536,10 +5619,14 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
     let envelope: rockstream_types::secret::EncryptedSecret =
         serde_json::from_slice(&envelope_bytes).unwrap();
     assert_eq!(envelope.name, "kafka_auth");
-    assert_eq!(envelope.metadata.version, 2);
+    assert_eq!(envelope.metadata.version, 3);
     assert!(!envelope.ciphertext.is_empty());
     assert_eq!(envelope.nonce.len(), 12);
-    for value in [b"old-pass".as_slice(), b"new-pass".as_slice()] {
+    for value in [
+        b"old-pass".as_slice(),
+        b"live-pass".as_slice(),
+        b"new-pass".as_slice(),
+    ] {
         assert!(
             !envelope_bytes
                 .windows(value.len())
@@ -5621,7 +5708,7 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
         .unwrap();
     let audit_json = serde_json::to_string(&audit).unwrap();
     assert!(!audit_json.is_empty());
-    for value in ["old-pass", "new-pass", "steady-pass"] {
+    for value in ["old-pass", "live-pass", "new-pass", "steady-pass"] {
         assert!(
             !audit_json.contains(value),
             "secret value leaked into audit"
@@ -5655,8 +5742,25 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
         .into_iter()
         .filter(|record| record.action == SecurityAuditClass::SecretRotation)
         .collect::<Vec<_>>();
-    assert_eq!(rotation_audits.len(), 1);
-    let rotation_audit = &rotation_audits[0];
+    assert_eq!(rotation_audits.len(), 2);
+    let live_audit = rotation_audits
+        .iter()
+        .find(|record| {
+            record.operation_id == AuditField::Known(live_rotation_operation_id.to_string())
+        })
+        .unwrap();
+    assert_eq!(
+        live_audit.before_state,
+        AuditField::Known("version=1".to_string())
+    );
+    assert_eq!(
+        live_audit.after_state,
+        AuditField::Known("version=2".to_string())
+    );
+    let rotation_audit = rotation_audits
+        .iter()
+        .find(|record| record.operation_id == AuditField::Known(rotation_operation_id.to_string()))
+        .unwrap();
     assert_eq!(
         rotation_audit.event_id,
         format!("gateway-secret-rotation-{rotation_operation_id}")
@@ -5697,11 +5801,11 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
     assert_eq!(rotation_audit.policy_revision, AuditField::Known(1));
     assert_eq!(
         rotation_audit.before_state,
-        AuditField::Known("version=1".to_string())
+        AuditField::Known("version=2".to_string())
     );
     assert_eq!(
         rotation_audit.after_state,
-        AuditField::Known("version=2".to_string())
+        AuditField::Known("version=3".to_string())
     );
     let operation = rockstream_control::ManagementOperationStore::new(
         rockstream_storage::build_runtime_object_store(&shard_dir, "gateway-shard").unwrap(),
