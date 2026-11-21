@@ -150,6 +150,9 @@ async fn backfill_fence_simruntime_restarts_preserve_exactly_once() {
                     )
                 );
                 owner = recovered.acquire_owner("worker-b").unwrap();
+                // Recovery fences input until the exact durable token is
+                // acknowledged, even if the old owner already ACKed it.
+                recovered.acknowledge_recovered(&owner).await.unwrap();
                 coordinator = recovered;
             }
         }

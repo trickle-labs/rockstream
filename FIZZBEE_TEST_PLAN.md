@@ -900,6 +900,17 @@ boundary outside the M1–M7 worker, lease, frontier, and sink state machines;
 the tests do not establish unbounded contention liveness, crash durability,
 or assembled release-process qualification.
 
+Issue #348 (PR #396) enforces a coordinator-owned `pending_ack` and
+`blocked_reason` gate in `SourceRuntimeCoordinator`. After a durable M3 source
+commit succeeds, `pending_ack` blocks new snapshot or delta polling and M3
+commits until `acknowledge_recovered` reconciles the committed epoch and offset
+with the upstream source and awaits `resume`. During PostgreSQL `pgoutput`
+recovery, `open_pgoutput`, table validation, confirmed-LSN inspection, and
+credential rotation remain permitted under the active owner lease so the slot
+can be opened and validated before `acknowledge_recovered` clears `pending_ack`.
+This refines the M3 post-commit source-acknowledgement recovery boundary without
+adding new formal transitions.
+
 Issue #305 strengthens the file-backed audit append boundary in
 `crates/rockstream-control/src/audit.rs`. `FileAuditLog::append` writes each
 JSONL event and calls `sync_all` on the file before returning success. On Unix,

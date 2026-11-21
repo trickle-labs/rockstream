@@ -625,7 +625,9 @@ async fn worker_process_fixture() {
             "recover durable staged update"
         );
     }
-    if ack_gap && id == 2 {
+    // Every recovered durable source checkpoint must be acknowledged before
+    // polling (including ordinary/enospc owner replacement, not only ACK-gap).
+    if source.has_pending_ack() {
         source.acknowledge_recovered(&owner).await.unwrap();
     }
     let final_epoch = if ack_gap {
