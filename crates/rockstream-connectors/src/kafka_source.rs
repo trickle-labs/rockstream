@@ -295,7 +295,7 @@ impl KafkaSourceIdentityV1 {
 pub struct KafkaSource {
     _connector_id: ConnectorId,
     schema: SchemaRef,
-    consumer: StreamConsumer,
+    consumer: std::sync::Arc<StreamConsumer>,
     consumer_config: ClientConfig,
     topic: String,
     paused: bool,
@@ -412,6 +412,7 @@ impl KafkaSource {
             .set("enable.auto.commit", "false")
             .set("enable.auto.offset.store", "false")
             .set("auto.offset.reset", "earliest")
+            .set("socket.timeout.ms", "10000")
             .set(
                 "queued.max.messages.kbytes",
                 KAFKA_SOURCE_BUFFER_LIMIT.to_string(),
@@ -450,7 +451,7 @@ impl KafkaSource {
         Ok(Self {
             _connector_id: connector_id,
             schema,
-            consumer,
+            consumer: std::sync::Arc::new(consumer),
             consumer_config,
             topic: topic.to_owned(),
             paused: false,
@@ -536,7 +537,10 @@ impl KafkaSource {
         replacement
             .subscribe(&[&self.topic])
             .map_err(|_| SourceError::Io("Kafka SASL consumer subscription failed".to_string()))?;
-        drop(std::mem::replace(&mut self.consumer, replacement));
+        drop(std::mem::replace(
+            &mut self.consumer,
+            std::sync::Arc::new(replacement),
+        ));
         self.consumer_config = consumer_config;
         self.assigned_partitions.clear();
         // Force the replacement consumer to seek from the durable source token.
@@ -1022,12 +1026,27 @@ impl SourceConnector for KafkaSource {
             // The first poll may fetch an older, unacknowledged group position; M3's token is authoritative.
             self.seek_recovery_offset(&offset, &assigned)?;
         }
-        if let Err(error) = self.consumer.commit(&commit, CommitMode::Sync) {
+        let consumer = std::sync::Arc::clone(&self.consumer);
+        let commit_result = tokio::time::timeout(
+            Duration::from_secs(15),
+            tokio::task::spawn_blocking(move || consumer.commit(&commit, CommitMode::Sync)),
+        )
+        .await;
+        let commit_error = match commit_result {
+            Ok(Ok(Ok(()))) => None,
+            Ok(Ok(Err(error))) => Some(format!(
+                "Kafka commit failed: {error}. Next steps: retry the source epoch"
+            )),
+            Ok(Err(error)) => Some(format!(
+                "Kafka commit task failed: {error}. Next steps: retry the source epoch"
+            )),
+            Err(_) => Some(
+                "Kafka commit timed out after 15s. Next steps: retry the source epoch".to_owned(),
+            ),
+        };
+        if let Some(reason) = commit_error {
             self.pending_retryable_broker_ack = Some((epoch, offset));
-            return Err(SourceError::CommitOffsetFailed {
-                epoch,
-                reason: format!("Kafka commit failed: {error}. Next steps: retry the source epoch"),
-            });
+            return Err(SourceError::CommitOffsetFailed { epoch, reason });
         }
         self.pending_retryable_broker_ack = None;
         self.last_committed = Some((epoch, offset));
