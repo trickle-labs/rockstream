@@ -5356,8 +5356,7 @@ impl GatewayHandler {
     ) {
         let key = format!("{}:{view_name}", source.name);
         let (abort, registration) = futures::future::AbortHandle::new_pair();
-        if let dashmap::mapref::entry::Entry::Vacant(entry) =
-            self.source_workers.entry(key.clone())
+        if let dashmap::mapref::entry::Entry::Vacant(entry) = self.source_workers.entry(key.clone())
         {
             entry.insert(abort);
         } else {
@@ -5392,8 +5391,7 @@ impl GatewayHandler {
         let connector_id = identity.connector_id();
         let key = format!("pgoutput:{}", connector_id.0);
         let (abort, registration) = futures::future::AbortHandle::new_pair();
-        if let dashmap::mapref::entry::Entry::Vacant(entry) =
-            self.source_workers.entry(key.clone())
+        if let dashmap::mapref::entry::Entry::Vacant(entry) = self.source_workers.entry(key.clone())
         {
             entry.insert(abort);
         } else {
@@ -5657,10 +5655,7 @@ impl GatewayHandler {
                     // messages and spill, reopen under the same fenced owner,
                     // and replay from the durable slot/checkpoint.
                     tracing::warn!(%reason, "pgoutput transport lost; reopening shared slot");
-                    if let Err(error) = coordinator
-                        .discard_interrupted_envelope(&shard_db)
-                        .await
-                    {
+                    if let Err(error) = coordinator.discard_interrupted_envelope(&shard_db).await {
                         handler.block_pgoutput_aliases(
                             &aliases,
                             format!("pgoutput disconnect cleanup failed: {error}"),

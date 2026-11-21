@@ -178,7 +178,6 @@ async fn assert_shared_pgoutput_slot_two_tables() {
     handle.abort();
 }
 
-
 // Versioned shared-slot recovery oracles: docs/testing/shared-pgoutput-recovery-v1.md.
 // These are intentionally NOT aliases of the healthy attachment/status helper.
 #[derive(Clone, Copy, Debug)]
@@ -236,9 +235,7 @@ fn expected_base(table: &str, phase: HistoryPhase) -> Vec<(i64, i64)> {
 
 async fn query_pairs(client: &Client, relation: &str, column: &str) -> Vec<(i64, i64)> {
     client
-        .simple_query(&format!(
-            "SELECT id, {column} FROM {relation} ORDER BY id"
-        ))
+        .simple_query(&format!("SELECT id, {column} FROM {relation} ORDER BY id"))
         .await
         .unwrap()
         .into_iter()
@@ -341,6 +338,7 @@ async fn source_status(client: &Client, name: &str) -> (Option<String>, Option<S
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SharedSlotProgress {
     checkpoint: SourceCheckpoint,
+    frontier_epoch: u64,
     slot_lsn: PgLsn,
 }
 
@@ -355,6 +353,17 @@ async fn shared_slot_progress(
         .await
         .unwrap()
         .expect("shared slot requires a durable committed checkpoint");
+    let frontier_bytes = db
+        .get(&rockstream_storage::ShardKeyEncoder::frontier_key())
+        .await
+        .unwrap()
+        .expect("shared slot requires a durable shard frontier");
+    let frontier_epoch = u64::from_be_bytes(
+        frontier_bytes
+            .as_slice()
+            .try_into()
+            .expect("shard frontier must be an 8-byte epoch"),
+    );
     let slot = upstream
         .query_one(
             "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = 'shared_slot'",
@@ -370,6 +379,7 @@ async fn shared_slot_progress(
     .unwrap();
     SharedSlotProgress {
         checkpoint,
+        frontier_epoch,
         slot_lsn,
     }
 }
@@ -377,12 +387,19 @@ async fn shared_slot_progress(
 fn assert_progress_advances(previous: &SharedSlotProgress, next: &SharedSlotProgress) {
     assert_eq!(
         next.checkpoint.source_epoch,
-        previous.checkpoint.source_epoch + 1,
-        "one upstream COMMIT must advance the source checkpoint by exactly one epoch: {previous:?} -> {next:?}"
+        previous.frontier_epoch + 1,
+        "one upstream COMMIT must advance the source checkpoint by exactly one epoch above the previous shard frontier: {previous:?} -> {next:?}"
+    );
+    assert_eq!(
+        next.frontier_epoch, next.checkpoint.source_epoch,
+        "the committed source checkpoint must match the shard frontier: {next:?}"
     );
     let old = PgLsn::from_offset_token(&previous.checkpoint.token).unwrap();
     let new = PgLsn::from_offset_token(&next.checkpoint.token).unwrap();
-    assert!(new > old, "source LSN did not advance: {previous:?} -> {next:?}");
+    assert!(
+        new > old,
+        "source LSN did not advance: {previous:?} -> {next:?}"
+    );
     assert!(
         next.slot_lsn >= previous.slot_lsn,
         "PostgreSQL slot regressed: {previous:?} -> {next:?}"
@@ -405,8 +422,7 @@ async fn wait_acknowledged_progress(
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let current = shared_slot_progress(upstream, db, connector_id).await;
-        if current.checkpoint.source_epoch == expected_epoch
-            && current.slot_lsn > previous_slot_lsn
+        if current.checkpoint.source_epoch == expected_epoch && current.slot_lsn > previous_slot_lsn
         {
             let durable = PgLsn::from_offset_token(&current.checkpoint.token).unwrap();
             assert!(
@@ -529,9 +545,7 @@ async fn apply_cross_table_transaction(upstream: &Client, three_tables: bool) {
         .unwrap();
     if three_tables {
         upstream
-            .batch_execute(
-                "UPDATE c SET val = 215 WHERE id = 21; INSERT INTO c VALUES (23, 230);",
-            )
+            .batch_execute("UPDATE c SET val = 215 WHERE id = 21; INSERT INTO c VALUES (23, 230);")
             .await
             .unwrap();
     }
@@ -561,7 +575,10 @@ async fn pgoutput_backend_pid(upstream: &Client) -> Option<i32> {
         )
         .await
         .unwrap();
-    assert!(rows.len() <= 1, "only one physical shared-slot owner is allowed");
+    assert!(
+        rows.len() <= 1,
+        "only one physical shared-slot owner is allowed"
+    );
     rows.first().map(|row| row.get(0))
 }
 
@@ -620,9 +637,8 @@ async fn run_shared_slot_scenario(scenario: SharedSlotScenario) {
         "CREATE PUBLICATION shared_pub FOR TABLE {};",
         names.join(", ")
     ));
-    upstream_ddl.push_str(
-        "INSERT INTO a VALUES (1,10),(2,20); INSERT INTO b VALUES (11,110),(12,120);",
-    );
+    upstream_ddl
+        .push_str("INSERT INTO a VALUES (1,10),(2,20); INSERT INTO b VALUES (11,110),(12,120);");
     if three {
         upstream_ddl.push_str("INSERT INTO c VALUES (21,210),(22,220);");
     }
@@ -679,7 +695,12 @@ async fn run_shared_slot_scenario(scenario: SharedSlotScenario) {
             .unwrap();
     }
     wait_exact_relations(
-        &client, names, HistoryPhase::Initial, scenario, &revision, &pg_version,
+        &client,
+        names,
+        HistoryPhase::Initial,
+        scenario,
+        &revision,
+        &pg_version,
     )
     .await;
     let published = upstream
@@ -695,7 +716,10 @@ async fn run_shared_slot_scenario(scenario: SharedSlotScenario) {
         .collect::<Vec<_>>();
     assert_eq!(
         published,
-        names.iter().map(|name| name.to_string()).collect::<Vec<_>>(),
+        names
+            .iter()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>(),
         "all expected relations must share the same publication"
     );
     let slot_count: i64 = upstream
@@ -707,7 +731,10 @@ async fn run_shared_slot_scenario(scenario: SharedSlotScenario) {
         .await
         .unwrap()
         .get(0);
-    assert_eq!(slot_count, 1, "must have exactly one physical pgoutput slot");
+    assert_eq!(
+        slot_count, 1,
+        "must have exactly one physical pgoutput slot"
+    );
     assert_eq!(
         handler.active_source_worker_count_for_test(),
         1,
@@ -752,12 +779,13 @@ async fn run_shared_slot_scenario(scenario: SharedSlotScenario) {
                     &before,
                     &SharedSlotProgress {
                         slot_lsn: before.slot_lsn,
+                        frontier_epoch: at_cut.frontier_epoch,
                         checkpoint: at_cut.checkpoint.clone(),
                     },
                 );
                 assert_eq!(
                     at_cut.checkpoint.source_epoch,
-                    before.checkpoint.source_epoch + 1,
+                    before.frontier_epoch + 1,
                     "one complete cross-table transaction must commit as one M3 epoch"
                 );
             }
@@ -787,8 +815,9 @@ async fn run_shared_slot_scenario(scenario: SharedSlotScenario) {
                 &pg_version,
             )
             .await;
-            let expected_recovery_epoch = if matches!(scenario, SharedSlotScenario::RestartBeforeM3) {
-                before.checkpoint.source_epoch + 1
+            let expected_recovery_epoch = if matches!(scenario, SharedSlotScenario::RestartBeforeM3)
+            {
+                before.frontier_epoch + 1
             } else {
                 at_cut.checkpoint.source_epoch
             };
@@ -805,8 +834,7 @@ async fn run_shared_slot_scenario(scenario: SharedSlotScenario) {
                 assert_progress_advances(&before, &recovered);
             } else {
                 assert_eq!(
-                    recovered.checkpoint,
-                    at_cut.checkpoint,
+                    recovered.checkpoint, at_cut.checkpoint,
                     "after-M3 restart must recover the same durable epoch, not reapply"
                 );
                 assert!(recovered.slot_lsn > before.slot_lsn);
@@ -830,12 +858,18 @@ async fn run_shared_slot_scenario(scenario: SharedSlotScenario) {
                 &upstream,
                 &db,
                 connector_id,
-                recovered.checkpoint.source_epoch + 1,
+                recovered.frontier_epoch + 1,
                 recovered.slot_lsn,
             )
             .await;
             assert_progress_advances(&recovered, &after_followup);
-            proof_progress(scenario, &revision, &pg_version, "continued", &after_followup);
+            proof_progress(
+                scenario,
+                &revision,
+                &pg_version,
+                "continued",
+                &after_followup,
+            );
             recovered_task.abort();
             recovered_handler.abort_source_workers_for_test();
         }
@@ -853,7 +887,12 @@ async fn run_shared_slot_scenario(scenario: SharedSlotScenario) {
                 .await
                 .expect("gateway never buffered the first pgoutput change");
             assert_exact_relations(
-                &client, names, HistoryPhase::Initial, scenario, &revision, &pg_version,
+                &client,
+                names,
+                HistoryPhase::Initial,
+                scenario,
+                &revision,
+                &pg_version,
             )
             .await;
             let partially_decoded = shared_slot_progress(&upstream, &db, connector_id).await;
@@ -862,7 +901,11 @@ async fn run_shared_slot_scenario(scenario: SharedSlotScenario) {
                 "partial pgoutput envelope must not advance M3 or the slot"
             );
             proof_progress(
-                scenario, &revision, &pg_version, "partial-envelope-before-disconnect", &partially_decoded,
+                scenario,
+                &revision,
+                &pg_version,
+                "partial-envelope-before-disconnect",
+                &partially_decoded,
             );
             let pid = pgoutput_backend_pid(&upstream)
                 .await
@@ -872,7 +915,10 @@ async fn run_shared_slot_scenario(scenario: SharedSlotScenario) {
                 .await
                 .unwrap()
                 .get(0);
-            assert!(terminated, "must actually terminate the replication backend {pid}");
+            assert!(
+                terminated,
+                "must actually terminate the replication backend {pid}"
+            );
             eprintln!(
                 "SHARED_SLOT_PROOF scenario={} revision={revision} postgres={pg_version:?} cut={} terminated_pid={pid} actual_terminated={terminated}",
                 scenario.identity(),
@@ -898,14 +944,19 @@ async fn run_shared_slot_scenario(scenario: SharedSlotScenario) {
                 scenario.cut(),
             );
             wait_exact_relations(
-                &client, names, HistoryPhase::Committed, scenario, &revision, &pg_version,
+                &client,
+                names,
+                HistoryPhase::Committed,
+                scenario,
+                &revision,
+                &pg_version,
             )
             .await;
             let recovered = wait_acknowledged_progress(
                 &upstream,
                 &db,
                 connector_id,
-                before.checkpoint.source_epoch + 1,
+                before.frontier_epoch + 1,
                 before.slot_lsn,
             )
             .await;
@@ -913,25 +964,39 @@ async fn run_shared_slot_scenario(scenario: SharedSlotScenario) {
             proof_progress(scenario, &revision, &pg_version, "resumed", &recovered);
             for name in names {
                 assert!(
-                    matches!(source_status(&client, name).await.0.as_deref(), Some("OK" | "RUNNING")),
+                    matches!(
+                        source_status(&client, name).await.0.as_deref(),
+                        Some("OK" | "RUNNING")
+                    ),
                     "alias {name} did not recover after disconnect"
                 );
             }
             apply_followup(&upstream, true).await;
             wait_exact_relations(
-                &client, names, HistoryPhase::Continued, scenario, &revision, &pg_version,
+                &client,
+                names,
+                HistoryPhase::Continued,
+                scenario,
+                &revision,
+                &pg_version,
             )
             .await;
             let after_followup = wait_acknowledged_progress(
                 &upstream,
                 &db,
                 connector_id,
-                recovered.checkpoint.source_epoch + 1,
+                recovered.frontier_epoch + 1,
                 recovered.slot_lsn,
             )
             .await;
             assert_progress_advances(&recovered, &after_followup);
-            proof_progress(scenario, &revision, &pg_version, "continued", &after_followup);
+            proof_progress(
+                scenario,
+                &revision,
+                &pg_version,
+                "continued",
+                &after_followup,
+            );
             task.abort();
             handler.abort_source_workers_for_test();
         }
@@ -947,12 +1012,23 @@ async fn run_shared_slot_scenario(scenario: SharedSlotScenario) {
             // This is the explicit upstream transaction boundary; schema
             // mutations and a valid a-row must remain invisible before COMMIT.
             assert_exact_relations(
-                &client, names, HistoryPhase::Initial, scenario, &revision, &pg_version,
+                &client,
+                names,
+                HistoryPhase::Initial,
+                scenario,
+                &revision,
+                &pg_version,
             )
             .await;
             let pre_commit = shared_slot_progress(&upstream, &db, connector_id).await;
             assert_eq!(pre_commit, before);
-            proof_progress(scenario, &revision, &pg_version, "upstream-before-commit", &pre_commit);
+            proof_progress(
+                scenario,
+                &revision,
+                &pg_version,
+                "upstream-before-commit",
+                &pre_commit,
+            );
             upstream.batch_execute("COMMIT").await.unwrap();
             let blocked = tokio::time::timeout(Duration::from_secs(40), async {
                 loop {
@@ -979,12 +1055,26 @@ async fn run_shared_slot_scenario(scenario: SharedSlotScenario) {
                 assert_eq!(source_status(&client, name).await, blocked);
             }
             assert_exact_relations(
-                &client, names, HistoryPhase::Initial, scenario, &revision, &pg_version,
+                &client,
+                names,
+                HistoryPhase::Initial,
+                scenario,
+                &revision,
+                &pg_version,
             )
             .await;
             let rejected = shared_slot_progress(&upstream, &db, connector_id).await;
-            assert_eq!(rejected, before, "rejected cross-table transaction must not commit or ACK");
-            proof_progress(scenario, &revision, &pg_version, "blocked-after-commit", &rejected);
+            assert_eq!(
+                rejected, before,
+                "rejected cross-table transaction must not commit or ACK"
+            );
+            proof_progress(
+                scenario,
+                &revision,
+                &pg_version,
+                "blocked-after-commit",
+                &rejected,
+            );
             wait_source_workers_stopped(&handler).await;
             // A later valid a-only transaction must NOT sneak past the
             // explicitly blocked shared-slot owner. This is a fail-closed
@@ -994,10 +1084,18 @@ async fn run_shared_slot_scenario(scenario: SharedSlotScenario) {
                 .await
                 .unwrap();
             assert_exact_relations(
-                &client, names, HistoryPhase::Initial, scenario, &revision, &pg_version,
+                &client,
+                names,
+                HistoryPhase::Initial,
+                scenario,
+                &revision,
+                &pg_version,
             )
             .await;
-            assert_eq!(shared_slot_progress(&upstream, &db, connector_id).await, before);
+            assert_eq!(
+                shared_slot_progress(&upstream, &db, connector_id).await,
+                before
+            );
             eprintln!(
                 "SHARED_SLOT_PROOF scenario={} revision={revision} postgres={pg_version:?} cut={} source_status={blocked:?} followup=correctly-blocked-until-rebuild",
                 scenario.identity(),
