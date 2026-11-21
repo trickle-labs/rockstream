@@ -723,6 +723,21 @@ exercise the recovery gate. M1 abstracts the batch and does not model compiled
 operators, gateway cancellation, source shuffle ownership, or management
 authentication. Those boundaries require separate qualification.
 
+The gateway records pending source dispatch in the base-row batch and clears it
+after all source requests complete; reads and subsequent writes fail if a
+gateway restarts with that record. Distributed reads also fail when snapshots
+do not contain worker output, rather than report an empty result. The owned
+shuffle path records a source epoch on its anchor before dispatch and
+clears that record only after all target shards report committed execution.
+The process regression stops the gateway with a source request outstanding and
+checks the exact input and post-restart failure.
+Worker execution records distinguish matching committed replays from conflicting
+input. Distributed view reads fail while execution is incomplete or requires
+recovery. The coordinator, gateway, and runtime tests cover ordering, failure,
+restart, closed-inlet delivery, and exact replay. M1 does not model the journal or the
+transport-to-worker handoff; the bare credit-only transport and independent-host
+recovery remain unqualified by these tests.
+
 Issue #303's #309 slice binds control-worker registration to the authenticated
 certificate identity. `control_worker_mtls_tests.rs` covers missing, expired,
 and untrusted certificates, identity mismatch, and role-only rejection; the
@@ -1827,6 +1842,10 @@ complete/truncated/row-over-budget responses and v3 logical-key/failure behavior
 ## v0.72 CLI checkpoint export integrity (#221)
 
 The CLI backup operation selects one committed control checkpoint and must enumerate its required immutable shard manifest, WAL and SST objects before exporting. A merely visible-prefix inventory is insufficient: missing referenced shard storage must fail with a checkpoint-integrity error and must not create a terminal success marker. The management and CLI export paths now share the existing checkpoint-aware inventory; this does not alter M3 cluster checkpoint durability, lease fencing or the committed checkpoint itself. Concrete coverage: `cli_prefix_export_rejects_missing_committed_shard_objects_before_success` deletes a real checkpointed shard before CLI export and requires failure without a commit marker; `lfs_export_restore_fresh_cluster_is_bit_identical` preserves the positive committed state recovery contract. Checkpoint-export error-code aliasing has been corrected: RS-3613 identifies export-in-progress and RS-3614 identifies export/restore failure; RS-5035 remains the cataloged skew-SLO error. This is an operator diagnostics change, not a new checkpoint durability claim.
+
+## Raft heartbeat lease age bounding (#351)
+
+`RaftControlGroup` bounds leader authority by the initiation timestamp (`round_started_at`) of each heartbeat round rather than the response completion timestamp. A delayed quorum acknowledgement whose round began more than `ELECTION_TIMEOUT_MIN` ago cannot refresh `last_quorum_ack`, and the leader steps down when no fresh majority proof remains. This tightens local leader self-fencing to match the M4 monotonic fencing contract without changing durable Raft term/vote persistence or shard lease token monotonicity.
 
 ## Bounded pgoutput transport and streaming transaction decoding (#349)
 

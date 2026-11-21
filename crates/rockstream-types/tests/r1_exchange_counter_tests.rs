@@ -8,6 +8,7 @@ use rockstream_types::metrics::{
 fn encoded_exchange_counter_equals_fixture_serialization() {
     metrics::reset_all();
     let frame = RuntimeExchangeMessage {
+        attempt_id: None,
         version: 1,
         request_id: "request-9".into(),
         workload_id: WorkloadId(7),

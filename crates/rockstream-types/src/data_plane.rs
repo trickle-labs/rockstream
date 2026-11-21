@@ -96,8 +96,23 @@ pub struct SourceDeltaRequest {
     pub rows: Vec<RuntimeRow>,
 }
 
+/// Durable record of a source epoch that has not yet been fully reconciled.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OwnedEpochIntent {
+    pub attempt_id: uuid::Uuid,
+    pub version: u32,
+    pub request_id: String,
+    pub workload_id: WorkloadId,
+    pub epoch: Epoch,
+    pub source: String,
+    pub anchor_shard: ShardId,
+    pub target_shards: Vec<ShardId>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeExchangeMessage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<uuid::Uuid>,
     pub version: u32,
     pub request_id: String,
     pub workload_id: WorkloadId,
@@ -139,6 +154,8 @@ impl RuntimeExchangeMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeOutputDelta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<uuid::Uuid>,
     pub version: u32,
     pub request_id: String,
     pub workload_id: WorkloadId,
@@ -213,6 +230,7 @@ mod tests {
             "lfs:worker-5/shard-2".into(),
         );
         let output = RuntimeOutputDelta {
+            attempt_id: None,
             version: 1,
             request_id: "request-9".into(),
             workload_id: WorkloadId(7),
@@ -251,6 +269,7 @@ mod tests {
             rows: output.rows.clone(),
         };
         let exchange = RuntimeExchangeMessage {
+            attempt_id: None,
             version: output.version,
             request_id: output.request_id.clone(),
             workload_id: output.workload_id,
@@ -295,6 +314,7 @@ mod tests {
             weight: 1,
         }];
         let output = RuntimeOutputDelta {
+            attempt_id: None,
             version: 1,
             request_id: "request-9".into(),
             workload_id: WorkloadId(7),
@@ -323,6 +343,7 @@ mod tests {
             workers: vec![status.clone()],
         };
         let frame = RuntimeExchangeMessage {
+            attempt_id: None,
             version: 1,
             request_id: "request-9".into(),
             workload_id: WorkloadId(7),
