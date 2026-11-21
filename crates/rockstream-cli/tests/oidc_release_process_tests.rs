@@ -4071,7 +4071,12 @@ async fn subscription_revocation_is_enforced_by_release_gateway() {
         ))
         .unwrap()
     };
-    let grant_audit = |event_id: &str, revision: u64, before: AuditField<String>, after: String| {
+    let grant_audit = |event_id: &str,
+                       target: u64,
+                       operation: u64,
+                       revision: u64,
+                       before: AuditField<String>,
+                       after: String| {
         SecurityAuditRecord {
             format_version: SECURITY_AUDIT_FORMAT_VERSION,
             event_id: event_id.into(),
@@ -4080,12 +4085,12 @@ async fn subscription_revocation_is_enforced_by_release_gateway() {
                 .unwrap()
                 .as_millis() as u64,
             actor: AuditIdentity::Verified("principal:1".into()),
-            target: AuditField::Known("principal:2".into()),
+            target: AuditField::Known(format!("principal:{target}")),
             scope: AuditField::Known("cluster".into()),
             action: SecurityAuditClass::GrantChange,
             outcome: SecurityAuditOutcome::Success,
             correlation: AuditCorrelation::Observed(event_id.into()),
-            operation_id: AuditField::Known((revision + 1).to_string()),
+            operation_id: AuditField::Known(operation.to_string()),
             policy_revision: AuditField::Known(revision),
             before_state: before,
             after_state: AuditField::Known(after),
@@ -4102,9 +4107,41 @@ async fn subscription_revocation_is_enforced_by_release_gateway() {
                     grantor_revision: Some((PrincipalId(1), 1)),
                     audit: grant_audit(
                         "seed-reader",
+                        2,
+                        2,
                         1,
                         AuditField::NotApplicable,
                         format!("revision=1;policy={}", policy(&reader)),
+                    ),
+                }],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut observer = reader.clone();
+    observer.id = PrincipalId(3);
+    observer.display_name = "independent subscription reader".into();
+    let LoginMethod::ScramSha256 { username, .. } = &mut observer.login_methods[0] else {
+        unreachable!()
+    };
+    *username = "carol".into();
+    catalog
+        .commit_txn(
+            CatalogTxn::new(
+                3,
+                3,
+                vec![CatalogMutation::PutSecurityPrincipal {
+                    principal: observer.clone(),
+                    expected_revision: None,
+                    grantor_revision: Some((PrincipalId(1), 1)),
+                    audit: grant_audit(
+                        "seed-observer",
+                        3,
+                        3,
+                        1,
+                        AuditField::NotApplicable,
+                        format!("revision=1;policy={}", policy(&observer)),
                     ),
                 }],
             )
@@ -4155,6 +4192,33 @@ async fn subscription_revocation_is_enforced_by_release_gateway() {
             .await
             .unwrap();
     let subscriber_task = tokio::spawn(subscriber_connection);
+    let (observer_client, observer_connection) =
+        tokio_postgres::connect(&connect("carol"), tokio_postgres::NoTls)
+            .await
+            .unwrap();
+    let observer_task = tokio::spawn(observer_connection);
+    let mut observer_rows = Box::pin(
+        observer_client
+            .simple_query_raw("SUBSCRIBE subscribed AS OF NOW WITH SNAPSHOT")
+            .await
+            .unwrap(),
+    );
+    let observer_schema = tokio::time::timeout(Duration::from_secs(10), observer_rows.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let tokio_postgres::SimpleQueryMessage::RowDescription(observer_columns) = observer_schema
+    else {
+        panic!("expected observer subscription columns")
+    };
+    assert_eq!(
+        observer_columns
+            .iter()
+            .map(|column| column.name())
+            .collect::<Vec<_>>(),
+        vec!["id", "mz_timestamp", "mz_diff"]
+    );
     let mut rows = Box::pin(
         subscriber
             .simple_query_raw("SUBSCRIBE subscribed AS OF NOW WITH SNAPSHOT")
@@ -4191,6 +4255,17 @@ async fn subscription_revocation_is_enforced_by_release_gateway() {
     assert_eq!(first_row.get(0), Some("1"));
     assert!(first_row.get(1).unwrap().parse::<u64>().unwrap() > 0);
     assert_eq!(first_row.get(2), Some("1"));
+    let observer_first = tokio::time::timeout(Duration::from_secs(10), observer_rows.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let tokio_postgres::SimpleQueryMessage::Row(observer_first) = observer_first else {
+        panic!("expected observer row")
+    };
+    assert_eq!(observer_first.get(0), Some("1"));
+    assert!(observer_first.get(1).unwrap().parse::<u64>().unwrap() > 0);
+    assert_eq!(observer_first.get(2), Some("1"));
     catalog.refresh().await.unwrap();
     let before = policy(&reader);
     reader.revision = 2;
@@ -4200,13 +4275,15 @@ async fn subscription_revocation_is_enforced_by_release_gateway() {
         .commit_txn(
             CatalogTxn::new(
                 revision,
-                3,
+                4,
                 vec![CatalogMutation::PutSecurityPrincipal {
                     principal: reader.clone(),
                     expected_revision: Some(1),
                     grantor_revision: Some((PrincipalId(1), 1)),
                     audit: grant_audit(
                         "revoke-reader",
+                        2,
+                        4,
                         2,
                         AuditField::Known(format!("revision=1;policy={before}")),
                         format!("revision=2;policy={}", policy(&reader)),
@@ -4234,6 +4311,17 @@ async fn subscription_revocation_is_enforced_by_release_gateway() {
         .batch_execute("INSERT INTO subscribed VALUES (2)")
         .await
         .unwrap();
+    let observer_next = tokio::time::timeout(Duration::from_secs(10), observer_rows.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let tokio_postgres::SimpleQueryMessage::Row(observer_next) = observer_next else {
+        panic!("expected unaffected observer row")
+    };
+    assert_eq!(observer_next.get(0), Some("2"));
+    assert!(observer_next.get(1).unwrap().parse::<u64>().unwrap() > 0);
+    assert_eq!(observer_next.get(2), Some("1"));
     assert_eq!(
         subscriber
             .query_one("SELECT 1", &[])
@@ -4291,6 +4379,7 @@ async fn subscription_revocation_is_enforced_by_release_gateway() {
     );
     writer_task.abort();
     subscriber_task.abort();
+    observer_task.abort();
     process.0.kill().unwrap();
     process.0.wait().unwrap();
 }
