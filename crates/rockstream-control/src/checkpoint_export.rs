@@ -155,14 +155,7 @@ impl CheckpointExportService {
             .map_err(|_| CheckpointExportError::InFlight)?;
         rockstream_types::metrics::set_checkpoint_export_objects_in_flight(1);
         let result = self
-            .export_objects_inner(
-                source,
-                destination,
-                checkpoint,
-                generation,
-                objects,
-                guard,
-            )
+            .export_objects_inner(source, destination, checkpoint, generation, objects, guard)
             .await;
         rockstream_types::metrics::set_checkpoint_export_objects_in_flight(0);
         result
@@ -342,8 +335,8 @@ impl CheckpointExportService {
         for root in roots {
             let mut listing = source.list(Some(&root));
             while let Some(entry) = listing.next().await {
-                let meta = entry
-                    .map_err(|error| CheckpointExportError::ObjectStore(error.to_string()))?;
+                let meta =
+                    entry.map_err(|error| CheckpointExportError::ObjectStore(error.to_string()))?;
                 scanned += 1;
                 if scanned > MAX_CHECKPOINT_EXPORT_SCAN_WINDOW {
                     return Err(CheckpointExportError::Integrity(format!(
@@ -1081,14 +1074,11 @@ fn is_selected_checkpoint_metadata(path: &Path, checkpoint: &ClusterCheckpoint) 
     if let Some(suffix) = name.strip_prefix("control/changelog-checkpoints/") {
         return suffix.split_once('-').is_some_and(|(id, shard)| {
             id.parse::<u64>() == Ok(checkpoint.checkpoint_id.0)
-                && shard
-                    .parse::<u64>()
-                    .ok()
-                    .is_some_and(|shard| {
-                        checkpoint
-                            .shards
-                            .contains_key(&rockstream_types::ids::ShardId(shard))
-                    })
+                && shard.parse::<u64>().ok().is_some_and(|shard| {
+                    checkpoint
+                        .shards
+                        .contains_key(&rockstream_types::ids::ShardId(shard))
+                })
         });
     }
     true
@@ -1597,7 +1587,9 @@ mod tests {
             .await
             .is_err());
         assert!(matches!(
-            target.head(&Path::from("control/bootstrap/active-generation")).await,
+            target
+                .head(&Path::from("control/bootstrap/active-generation"))
+                .await,
             Err(object_store::Error::NotFound { .. })
         ));
     }
@@ -1631,9 +1623,13 @@ mod tests {
             .restore_generation(export, target.clone(), "target-has-newer")
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("another discoverable checkpoint"));
+        assert!(error
+            .to_string()
+            .contains("another discoverable checkpoint"));
         assert!(matches!(
-            target.head(&Path::from("control/bootstrap/active-generation")).await,
+            target
+                .head(&Path::from("control/bootstrap/active-generation"))
+                .await,
             Err(object_store::Error::NotFound { .. })
         ));
     }

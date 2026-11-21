@@ -430,12 +430,8 @@ async fn assert_export_racing_new_manifest_fails_closed(
         .await
         .unwrap();
     db.put(b"view/rows", b"committed-newer").await.unwrap();
-    db.put(b"view/rows/3", b"newer-second-row")
-        .await
-        .unwrap();
-    db.put(b"view/rows/4", b"newer-only-row")
-        .await
-        .unwrap();
+    db.put(b"view/rows/3", b"newer-second-row").await.unwrap();
+    db.put(b"view/rows/4", b"newer-only-row").await.unwrap();
     db.put(&ShardKeyEncoder::frontier_key(), &36u64.to_be_bytes())
         .await
         .unwrap();
@@ -483,7 +479,9 @@ async fn assert_export_racing_new_manifest_fails_closed(
     );
     assert!(matches!(
         export
-            .head(&Path::from(format!("checkpoint-exports/{generation}/commit")))
+            .head(&Path::from(format!(
+                "checkpoint-exports/{generation}/commit"
+            )))
             .await,
         Err(object_store::Error::NotFound { .. })
     ));
@@ -533,8 +531,14 @@ async fn assert_export_racing_new_manifest_fails_closed(
         record["checkpoint"],
         serde_json::to_value(&checkpoint_b).unwrap()
     );
-    assert_eq!(record["object_count"], serde_json::json!(outcome_b.object_count));
-    assert_eq!(record["requires_checkpoint_manifest"], serde_json::json!(true));
+    assert_eq!(
+        record["object_count"],
+        serde_json::json!(outcome_b.object_count)
+    );
+    assert_eq!(
+        record["requires_checkpoint_manifest"],
+        serde_json::json!(true)
+    );
     service
         .validate_generation(export.clone(), &generation_b)
         .await
@@ -578,20 +582,44 @@ async fn assert_export_racing_new_manifest_fails_closed(
         .await
         .unwrap();
     assert_eq!(
-        shard.reader.get(b"view/rows").await.unwrap().unwrap().as_ref(),
+        shard
+            .reader
+            .get(b"view/rows")
+            .await
+            .unwrap()
+            .unwrap()
+            .as_ref(),
         b"committed-newer"
     );
     assert_eq!(
-        shard.reader.get(b"view/rows/1").await.unwrap().unwrap().as_ref(),
+        shard
+            .reader
+            .get(b"view/rows/1")
+            .await
+            .unwrap()
+            .unwrap()
+            .as_ref(),
         b"committed"
     );
     assert_eq!(shard.reader.get(b"view/rows/2").await.unwrap(), None);
     assert_eq!(
-        shard.reader.get(b"view/rows/3").await.unwrap().unwrap().as_ref(),
+        shard
+            .reader
+            .get(b"view/rows/3")
+            .await
+            .unwrap()
+            .unwrap()
+            .as_ref(),
         b"newer-second-row"
     );
     assert_eq!(
-        shard.reader.get(b"view/rows/4").await.unwrap().unwrap().as_ref(),
+        shard
+            .reader
+            .get(b"view/rows/4")
+            .await
+            .unwrap()
+            .unwrap()
+            .as_ref(),
         b"newer-only-row"
     );
     assert_eq!(
@@ -605,7 +633,10 @@ async fn assert_export_racing_new_manifest_fails_closed(
         &36u64.to_be_bytes()
     );
     for (path, expected) in [
-        ("control/catalog/views", b"view=v committed_epoch=36".as_slice()),
+        (
+            "control/catalog/views",
+            b"view=v committed_epoch=36".as_slice(),
+        ),
         ("control/connectors/source-resume", b"offset=99".as_slice()),
     ] {
         assert_eq!(
@@ -689,7 +720,9 @@ async fn lfs_export_rejects_mutable_catalog_changed_during_inventory() {
     );
     assert!(matches!(
         export
-            .head(&Path::from("checkpoint-exports/mutable-catalog-race/commit"))
+            .head(&Path::from(
+                "checkpoint-exports/mutable-catalog-race/commit"
+            ))
             .await,
         Err(object_store::Error::NotFound { .. })
     ));
@@ -1091,13 +1124,8 @@ async fn minio_tc_export_racing_committed_manifest_fails_closed_and_recovers_new
     let Some((_container, source, export, target)) = minio_stores("manifest-race").await else {
         return;
     };
-    assert_export_racing_new_manifest_fails_closed(
-        source,
-        export,
-        target,
-        "minio-manifest-race",
-    )
-    .await;
+    assert_export_racing_new_manifest_fails_closed(source, export, target, "minio-manifest-race")
+        .await;
 }
 
 #[tokio::test]
