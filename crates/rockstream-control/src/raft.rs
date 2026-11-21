@@ -414,8 +414,7 @@ impl RaftConfig {
 
     fn leader_quorum_timeout(&self) -> Duration {
         // At least one nanosecond of separation, even for tiny test configs.
-        self.election_timeout_min
-            - (self.heartbeat_interval / 2).max(Duration::from_nanos(1))
+        self.election_timeout_min - (self.heartbeat_interval / 2).max(Duration::from_nanos(1))
     }
 }
 
@@ -742,7 +741,11 @@ async fn start_election(
             guard.persistent.current_term += 1;
             guard.persistent.voted_for = Some(config.node_id);
             guard.last_contact = Instant::now();
-            (guard.persistent.current_term, guard.persistent, guard.last_contact)
+            (
+                guard.persistent.current_term,
+                guard.persistent,
+                guard.last_contact,
+            )
         };
         store.save(&snapshot).await;
         // Self-vote persistence and delayed vote responses must never age
@@ -809,11 +812,7 @@ async fn start_election(
 /// safe to do this before unrelated RPCs finish: the follower that ACKed
 /// could not have received the request before round_started. Never revive
 /// already-aged evidence beyond its original follower-election window.
-fn renew_leader_quorum(
-    inner: &Arc<RwLock<RaftInner>>,
-    term: u64,
-    round_started: Instant,
-) {
+fn renew_leader_quorum(inner: &Arc<RwLock<RaftInner>>, term: u64, round_started: Instant) {
     let mut guard = inner.write();
     if guard.role == RaftRole::Leader
         && guard.persistent.current_term == term
@@ -839,7 +838,11 @@ async fn send_heartbeats(
             }
             return;
         }
-        (guard.persistent.current_term, config.node_id, Instant::now())
+        (
+            guard.persistent.current_term,
+            config.node_id,
+            Instant::now(),
+        )
     };
     let mut responses: FuturesUnordered<_> = config
         .peers
