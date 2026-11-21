@@ -52,7 +52,10 @@ async fn worker_exchange_listener_lifecycle_tracks_control_connection() {
         let WorkerMessage::Register(registration) = serde_json::from_str(&line).unwrap() else {
             panic!("worker must register before control messages");
         };
-        let exchange_addr = registration.address.parse::<std::net::SocketAddr>().unwrap();
+        let exchange_addr = registration
+            .address
+            .parse::<std::net::SocketAddr>()
+            .unwrap();
         assert_eq!(exchange_addr.ip(), std::net::Ipv4Addr::LOCALHOST);
         assert_ne!(exchange_addr.port(), 0);
         let reply = serde_json::to_string(&ControlMessage::Registered {

@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
-use object_store::{ObjectStore, prefix::PrefixStore};
+use object_store::{prefix::PrefixStore, ObjectStore};
 use rockstream_control::{
     CheckpointManifestStore, ControlService, ManagementOperationStore, ManagementService,
     OperationKind, OperationStatus, OperationUpdate, ShardManager, TopologyCatalog,
 };
 use rockstream_management_proto::v1::{
-    CreateBackupRequest, GetOperationRequest, Operation,
-    management_service_client::ManagementServiceClient,
+    management_service_client::ManagementServiceClient, CreateBackupRequest, GetOperationRequest,
+    Operation,
 };
 use rockstream_runtime::client::start_worker_client_with_insecure_internal_dev_and_metadata as start_test_worker_client;
 use rockstream_types::checkpoint::{CheckpointId, ClusterCheckpoint, PerShardCheckpoint};
@@ -151,12 +151,10 @@ async fn create_backup_snapshots_real_worker_shard_and_is_idempotent() {
     assert_eq!(completed.kind, "create_backup");
     assert_eq!(completed.state, "succeeded");
     assert_eq!(completed.started_at, accepted_operation.started_at);
-    assert!(
-        completed
-            .updated_at
-            .parse::<chrono::DateTime<chrono::FixedOffset>>()
-            .is_ok()
-    );
+    assert!(completed
+        .updated_at
+        .parse::<chrono::DateTime<chrono::FixedOffset>>()
+        .is_ok());
     assert_eq!(completed.progress, "100%");
     assert_eq!(completed.phase, "completed");
     assert_eq!(completed.error_code, "");

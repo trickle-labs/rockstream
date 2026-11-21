@@ -25,8 +25,8 @@ use tokio_util::task::AbortOnDropHandle;
 
 use rockstream_types::config::ExchangeConfig;
 use rockstream_types::data_plane::{
-    DEPLOYMENT_DESCRIPTOR_VERSION, DeploymentDescriptor, RuntimeExchangeMessage,
-    RuntimeOutputDelta, RuntimeRow,
+    DeploymentDescriptor, RuntimeExchangeMessage, RuntimeOutputDelta, RuntimeRow,
+    DEPLOYMENT_DESCRIPTOR_VERSION,
 };
 use rockstream_types::identity::InternalTlsConfig;
 use rockstream_types::ids::{LeaseToken, OperatorId, ShardId, WorkerId, WorkloadId};
@@ -1232,7 +1232,7 @@ mod data_plane_tests {
                 .map(|value| value.to_vec()),
             Some(1_u64.to_be_bytes().to_vec())
         );
-        use rockstream_ops::sink::{ColumnValue, read_view_output};
+        use rockstream_ops::sink::{read_view_output, ColumnValue};
         let stored = read_view_output(&db, OperatorId(10), 2).await.unwrap();
         let expected = vec![
             (1, vec![ColumnValue::Int64(1), ColumnValue::Int64(10)], 1),
@@ -1386,7 +1386,7 @@ mod data_plane_tests {
         assert_eq!(metrics.emitted_updates, 2);
 
         // 3. Check storage: only key 20 was written, key 10 was omitted completely
-        use rockstream_ops::sink::{ColumnValue, read_view_output};
+        use rockstream_ops::sink::{read_view_output, ColumnValue};
         let stored = read_view_output(&db, OperatorId(10), 2).await.unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].0, 1); // epoch 1
@@ -1755,7 +1755,7 @@ mod data_plane_tests {
             }
             other => panic!("unexpected worker response: {other:?}"),
         }
-        use rockstream_ops::sink::{ColumnValue, read_view_output};
+        use rockstream_ops::sink::{read_view_output, ColumnValue};
         let stored = read_view_output(&db, OperatorId(10), 2).await.unwrap();
         assert_eq!(
             stored
@@ -1826,7 +1826,7 @@ mod data_plane_tests {
         assert_eq!(compactor.metrics().collapsed_updates(), 1);
         assert_eq!(compactor.metrics().cancelled_zero_weight_updates(), 0);
 
-        use rockstream_ops::sink::{ColumnValue, read_view_output};
+        use rockstream_ops::sink::{read_view_output, ColumnValue};
         let stored = read_view_output(&db, OperatorId(10), 2).await.unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(
@@ -2606,9 +2606,7 @@ where
                 .parse::<std::net::SocketAddr>()
                 .ok()
                 .filter(|addr| addr.port() == 0)
-                .map(|addr| {
-                    std::net::SocketAddr::new(addr.ip(), local_addr.port()).to_string()
-                })
+                .map(|addr| std::net::SocketAddr::new(addr.ip(), local_addr.port()).to_string())
                 .unwrap_or(registration_address),
             Some(_) => registration_address,
             None => local_addr.to_string(),

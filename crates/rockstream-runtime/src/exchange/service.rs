@@ -455,11 +455,9 @@ impl ExchangeService {
         &self,
         addr: std::net::SocketAddr,
     ) -> Result<tokio::task::JoinHandle<()>, String> {
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .map_err(|error| {
-                format!("{RS_0001}: failed to bind worker shuffle listener {addr}: {error}")
-            })?;
+        let listener = tokio::net::TcpListener::bind(addr).await.map_err(|error| {
+            format!("{RS_0001}: failed to bind worker shuffle listener {addr}: {error}")
+        })?;
         self.start_listener(listener).await
     }
 

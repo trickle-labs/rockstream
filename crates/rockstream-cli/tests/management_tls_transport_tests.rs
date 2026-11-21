@@ -12,8 +12,8 @@ use rockstream_cli::output::{
 };
 use rockstream_cli::transport::ManagementCliClient;
 use rockstream_control::{
-    MANAGEMENT_OPERATION_RECORD_VERSION, ManagementOperationStore, ManagementService, ShardManager,
-    TopologyCatalog,
+    ManagementOperationStore, ManagementService, ShardManager, TopologyCatalog,
+    MANAGEMENT_OPERATION_RECORD_VERSION,
 };
 use rockstream_management_proto::v1::{
     GetClusterStatusRequest, Operation as ManagementWireOperation, SecurityPresetGrant,
@@ -24,8 +24,8 @@ use rockstream_storage::catalog::{CatalogMutation, CatalogStore, CatalogTxn, Dur
 use rockstream_test_support::pki::TestPki;
 use rockstream_types::authorization::{
     AuditCorrelation, AuditField, AuditIdentity, LoginMethod, PermissionPreset, PolicyScope,
-    SECURITY_AUDIT_FORMAT_VERSION, SECURITY_PRINCIPAL_FORMAT_VERSION, ScopedPresetGrant,
-    SecurityAuditClass, SecurityAuditOutcome, SecurityAuditRecord, SecurityPrincipal,
+    ScopedPresetGrant, SecurityAuditClass, SecurityAuditOutcome, SecurityAuditRecord,
+    SecurityPrincipal, SECURITY_AUDIT_FORMAT_VERSION, SECURITY_PRINCIPAL_FORMAT_VERSION,
 };
 use rockstream_types::config::NodeConfig;
 use rockstream_types::error_code::RS_0003;
@@ -380,12 +380,10 @@ async fn management_cli_connects_to_mtls_service_and_reads_exact_status() {
     assert_eq!(status.request_capacity, 64);
     assert_eq!(status.ack_waiter_fill, 0);
     assert_eq!(status.ack_waiter_capacity, 0);
-    assert!(
-        status
-            .observed_at
-            .parse::<chrono::DateTime<chrono::FixedOffset>>()
-            .is_ok()
-    );
+    assert!(status
+        .observed_at
+        .parse::<chrono::DateTime<chrono::FixedOffset>>()
+        .is_ok());
 
     let worker_addr = server.addr.to_string();
     let worker_tls = pki.worker_tls_config(1);
@@ -583,12 +581,10 @@ async fn management_release_process_authenticates_and_authorizes_real_cli_reques
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
     let node = &before_workers.nodes[0];
-    assert!(
-        before_workers
-            .observed_at
-            .parse::<chrono::DateTime<chrono::FixedOffset>>()
-            .is_ok()
-    );
+    assert!(before_workers
+        .observed_at
+        .parse::<chrono::DateTime<chrono::FixedOffset>>()
+        .is_ok());
     assert_eq!(node.node_id, 1);
     assert_eq!(node.role, "worker");
     assert_eq!(node.address, exchange_addr.to_string());
@@ -660,19 +656,15 @@ async fn management_release_process_authenticates_and_authorizes_real_cli_reques
         &["status"],
     );
     let mut actual_status: ManagementClusterStatusInfo = parse_json(&admin_status);
-    assert!(
-        actual_status
-            .observed_at
-            .parse::<chrono::DateTime<chrono::FixedOffset>>()
-            .is_ok()
-    );
+    assert!(actual_status
+        .observed_at
+        .parse::<chrono::DateTime<chrono::FixedOffset>>()
+        .is_ok());
     assert!(actual_status.source_version.starts_with("topology:"));
-    assert!(
-        actual_status
-            .nodes
-            .iter()
-            .all(|node| node.source_version == actual_status.source_version)
-    );
+    assert!(actual_status
+        .nodes
+        .iter()
+        .all(|node| node.source_version == actual_status.source_version));
     let actual_capacity_headroom = actual_status
         .nodes
         .first()
@@ -785,24 +777,20 @@ async fn management_release_process_authenticates_and_authorizes_real_cli_reques
         &["cluster", "workers", "list"],
     );
     let mut after_denied_drain: ManagementNodesInfo = parse_json(&after_denied_drain);
-    assert!(
-        after_denied_drain
-            .observed_at
-            .parse::<chrono::DateTime<chrono::FixedOffset>>()
-            .is_ok()
-    );
+    assert!(after_denied_drain
+        .observed_at
+        .parse::<chrono::DateTime<chrono::FixedOffset>>()
+        .is_ok());
     let denied_capacity_headroom = after_denied_drain
         .nodes
         .first()
         .expect("denied drain must preserve the registered worker")
         .capacity_headroom;
     assert!((0.0..=1.0).contains(&denied_capacity_headroom));
-    assert!(
-        after_denied_drain
-            .nodes
-            .iter()
-            .all(|node| node.source_version == after_denied_drain.source_version)
-    );
+    assert!(after_denied_drain
+        .nodes
+        .iter()
+        .all(|node| node.source_version == after_denied_drain.source_version));
     let denied_revision = after_denied_drain
         .source_version
         .strip_prefix("topology:")

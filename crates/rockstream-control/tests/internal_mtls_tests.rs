@@ -14,7 +14,7 @@ use rockstream_cli::run_cluster_status;
 use rockstream_cli::transport::{ClientIdentity, ControlClient};
 use rockstream_control::audit::FileAuditLog;
 use rockstream_control::delegation::{
-    ActorAssertionSigner, ActorAssertionVerifier, request_digest,
+    request_digest, ActorAssertionSigner, ActorAssertionVerifier,
 };
 use rockstream_control::kek::EnvKekProvider;
 use rockstream_control::{ControlService, SecretStore, ShardManager, TopologyCatalog};
@@ -27,9 +27,9 @@ use rockstream_storage::catalog::{
 use rockstream_test_support::pki::TestPki;
 use rockstream_types::authorization::{
     AuditCorrelation, AuditField, AuditIdentity, LoginMethod, PermissionPreset, PolicyScope,
-    ResourceKind, SECURITY_AUDIT_FORMAT_VERSION, SECURITY_PRINCIPAL_FORMAT_VERSION,
-    ScopedActionGrant, ScopedPresetGrant, SecurityAction, SecurityAuditClass, SecurityAuditOutcome,
-    SecurityAuditRecord, SecurityPrincipal,
+    ResourceKind, ScopedActionGrant, ScopedPresetGrant, SecurityAction, SecurityAuditClass,
+    SecurityAuditOutcome, SecurityAuditRecord, SecurityPrincipal, SECURITY_AUDIT_FORMAT_VERSION,
+    SECURITY_PRINCIPAL_FORMAT_VERSION,
 };
 use rockstream_types::error_code::{RS_2400, RS_2410, RS_2411};
 use rockstream_types::ids::{
@@ -536,11 +536,9 @@ async fn worker_secret_tokens_are_workload_bound_and_recheck_current_grants() {
         )
         .await
         .unwrap();
-    assert!(
-        worker
-            .get_deployment(request.workload_id, ShardId(request.workload_id.0 * 16))
-            .is_some()
-    );
+    assert!(worker
+        .get_deployment(request.workload_id, ShardId(request.workload_id.0 * 16))
+        .is_some());
 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -549,11 +547,9 @@ async fn worker_secret_tokens_are_workload_bound_and_recheck_current_grants() {
                 record.action == SecurityAuditClass::AuthorizationDenial
                     && record.target == AuditField::Known("kafka".to_owned())
             }) {
-                assert!(
-                    worker
-                        .secret(request.workload_id, "kafka", current_time_secs())
-                        .is_none()
-                );
+                assert!(worker
+                    .secret(request.workload_id, "kafka", current_time_secs())
+                    .is_none());
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -575,11 +571,9 @@ async fn worker_secret_tokens_are_workload_bound_and_recheck_current_grants() {
                     && record.target == AuditField::Known("kafka".to_owned())
                     && record.policy_revision == AuditField::Known(2)
             }) {
-                assert!(
-                    worker
-                        .secret(request.workload_id, "kafka", current_time_secs())
-                        .is_none()
-                );
+                assert!(worker
+                    .secret(request.workload_id, "kafka", current_time_secs())
+                    .is_none());
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -656,21 +650,15 @@ async fn worker_secret_tokens_are_workload_bound_and_recheck_current_grants() {
         record.actor == AuditIdentity::Verified("principal-2".to_owned())
             && record.scope == AuditField::Known(format!("{:?}", worker_secret_scope()))
     }));
-    assert!(
-        denials
-            .iter()
-            .any(|record| record.policy_revision == AuditField::Known(1))
-    );
-    assert!(
-        denials
-            .iter()
-            .any(|record| record.policy_revision == AuditField::Known(2))
-    );
-    assert!(
-        denials
-            .iter()
-            .any(|record| record.policy_revision == AuditField::Known(3))
-    );
+    assert!(denials
+        .iter()
+        .any(|record| record.policy_revision == AuditField::Known(1)));
+    assert!(denials
+        .iter()
+        .any(|record| record.policy_revision == AuditField::Known(2)));
+    assert!(denials
+        .iter()
+        .any(|record| record.policy_revision == AuditField::Known(3)));
     let success = records
         .iter()
         .find(|record| {

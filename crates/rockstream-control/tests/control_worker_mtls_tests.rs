@@ -8,8 +8,8 @@ use rockstream_runtime::client::start_worker_client_with_tls;
 use rockstream_storage::catalog::{CatalogStore, DurableCatalogStore};
 use rockstream_test_support::pki::TestPki;
 use rockstream_types::authorization::{
-    AuditCorrelation, AuditField, AuditIdentity, SECURITY_AUDIT_FORMAT_VERSION, SecurityAuditClass,
-    SecurityAuditOutcome, SecurityAuditRecord,
+    AuditCorrelation, AuditField, AuditIdentity, SecurityAuditClass, SecurityAuditOutcome,
+    SecurityAuditRecord, SECURITY_AUDIT_FORMAT_VERSION,
 };
 use rockstream_types::error_code::RS_2401;
 use rockstream_types::ids::{ShardId, WorkerId};
@@ -149,11 +149,9 @@ async fn test_control_worker_mtls_valid_cert_admitted() {
 
     // Verify audit log has worker.registered
     let events = audit.read_all().unwrap();
-    assert!(
-        events
-            .iter()
-            .any(|e| e.action == "worker.registered" && e.resource == "worker-1")
-    );
+    assert!(events
+        .iter()
+        .any(|e| e.action == "worker.registered" && e.resource == "worker-1"));
 
     worker_handle.abort();
     handle.shutdown();
@@ -383,12 +381,10 @@ async fn test_control_worker_mtls_missing_cert_rejected() {
             && (e.detail.as_deref().unwrap_or("").contains("RS-2410")
                 || e.detail.as_deref().unwrap_or("").contains("RS-2411"))
     }));
-    assert!(
-        events
-            .iter()
-            .filter(|event| event.action == "security.internal_mtls_denied")
-            .all(|event| event.actor == "unknown")
-    );
+    assert!(events
+        .iter()
+        .filter(|event| event.action == "security.internal_mtls_denied")
+        .all(|event| event.actor == "unknown"));
 
     worker_handle.abort();
     handle.shutdown();
@@ -425,12 +421,10 @@ async fn test_control_worker_mtls_expired_cert_rejected() {
         e.action == "security.internal_mtls_denied"
             && e.detail.as_deref().unwrap_or("").contains("RS-2411")
     }));
-    assert!(
-        events
-            .iter()
-            .filter(|event| event.action == "security.internal_mtls_denied")
-            .all(|event| event.actor == "unknown")
-    );
+    assert!(events
+        .iter()
+        .filter(|event| event.action == "security.internal_mtls_denied")
+        .all(|event| event.actor == "unknown"));
 
     handle.shutdown();
 }
@@ -466,12 +460,10 @@ async fn test_control_worker_mtls_untrusted_ca_rejected() {
         e.action == "security.internal_mtls_denied"
             && e.detail.as_deref().unwrap_or("").contains("RS-2411")
     }));
-    assert!(
-        events
-            .iter()
-            .filter(|event| event.action == "security.internal_mtls_denied")
-            .all(|event| event.actor == "unknown")
-    );
+    assert!(events
+        .iter()
+        .filter(|event| event.action == "security.internal_mtls_denied")
+        .all(|event| event.actor == "unknown"));
 
     handle.shutdown();
 }
@@ -682,11 +674,9 @@ async fn test_control_worker_mtls_cannot_claim_another_registered_worker() {
         denials[1].detail.as_deref(),
         Some("registered_worker_id=worker-1, claimed_worker_id=worker-2, error_code=RS-2401")
     );
-    assert!(
-        !events
-            .iter()
-            .any(|event| { event.action == "worker.deregistered" && event.resource == "worker-2" })
-    );
+    assert!(!events
+        .iter()
+        .any(|event| { event.action == "worker.deregistered" && event.resource == "worker-2" }));
     let records = security_catalog
         .list_security_audit_records()
         .await
