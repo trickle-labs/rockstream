@@ -1358,7 +1358,7 @@ pub fn sample_process_rss_bytes() -> Result<u64, String> {
         )
     };
     if kr != 0 {
-        return Err(format!("mach task_info failed with kern_return_t={kr}"));
+        return Err(format!("RS-0001: mach task_info failed with kern_return_t={kr}"));
     }
     let info = unsafe { info.assume_init() };
     Ok(info.resident_size)
@@ -1366,7 +1366,7 @@ pub fn sample_process_rss_bytes() -> Result<u64, String> {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn sample_process_rss_bytes() -> Result<u64, String> {
-    Err("process RSS sampling is unsupported on this OS".to_string())
+    Err("RS-3028: process RSS sampling is unsupported on this OS".to_string())
 }
 
 /// Recursively measure actual disk usage in bytes under `root`.
