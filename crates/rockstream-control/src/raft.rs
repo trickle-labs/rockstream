@@ -896,13 +896,14 @@ async fn send_heartbeats(
         }
     } else {
         let mut guard = inner.write();
-        if guard.role == RaftRole::Leader && guard.persistent.current_term == term {
-            if !has_live_leader_quorum(&guard) {
-                // No usable majority proof remains, even if a stale round
-                // eventually returned a nominal quorum.
-                guard.role = RaftRole::Follower;
-                guard.current_leader = None;
-            }
+        if guard.role == RaftRole::Leader
+            && guard.persistent.current_term == term
+            && !has_live_leader_quorum(&guard)
+        {
+            // No usable majority proof remains, even if a stale round
+            // eventually returned a nominal quorum.
+            guard.role = RaftRole::Follower;
+            guard.current_leader = None;
         }
     }
 }
