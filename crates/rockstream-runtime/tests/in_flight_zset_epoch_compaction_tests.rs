@@ -611,6 +611,7 @@ async fn test_runtime_pipeline_all_rows_net_zero_omits_storage_writes_and_progre
 
     // Exchange frame where all rows offset to net-zero (+1 and -1 on key 555)
     let frame = RuntimeExchangeMessage {
+        attempt_id: None,
         version: DEPLOYMENT_DESCRIPTOR_VERSION,
         request_id: "req-zero-omit".to_string(),
         workload_id: WorkloadId(1),
@@ -676,6 +677,7 @@ async fn test_runtime_pipeline_mixed_rows_exact_storage_and_progress_delta() {
     // - key 30: +1 -> net weight 1
     // - key 40: +2, -2 -> net zero (omitted from pipeline & storage)
     let frame = RuntimeExchangeMessage {
+        attempt_id: None,
         version: DEPLOYMENT_DESCRIPTOR_VERSION,
         request_id: "req-mixed".to_string(),
         workload_id: WorkloadId(1),
