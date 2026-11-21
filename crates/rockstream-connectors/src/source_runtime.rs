@@ -645,8 +645,15 @@ impl SourceRuntimeCoordinator<KafkaSource> {
 
 impl SourceRuntimeCoordinator<PostgresCdcSource> {
     /// Open PostgreSQL only after recovery and the source owner fence.
+    /// Opening or validating the slot before `acknowledge_recovered` is
+    /// required during startup recovery while `pending_ack` is still set.
     pub async fn open_pgoutput(&mut self, lease: &SourceOwnerLease) -> Result<(), SourceError> {
-        self.require_active_lease(lease)?;
+        self.require_owner_lease(lease)?;
+        if let Some(reason) = &self.blocked_reason {
+            return Err(SourceError::Io(format!(
+                "RS-4016: source is blocked pending recovery: {reason}"
+            )));
+        }
         if !self.recovered {
             return Err(SourceError::Io(
                 "RS-4012: pgoutput cannot open before checkpoint recovery".to_string(),
@@ -671,7 +678,7 @@ impl SourceRuntimeCoordinator<PostgresCdcSource> {
         &self,
         lease: &SourceOwnerLease,
     ) -> Result<Option<crate::PgLsn>, SourceError> {
-        self.require_active_lease(lease)?;
+        self.require_owner_lease(lease)?;
         self.source.confirmed_flush_lsn().await
     }
 
@@ -691,7 +698,7 @@ impl SourceRuntimeCoordinator<PostgresCdcSource> {
         lease: &SourceOwnerLease,
         table: &str,
     ) -> Result<(), SourceError> {
-        self.require_active_lease(lease)?;
+        self.require_owner_lease(lease)?;
         self.source.validate_pgoutput_table(table).await
     }
 
@@ -700,7 +707,7 @@ impl SourceRuntimeCoordinator<PostgresCdcSource> {
         lease: &SourceOwnerLease,
         relation_id: u32,
     ) -> Result<Vec<(bool, bool)>, SourceError> {
-        self.require_active_lease(lease)?;
+        self.require_owner_lease(lease)?;
         self.source.relation_column_policies(relation_id).await
     }
 
@@ -708,7 +715,7 @@ impl SourceRuntimeCoordinator<PostgresCdcSource> {
         &self,
         lease: &SourceOwnerLease,
     ) -> Result<(Option<&str>, u64), SourceError> {
-        self.require_active_lease(lease)?;
+        self.require_owner_lease(lease)?;
         Ok(self.source.secret_binding())
     }
 
@@ -719,7 +726,7 @@ impl SourceRuntimeCoordinator<PostgresCdcSource> {
         version: u64,
         password: String,
     ) -> Result<bool, SourceError> {
-        self.require_active_lease(lease)?;
+        self.require_owner_lease(lease)?;
         let has_checkpoint = self.committed_epoch() != 0;
         self.source
             .rotate_pgoutput_secret_at_epoch(secret_name, version, password, has_checkpoint)

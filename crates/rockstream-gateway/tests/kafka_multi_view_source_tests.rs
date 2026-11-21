@@ -231,8 +231,7 @@ async fn real_broker_ack_outage_after_m3_recovers_with_no_new_input_in_same_proc
     let owner = runtime.acquire_owner("gateway-kafka-live").unwrap();
     producer
         .send(
-            FutureRecord::<(), _>::to(topic)
-                .payload(r#"{"timestamp":1,"values":[1],"weight":1}"#),
+            FutureRecord::<(), _>::to(topic).payload(r#"{"timestamp":1,"values":[1],"weight":1}"#),
             Duration::from_secs(5),
         )
         .await
@@ -243,14 +242,20 @@ async fn real_broker_ack_outage_after_m3_recovers_with_no_new_input_in_same_proc
         if !delta.batches.is_empty() {
             break delta.new_offset;
         }
-        assert!(Instant::now() < deadline, "Kafka source never received first input");
+        assert!(
+            Instant::now() < deadline,
+            "Kafka source never received first input"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
 
     fn m3(epoch: u64) -> WriteBatch {
         let mut batch = WriteBatch::new();
         batch.put(&[ShardPrefix::OpState.as_byte(), 1], b"pipeline-state");
-        batch.put(&[ShardPrefix::ViewOutput.as_byte(), 1], b"materialized-once");
+        batch.put(
+            &[ShardPrefix::ViewOutput.as_byte(), 1],
+            b"materialized-once",
+        );
         batch.put(&ShardKeyEncoder::frontier_key(), &epoch.to_be_bytes());
         batch
     }
@@ -262,10 +267,7 @@ async fn real_broker_ack_outage_after_m3_recovers_with_no_new_input_in_same_proc
                 "kafka_ack_view",
                 0,
                 token.as_bytes().to_vec(),
-                SnapshotDeltaFence::new(
-                    OffsetToken::new(vec![]),
-                    OffsetToken::new(vec![]),
-                ),
+                SnapshotDeltaFence::new(OffsetToken::new(vec![]), OffsetToken::new(vec![])),
                 epoch,
             ),
             0,
@@ -334,7 +336,10 @@ async fn real_broker_ack_outage_after_m3_recovers_with_no_new_input_in_same_proc
         match runtime.acknowledge_recovered(&owner).await {
             Ok(()) => break,
             Err(error) => {
-                assert!(Instant::now() < retry_deadline, "Kafka ACK did not recover: {error}");
+                assert!(
+                    Instant::now() < retry_deadline,
+                    "Kafka ACK did not recover: {error}"
+                );
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
         }
@@ -342,7 +347,11 @@ async fn real_broker_ack_outage_after_m3_recovers_with_no_new_input_in_same_proc
     assert_eq!(runtime.blocked_reason(), None);
     assert!(!runtime.has_pending_ack());
     assert_eq!(
-        runtime.metrics().await.unwrap().source_runtime_in_flight_epochs,
+        runtime
+            .metrics()
+            .await
+            .unwrap()
+            .source_runtime_in_flight_epochs,
         0
     );
     assert_eq!(
@@ -354,8 +363,7 @@ async fn real_broker_ack_outage_after_m3_recovers_with_no_new_input_in_same_proc
     // subsequent real Kafka input can still commit after the idle recovery.
     producer
         .send(
-            FutureRecord::<(), _>::to(topic)
-                .payload(r#"{"timestamp":2,"values":[2],"weight":1}"#),
+            FutureRecord::<(), _>::to(topic).payload(r#"{"timestamp":2,"values":[2],"weight":1}"#),
             Duration::from_secs(5),
         )
         .await
@@ -366,7 +374,10 @@ async fn real_broker_ack_outage_after_m3_recovers_with_no_new_input_in_same_proc
         if !delta.batches.is_empty() {
             break delta.new_offset;
         }
-        assert!(Instant::now() < deadline, "Kafka source did not resume after ACK retry");
+        assert!(
+            Instant::now() < deadline,
+            "Kafka source did not resume after ACK retry"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
     runtime
@@ -379,8 +390,5 @@ async fn real_broker_ack_outage_after_m3_recovers_with_no_new_input_in_same_proc
         )
         .await
         .unwrap();
-    assert_eq!(
-        runtime.into_inner().last_committed(),
-        Some((2, next_token)),
-    );
+    assert_eq!(runtime.into_inner().last_committed(), Some((2, next_token)),);
 }

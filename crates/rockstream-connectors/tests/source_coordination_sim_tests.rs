@@ -681,13 +681,22 @@ async fn pending_ack_blocks_poll_until_idle_recovery_acks_exact_durable_checkpoi
     assert!(coordinator.has_pending_ack());
     assert!(coordinator.blocked_reason().is_some());
     assert_eq!(
-        coordinator.metrics().await.unwrap().source_runtime_in_flight_epochs,
+        coordinator
+            .metrics()
+            .await
+            .unwrap()
+            .source_runtime_in_flight_epochs,
         1
     );
     // No further read or M3 write is allowed before the broker ACK.
     assert!(coordinator.poll_delta(1024, 1).await.is_err());
     assert!(coordinator
-        .commit_epoch(&owner, 2, OffsetToken::new(b"unread-02".to_vec()), m3_batch(2))
+        .commit_epoch(
+            &owner,
+            2,
+            OffsetToken::new(b"unread-02".to_vec()),
+            m3_batch(2)
+        )
         .await
         .is_err());
     assert_eq!(
@@ -701,10 +710,19 @@ async fn pending_ack_blocks_poll_until_idle_recovery_acks_exact_durable_checkpoi
     assert!(!coordinator.has_pending_ack());
     assert_eq!(coordinator.blocked_reason(), None);
     assert_eq!(
-        coordinator.metrics().await.unwrap().source_runtime_in_flight_epochs,
+        coordinator
+            .metrics()
+            .await
+            .unwrap()
+            .source_runtime_in_flight_epochs,
         0
     );
-    assert!(coordinator.poll_delta(1024, 1).await.unwrap().batches.is_empty());
+    assert!(coordinator
+        .poll_delta(1024, 1)
+        .await
+        .unwrap()
+        .batches
+        .is_empty());
     let next = OffsetToken::new(b"healthy-02".to_vec());
     coordinator
         .commit_epoch(&owner, 2, next.clone(), m3_batch(2))
@@ -715,7 +733,10 @@ async fn pending_ack_blocks_poll_until_idle_recovery_acks_exact_durable_checkpoi
         Some(SourceCheckpoint::prepared(connector_id, 2, next.clone()).committed())
     );
     assert_eq!(
-        db.get(&[ShardPrefix::ViewOutput.as_byte(), 1]).await.unwrap().as_deref(),
+        db.get(&[ShardPrefix::ViewOutput.as_byte(), 1])
+            .await
+            .unwrap()
+            .as_deref(),
         Some(b"output".as_slice()),
     );
     let source = coordinator.into_inner();
@@ -723,7 +744,10 @@ async fn pending_ack_blocks_poll_until_idle_recovery_acks_exact_durable_checkpoi
         source.acknowledgements,
         vec![(1, durable.clone()), (1, durable), (2, next)]
     );
-    assert_eq!(source.poll_calls, 1, "the blocked poll never reached the connector");
+    assert_eq!(
+        source.poll_calls, 1,
+        "the blocked poll never reached the connector"
+    );
     assert_eq!(source.pause_calls.len(), 1, "async pause must actually run");
     assert_eq!(source.resume_calls, 1, "recovery must resume the source");
 }
@@ -750,7 +774,9 @@ async fn repeated_backfill_ack_failures_do_not_leak_in_flight_epochs_or_replay_m
         store.clone(),
     );
     coordinator.recover().await.unwrap();
-    let owner = coordinator.acquire_owner("same-worker-over-64-failures").unwrap();
+    let owner = coordinator
+        .acquire_owner("same-worker-over-64-failures")
+        .unwrap();
     let fence = SnapshotDeltaFence::new(
         OffsetToken::new(b"snapshot-fence".to_vec()),
         OffsetToken::new(b"live-fence".to_vec()),
@@ -773,7 +799,10 @@ async fn repeated_backfill_ack_failures_do_not_leak_in_flight_epochs_or_replay_m
             Some(epoch),
         );
         let mut batch = m3_batch(epoch);
-        batch.put(format!("view_output/repeat_view/{epoch}").as_bytes(), b"once");
+        batch.put(
+            format!("view_output/repeat_view/{epoch}").as_bytes(),
+            b"once",
+        );
         fail_next_ack.store(true, Ordering::SeqCst);
         assert!(coordinator
             .commit_backfill_epoch(&owner, epoch, token.clone(), lifecycle, batch)
@@ -783,7 +812,11 @@ async fn repeated_backfill_ack_failures_do_not_leak_in_flight_epochs_or_replay_m
             .contains("RS-4016"));
         assert!(coordinator.has_pending_ack());
         assert_eq!(
-            coordinator.metrics().await.unwrap().source_runtime_in_flight_epochs,
+            coordinator
+                .metrics()
+                .await
+                .unwrap()
+                .source_runtime_in_flight_epochs,
             1,
         );
         assert!(coordinator.poll_delta(1024, 1).await.is_err());
@@ -791,7 +824,11 @@ async fn repeated_backfill_ack_failures_do_not_leak_in_flight_epochs_or_replay_m
         assert!(!coordinator.has_pending_ack());
         assert_eq!(coordinator.blocked_reason(), None);
         assert_eq!(
-            coordinator.metrics().await.unwrap().source_runtime_in_flight_epochs,
+            coordinator
+                .metrics()
+                .await
+                .unwrap()
+                .source_runtime_in_flight_epochs,
             0,
         );
         transcript.push((epoch, token.clone())); // first attempt failed
@@ -809,14 +846,25 @@ async fn repeated_backfill_ack_failures_do_not_leak_in_flight_epochs_or_replay_m
         Some(SourceCheckpoint::prepared(connector_id, COUNT + 1, healthy).committed())
     );
     let output = db.scan_prefix(b"view_output/repeat_view/").await.unwrap();
-    assert_eq!(output.len(), COUNT as usize, "no M3 output can be reapplied by retrying ACK");
+    assert_eq!(
+        output.len(),
+        COUNT as usize,
+        "no M3 output can be reapplied by retrying ACK"
+    );
     assert!(output.iter().all(|(_, value)| value.as_ref() == b"once"));
     assert_eq!(
-        coordinator.metrics().await.unwrap().source_runtime_in_flight_epochs,
+        coordinator
+            .metrics()
+            .await
+            .unwrap()
+            .source_runtime_in_flight_epochs,
         0
     );
     let source = coordinator.into_inner();
-    assert_eq!(source.acknowledgements, transcript, "complete broker ACK transcript");
+    assert_eq!(
+        source.acknowledgements, transcript,
+        "complete broker ACK transcript"
+    );
     assert_eq!(source.poll_calls, 0, "all blocked polls were fenced");
     assert_eq!(source.pause_calls.len(), COUNT as usize);
     assert_eq!(source.resume_calls, COUNT as usize);
