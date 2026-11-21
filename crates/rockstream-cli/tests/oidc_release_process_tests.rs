@@ -4271,6 +4271,7 @@ async fn subscription_revocation_is_enforced_by_release_gateway() {
     reader.revision = 2;
     reader.preset_grants.clear();
     let revision = catalog.get_revision().await + 1;
+    let revoked_at = Instant::now();
     catalog
         .commit_txn(
             CatalogTxn::new(
@@ -4294,7 +4295,6 @@ async fn subscription_revocation_is_enforced_by_release_gateway() {
         )
         .await
         .unwrap();
-    let revoked_at = Instant::now();
     let denial = tokio::time::timeout(Duration::from_secs(60), rows.next())
         .await
         .expect("subscription must reauthorize within 60 seconds")
