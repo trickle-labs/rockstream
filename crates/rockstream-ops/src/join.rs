@@ -491,7 +491,7 @@ impl JoinStateCore {
         let mut left_cols: Vec<Vec<i64>> = vec![Vec::new(); self.left_n_cols];
         let mut right_cols: Vec<Vec<i64>> = vec![Vec::new(); self.right_n_cols];
         let mut out_weights: Vec<i64> = Vec::new();
-        let mut out_key_slices: Vec<Vec<u8>> = Vec::new();
+        let mut out_left_indices: Vec<usize> = Vec::new();
 
         let mut right_by_key: HashMap<&[u8], Vec<(Vec<i64>, i64)>> = HashMap::new();
         for (join_key, _row_id, row_bytes, weight) in &self.right_staged.rows {
@@ -501,7 +501,7 @@ impl JoinStateCore {
             ));
         }
 
-        for (join_key, _row_id, left_bytes, l_w) in &self.left_staged.rows {
+        for (left_idx, (join_key, _row_id, left_bytes, l_w)) in self.left_staged.rows.iter().enumerate() {
             if let Some(right_rows) = right_by_key.get(join_key.as_slice()) {
                 let left_vals = JoinOp::deserialize_row(left_bytes, self.left_n_cols);
                 for (right_vals, r_w) in right_rows {
@@ -512,11 +512,34 @@ impl JoinStateCore {
                         right_cols[i].push(*v);
                     }
                     out_weights.push(l_w * r_w);
-                    out_key_slices.push(join_key.clone());
+                    out_left_indices.push(left_idx);
                 }
             }
         }
         drop(right_by_key);
+
+        // Build the output capsule while staged keys are still available. Fanout
+        // can be millions of rows: store a source-row index instead of cloning
+        // the encoded join key for every matching pair.
+        let batch = JoinOp::make_output_batch(left_cols, right_cols, &schema)?;
+        let mut out = ArrowZSet::new(batch, out_weights);
+        if !out.is_empty() {
+            let left_hashes: Vec<u128> = self
+                .left_staged
+                .rows
+                .iter()
+                .map(|(key, _, _, _)| {
+                    rockstream_types::KeyCapsule::from_typed_bytes(key.clone()).stable_hash()
+                })
+                .collect();
+            let propagated = BatchKeyCapsule::from_encoded_slices(
+                self.left_key_cols.clone(),
+                out_left_indices.iter().map(|&idx| {
+                    (self.left_staged.rows[idx].0.as_slice(), left_hashes[idx], false)
+                }),
+            );
+            out.push_key_capsule(Arc::new(propagated));
+        }
 
         for (join_key, row_id, row_bytes, w) in self.left_staged.rows.drain(..) {
             self.dirty_left.insert((join_key.clone(), row_id));
@@ -528,19 +551,6 @@ impl JoinStateCore {
         }
         self.left_staged.staged_bytes = 0;
         self.right_staged.staged_bytes = 0;
-
-        let batch = JoinOp::make_output_batch(left_cols, right_cols, &schema)?;
-        let mut out = ArrowZSet::new(batch, out_weights);
-        if !out.is_empty() {
-            let propagated = BatchKeyCapsule::from_encoded_slices(
-                self.left_key_cols.clone(),
-                out_key_slices.iter().map(|k| {
-                    let h = rockstream_types::KeyCapsule::from_typed_bytes(k.clone()).stable_hash();
-                    (k.as_slice(), h, false)
-                }),
-            );
-            out.push_key_capsule(Arc::new(propagated));
-        }
         Ok(out)
     }
 
