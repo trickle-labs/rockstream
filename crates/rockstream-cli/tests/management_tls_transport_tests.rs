@@ -690,6 +690,12 @@ async fn management_release_process_authenticates_and_authorizes_real_cli_reques
         node.registered_at_ms = 0;
         node.source_version = "<topology-version>".to_owned();
     }
+    let node_address = actual_status.nodes[0]
+        .address
+        .parse::<std::net::SocketAddr>()
+        .unwrap();
+    assert_eq!(node_address.ip(), std::net::Ipv4Addr::LOCALHOST);
+    assert_ne!(node_address.port(), 0);
     assert_eq!(
         actual_status,
         ManagementClusterStatusInfo {

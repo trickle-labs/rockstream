@@ -52,7 +52,7 @@ reqwest = { workspace = true }
 rockstream-test-support.workspace = true
 proptest = { workspace = true }
 tempfile = "3"
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true, features = ["minio"] }
 hex = { workspace = true }
