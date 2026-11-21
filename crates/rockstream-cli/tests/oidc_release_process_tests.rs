@@ -4377,6 +4377,41 @@ async fn subscription_revocation_is_enforced_by_release_gateway() {
             after_state: AuditField::NotApplicable,
         }
     );
+    let new_read = subscriber
+        .query("SELECT id FROM subscribed", &[])
+        .await
+        .expect_err("revoked reader must not start another protected read");
+    let new_read = new_read
+        .as_db_error()
+        .expect("new read denial must be a database error");
+    assert_eq!(new_read.code().code(), "42501");
+    assert_eq!(new_read.message(), "[RS-2401] auth.permission_denied: principal 'bob' is not authorized for action 'DataRead' on public.subscribed. next_steps: Request an authorized scoped grant, then retry.");
+    assert_eq!(
+        subscriber
+            .query_one("SELECT 1", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        1
+    );
+    catalog.refresh().await.unwrap();
+    let after_new_read = catalog.list_security_audit_records().await.unwrap();
+    let new_denials = after_new_read
+        .iter()
+        .filter(|record| {
+            record.action == SecurityAuditClass::AuthorizationDenial
+                && record.target == AuditField::Known("public.subscribed".into())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(new_denials.len(), 2);
+    let new_audit = new_denials[1];
+    assert!(new_audit.event_id.starts_with("gateway-authz-"));
+    assert_ne!(new_audit.event_id, audit.event_id);
+    assert!(new_audit.timestamp_ms >= audit.timestamp_ms);
+    let mut expected_new_audit = audit.clone();
+    expected_new_audit.event_id = new_audit.event_id.clone();
+    expected_new_audit.timestamp_ms = new_audit.timestamp_ms;
+    assert_eq!(new_audit, &expected_new_audit);
     writer_task.abort();
     subscriber_task.abort();
     observer_task.abort();
