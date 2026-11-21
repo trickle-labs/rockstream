@@ -268,18 +268,79 @@ impl JoinState {
 
 // ─── Staged delta ─────────────────────────────────────────────────────────────
 
+/// Adapter providing [`ExactSizeIterator`] when total run length is known up front.
+struct ExactLenIter<I> {
+    iter: I,
+    remaining: usize,
+}
+
+impl<I: Iterator> ExactLenIter<I> {
+    fn new(iter: I, remaining: usize) -> Self {
+        Self { iter, remaining }
+    }
+}
+
+impl<I: Iterator> Iterator for ExactLenIter<I> {
+    type Item = I::Item;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let item = self.iter.next()?;
+        self.remaining = self.remaining.saturating_sub(1);
+        Some(item)
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl<I: Iterator> ExactSizeIterator for ExactLenIter<I> {
+    #[inline]
+    fn len(&self) -> usize {
+        self.remaining
+    }
+}
+
+#[derive(Debug)]
+struct StagedRow {
+    join_key: Vec<u8>,
+    join_key_hash: u128,
+    row_id: u128,
+    row_bytes: Vec<u8>,
+    weight: i64,
+}
+
+struct ColumnarRightBucket {
+    cols: Vec<Vec<i64>>,
+    weights: Vec<i64>,
+}
+
 /// One side's staged delta for an epoch.
 #[derive(Debug, Default)]
 struct StagedDelta {
-    /// (join_key, row_id, row_bytes, weight)
-    rows: Vec<(Vec<u8>, u128, Vec<u8>, i64)>,
+    rows: Vec<StagedRow>,
     staged_bytes: u64,
 }
 
 impl StagedDelta {
-    fn push(&mut self, join_key: Vec<u8>, row_id: u128, row_bytes: Vec<u8>, weight: i64) {
+    fn push(
+        &mut self,
+        join_key: Vec<u8>,
+        join_key_hash: u128,
+        row_id: u128,
+        row_bytes: Vec<u8>,
+        weight: i64,
+    ) {
         self.staged_bytes += (join_key.len() + 16 + row_bytes.len() + 8) as u64;
-        self.rows.push((join_key, row_id, row_bytes, weight));
+        self.rows.push(StagedRow {
+            join_key,
+            join_key_hash,
+            row_id,
+            row_bytes,
+            weight,
+        });
     }
 
     #[allow(dead_code)]
@@ -310,6 +371,9 @@ pub struct JoinStateCore {
     state_loaded: bool,
     loaded_left_keys: HashSet<Vec<u8>>,
     loaded_right_keys: HashSet<Vec<u8>>,
+    /// Propagate output `BatchKeyCapsule` when at least one side of the current
+    /// epoch carried a pre-attached key capsule (fused/prepacked pipeline).
+    propagate_output_capsule: bool,
 }
 
 impl JoinStateCore {
@@ -335,6 +399,7 @@ impl JoinStateCore {
             state_loaded: false,
             loaded_left_keys: HashSet::new(),
             loaded_right_keys: HashSet::new(),
+            propagate_output_capsule: false,
         }
     }
 
@@ -371,47 +436,62 @@ impl JoinStateCore {
         if delta.is_empty() {
             return Ok(ArrowZSet::empty(schema));
         }
+        let input_has_capsule = delta.key_capsule_for(&self.left_key_cols).is_some();
+        self.propagate_output_capsule |= input_has_capsule;
+        let propagate = self.propagate_output_capsule;
         let capsule = delta.get_or_build_key_capsule(&self.left_key_cols)?;
+        let left_arrs: Vec<&Int64Array> = delta
+            .data
+            .columns()
+            .iter()
+            .map(|col| col.as_any().downcast_ref::<Int64Array>().expect("Int64"))
+            .collect();
         let mut left_cols: Vec<Vec<i64>> = vec![Vec::new(); self.left_n_cols];
         let mut right_cols: Vec<Vec<i64>> = vec![Vec::new(); self.right_n_cols];
         let mut out_weights: Vec<i64> = Vec::new();
-        let mut out_key_rows: Vec<(usize, u128)> = Vec::new();
+        let mut out_key_runs: Vec<(usize, u128, usize)> = Vec::new();
 
-        for row_idx in 0..delta.num_rows() {
+        for (row_idx, &w) in delta.weights.iter().enumerate().take(delta.num_rows()) {
             if capsule.row_contains_null(row_idx) {
                 continue;
             }
-            let w = delta.weights[row_idx];
             let join_key_slice = capsule.row_bytes(row_idx);
             let join_key_hash = capsule.row_hash_u128(row_idx);
-            let row_bytes = JoinOp::serialize_row(&delta.data, row_idx);
+            let mut row_bytes = Vec::with_capacity(left_arrs.len() * 8);
+            for arr in &left_arrs {
+                row_bytes.extend_from_slice(&arr.value(row_idx).to_be_bytes());
+            }
             let row_id = stable_row_id(self.op_id.0, join_key_slice, &row_bytes);
 
-            let left_vals = JoinOp::deserialize_row(&row_bytes, self.left_n_cols);
+            let mut matches = 0usize;
             for (right_row_bytes, r_weight) in self.state.probe_right(join_key_slice) {
-                let right_vals = JoinOp::deserialize_row(right_row_bytes, self.right_n_cols);
-                for (i, v) in left_vals.iter().enumerate() {
-                    left_cols[i].push(*v);
+                for (i, arr) in left_arrs.iter().take(self.left_n_cols).enumerate() {
+                    left_cols[i].push(arr.value(row_idx));
                 }
-                for (i, v) in right_vals.iter().enumerate() {
-                    right_cols[i].push(*v);
-                }
+                JoinOp::push_serialized_row(right_row_bytes, &mut right_cols);
                 out_weights.push(w * r_weight);
-                out_key_rows.push((row_idx, join_key_hash));
+                matches += 1;
+            }
+            if propagate && matches > 0 {
+                out_key_runs.push((row_idx, join_key_hash, matches));
             }
 
             self.left_staged
-                .push(join_key_slice.to_vec(), row_id, row_bytes, w);
+                .push(join_key_slice.to_vec(), join_key_hash, row_id, row_bytes, w);
         }
 
         let batch = JoinOp::make_output_batch(left_cols, right_cols, &schema)?;
         let mut out = ArrowZSet::new(batch, out_weights);
-        if !out.is_empty() {
+        if propagate && !out.is_empty() {
+            let total = out.num_rows();
             let propagated = BatchKeyCapsule::from_encoded_slices(
                 self.left_key_cols.clone(),
-                out_key_rows
-                    .iter()
-                    .map(|&(src_row, h128)| (capsule.row_bytes(src_row), h128, false)),
+                ExactLenIter::new(
+                    out_key_runs.iter().flat_map(|&(src_row, h128, count)| {
+                        std::iter::repeat_n((capsule.row_bytes(src_row), h128, false), count)
+                    }),
+                    total,
+                ),
             );
             out.push_key_capsule(Arc::new(propagated));
         }
@@ -431,47 +511,62 @@ impl JoinStateCore {
         if delta.is_empty() {
             return Ok(ArrowZSet::empty(schema));
         }
+        let input_has_capsule = delta.key_capsule_for(&self.right_key_cols).is_some();
+        self.propagate_output_capsule |= input_has_capsule;
+        let propagate = self.propagate_output_capsule;
         let capsule = delta.get_or_build_key_capsule(&self.right_key_cols)?;
+        let right_arrs: Vec<&Int64Array> = delta
+            .data
+            .columns()
+            .iter()
+            .map(|col| col.as_any().downcast_ref::<Int64Array>().expect("Int64"))
+            .collect();
         let mut left_cols: Vec<Vec<i64>> = vec![Vec::new(); self.left_n_cols];
         let mut right_cols: Vec<Vec<i64>> = vec![Vec::new(); self.right_n_cols];
         let mut out_weights: Vec<i64> = Vec::new();
-        let mut out_key_rows: Vec<(usize, u128)> = Vec::new();
+        let mut out_key_runs: Vec<(usize, u128, usize)> = Vec::new();
 
-        for row_idx in 0..delta.num_rows() {
+        for (row_idx, &w) in delta.weights.iter().enumerate().take(delta.num_rows()) {
             if capsule.row_contains_null(row_idx) {
                 continue;
             }
-            let w = delta.weights[row_idx];
             let join_key_slice = capsule.row_bytes(row_idx);
             let join_key_hash = capsule.row_hash_u128(row_idx);
-            let row_bytes = JoinOp::serialize_row(&delta.data, row_idx);
+            let mut row_bytes = Vec::with_capacity(right_arrs.len() * 8);
+            for arr in &right_arrs {
+                row_bytes.extend_from_slice(&arr.value(row_idx).to_be_bytes());
+            }
             let row_id = stable_row_id(self.op_id.0, join_key_slice, &row_bytes);
 
-            let right_vals = JoinOp::deserialize_row(&row_bytes, self.right_n_cols);
+            let mut matches = 0usize;
             for (left_row_bytes, l_weight) in self.state.probe_left(join_key_slice) {
-                let left_vals = JoinOp::deserialize_row(left_row_bytes, self.left_n_cols);
-                for (i, v) in left_vals.iter().enumerate() {
-                    left_cols[i].push(*v);
-                }
-                for (i, v) in right_vals.iter().enumerate() {
-                    right_cols[i].push(*v);
+                JoinOp::push_serialized_row(left_row_bytes, &mut left_cols);
+                for (i, arr) in right_arrs.iter().take(self.right_n_cols).enumerate() {
+                    right_cols[i].push(arr.value(row_idx));
                 }
                 out_weights.push(l_weight * w);
-                out_key_rows.push((row_idx, join_key_hash));
+                matches += 1;
+            }
+            if propagate && matches > 0 {
+                out_key_runs.push((row_idx, join_key_hash, matches));
             }
 
             self.right_staged
-                .push(join_key_slice.to_vec(), row_id, row_bytes, w);
+                .push(join_key_slice.to_vec(), join_key_hash, row_id, row_bytes, w);
         }
 
         let batch = JoinOp::make_output_batch(left_cols, right_cols, &schema)?;
         let mut out = ArrowZSet::new(batch, out_weights);
-        if !out.is_empty() {
+        if propagate && !out.is_empty() {
+            let total = out.num_rows();
             let propagated = BatchKeyCapsule::from_encoded_slices(
                 self.left_key_cols.clone(),
-                out_key_rows
-                    .iter()
-                    .map(|&(src_row, h128)| (capsule.row_bytes(src_row), h128, false)),
+                ExactLenIter::new(
+                    out_key_runs.iter().flat_map(|&(src_row, h128, count)| {
+                        std::iter::repeat_n((capsule.row_bytes(src_row), h128, false), count)
+                    }),
+                    total,
+                ),
             );
             out.push_key_capsule(Arc::new(propagated));
         }
@@ -488,69 +583,108 @@ impl JoinStateCore {
     /// Compute `ΔL ⋈ ΔR`, apply staged deltas to arrangements, and return correction output.
     pub fn commit_epoch_mut(&mut self) -> Result<ArrowZSet, OpError> {
         let schema = join_output_schema_n(self.left_n_cols, self.right_n_cols);
-        let mut left_cols: Vec<Vec<i64>> = vec![Vec::new(); self.left_n_cols];
-        let mut right_cols: Vec<Vec<i64>> = vec![Vec::new(); self.right_n_cols];
-        let mut out_weights: Vec<i64> = Vec::new();
-        let mut out_left_indices: Vec<usize> = Vec::new();
+        let propagate_capsule = std::mem::take(&mut self.propagate_output_capsule);
 
-        let mut right_by_key: HashMap<&[u8], Vec<(Vec<i64>, i64)>> = HashMap::new();
-        for (join_key, _row_id, row_bytes, weight) in &self.right_staged.rows {
-            right_by_key.entry(join_key.as_slice()).or_default().push((
-                JoinOp::deserialize_row(row_bytes, self.right_n_cols),
-                *weight,
-            ));
+        // Group staged right rows into columnar buckets so ΔL ⋈ ΔR appends whole
+        // column slices via fill/memcpy instead of per-match Vec allocations.
+        let mut right_by_key: HashMap<&[u8], ColumnarRightBucket> = HashMap::new();
+        for row in &self.right_staged.rows {
+            let bucket = right_by_key
+                .entry(row.join_key.as_slice())
+                .or_insert_with(|| ColumnarRightBucket {
+                    cols: vec![Vec::new(); self.right_n_cols],
+                    weights: Vec::new(),
+                });
+            JoinOp::push_serialized_row(&row.row_bytes, &mut bucket.cols);
+            bucket.weights.push(row.weight);
         }
 
-        for (left_idx, (join_key, _row_id, left_bytes, l_w)) in self.left_staged.rows.iter().enumerate() {
-            if let Some(right_rows) = right_by_key.get(join_key.as_slice()) {
-                let left_vals = JoinOp::deserialize_row(left_bytes, self.left_n_cols);
-                for (right_vals, r_w) in right_rows {
-                    for (i, v) in left_vals.iter().enumerate() {
-                        left_cols[i].push(*v);
-                    }
-                    for (i, v) in right_vals.iter().enumerate() {
-                        right_cols[i].push(*v);
-                    }
-                    out_weights.push(l_w * r_w);
-                    out_left_indices.push(left_idx);
+        let total_out: usize = self
+            .left_staged
+            .rows
+            .iter()
+            .filter_map(|row| {
+                right_by_key
+                    .get(row.join_key.as_slice())
+                    .map(|bucket| bucket.weights.len())
+            })
+            .sum();
+
+        let mut left_cols: Vec<Vec<i64>> = (0..self.left_n_cols)
+            .map(|_| Vec::with_capacity(total_out))
+            .collect();
+        let mut right_cols: Vec<Vec<i64>> = (0..self.right_n_cols)
+            .map(|_| Vec::with_capacity(total_out))
+            .collect();
+        let mut out_weights: Vec<i64> = Vec::with_capacity(total_out);
+        let mut out_key_runs: Vec<(usize, usize)> = if propagate_capsule {
+            Vec::with_capacity(self.left_staged.rows.len())
+        } else {
+            Vec::new()
+        };
+
+        for (left_idx, row) in self.left_staged.rows.iter().enumerate() {
+            if let Some(bucket) = right_by_key.get(row.join_key.as_slice()) {
+                let n = bucket.weights.len();
+                for (col, chunk) in left_cols
+                    .iter_mut()
+                    .zip(row.row_bytes.as_chunks::<8>().0.iter())
+                {
+                    let val = i64::from_be_bytes(*chunk);
+                    col.resize(col.len() + n, val);
+                }
+                for (dst, src) in right_cols.iter_mut().zip(bucket.cols.iter()) {
+                    dst.extend_from_slice(src);
+                }
+                let lw = row.weight;
+                if lw == 1 {
+                    out_weights.extend_from_slice(&bucket.weights);
+                } else {
+                    out_weights.extend(bucket.weights.iter().map(|&r_w| lw * r_w));
+                }
+                if propagate_capsule {
+                    out_key_runs.push((left_idx, n));
                 }
             }
         }
         drop(right_by_key);
 
-        // Build the output capsule while staged keys are still available. Fanout
-        // can be millions of rows: store a source-row index instead of cloning
-        // the encoded join key for every matching pair.
-        let batch = JoinOp::make_output_batch(left_cols, right_cols, &schema)?;
-        let mut out = ArrowZSet::new(batch, out_weights);
-        if !out.is_empty() {
-            let left_hashes: Vec<u128> = self
-                .left_staged
-                .rows
-                .iter()
-                .map(|(key, _, _, _)| {
-                    rockstream_types::KeyCapsule::from_typed_bytes(key.clone()).stable_hash()
-                })
-                .collect();
-            let propagated = BatchKeyCapsule::from_encoded_slices(
+        let propagated_capsule = if propagate_capsule && total_out > 0 {
+            Some(Arc::new(BatchKeyCapsule::from_encoded_slices(
                 self.left_key_cols.clone(),
-                out_left_indices.iter().map(|&idx| {
-                    (self.left_staged.rows[idx].0.as_slice(), left_hashes[idx], false)
-                }),
-            );
-            out.push_key_capsule(Arc::new(propagated));
-        }
+                ExactLenIter::new(
+                    out_key_runs.iter().flat_map(|&(left_idx, count)| {
+                        let row = &self.left_staged.rows[left_idx];
+                        std::iter::repeat_n(
+                            (row.join_key.as_slice(), row.join_key_hash, false),
+                            count,
+                        )
+                    }),
+                    total_out,
+                ),
+            )))
+        } else {
+            None
+        };
 
-        for (join_key, row_id, row_bytes, w) in self.left_staged.rows.drain(..) {
-            self.dirty_left.insert((join_key.clone(), row_id));
-            self.state.update_left(join_key, row_id, row_bytes, w);
+        for row in self.left_staged.rows.drain(..) {
+            self.dirty_left.insert((row.join_key.clone(), row.row_id));
+            self.state
+                .update_left(row.join_key, row.row_id, row.row_bytes, row.weight);
         }
-        for (join_key, row_id, row_bytes, w) in self.right_staged.rows.drain(..) {
-            self.dirty_right.insert((join_key.clone(), row_id));
-            self.state.update_right(join_key, row_id, row_bytes, w);
+        for row in self.right_staged.rows.drain(..) {
+            self.dirty_right.insert((row.join_key.clone(), row.row_id));
+            self.state
+                .update_right(row.join_key, row.row_id, row.row_bytes, row.weight);
         }
         self.left_staged.staged_bytes = 0;
         self.right_staged.staged_bytes = 0;
+
+        let batch = JoinOp::make_output_batch(left_cols, right_cols, &schema)?;
+        let mut out = ArrowZSet::new(batch, out_weights);
+        if let Some(propagated) = propagated_capsule {
+            out.push_key_capsule(propagated);
+        }
         Ok(out)
     }
 
@@ -569,7 +703,7 @@ impl JoinStateCore {
             .rows
             .iter()
             .chain(&self.right_staged.rows)
-            .filter(|(_, _, _, weight)| *weight != 0)
+            .filter(|row| row.weight != 0)
             .count() as u64;
         let correction = self.commit_epoch_mut()?;
         let out_schema = join_output_schema_n(self.left_n_cols, self.right_n_cols);
@@ -893,6 +1027,14 @@ impl JoinOp {
             .take(n_cols)
             .map(|c| i64::from_be_bytes(*c))
             .collect()
+    }
+
+    /// Append a serialized row's Int64 values directly into columnar output buffers.
+    #[inline]
+    fn push_serialized_row(bytes: &[u8], cols: &mut [Vec<i64>]) {
+        for (col, chunk) in cols.iter_mut().zip(bytes.as_chunks::<8>().0.iter()) {
+            col.push(i64::from_be_bytes(*chunk));
+        }
     }
 
     /// Build the output `RecordBatch` from collected column values.

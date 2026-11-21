@@ -1305,8 +1305,12 @@ pub struct RssCalibrationReport {
 /// Sample the current process's real resident set size (RSS) in bytes from the OS.
 #[cfg(target_os = "linux")]
 pub fn sample_process_rss_bytes() -> Result<u64, String> {
-    let status = std::fs::read_to_string("/proc/self/status")
-        .map_err(|e| format!("failed to read /proc/self/status: {e}"))?;
+    let status = std::fs::read_to_string("/proc/self/status").map_err(|e| {
+        format!(
+            "{}: failed to read /proc/self/status: {e}",
+            crate::error_code::RS_0001
+        )
+    })?;
     let kib: u64 = status
         .lines()
         .find_map(|line| {
@@ -1316,7 +1320,12 @@ pub fn sample_process_rss_bytes() -> Result<u64, String> {
                 .parse()
                 .ok()
         })
-        .ok_or_else(|| "/proc/self/status has no parseable VmRSS".to_string())?;
+        .ok_or_else(|| {
+            format!(
+                "{}: /proc/self/status has no parseable VmRSS",
+                crate::error_code::RS_0001
+            )
+        })?;
     Ok(kib.saturating_mul(1024))
 }
 
@@ -1358,7 +1367,10 @@ pub fn sample_process_rss_bytes() -> Result<u64, String> {
         )
     };
     if kr != 0 {
-        return Err(format!("RS-0001: mach task_info failed with kern_return_t={kr}"));
+        return Err(format!(
+            "{}: mach task_info failed with kern_return_t={kr}",
+            crate::error_code::RS_0001
+        ));
     }
     let info = unsafe { info.assume_init() };
     Ok(info.resident_size)
@@ -1366,7 +1378,10 @@ pub fn sample_process_rss_bytes() -> Result<u64, String> {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn sample_process_rss_bytes() -> Result<u64, String> {
-    Err("RS-3028: process RSS sampling is unsupported on this OS".to_string())
+    Err(format!(
+        "{}: process RSS sampling is unsupported on this OS",
+        crate::error_code::RS_3028
+    ))
 }
 
 /// Recursively measure actual disk usage in bytes under `root`.
