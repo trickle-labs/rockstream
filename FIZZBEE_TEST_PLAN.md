@@ -723,6 +723,21 @@ exercise the recovery gate. M1 abstracts the batch and does not model compiled
 operators, gateway cancellation, source shuffle ownership, or management
 authentication. Those boundaries require separate qualification.
 
+The gateway records pending source dispatch in the base-row batch and clears it
+after all source requests complete; reads and subsequent writes fail if a
+gateway restarts with that record. Distributed reads also fail when snapshots
+do not contain worker output, rather than report an empty result. The owned
+shuffle path records a source epoch on its anchor before dispatch and
+clears that record only after all target shards report committed execution.
+The process regression stops the gateway with a source request outstanding and
+checks the exact input and post-restart failure.
+Worker execution records distinguish matching committed replays from conflicting
+input. Distributed view reads fail while execution is incomplete or requires
+recovery. The coordinator, gateway, and runtime tests cover ordering, failure,
+restart, closed-inlet delivery, and exact replay. M1 does not model the journal or the
+transport-to-worker handoff; the bare credit-only transport and independent-host
+recovery remain unqualified by these tests.
+
 Issue #303's #309 slice binds control-worker registration to the authenticated
 certificate identity. `control_worker_mtls_tests.rs` covers missing, expired,
 and untrusted certificates, identity mismatch, and role-only rejection; the
@@ -907,6 +922,18 @@ records, and advances the catalog revision. This is a catalog revision/retry
 boundary outside the M1–M7 worker, lease, frontier, and sink state machines;
 the tests do not establish unbounded contention liveness, crash durability,
 or assembled release-process qualification.
+
+Issue #350 (PR #397) qualifies the four shared-slot PostgreSQL `pgoutput`
+recovery boundaries in `crates/rockstream-gateway/tests/cdc_transaction_atomicity_tests.rs`:
+pre-M3 crash (`restart-before-m3`), durable-M3/pre-slot-ACK crash
+(`restart-after-m3-before-slot-ack`), mid-envelope three-table replication
+disconnect/reconnect (`three-table-disconnect-resume`), and incompatible schema
+rejection before commit (`schema-change-before-commit`). When a transport
+disconnect occurs mid-envelope, `SharedPgOutputCoordinator::discard_interrupted_envelope`
+clears both spilled and in-memory uncommitted change buffers before
+`SourceRuntimeCoordinator::reopen_pgoutput_after_disconnect` reconnects under
+the same fenced owner lease. This refines the M3 shared-slot recovery boundary
+without altering the abstract FizzBee state machines.
 
 Issue #305 strengthens the file-backed audit append boundary in
 `crates/rockstream-control/src/audit.rs`. `FileAuditLog::append` writes each
@@ -1298,6 +1325,35 @@ coordination and acknowledgment barrier protocols adhere to the end-to-end
 guarantee matrix covered by
 `crates/rockstream-connectors/tests/postgres_cdc_guarantee_matrix_tests.rs` and
 `crates/rockstream-gateway/tests/source_ddl_postgres_kafka_tests.rs`.
+
+Issue #347 refines the **PostgreSQL CDC initial snapshot-to-WAL handoff**:
+`capture_source_snapshot` and `capture_pgoutput_snapshot` now create a
+`pgoutput` logical replication slot through a replication-mode connection with
+an exported snapshot. Before scanning any relation, the read-only
+repeatable-read SQL transaction binds that exported MVCC snapshot via
+`SET TRANSACTION SNAPSHOT`, and the source records the slot's atomic
+`consistent_point` as the snapshot LSN. This replaces the non-atomic pairing
+of an independently opened snapshot transaction and
+`pg_current_wal_lsn()`. All imported relations share the same snapshot and
+fence; changes committed before slot creation appear in the snapshot, while
+subsequent commits are consumed from WAL after the fence, rather than being
+missed or replayed twice.
+
+**Safety / recovery boundary:** an active slot is rejected rather than
+replaced (RS-4013), and a missing checkpointed slot remains fail-closed
+(RS-4011). Snapshot capture must complete before normal CDC processing;
+a checkpointed restart resumes from durable source progress rather than
+creating a new bootstrap snapshot. This refines M3's source progress and
+checkpoint-coupled commit assumptions but does not extend the M1–M7 FizzBee
+models to PostgreSQL MVCC snapshots, replication slots, or WAL records.
+The exact-once handoff obligation is checked against real PostgreSQL by
+`postgres_cdc_synchronized_snapshot_handoff_is_exact_across_restart`
+in `crates/rockstream-connectors/tests/postgres_cdc_guarantee_matrix_tests.rs`
+and `pgoutput_gateway_synchronized_snapshot_handoff_multi_relation_and_restart_exact`
+in `crates/rockstream-gateway/tests/cdc_transaction_atomicity_tests.rs`.
+Together they exercise in-flight commits at slot creation, concurrent
+INSERT/UPDATE/DELETE after snapshot binding, multi-relation gateway/view
+materialization, and checkpointed restart without gaps or duplicates.
 
 Issue #339 extends that **external PostgreSQL pgoutput boundary** with
 transactional `TRUNCATE` semantics. A decoded `T` message retains the enclosing
@@ -1786,3 +1842,7 @@ complete/truncated/row-over-budget responses and v3 logical-key/failure behavior
 ## v0.72 CLI checkpoint export integrity (#221)
 
 The CLI backup operation selects one committed control checkpoint and must enumerate its required immutable shard manifest, WAL and SST objects before exporting. A merely visible-prefix inventory is insufficient: missing referenced shard storage must fail with a checkpoint-integrity error and must not create a terminal success marker. The management and CLI export paths now share the existing checkpoint-aware inventory; this does not alter M3 cluster checkpoint durability, lease fencing or the committed checkpoint itself. Concrete coverage: `cli_prefix_export_rejects_missing_committed_shard_objects_before_success` deletes a real checkpointed shard before CLI export and requires failure without a commit marker; `lfs_export_restore_fresh_cluster_is_bit_identical` preserves the positive committed state recovery contract. Checkpoint-export error-code aliasing has been corrected: RS-3613 identifies export-in-progress and RS-3614 identifies export/restore failure; RS-5035 remains the cataloged skew-SLO error. This is an operator diagnostics change, not a new checkpoint durability claim.
+
+## Raft heartbeat lease age bounding (#351)
+
+`RaftControlGroup` bounds leader authority by the initiation timestamp (`round_started_at`) of each heartbeat round rather than the response completion timestamp. A delayed quorum acknowledgement whose round began more than `ELECTION_TIMEOUT_MIN` ago cannot refresh `last_quorum_ack`, and the leader steps down when no fresh majority proof remains. This tightens local leader self-fencing to match the M4 monotonic fencing contract without changing durable Raft term/vote persistence or shard lease token monotonicity.

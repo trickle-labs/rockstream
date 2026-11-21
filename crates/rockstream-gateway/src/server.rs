@@ -2175,7 +2175,7 @@ pub struct GatewayHandler {
     /// Bound only by `GatewayServer`; source tasks upgrade it per poll and
     /// exit when the server releases its handler.
     self_ref: Arc<Mutex<Weak<GatewayHandler>>>,
-    source_workers: Arc<DashMap<String, ()>>,
+    source_workers: Arc<DashMap<String, futures::future::AbortHandle>>,
     pgoutput_coordinators:
         Arc<DashMap<ConnectorId, Arc<tokio::sync::Mutex<SharedPgOutputCoordinator>>>>,
     /// ponytail: source creation is rare; replace this global lock with
@@ -4343,11 +4343,41 @@ impl GatewayHandler {
     }
 
     async fn ensure_local_view_consistency(&self) -> PgWireResult<()> {
-        if !self.pending_view_recovery.lock().is_empty() {
+        let pending = if let Some(db) = &self.shard_db {
+            db.get(&rockstream_storage::ShardKeyEncoder::meta_key(
+                b"distributed-source-pending",
+            ))
+            .await
+            .map_err(|e| PgWireError::ApiError(Box::new(GatewayError::Storage(e))))?
+            .is_some()
+        } else {
+            false
+        };
+        if pending || !self.pending_view_recovery.lock().is_empty() {
             let _guard = self.shard_commit_lock.lock().await;
             self.recover_pending_views_locked()
                 .await
                 .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+            self.ensure_no_pending_distributed_locked()
+                .await
+                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_no_pending_distributed_locked(&self) -> Result<(), GatewayError> {
+        if let Some(db) = &self.shard_db {
+            if db
+                .get(&rockstream_storage::ShardKeyEncoder::meta_key(
+                    b"distributed-source-pending",
+                ))
+                .await?
+                .is_some()
+            {
+                return Err(GatewayError::QueryTimeExecutionFailed {
+                    detail: "distributed source requires recovery; preserve source input and shard storage and contact the operator before retrying".to_string(),
+                });
+            }
         }
         Ok(())
     }
@@ -5330,6 +5360,28 @@ impl GatewayHandler {
         );
     }
 
+    /// Cancel every live source worker, including one paused inside an M3
+    /// commit. The gateway process can then be retired without allowing an
+    /// old slot owner to race a newly recovered owner.
+    #[doc(hidden)]
+    pub fn abort_source_workers_for_test(&self) -> usize {
+        let handles = self
+            .source_workers
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect::<Vec<_>>();
+        for handle in &handles {
+            handle.abort();
+        }
+        handles.len()
+    }
+
+    /// Observe task cleanup after a simulated owner crash.
+    #[doc(hidden)]
+    pub fn active_source_worker_count_for_test(&self) -> usize {
+        self.source_workers.len()
+    }
+
     fn spawn_kafka_source_worker(
         &self,
         source: CatalogSourceEntry,
@@ -5337,7 +5389,11 @@ impl GatewayHandler {
         shard_db: Arc<rockstream_storage::ShardDb>,
     ) {
         let key = format!("{}:{view_name}", source.name);
-        if self.source_workers.insert(key.clone(), ()).is_some() {
+        let (abort, registration) = futures::future::AbortHandle::new_pair();
+        if let dashmap::mapref::entry::Entry::Vacant(entry) = self.source_workers.entry(key.clone())
+        {
+            entry.insert(abort);
+        } else {
             return;
         }
         let weak = self.self_ref.lock().clone();
@@ -5346,8 +5402,11 @@ impl GatewayHandler {
             return;
         }
         tokio::spawn(async move {
-            GatewayHandler::run_kafka_source_worker(weak.clone(), source, view_name, shard_db)
-                .await;
+            let _ = futures::future::Abortable::new(
+                GatewayHandler::run_kafka_source_worker(weak.clone(), source, view_name, shard_db),
+                registration,
+            )
+            .await;
             if let Some(handler) = weak.upgrade() {
                 handler.source_workers.remove(&key);
             }
@@ -5365,7 +5424,11 @@ impl GatewayHandler {
         };
         let connector_id = identity.connector_id();
         let key = format!("pgoutput:{}", connector_id.0);
-        if self.source_workers.insert(key.clone(), ()).is_some() {
+        let (abort, registration) = futures::future::AbortHandle::new_pair();
+        if let dashmap::mapref::entry::Entry::Vacant(entry) = self.source_workers.entry(key.clone())
+        {
+            entry.insert(abort);
+        } else {
             return;
         }
         let weak = self.self_ref.lock().clone();
@@ -5374,11 +5437,14 @@ impl GatewayHandler {
             return;
         }
         tokio::spawn(async move {
-            GatewayHandler::run_postgres_cdc_source_worker(
-                weak.clone(),
-                source,
-                view_name,
-                shard_db,
+            let _ = futures::future::Abortable::new(
+                GatewayHandler::run_postgres_cdc_source_worker(
+                    weak.clone(),
+                    source,
+                    view_name,
+                    shard_db,
+                ),
+                registration,
             )
             .await;
             if let Some(handler) = weak.upgrade() {
@@ -5615,6 +5681,48 @@ impl GatewayHandler {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
+                Err(rockstream_connectors::SourceError::Io(reason))
+                    if reason.starts_with("RS-4017: pgoutput connection disconnected:") =>
+                {
+                    // Only transport loss is retryable: the slot still owns the
+                    // unacknowledged transaction. Discard partial relation
+                    // messages and spill, reopen under the same fenced owner,
+                    // and replay from the durable slot/checkpoint.
+                    tracing::warn!(%reason, "pgoutput transport lost; reopening shared slot");
+                    if let Err(error) = coordinator.discard_interrupted_envelope(&shard_db).await {
+                        handler.block_pgoutput_aliases(
+                            &aliases,
+                            format!("pgoutput disconnect cleanup failed: {error}"),
+                        );
+                        break;
+                    }
+                    let mut last_error = None;
+                    for _ in 0..20 {
+                        match coordinator
+                            .runtime
+                            .reopen_pgoutput_after_disconnect(&lease)
+                            .await
+                        {
+                            Ok(()) => {
+                                last_error = None;
+                                break;
+                            }
+                            Err(error) => {
+                                last_error = Some(error);
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                        }
+                    }
+                    if let Some(error) = last_error {
+                        handler.block_pgoutput_aliases(
+                            &aliases,
+                            format!("pgoutput reconnect failed: {error}"),
+                        );
+                        break;
+                    }
+                    handler.project_pgoutput_status(&coordinator);
+                    continue;
+                }
                 Err(error) => {
                     handler
                         .block_pgoutput_aliases(&aliases, format!("pgoutput poll failed: {error}"));
@@ -5622,6 +5730,12 @@ impl GatewayHandler {
                 }
             };
             let is_commit = matches!(&event, PgOutputEvent::Commit { .. });
+            let is_change = matches!(
+                &event,
+                PgOutputEvent::Insert { .. }
+                    | PgOutputEvent::Update { .. }
+                    | PgOutputEvent::Delete { .. }
+            );
             let mut result = match event {
                 PgOutputEvent::Begin { xid } if coordinator.active_envelope.is_none() => {
                     match handler
@@ -5710,6 +5824,12 @@ impl GatewayHandler {
                 {
                     result = Err(error);
                 }
+            }
+            if is_change && result.is_ok() {
+                // The test barrier ensures a real partial envelope has been
+                // buffered before the PostgreSQL backend is disconnected.
+                // This is otherwise a no-op, including in production builds.
+                shard_db.await_pgoutput_change_cut_for_test().await;
             }
             if let Err(error) = result {
                 let reason = match &error {
@@ -9591,6 +9711,15 @@ impl GatewayHandler {
         order_by: Vec<(String, bool)>,
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<Response<'static>>> {
+        let _distributed_read_guard = if self.distributed_data_plane.is_some() {
+            let guard = self.shard_commit_lock.lock().await;
+            self.ensure_no_pending_distributed_locked()
+                .await
+                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+            Some(guard)
+        } else {
+            None
+        };
         if let Some(error_responses) = self
             .select_access_error_response(view_name, conn_id)
             .await?
@@ -9691,6 +9820,14 @@ impl GatewayHandler {
                     detail: format!("read distributed view {view_name}: {error}"),
                 }))
             })?;
+            // shortcut: snapshots omit worker output, remove this gate when reads include it.
+            if snapshot.shards.iter().all(|shard| shard.deltas.is_empty()) {
+                return Err(PgWireError::ApiError(Box::new(
+                    GatewayError::QueryTimeExecutionFailed {
+                        detail: format!("distributed view {view_name} output is unavailable; contact the operator before relying on this result"),
+                    },
+                )));
+            }
             let mut rows = merge_workload_snapshot(&snapshot)
                 .map_err(|error| PgWireError::ApiError(Box::new(error)))?;
             if !order_by.is_empty() {
@@ -12660,6 +12797,9 @@ impl GatewayHandler {
         self.recover_pending_views_locked()
             .await
             .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+        self.ensure_no_pending_distributed_locked()
+            .await
+            .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
         let (epoch, ops, changes, distributed_deltas) = {
             if ops.is_empty() {
                 if let Some(conn_id) = conn_id {
@@ -12766,6 +12906,22 @@ impl GatewayHandler {
                     }
                 }
             }
+            if !distributed_deltas.is_empty() {
+                let pending = distributed_deltas
+                    .iter()
+                    .map(|(view, request, _)| {
+                        format!(
+                            "{} {} {} {}",
+                            view, request.epoch, request.source, request.request_id
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                batch.put(
+                    &rockstream_storage::ShardKeyEncoder::meta_key(b"distributed-source-pending"),
+                    pending.as_bytes(),
+                );
+            }
             *self.pending_view_recovery.lock() = views.clone();
             for view in &views {
                 if let Err(error) = self
@@ -12859,16 +13015,18 @@ impl GatewayHandler {
         // serving shard from a raw DML store into a live view serving layer.
         {
             if let Some(data_plane) = &self.distributed_data_plane {
-                for (view_name, request, assertion) in distributed_deltas {
+                for (view_name, request, assertion) in &distributed_deltas {
                     let response = match assertion {
                         Some(assertion) => {
-                            data_plane.submit_delta_delegated(request, &assertion).await
+                            data_plane
+                                .submit_delta_delegated(request.clone(), assertion)
+                                .await
                         }
-                        None => data_plane.submit_delta(request).await,
+                        None => data_plane.submit_delta(request.clone()).await,
                     };
                     response.map_err(|error| {
                         PgWireError::ApiError(Box::new(GatewayError::QueryTimeExecutionFailed {
-                            detail: format!("distributed view refresh {view_name}: {error}"),
+                            detail: format!("distributed view refresh {view_name}: {error}; preserve source input and shard storage and contact the operator before retrying"),
                         }))
                     })?;
                 }
@@ -12881,6 +13039,14 @@ impl GatewayHandler {
             shard_db.flush().await.map_err(|e| {
                 PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
             })?;
+            if !distributed_deltas.is_empty() {
+                shard_db
+                    .delete(&rockstream_storage::ShardKeyEncoder::meta_key(
+                        b"distributed-source-pending",
+                    ))
+                    .await
+                    .map_err(|e| PgWireError::ApiError(Box::new(GatewayError::Storage(e))))?;
+            }
             self.frontier_published_at_ms
                 .store(current_time_ms(), Ordering::SeqCst);
             self.pending_view_recovery.lock().clear();

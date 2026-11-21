@@ -295,6 +295,16 @@ pub enum ControlMessage {
     Execute {
         frame: crate::data_plane::RuntimeExchangeMessage,
     },
+    DispatchOwnedShuffle {
+        target: WorkerInfo,
+        frame: crate::data_plane::RuntimeExchangeMessage,
+    },
+    PrepareOwnedEpoch {
+        intent: crate::data_plane::OwnedEpochIntent,
+    },
+    FinishOwnedEpoch {
+        intent: crate::data_plane::OwnedEpochIntent,
+    },
     DeploymentReady {
         workload_id: crate::ids::WorkloadId,
         workers: Vec<crate::data_plane::WorkerExecutionStatus>,
@@ -835,6 +845,24 @@ pub enum WorkerMessage {
     },
     /// Initial registration request.
     Register(WorkerRegistration),
+    OwnedShuffleReady {
+        worker_id: WorkerId,
+    },
+    OwnedEpochRecoveryRequired {
+        worker_id: WorkerId,
+        workload_id: crate::ids::WorkloadId,
+        shard_id: ShardId,
+    },
+    OwnedEpochPrepared {
+        worker_id: WorkerId,
+        intent: crate::data_plane::OwnedEpochIntent,
+        error: Option<String>,
+    },
+    OwnedEpochFinished {
+        worker_id: WorkerId,
+        intent: crate::data_plane::OwnedEpochIntent,
+        error: Option<String>,
+    },
     DeployWorkload(crate::data_plane::DeploymentRequest),
     DeploymentReady {
         version: u32,
@@ -850,6 +878,14 @@ pub enum WorkerMessage {
         output: crate::data_plane::RuntimeOutputDelta,
         input_rows: u64,
         output_rows: u64,
+    },
+    ExecutionFailed {
+        output: crate::data_plane::RuntimeOutputDelta,
+        message: String,
+    },
+    ShuffleDispatchFailed {
+        output: crate::data_plane::RuntimeOutputDelta,
+        message: String,
     },
     ReadWorkload {
         workload_id: crate::ids::WorkloadId,

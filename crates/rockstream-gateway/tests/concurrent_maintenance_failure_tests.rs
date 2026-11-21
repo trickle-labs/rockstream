@@ -276,6 +276,7 @@ async fn test_stale_owner_fenced_before_stage() {
 
     // Stale owner attempts to enqueue frame using old_lease
     let stale_frame = RuntimeExchangeMessage {
+        attempt_id: None,
         version: 1,
         request_id: "req_stale".to_string(),
         workload_id: rockstream_types::ids::WorkloadId(1),
@@ -296,6 +297,7 @@ async fn test_stale_owner_fenced_before_stage() {
 
     // Valid owner enqueuing with new_lease succeeds
     let valid_frame = RuntimeExchangeMessage {
+        attempt_id: None,
         version: 1,
         request_id: "req_valid".to_string(),
         workload_id: rockstream_types::ids::WorkloadId(1),

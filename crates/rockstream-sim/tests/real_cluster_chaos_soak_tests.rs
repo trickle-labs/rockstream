@@ -25,7 +25,7 @@ use rockstream_ops::{
     ArrowZSet,
 };
 use rockstream_plan::PlanNode;
-use rockstream_runtime::start_worker_client;
+use rockstream_runtime::client::start_worker_client_with_insecure_internal_dev_and_metadata as start_test_worker_client;
 use rockstream_sim::qualification::worker_failure::{
     qualification_records, validate, RecoveryFailure, WorkerObservation, WorkerRecoveryEvidence,
     MANIFEST,
@@ -503,9 +503,15 @@ async fn worker_process_fixture() {
                 .unwrap_or_else(|_| "worker-failure-source".to_owned()),
         )
     };
-    let (worker, _task) = start_worker_client(id, &control, &root.join(format!("worker-{id}")))
-        .await
-        .unwrap();
+    let (worker, _task) = start_test_worker_client(
+        id,
+        &control,
+        &root.join(format!("worker-{id}")),
+        Default::default(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
     let deadline = Instant::now() + WAIT;
     while worker.worker_id().is_none() {
         assert!(Instant::now() < deadline, "registration deadline");

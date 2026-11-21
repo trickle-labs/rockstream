@@ -1443,7 +1443,7 @@ async fn delegated_actor_policy_is_rechecked_by_release_control_process() {
         .unwrap_err();
     assert_eq!(
         policy_denial.to_string(),
-        "RS-2401: asserted user actor is no longer authorized for this operation and scope"
+        "RS-2401: asserted user actor is no longer authorized for this operation and scope; Request elevated RBAC role from an admin or contact the namespace owner"
     );
     let identity_denial = client
         .deploy_delegated(request, &wrong_deployment)
@@ -1451,7 +1451,7 @@ async fn delegated_actor_policy_is_rechecked_by_release_control_process() {
         .unwrap_err();
     assert_eq!(
         identity_denial.to_string(),
-        "RS-2400: gateway actor assertion is invalid, expired, or bound to another deployment/request"
+        "RS-2400: gateway actor assertion is invalid, expired, or bound to another deployment/request; Provide valid credentials (Bearer token or mTLS certificate)"
     );
 
     process.0.kill().unwrap();
@@ -1867,7 +1867,17 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
         .expect("registered error includes diagnostic context");
     assert!(uuid::Uuid::parse_str(correlation_id).is_ok());
     let expected_message = format!(
-        "[RS-2026] query.query_time_execution_failed: Query-time DataFusion planning or execution failed for an ad hoc query (detail=deploy distributed view stale_view: RS-2401: asserted user actor is no longer authorized for this operation and scope) (correlation_id=<uuid> context=detail=deploy distributed view stale_view: RS-2401: asserted user actor is no longer authorized for this operation and scope) next_steps: {}",
+        "[RS-2026] query.query_time_execution_failed: Query-time DataFusion planning or execution failed for an ad hoc query (detail=deploy distributed view stale_view: RS-2401: asserted user actor is no longer authorized for this operation and scope; {}) (correlation_id=<uuid> context=detail=deploy distributed view stale_view: RS-2401: asserted user actor is no longer authorized for this operation and scope; {}) next_steps: {}",
+        rockstream_types::error_code::ErrorDescriptor::lookup(
+            rockstream_types::error_code::RS_2401
+        )
+        .unwrap()
+        .default_next_steps,
+        rockstream_types::error_code::ErrorDescriptor::lookup(
+            rockstream_types::error_code::RS_2401
+        )
+        .unwrap()
+        .default_next_steps,
         descriptor.default_next_steps
     );
     assert_eq!(
