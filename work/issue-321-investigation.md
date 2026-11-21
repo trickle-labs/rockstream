@@ -170,5 +170,98 @@ search found `WorkerStreamMultiplexer::send_frame` callers in tests,
 simulations and benchmarks, but no production caller; the owning recovery
 observation remains inconclusive.
 
-Management authentication remains owned by open issue #303. No authenticated
-release-process path was qualified in this investigation.
+Management authentication remains owned by open issue #303. A separate
+qualification used the unmerged management candidate at commit
+`66e9ff6ea0e64800609ae5c6076afb1dfda87a2d`, a release image built from that
+revision, and an isolated control process with two simulated worker peers.
+The `linux/amd64` image ID was
+`sha256:cc9bf1b13bdd8c58f2651afff9cfd1009e4bf33ea608a9706fc2eb664a6f4b57`.
+The temporary test checkout added a second CLI certificate and a grantless
+durable principal to the existing drain fixture; those test-only changes were
+not part of the image. The management endpoint used an ephemeral loopback host
+port mapped to the control container's port 9201.
+The draft subsequently advanced to `d698bdfc88c1f4f4434e6e4254b3885e0dc3e6e7`;
+that later commit changes CLI TLS reload code and tests, not the catalog store
+or management service. A separate unsequenced test on its clean-source release
+image `sha256:130672615eb2ec76df148ce95ab791e67d02a83f0287c488513e8640e3709813`
+reproduced the same catalog failure described below; it did not establish
+the serialized positive behavior for that later commit. A subsequent temporary
+test used that image for a real control process and two real worker containers,
+with shard 77 initially assigned to worker 601 and backed by MinIO. Two
+unauthenticated gRPC attempts, for status and drain, each returned
+`Unknown error: transport error`; the test waited for each failure audit before
+the next attempt. A mapped principal without grants was denied both calls.
+The complete shard and operation lists, and node fields other than changing
+headroom and topology version, matched before and after rejection. Denial audit
+records matched exactly after normalizing generated IDs and timestamps. An
+authorized drain moved shard 77 to worker 602, completed at 100%, and the
+seeded key retained its exact value after the workers stopped and storage was
+reopened. The test passed twice. An extended run also passed after checking
+that plaintext received the TLS fatal decode-error alert and that the client
+refused both missing CA trust and an explicit plaintext URL. It does not
+eliminate the unsequenced audit race or establish the whole #303 release-endpoint
+matrix.
+The [real-worker test patch](issue-321-real-worker-reproducer.patch) applies
+with `rtk git apply --unidiff-zero` to the tested draft commit and expects the
+clean-source image tagged
+`rockstream-321-qual:d698bdfc88c1`. Run its selected test with
+`rtk cargo test -p rockstream-sim --test issue_321_real_process management_denial_and_drain_with_real_release_workers -- --exact`;
+Docker and the fixture's MinIO image are required. The patch is a qualification
+fixture, not a catalog repair or an assertion that the unsequenced race passes.
+An unauthenticated TLS handshake and a plaintext HTTP/2 preface were rejected;
+the latter received the TLS fatal decode-error alert `15 03 03 00 02 02 32`.
+When the test waited for each authentication-failure audit record before the
+next attempt, an authenticated principal with no grants was denied both a
+cluster-status read and a worker drain. The complete observable status and
+operation list were unchanged, the donor's original shard lease still fenced
+successfully, and the denial audit records matched the actor, actions, scopes,
+outcomes, and policy revision. An authorized drain then completed and moved
+the shard to the recipient. This serialized experiment passed; its simulated
+peers do not prove real worker lifecycle or full release qualification.
+
+Without that audit sequencing, the same two rejected handshakes were followed
+by an administrator request failing twice in separate runs. The control log
+reported incomplete catalog history: expected revision 4, found revision 3.
+An independent in-memory storage reproducer on main
+`9cae51408ad42252c793a165a18e6eaed43352d6` committed two different
+transactions at revision 1 and then received `RS-1003` on recovery, for both
+one catalog instance and two instances sharing a store. A clean, dedicated
+main build repeated this result after an earlier run used a shared Cargo target.
+The diagnostic test asserts the observed defect; it is not a passing regression
+for a repair. A clean build of the draft's security catalog also accepted two
+different principal changes at revision 2 and then failed recovery on the
+duplicate revision. Another main diagnostic committed table 1 at revision 1, snapshotted and
+compacted that revision, and then committed table 2 from a stale catalog instance
+at revision 1. Both calls returned success. Recovery returned exactly table 1
+and no table 2: the stale acknowledged mutation was omitted because replay skips
+logs already covered by the snapshot. A separate test repeated this outcome
+with a filesystem object store and two OS processes: the second process opened
+its catalog before the first committed and compacted the snapshot, then its
+stale revision-1 commit returned success but was absent after recovery. These
+are diagnostic tests, not release-process evidence of this particular loss.
+Regression checks requiring rejection of stale writes failed in the clean main
+build both before and after compaction. Cross-process fencing, compaction,
+crash recovery, and compatibility of a fix remain open.
+The workspace's `object_store` 0.14 local filesystem backend returns
+`NotImplemented` for conditional `PutMode::Update`; a local test verified
+that the old object remains unchanged. A portable fix cannot assume that
+conditional update is available on every supported store.
+On current main, `CatalogStubs::persist_mutations` also discards errors from
+`commit_txn` in its synchronous and spawned paths. It is called by multiple
+gateway catalog mutations. Adding a new conflict error solely in the store
+would therefore be insufficient: those paths must propagate or safely resolve
+the failure before reporting the affected mutation as successful.
+The pgwire `CREATE VIEW` path calls `add_view_with_deps`, which publishes the
+view in the in-memory catalog before invoking that error-discarding persistence
+path; by contrast, durable `CREATE TABLE` uses `add_table_durably`. A pgwire
+test in the clean main build injected a catalog-log write failure after
+successfully creating a base table. `CREATE VIEW uncommitted_view AS SELECT id FROM durable_rows`
+returned `CommandComplete(0)` and `pg_views` contained exactly
+`uncommitted_view`; after restarting the gateway, `pg_views` was empty. The
+injected catalog append failed exactly once. This is a separate view-creation
+failure observation, not proof about the requested DML rollback paths. Source
+inspection also shows that view compilation may publish a local directory entry
+or deploy a distributed plan before catalog registration; a complete repair
+must handle those effects, not just return the catalog error.
+
+On clean main `9cae51408ad42252c793a165a18e6eaed43352d6`, the [durable catch-up regression](issue-321-durable-rejection.patch) failed with a filesystem-backed store. For uncommitted epoch 1 and a closed inlet, the initial call returned `Ok(())`; after reopening with frontier 0, retry also returned `Ok(())` but delivered no rows within 150 ms. The expected outcome is an initial error, followed by exactly `[(5, 50), (6, 60)]` on retry without another delivery. The test exercises the helper directly and does not demonstrate an owning epoch or a committed result. Run it after `git apply --unidiff-zero work/issue-321-durable-rejection.patch` using `cargo test -p rockstream-runtime --test fast_path_wal_elision_tests issue_321_durable_catch_up_retries_after_closed_inlet`.
