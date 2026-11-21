@@ -143,7 +143,7 @@ async fn create_backup_snapshots_real_worker_shard_and_is_idempotent() {
     assert_eq!(accepted.protocol_version, 1);
     let accepted_operation = accepted.operation.unwrap();
     assert_eq!(accepted_operation.kind, "create_backup");
-    assert_eq!(accepted_operation.source_version, "operation-record:3");
+    assert_eq!(accepted_operation.source_version, "operation-record:4");
     assert_eq!(accepted_operation.operation_id, idempotency_key);
     assert!(!accepted_operation.operation_id.is_empty());
     let completed = await_succeeded(&mut client, idempotency_key).await;
@@ -161,7 +161,7 @@ async fn create_backup_snapshots_real_worker_shard_and_is_idempotent() {
     assert_eq!(completed.phase, "completed");
     assert_eq!(completed.error_code, "");
     assert!(completed.next_steps.is_empty());
-    assert_eq!(completed.source_version, "operation-record:3");
+    assert_eq!(completed.source_version, "operation-record:4");
     let replay = client
         .create_backup(CreateBackupRequest {
             protocol_version: 1,

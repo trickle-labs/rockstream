@@ -16,6 +16,14 @@ grants `secret.use`. A gateway running without a durable authenticated policy
 denies secret administration. Secret input remains write-only, and no SQL GET
 returns an existing secret value.
 
+Before each `ALTER SECRET`, set `rockstream.idempotency_key` to a canonical
+client-generated UUID in the same SQL session. Reuse that UUID and the exact
+request after a lost response; the durable operation binds it to the actor,
+deployment, secret scope, and a digest of the submitted values. A changed request
+under the same UUID is rejected. The authorized management `GetOperation` path
+returns the safe operation result when it uses the same operation store; the
+client-known UUID remains the SQL retry identity.
+
 Applications can inject an `AwsKmsKekProvider::new(key_arn, region)` into a
 `SecretStore` and supply that store through `ControlService::with_secret_store`.
 Supplying an ARN alone does not select this provider in the default services.
@@ -160,6 +168,7 @@ Worker shuffle and native management APIs are separate transport boundaries. A c
 
 The native management API requires mTLS and a durable security catalog. Only certificates with a parsed `Cli` node identity are eligible for principal mapping; worker and control-node certificates are rejected and audited even when their fingerprints are listed as login methods. A verified CLI certificate is mapped by SHA-256 fingerprint to an enabled principal; the node role, CLI role flag, and headers do not grant application authority. Each RPC evaluates the principal's current persisted grants for the requested action and scope. A failed handshake, wrong-role certificate, or unmapped certificate establishes no management session. An authorization denial is audited and rejects that operation while preserving the authenticated session. Startup fails when the security catalog is unavailable or has no enabled administrator and mTLS principal. This implementation and its component tests do not constitute the assembled v0.73 qualification sign-off; missing release evidence remains blocking.
 
+Management support artifacts require current `SupportGenerate` authority on the requested cluster or node scope. Downloads use an opaque UUID, require both artifact-download authority and current authority on the original scope, and are bound to the creating principal. Artifacts contain sanitized operational metadata only. Each is limited to 10 MiB and remains available for at most 10 minutes. The shared object store retains at most 2,048 artifacts and 100 MiB of payload per deployment; at either limit it rejects new generation and never evicts an unexpired artifact. Each management-service instance admits one artifact generation at a time. A pre-admission busy response does not create an operation record; an admitted quota failure records a failed operation and audit. Both use gRPC `ResourceExhausted`. Backends without atomic conditional writes keep the management API available but disable support-artifact generation and download. Expired data is cleaned within 60 seconds and before listeners open during startup recovery.
 Principals with cluster-scoped `principal.manage` may list durable principal metadata, preset/scoped grants, and their effective action/scope pairs through the paginated Management API. Responses omit login methods and credential material.
 
 `SetSecurityPrincipalGrants` replaces grants on an existing principal. It requires a canonical client-generated UUID, the target revision and grantor revision the caller reviewed, and current `grant.manage` authority. The UUID is the operation ID and is bound to the authenticated principal, deployment context, target, revisions, and requested grants. The catalog commits the grant change and its audit record atomically; the durable operation stores the complete safe result. Retry with the same UUID after a lost response, then use the authorized `GetOperation` RPC to reconcile. Do not retry as a new operation. Operation listings omit grant results; the original grantor or a current grant manager may read the result.
@@ -269,14 +278,23 @@ and `AFTER` excludes that row. Pages default to 100 rows and are limited to 500.
 The gateway checks the requested time-range grant on every page and durably
 audits denials while preserving an authenticated session. The result includes
 explicit verified, unverified, unknown, and not-applicable field states.
+For bounded audit-only access, an `administrator` preset may be scoped to an
+`AuditRange`; that grant permits only audit reads within the granted range.
 Pages use live keyset ordering rather than a multi-request snapshot. Records
 committed during pagination may appear when their key sorts after the cursor;
 restart from the first page to include records that sort at or before it. If
 the policy revision changes between authorization and page read, return a
-retryable conflict without disclosing records.
+retryable conflict without disclosing records. A client `CancelRequest` stops
+an audit-page read with RS-2050 and leaves retained history unchanged.
 
 ## First administrator preprovisioning
 
 Run trusted offline tooling while all RockStream processes for the deployment are stopped. Invoke `rockstream security preprovision-admin --storage <root> --layout <all|gateway> --principal-file <path> --operation-id <id> [--yes]`. The command accepts a JSON `SecurityPrincipal` with an enabled interactive cluster administrator; provide only verifier or public certificate identity material, never a plaintext password or private key. Select `--layout all` for an `all` role deployment, or `--layout gateway` for a `gateway` or `control` deployment. `--storage` must match the deployment's `start --storage` value, and `--operation-id` must be unique for the catalog and reused on retry. The command requires `--yes` in non-interactive use.
 
 The principal and its grant-change audit event commit together; the audit actor is `unknown` because bootstrap has no authenticated application session. The operation rejects a nonempty security catalog, and a retry verifies the committed principal and audit record. It is not a public network operation. Catalog mutations also reject removal, disablement, or downgrade of the last active administrator.
+
+### Offline administrator credential recovery
+
+If an existing administrator loses access to its login credentials, run trusted offline tooling with direct operator access to the durable deployment catalog while all RockStream processes are stopped. The current CLI accepts `rockstream security recover-admin --storage <root> --layout <all|gateway> --principal-id <id> --login-methods-file <path> --operation-id <id> [--yes]`. The file is a JSON array of replacement `LoginMethod` records; it contains verifier or public identity material, never a plaintext password. Reuse the same unique operation ID on retry. The CLI calls `DurableCatalogStore::recover_administrator_credentials`; the catalog increments the principal revision and commits the replacement login methods with an `AdminOperationCompletion` audit record in one transaction. Because this route runs offline, the audit actor is `unknown` and correlation is `not_applicable`.
+
+Recovery only replaces login methods for an enabled principal that already has an interactive cluster Administrator grant. It preserves the principal identity and all grants; it cannot create a principal, promote a role, or self-grant authority. The caller must not expose or log credential material. If the administrator record is absent or the durable catalog cannot be recovered, this method fails closed; restore the trusted deployment state through the documented backup recovery process rather than creating an administrator through an online request.

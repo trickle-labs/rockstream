@@ -2275,7 +2275,6 @@ struct WorkloadDeploymentContext<'a> {
     worker_senders: &'a Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
     data_plane: &'a Arc<AsyncMutex<DataPlaneState>>,
 }
-
 async fn deploy_workload(
     request: DeploymentRequest,
     actor: Option<DelegatedActor>,

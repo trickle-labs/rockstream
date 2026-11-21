@@ -15,6 +15,11 @@ use rockstream_control::{
     MANAGEMENT_OPERATION_RECORD_VERSION, ManagementOperationStore, ManagementService, ShardManager,
     TopologyCatalog,
 };
+use rockstream_management_proto::v1::{
+    GetClusterStatusRequest, Operation as ManagementWireOperation, SecurityPresetGrant,
+    SetSecurityPrincipalGrantsRequest,
+};
+use rockstream_management_proto::PROTOCOL_VERSION;
 use rockstream_storage::catalog::{CatalogMutation, CatalogStore, CatalogTxn, DurableCatalogStore};
 use rockstream_test_support::pki::TestPki;
 use rockstream_types::authorization::{
@@ -25,6 +30,9 @@ use rockstream_types::authorization::{
 use rockstream_types::config::NodeConfig;
 use rockstream_types::error_code::RS_0003;
 use rockstream_types::ids::PrincipalId;
+#[path = "common/management_auth.rs"]
+mod management_auth;
+use management_auth::management_client;
 use sha2::Digest;
 
 struct RunningProcess(Child);
@@ -910,6 +918,64 @@ async fn management_release_process_authenticates_and_authorizes_real_cli_reques
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
+    let operation_id = "00000000-0000-4000-8000-000000000126";
+    let mut management = management_client(management_addr, &pki).await;
+    let mut operation = management
+        .set_security_principal_grants(SetSecurityPrincipalGrantsRequest {
+            protocol_version: PROTOCOL_VERSION,
+            principal_id: admin.id.0,
+            expected_revision: admin.revision,
+            expected_grantor_revision: admin.revision,
+            idempotency_key: operation_id.to_owned(),
+            preset_grants: vec![SecurityPresetGrant {
+                preset: "operator".to_owned(),
+                scope_json: "\"cluster\"".to_owned(),
+            }],
+            scoped_grants: Vec::new(),
+        })
+        .await
+        .expect("authenticated release management request should return its failed operation")
+        .into_inner()
+        .operation
+        .expect("last-administrator denial should retain an operation record");
+    assert!(chrono::DateTime::parse_from_rfc3339(&operation.started_at).is_ok());
+    assert!(chrono::DateTime::parse_from_rfc3339(&operation.updated_at).is_ok());
+    operation.started_at = "<timestamp>".to_owned();
+    operation.updated_at = "<timestamp>".to_owned();
+    assert_eq!(
+        operation,
+        ManagementWireOperation {
+            operation_id: operation_id.to_owned(),
+            kind: "security_principal_grants".to_owned(),
+            state: "failed".to_owned(),
+            started_at: "<timestamp>".to_owned(),
+            updated_at: "<timestamp>".to_owned(),
+            progress: "100%".to_owned(),
+            phase: "security_policy_rejected".to_owned(),
+            error_code: String::new(),
+            next_steps: vec![
+                "Review current authority and principal revisions before submitting a new mutation."
+                    .to_owned(),
+            ],
+            source_version: format!("operation-record:{MANAGEMENT_OPERATION_RECORD_VERSION}"),
+            result_json: r#"{"reason":"RS-2401: grant mutation would remove the last mTLS management administrator","status":"failed"}"#.to_owned(),
+        }
+    );
+    let status = management
+        .get_cluster_status(GetClusterStatusRequest {
+            protocol_version: PROTOCOL_VERSION,
+        })
+        .await
+        .expect("the authenticated management session remains usable after the denied mutation")
+        .into_inner();
+    assert_eq!(status.protocol_version, PROTOCOL_VERSION);
+    drop(management);
+    catalog.refresh().await.unwrap();
+    assert_eq!(
+        catalog.get_security_principal(admin.id).await.unwrap(),
+        Some(admin.clone())
+    );
+
     worker.stop();
     control.stop();
     catalog.refresh().await.unwrap();
@@ -992,4 +1058,61 @@ async fn management_release_process_authenticates_and_authorizes_real_cli_reques
         _ => String::new(),
     });
     assert_eq!(denials, expected_denials);
+
+    let mut operation_events = audit
+        .iter()
+        .filter(|record| record.operation_id == AuditField::Known(operation_id.to_owned()))
+        .collect::<Vec<_>>();
+    operation_events.sort_by_key(|record| record.event_id.as_str());
+    assert_eq!(
+        operation_events
+            .iter()
+            .map(|record| record.event_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            format!("management-security-grants-completion:{operation_id}"),
+            format!("management-security-grants-start:{operation_id}"),
+        ]
+    );
+    let completion = operation_events[0];
+    assert!(completion.timestamp_ms > 0);
+    assert_eq!(
+        completion,
+        &SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: format!("management-security-grants-completion:{operation_id}"),
+            timestamp_ms: completion.timestamp_ms,
+            actor: AuditIdentity::Verified("principal:1".to_owned()),
+            target: AuditField::Known("principal:1".to_owned()),
+            scope: AuditField::Known("cluster".to_owned()),
+            action: SecurityAuditClass::AdminOperationCompletion,
+            outcome: SecurityAuditOutcome::Failure,
+            correlation: AuditCorrelation::Observed(operation_id.to_owned()),
+            operation_id: AuditField::Known(operation_id.to_owned()),
+            policy_revision: AuditField::Known(admin.revision),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
+    );
+    let start = operation_events[1];
+    assert!(start.timestamp_ms > 0);
+    assert!(start.timestamp_ms <= completion.timestamp_ms);
+    assert_eq!(
+        start,
+        &SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: format!("management-security-grants-start:{operation_id}"),
+            timestamp_ms: start.timestamp_ms,
+            actor: AuditIdentity::Verified("principal:1".to_owned()),
+            target: AuditField::Known("principal:1".to_owned()),
+            scope: AuditField::Known("cluster".to_owned()),
+            action: SecurityAuditClass::AdminOperationStart,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::Observed(operation_id.to_owned()),
+            operation_id: AuditField::Known(operation_id.to_owned()),
+            policy_revision: AuditField::Known(admin.revision),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
+    );
 }

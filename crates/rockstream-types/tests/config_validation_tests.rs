@@ -379,3 +379,14 @@ listen_addr = "999.999.999.999:5432"
     assert_eq!(diag_addr.code, "RS-0002");
     assert!(diag_addr.message.contains("invalid socket address"));
 }
+
+#[test]
+fn test_md5_auth_mode_is_rejected_with_release_diagnostic() {
+    let report = validate_config_str("version = 1\n[auth]\nmode = \"md5\"\n", false);
+
+    assert!(!report.valid);
+    assert_eq!(
+        report.to_text(),
+        "[ERROR] auth.mode (RS-0002): authentication mode `md5` is unavailable: MD5 is not a release authentication mode (suggestion: Use a release-supported authentication mode.)"
+    );
+}

@@ -785,6 +785,11 @@ pub enum CheckpointCommand {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum SupportCommand {
+    /// Generate or download an actor-bound management support artifact.
+    Artifact {
+        #[command(subcommand)]
+        command: SupportArtifactCommand,
+    },
     /// Generate on-demand diagnostic support bundle.
     Bundle {
         /// Optional view name filter.
@@ -808,6 +813,27 @@ pub enum SupportCommand {
         /// Output file path for the support bundle.
         #[arg(long)]
         out: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum SupportArtifactCommand {
+    /// Generate a sanitized artifact through the authenticated management API.
+    Create {
+        /// Optional node scope; omit to capture cluster metadata.
+        #[arg(long)]
+        node_id: Option<u64>,
+        /// Client-generated identity used to retry or reconcile this request.
+        #[arg(long)]
+        idempotency_key: Option<uuid::Uuid>,
+    },
+    /// Download an artifact returned by `support artifact create`.
+    Download {
+        /// Opaque artifact UUID returned by the management API.
+        opaque_id: uuid::Uuid,
+        /// Local destination for the downloaded bytes.
+        #[arg(long)]
+        out: PathBuf,
     },
 }
 
@@ -967,6 +993,28 @@ pub enum SecurityCommand {
         /// JSON-serialized SecurityPrincipal containing an enabled interactive cluster administrator.
         #[arg(long)]
         principal_file: PathBuf,
+        /// Stable catalog operation ID to reuse if this command must be retried.
+        #[arg(long)]
+        operation_id: u64,
+        /// Confirm the deployment is stopped and the selected durable store is correct.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Replace login methods for an existing administrator while the deployment is stopped.
+    #[command(name = "recover-admin")]
+    RecoverAdministratorCredentials {
+        /// Select `all` for `--role all`, or `gateway` for `--role gateway`/`control`.
+        #[arg(long, value_enum)]
+        layout: SecurityCatalogLayout,
+        /// Node storage directory used by `start --storage` for this deployment.
+        #[arg(long)]
+        storage: PathBuf,
+        /// ID of the existing active cluster administrator to recover.
+        #[arg(long)]
+        principal_id: u64,
+        /// JSON array of replacement `LoginMethod` entries; contains no plaintext password.
+        #[arg(long)]
+        login_methods_file: PathBuf,
         /// Stable catalog operation ID to reuse if this command must be retried.
         #[arg(long)]
         operation_id: u64,

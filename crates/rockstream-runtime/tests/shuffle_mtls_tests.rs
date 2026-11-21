@@ -5,7 +5,7 @@ use parking_lot::RwLock;
 use rockstream_ops::zset::ArrowZSet;
 use rockstream_runtime::client::ShardState;
 use rockstream_runtime::exchange::pool::ShuffleClientPool;
-use rockstream_runtime::exchange::proto::ShuffleFrame;
+use rockstream_runtime::exchange::proto::{ExchangeFrame, ShuffleFrame};
 use rockstream_runtime::exchange::service::{ExchangeRegistry, ExchangeService};
 use rockstream_test_support::pki::TestPki;
 use rockstream_types::authorization::{
@@ -414,6 +414,72 @@ async fn test_worker_shuffle_grpc_mtls_rejects_unregistered_worker_identity() {
         Err(status) => status,
         Ok(_) => panic!("unregistered worker certificate must be rejected"),
     };
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        status.message(),
+        "RS-2401: worker node identity is not currently registered"
+    );
+    service.shutdown().await;
+}
+
+#[tokio::test]
+async fn exchange_stream_rejects_and_audits_unregistered_worker_identity() {
+    let pki = TestPki::generate();
+    let (audit_sender, mut audit_receiver, waiters) = audit_transport();
+    let registry = registry_with_workers(&[1]).with_security_audit(audit_sender, waiters.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let service = ExchangeService::new(registry).with_internal_tls(pki.worker_tls_config(1));
+    service.start(addr).await.unwrap();
+    let peers = Arc::new(RwLock::new(HashMap::from([(
+        WorkerId(1),
+        addr.to_string(),
+    )])));
+    let pool = ShuffleClientPool::new(peers).with_internal_tls(pki.worker_tls_config(2));
+    let mut client = pool.get_client(WorkerId(1)).await.unwrap();
+
+    let ack_waiters = waiters.clone();
+    let audit_task = tokio::spawn(async move {
+        let Some(WorkerMessage::ReportSecurityAudit { request_id, record }) =
+            audit_receiver.recv().await
+        else {
+            panic!("expected security audit report");
+        };
+        assert_eq!(request_id, record.event_id);
+        assert_eq!(
+            record.actor,
+            AuditIdentity::Unverified("worker:worker-2".to_owned())
+        );
+        assert_eq!(
+            record.target,
+            AuditField::Unverified("worker:worker-2".to_owned())
+        );
+        assert_eq!(record.scope, AuditField::Known("worker_shuffle".to_owned()));
+        assert_eq!(record.action, SecurityAuditClass::NodeIdentityRejection);
+        assert_eq!(record.outcome, SecurityAuditOutcome::Denied);
+        assert_eq!(record.correlation, AuditCorrelation::Unknown);
+        assert_eq!(record.operation_id, AuditField::NotApplicable);
+        assert_eq!(record.policy_revision, AuditField::NotApplicable);
+        assert_eq!(record.before_state, AuditField::NotApplicable);
+        assert_eq!(record.after_state, AuditField::NotApplicable);
+        ack_waiters
+            .lock()
+            .remove(&request_id)
+            .unwrap()
+            .send(true)
+            .unwrap();
+    });
+    let mut request = tonic::Request::new(futures::stream::iter(Vec::<ExchangeFrame>::new()));
+    request.metadata_mut().insert(
+        "protocol_version",
+        tonic::metadata::MetadataValue::from_static("1"),
+    );
+    let status = match client.exchange_stream(request).await {
+        Err(status) => status,
+        Ok(_) => panic!("unregistered worker identity must be rejected"),
+    };
+    audit_task.await.unwrap();
     assert_eq!(status.code(), tonic::Code::PermissionDenied);
     assert_eq!(
         status.message(),

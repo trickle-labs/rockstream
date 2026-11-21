@@ -13,6 +13,7 @@
 
 use crate::cli_args::SecurityCatalogLayout;
 use crate::output::OutputFormat;
+use rockstream_storage::catalog::CatalogStore;
 use rockstream_types::audit::AuditEvent;
 use rockstream_types::config::RockstreamConfig;
 use rockstream_types::diagnostic::{
@@ -620,8 +621,9 @@ async fn open_durable_secret_store(
     store: Arc<dyn object_store::ObjectStore>,
     shard_path: &str,
     security_catalog: Arc<dyn rockstream_storage::catalog::CatalogStore>,
+    operation_store: Option<(Arc<dyn object_store::ObjectStore>, String)>,
 ) -> Result<Arc<rockstream_control::SecretStore>, CliError> {
-    let secret_store = rockstream_control::SecretStore::open_durable(
+    let mut secret_store = rockstream_control::SecretStore::open_durable(
         format!("{shard_path}-secrets"),
         store,
         Arc::new(rockstream_control::EnvKekProvider::from_env()),
@@ -635,6 +637,12 @@ async fn open_durable_secret_store(
         )
     })?
     .with_security_audit_catalog(security_catalog);
+    if let Some((store, deployment_id)) = operation_store {
+        secret_store = secret_store.with_management_operation_store(
+            rockstream_control::ManagementOperationStore::new(store),
+            deployment_id,
+        );
+    }
     secret_store
         .flush_pending_security_audit_outbox()
         .await
@@ -658,6 +666,21 @@ impl output::Formattable for SecurityPreprovisionResult {
     fn to_text(&self) -> String {
         format!(
             "Preprovisioned administrator principal {} at catalog revision {}",
+            self.principal_id, self.catalog_revision
+        )
+    }
+}
+
+#[derive(Serialize)]
+struct SecurityRecoveryResult {
+    principal_id: u64,
+    catalog_revision: u64,
+}
+
+impl output::Formattable for SecurityRecoveryResult {
+    fn to_text(&self) -> String {
+        format!(
+            "Recovered administrator principal {} at catalog revision {}",
             self.principal_id, self.catalog_revision
         )
     }
@@ -704,6 +727,58 @@ pub async fn run_security_preprovision(
     Ok(output::render_output(
         &SecurityPreprovisionResult {
             principal_id: principal.id.0,
+            catalog_revision: revision,
+        },
+        format,
+    ))
+}
+
+pub async fn run_security_recover_admin(
+    format: output::OutputFormat,
+    storage_root: &Path,
+    layout: SecurityCatalogLayout,
+    principal_id: u64,
+    login_methods_file: &Path,
+    operation_id: u64,
+    yes: bool,
+) -> Result<String, CliError> {
+    prompt_confirmation(
+        "Confirm RockStream processes are stopped and this is the intended deployment store",
+        yes,
+    )?;
+    let login_methods: Vec<rockstream_types::authorization::LoginMethod> =
+        serde_json::from_reader(fs::File::open(login_methods_file).map_err(|error| {
+            CliError::new(
+                RS_0002,
+                format!("could not open administrator login-method file: {error}"),
+                "Check the selected login-method file and its permissions.",
+            )
+        })?)
+        .map_err(|error| {
+            CliError::new(
+                RS_0002,
+                format!("could not parse administrator login-method file: {error}"),
+                "Provide a JSON array of valid LoginMethod entries without plaintext passwords.",
+            )
+        })?;
+    let catalog = open_security_catalog(storage_root, layout).await?;
+    let revision = catalog
+        .recover_administrator_credentials(
+            rockstream_types::ids::PrincipalId(principal_id),
+            login_methods,
+            operation_id,
+        )
+        .await
+        .map_err(|error| {
+            CliError::new(
+                RS_0003,
+                format!("offline administrator credential recovery failed: {error}"),
+                "Use a stopped deployment and an existing active administrator principal with valid replacement login methods.",
+            )
+        })?;
+    Ok(output::render_output(
+        &SecurityRecoveryResult {
+            principal_id,
             catalog_revision: revision,
         },
         format,
@@ -1073,7 +1148,42 @@ async fn start_gateway_with_shard_and_catalog_and_dev_transport(
 
     let secret_store = match shared_secret_store {
         Some(secret_store) => secret_store,
-        None => open_durable_secret_store(store, shard_path, security_audit_catalog).await?,
+        None => {
+            let operations_store: Arc<dyn object_store::ObjectStore> =
+                if let Some(shared_dir) = &opts.control_shared_storage {
+                    fs::create_dir_all(shared_dir).map_err(|error| {
+                        CliError::new(
+                            RS_0003,
+                            format!("failed to create management shared-storage dir: {error}"),
+                            "Check filesystem permissions for --control-shared-storage.",
+                        )
+                    })?;
+                    Arc::new(
+                        object_store::local::LocalFileSystem::new_with_prefix(shared_dir).map_err(
+                            |error| {
+                                CliError::new(
+                                    RS_0003,
+                                    format!("failed to open management shared storage: {error}"),
+                                    "Check filesystem permissions for --control-shared-storage.",
+                                )
+                            },
+                        )?,
+                    )
+                } else {
+                    store.clone()
+                };
+            let deployment_id = rockstream_control::management::security_deployment_fingerprint(
+                &node_config,
+                &security_audit_catalog.deployment_namespace(),
+            );
+            open_durable_secret_store(
+                store,
+                shard_path,
+                security_audit_catalog,
+                Some((operations_store, deployment_id)),
+            )
+            .await?
+        }
     };
     let mut server = server
         .with_secret_store(secret_store)
@@ -1524,6 +1634,37 @@ pub fn run_start_with_dev_transport(
             }
             let security_catalog =
                 open_security_catalog(&opts.storage, SecurityCatalogLayout::All).await?;
+            let management_store: Arc<dyn object_store::ObjectStore> =
+                if let Some(shared_dir) = &opts.control_shared_storage {
+                    fs::create_dir_all(shared_dir).map_err(|error| {
+                        CliError::new(
+                            RS_0003,
+                            format!("failed to create management shared-storage dir: {error}"),
+                            "Check filesystem permissions for --control-shared-storage.",
+                        )
+                    })?;
+                    Arc::new(
+                        object_store::local::LocalFileSystem::new_with_prefix(shared_dir)
+                            .map_err(|error| {
+                                CliError::new(
+                                    RS_0003,
+                                    format!("failed to open management shared storage: {error}"),
+                                    "Check filesystem permissions for --control-shared-storage.",
+                                )
+                            })?,
+                    )
+                } else {
+                    Arc::new(
+                        object_store::local::LocalFileSystem::new_with_prefix(&opts.storage)
+                            .map_err(|error| {
+                                CliError::new(
+                                    RS_0003,
+                                    format!("failed to open management store: {error}"),
+                                    "Check storage directory permissions.",
+                                )
+                            })?,
+                    )
+                };
             let secret_object_store = rockstream_storage::build_runtime_object_store(
                 &opts.storage.join("shards/0"),
                 "shards/0",
@@ -1539,6 +1680,13 @@ pub fn run_start_with_dev_transport(
                 secret_object_store,
                 "db",
                 security_catalog.clone(),
+                Some((
+                    management_store.clone(),
+                    rockstream_control::management::security_deployment_fingerprint(
+                        &node_config,
+                        &security_catalog.deployment_namespace(),
+                    ),
+                )),
             )
             .await?;
             service = service
@@ -1575,9 +1723,20 @@ pub fn run_start_with_dev_transport(
                                 })?,
                         ) as Arc<dyn object_store::ObjectStore>
                     } else {
-                        store.clone()
+                        rockstream_storage::build_runtime_object_store(&opts.storage, "management")
+                            .map_err(|error| {
+                                CliError::new(
+                                    RS_0003,
+                                    format!("failed to open management store: {error}"),
+                                    "Check storage directory permissions or object-store credentials.",
+                                )
+                            })?
                     };
-                    service = service.with_management(addr.clone(), management_store, node_config.clone());
+                    service = service.with_management(
+                        addr.clone(),
+                        management_store,
+                        node_config.clone(),
+                    );
                 }
             }
             let handle = service
@@ -1623,6 +1782,7 @@ pub fn run_start_with_dev_transport(
                 secret_object_store,
                 "gateway",
                 security_catalog.clone(),
+                None,
             )
             .await?;
             service = service
@@ -1675,9 +1835,24 @@ pub fn run_start_with_dev_transport(
                 )));
             if opts.daemon {
                 if let Some(addr) = &node_config.control.management_addr {
+                    let management_store = if opts.control_shared_storage.is_some() {
+                        shared_object_store.clone()
+                    } else {
+                        rockstream_storage::build_runtime_object_store(
+                            &shared_store_dir,
+                            "management",
+                        )
+                        .map_err(|error| {
+                            CliError::new(
+                                RS_0003,
+                                format!("failed to open management store: {error}"),
+                                "Check storage directory permissions or object-store credentials.",
+                            )
+                        })?
+                    };
                     service = service.with_management(
                         addr.clone(),
-                        shared_object_store.clone(),
+                        management_store,
                         node_config.clone(),
                     );
                 }

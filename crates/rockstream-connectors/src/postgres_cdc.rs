@@ -180,6 +180,14 @@ pub enum PgOutputEvent {
         relation_id: u32,
         old_values: Vec<Option<String>>,
     },
+    /// PostgreSQL pgoutput Truncate (T). Relation IDs and options are scoped
+    /// to the enclosing transaction and must be applied in wire order.
+    Truncate {
+        xid: u32,
+        relation_ids: Vec<u32>,
+        cascade: bool,
+        restart_identity: bool,
+    },
     Commit {
         xid: u32,
         commit_lsn: PgLsn,
@@ -1473,12 +1481,22 @@ impl PostgresCdcSource {
                 }
                 _ => {}
             }
-            if let Some(change) = decode_native_pgoutput_text_message(
+            let change = match decode_native_pgoutput_text_message(
                 &mut pgoutput.relations,
                 self.schema.fields().len(),
                 lsn,
                 &payload,
-            )? {
+            ) {
+                Ok(change) => change,
+                Err(error) => {
+                    // The row-only caller may retry after a poll error. Do not
+                    // skip an unsupported TRUNCATE (or other malformed frame)
+                    // on retry and accidentally acknowledge its COMMIT.
+                    self.native_seen_messages = self.native_seen_messages.saturating_sub(1);
+                    return Err(error);
+                }
+            };
+            if let Some(change) = change {
                 let Some((_, changes, bytes)) = &mut self.native_transaction else {
                     return Err(SourceError::PollDeltaFailed {
                         reason: "pgoutput row frame without BEGIN is invalid".to_string(),
@@ -1534,7 +1552,13 @@ impl PostgresCdcSource {
         };
         let payload = message.get::<_, Vec<u8>>(1);
         self.native_seen_messages = self.native_seen_messages.saturating_add(1);
-        let event = decode_pgoutput_event(&mut self.native_xid, &payload)?;
+        let event = match decode_pgoutput_event(&mut self.native_xid, &payload) {
+            Ok(event) => event,
+            Err(error) => {
+                self.native_seen_messages = self.native_seen_messages.saturating_sub(1);
+                return Err(error);
+            }
+        };
         if matches!(event, PgOutputEvent::Commit { .. }) {
             self.native_seen_messages = 0;
         }
@@ -1953,7 +1977,6 @@ pub fn decode_pgoutput_event(
     }
     let xid = active_xid.ok_or_else(|| pgoutput_protocol_error("message without BEGIN"))?;
     match tag {
-        b'T' => Err(pgoutput_truncate_unsupported()),
         b'C' => {
             let commit_lsn = pgoutput_commit_lsn(payload)?;
             *active_xid = None;
@@ -2030,6 +2053,33 @@ pub fn decode_pgoutput_event(
                 xid,
                 relation_id,
                 old_values,
+            })
+        }
+        b'T' => {
+            // Protocol v1: count (u32), option flags (u8), then count
+            // relation OIDs (u32). Bound count by the actual frame before
+            // allocating so a malformed count cannot exhaust memory.
+            let count = usize::try_from(take_u32(&mut data)?)
+                .map_err(|_| pgoutput_protocol_error("TRUNCATE relation count overflow"))?;
+            let flags = take_byte(&mut data)?;
+            if flags & !0x03 != 0 || count == 0 || count > data.len() / 4 {
+                return Err(pgoutput_protocol_error("malformed TRUNCATE count or flags"));
+            }
+            let mut relation_ids = Vec::with_capacity(count);
+            let mut seen = std::collections::HashSet::with_capacity(count);
+            for _ in 0..count {
+                let relation_id = take_u32(&mut data)?;
+                if !seen.insert(relation_id) {
+                    return Err(pgoutput_protocol_error("duplicate TRUNCATE relation ID"));
+                }
+                relation_ids.push(relation_id);
+            }
+            ensure_consumed(data, "Truncate")?;
+            Ok(PgOutputEvent::Truncate {
+                xid,
+                relation_ids,
+                cascade: flags & 0x01 != 0,
+                restart_identity: flags & 0x02 != 0,
             })
         }
         _ => Err(pgoutput_protocol_error(&format!(
@@ -2602,7 +2652,7 @@ mod tests {
     }
 
     #[test]
-    fn pgoutput_truncate_fails_closed_on_all_decode_paths() {
+    fn pgoutput_truncate_row_only_paths_fail_closed_and_event_decodes() {
         // pgoutput TRUNCATE: relation count, option flags, then relation OIDs.
         let mut truncate = vec![b'T'];
         truncate.extend_from_slice(&1_u32.to_be_bytes());
@@ -2621,11 +2671,16 @@ mod tests {
         begin.extend_from_slice(&0_u64.to_be_bytes());
         begin.extend_from_slice(&52_u32.to_be_bytes());
         decode_pgoutput_event(&mut xid, &begin).unwrap();
-        let error = decode_pgoutput_event(&mut xid, &truncate)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("RS-4015"));
-        // The transaction remains uncommitted: callers must not acknowledge.
+        assert_eq!(
+            decode_pgoutput_event(&mut xid, &truncate).unwrap(),
+            PgOutputEvent::Truncate {
+                xid: 52,
+                relation_ids: vec![7],
+                cascade: false,
+                restart_identity: false,
+            }
+        );
+        // A TRUNCATE frame never commits the transaction by itself.
         assert_eq!(xid, Some(52));
     }
 
@@ -2637,6 +2692,51 @@ mod tests {
             .to_string();
         assert!(failure.contains("RS-4013"));
         assert!(failure.contains("publish_via_partition_root"));
+    }
+
+    #[test]
+    fn pgoutput_truncate_decodes_relations_flags_and_rejects_malformed_frames() {
+        let mut xid = None;
+        let mut begin = vec![b'B'];
+        begin.extend_from_slice(&100_u64.to_be_bytes());
+        begin.extend_from_slice(&0_u64.to_be_bytes());
+        begin.extend_from_slice(&52_u32.to_be_bytes());
+        assert_eq!(
+            decode_pgoutput_event(&mut xid, &begin).unwrap(),
+            PgOutputEvent::Begin { xid: 52 }
+        );
+
+        let mut truncate = vec![b'T'];
+        truncate.extend_from_slice(&2_u32.to_be_bytes());
+        truncate.push(0x03); // CASCADE and RESTART IDENTITY
+        truncate.extend_from_slice(&7_u32.to_be_bytes());
+        truncate.extend_from_slice(&8_u32.to_be_bytes());
+        assert_eq!(
+            decode_pgoutput_event(&mut xid, &truncate).unwrap(),
+            PgOutputEvent::Truncate {
+                xid: 52,
+                relation_ids: vec![7, 8],
+                cascade: true,
+                restart_identity: true,
+            }
+        );
+        assert_eq!(xid, Some(52));
+        for malformed in [
+            vec![b'T', 0, 0, 0, 2, 0, 0, 0, 0, 7],
+            vec![b'T', 0, 0, 0, 0, 0],
+            vec![b'T', 0, 0, 0, 1, 4, 0, 0, 0, 7],
+            vec![b'T', 0, 0, 0, 1, 0, 0, 0, 0, 7, 0],
+            vec![b'T', 0, 0, 0, 2, 0, 0, 0, 0, 7, 0, 0, 0, 7],
+            vec![b'T', 255, 255, 255, 255, 0],
+        ] {
+            assert!(decode_pgoutput_event(&mut xid, &malformed).is_err());
+            assert_eq!(xid, Some(52)); // Never advance the transaction.
+        }
+        let mut relations = std::collections::HashMap::new();
+        assert!(decode_native_pgoutput_message(&mut relations, 1, PgLsn(1), &truncate).is_err());
+        assert!(
+            decode_native_pgoutput_text_message(&mut relations, 1, PgLsn(1), &truncate).is_err()
+        );
     }
 
     #[test]

@@ -27,98 +27,136 @@ macro_rules! define_id {
 
 define_id!(
     /// Identifies a shard within the cluster.
-    ShardId, u64, "shard"
+    ShardId,
+    u64,
+    "shard"
 );
 
 define_id!(
     /// Identifies an operator instance within a pipeline.
-    OperatorId, u64, "op"
+    OperatorId,
+    u64,
+    "op"
 );
 
 define_id!(
     /// Identifies a materialized view.
-    ViewId, u64, "view"
+    ViewId,
+    u64,
+    "view"
 );
 
 define_id!(
     /// Identifies a namespace (tenant isolation boundary).
-    NamespaceId, u64, "ns"
+    NamespaceId,
+    u64,
+    "ns"
 );
 
 define_id!(
     /// Identifies an exchange (shuffle) channel.
-    ExchangeId, u64, "xchg"
+    ExchangeId,
+    u64,
+    "xchg"
 );
 
 define_id!(
     /// A fencing token for distributed lease management.
-    LeaseToken, u64, "lease"
+    LeaseToken,
+    u64,
+    "lease"
 );
 
 define_id!(
     /// Identifies a workload (resource and SLO grouping).
-    WorkloadId, u64, "workload"
+    WorkloadId,
+    u64,
+    "workload"
 );
 
 define_id!(
     /// Identifies a worker node in the cluster.
-    WorkerId, u64, "worker"
+    WorkerId,
+    u64,
+    "worker"
 );
 
 define_id!(
     /// Identifies a source connector/ingestion point.
-    SourceId, u64, "src"
+    SourceId,
+    u64,
+    "src"
 );
 
 define_id!(
     /// Identifies a connector (source or sink) instance.
-    ConnectorId, u64, "connector"
+    ConnectorId,
+    u64,
+    "connector"
 );
 
 define_id!(
     /// Identifies a `FrontierAggregator` instance (v0.45.6 — frontier-lease
     /// publisher election).
-    AggregatorId, u64, "aggregator"
+    AggregatorId,
+    u64,
+    "aggregator"
 );
 
 define_id!(
     /// Identifies a tenant within the cluster (v0.59.6).
-    TenantId, u64, "tenant"
+    TenantId,
+    u64,
+    "tenant"
 );
 
 define_id!(
     /// Identifies a physical shared arrangement (v0.59.6).
-    ArrangementId, u64, "arr"
+    ArrangementId,
+    u64,
+    "arr"
 );
 
 define_id!(
     /// Identifies a table in the catalog.
-    TableId, u64, "table"
+    TableId,
+    u64,
+    "table"
 );
 
 define_id!(
     /// Identifies a secondary index in the catalog.
-    IndexId, u64, "idx"
+    IndexId,
+    u64,
+    "idx"
 );
 
 define_id!(
     /// Identifies a database in the catalog.
-    DatabaseId, u64, "db"
+    DatabaseId,
+    u64,
+    "db"
 );
 
 define_id!(
     /// Identifies a sink instance.
-    SinkId, u64, "sink"
+    SinkId,
+    u64,
+    "sink"
 );
 
 define_id!(
     /// Identifies a compiled plan in the catalog.
-    CompiledPlanId, u64, "plan"
+    CompiledPlanId,
+    u64,
+    "plan"
 );
 
 define_id!(
     /// Identifies a principal/role in the catalog.
-    PrincipalId, u64, "principal"
+    PrincipalId,
+    u64,
+    "principal"
 );
 
 #[cfg(test)]

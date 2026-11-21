@@ -769,8 +769,12 @@ stream continuity while both certificate generations are trusted. Worker
 startup starts the listener, but production does not register `ExchangeInlet`s
 or connect them to compiled pipelines; application result delivery remains
 incomplete. The release-process test covers worker-stream continuity for this
-path. M1–M7 do not model this protocol, so these tests are implementation
-evidence, not formal proof.
+path. `ExchangeStream` now returns `UNIMPLEMENTED` after identity and protocol
+validation because it has no execution path; `ShuffleStream` is the handler
+that dispatches to registered inlets. This prevents a successful acknowledgment
+for undelivered data, but does not complete production pipeline wiring. M1–M7
+do not model this protocol, so these tests are implementation evidence, not
+formal proof.
 
 Issue #203 replaces the public `aws_kms` provider's ARN/region-derived local
 encryption with signed KMS `Encrypt` and `Decrypt` requests. Both operations
@@ -800,6 +804,13 @@ ACK is not attempted, and observes the new owner commit through frontier 5.
 The token-only model does not represent the numeric report value, Kafka group
 behavior, or the wire response; those details remain in the real-cluster evidence.
 
+PR #367 preserves the empty-snapshot lease-token initialization boundary:
+`ShardManagerSnapshot::default()` starts `next_token` at 1, and the first lease
+after restoring that snapshot must be nonzero. The Rust regression
+`restoring_empty_snapshot_keeps_first_lease_token_nonzero` checks it. M4 models
+token equality and authorization, not numeric token allocation, so this fix does
+not add a coordination transition.
+
 Issue #202 preserves secret readability across failed or interrupted KEK
 rotation in `crates/rockstream-control`. Rotation excludes secret reads and
 mutations, stages every rewrapped envelope, and publishes one atomic SlateDB
@@ -827,19 +838,36 @@ references and rejects deletion with `RS-2426` while a binding remains. The
 gateway pgoutput worker rechecks the durable secret version at transaction
 boundaries, resolves a changed value under the consumer's current grant, and
 reconnects only after the epoch result, source checkpoint, and slot ACK commit.
-The worker process and committed result state remain in place. A Docker-backed
-release-process regression rotates credentials with an upstream transaction
-pending, compares the complete result multiset after the transaction and a
-post-rotation write, then kills and restarts the gateway and compares the
-recovered result multiset. It does not yet verify the corresponding durable
-security-audit sequence or lost-response reconciliation. Kafka source/sink
-runtime rotation remains unqualified; SQL `CREATE SINK` does not configure the
-experimental runtime adapter. The `test_secret_references_survive_store_reopen` regression in
+The worker process and committed result state remain in place. The Docker-backed
+`pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_results`
+release-process test rotates credentials with an upstream transaction pending,
+checks the complete result multiset including duplicate and NULL rows, drops the
+committed rotation response, and retries with the same client-visible
+`rockstream.idempotency_key`; reuse of that key for a different request is
+rejected. It verifies the post-rotation checkpoint, redacted `SHOW SECRETS`,
+and complete results after gateway restart. The control-store
+`secret_rotation_reconciles_a_committed_audit_after_restart` test separately
+checks operation and audit recovery. Kafka source/sink runtime rotation remains
+unqualified and blocked: SQL `CREATE SINK` does not configure the experimental
+runtime adapter, and there is no supported release-process route for the
+multi-view sink case. The `test_secret_references_survive_store_reopen` regression in
 `crates/rockstream-control/tests/secrets_lifecycle_tests.rs` verifies that a
 reopened store retains the reference and continues to reject secret deletion.
 The `sink_secret_reference_blocks_secret_drop_until_sink_drop` regression in
 `crates/rockstream-gateway/src/server.rs` verifies that a sink binding blocks
 deletion until `DROP SINK` removes it.
+
+Issue #306 keeps release support artifacts sanitized and addresses downloads by
+opaque artifact ID bound to the authenticated principal and scope. The release
+tests compare the complete generated JSON, verify operator-only artifact access
+and denied backup creation, and cover same-key recovery across processes,
+durable operation/audit recovery after process exit, cancellation races, and
+expired-artifact denial and cleanup after restart. The enforced profile is
+10 MiB per artifact, 100 MiB and 2,048 retained artifacts per deployment, and
+10 minutes of availability; a full bound rejects new artifacts without
+eviction. MinIO tests cover shared cross-process budget and request contention.
+These are focused implementation and release-process checks; broader sustained
+pressure qualification and assembled #307 evidence remain outstanding.
 
 The v0.73 principal, grant, and audit changes persist reviewed policy revisions
 with their mutation audit records through the durable catalog. The
@@ -851,6 +879,41 @@ boundaries. The M1–M7 models do not represent principal policy or audit-retent
 state; this change adds no worker, epoch, lease, or sink transition. Release
 endpoint, concurrency, and bounded-retention qualification remains separate
 evidence.
+
+Issue #306 adds the management support-artifact lifecycle. The durable operation
+record binds the client idempotency key to one generation; its reservation and
+payload are persisted before terminal success, and the completion audit must be
+appended before success or artifact bytes are returned. Restart reconciliation
+reuses that operation and pending audit, while bounded cleanup removes expired
+artifacts. `support_artifact_reconciles_durable_boundaries_after_process_exit`,
+`support_artifact_completion_audit_failure_preserves_result_across_processes`,
+and `support_artifact_runs_in_release_process_and_recovers_after_restart` check
+the complete operation, audit, and artifact state across crash and restart
+boundaries. Cleanup runs every second and caps each sweep at 29 seconds, leaving
+time for two passes and a cleanup tick within the 60-second deletion bound;
+`minio_cleanup_at_the_artifact_count_limit_finishes_within_the_bound` exercises
+the maximum count, and `cleanup_rescans_artifacts_that_expire_during_a_sweep`
+checks expiry during cleanup. M1–M7 do not model this management workflow;
+these tests are implementation evidence, not formal proof.
+
+PR #388 (issue #302) hardens the durable catalog audit-append retry
+boundary against concurrent writers. The secret-store rotation audit writer
+and the gateway authentication and authorization audit writers refresh their
+catalog handle after an optimistic-revision conflict, then construct a new
+transaction at the refreshed revision. The shared
+`SECURITY_AUDIT_APPEND_ATTEMPTS` limit remains eight attempts; exhausted
+retries, refresh failures, and other storage errors fail rather than
+acknowledging an audit append that was not committed. Secret-store failures
+also mark the security-audit storage health metric as degraded. The regression
+`secret_rotation_refreshes_catalog_after_a_concurrent_audit_append` in
+`secrets_management_durability_tests.rs` and
+`gateway_security_audit_writers_refresh_after_catalog_conflicts` in
+`crates/rockstream-gateway/src/server.rs` check that a stale writer
+refreshes after another catalog handle commits, preserves earlier audit
+records, and advances the catalog revision. This is a catalog revision/retry
+boundary outside the M1–M7 worker, lease, frontier, and sink state machines;
+the tests do not establish unbounded contention liveness, crash durability,
+or assembled release-process qualification.
 
 Issue #305 strengthens the file-backed audit append boundary in
 `crates/rockstream-control/src/audit.rs`. `FileAuditLog::append` writes each
@@ -935,9 +998,12 @@ external source admission and ACK boundary, not M3's abstract record-level
 transition. A partitioned source published without
 `publish_via_partition_root = true` is rejected with `RS-4013` before the
 gateway accepts child-relation changes as parent-table data. A `pgoutput`
-TRUNCATE frame lacks row images, so its decoder fails closed with `RS-4015`
-before committing/acknowledging the containing transaction; it must not
-silently advance the slot LSN or leave stale aggregates presented as correct.
+TRUNCATE frame lacks row images, so the legacy row-only decoder fails closed
+with `RS-4015` before acknowledging the containing transaction. The
+relation-aware gateway instead reconstructs bounded row retractions from local
+committed images, applying them atomically with the slot checkpoint (issue #339).
+Neither path may silently advance the slot LSN or leave stale aggregates
+presented as correct.
 The M3 abstraction still requires durable input/output/checkpoint coupling
 before source acknowledgement, but does not model PostgreSQL relation OIDs,
 publication modes, partition DDL, or historical window state. Source-side
@@ -946,8 +1012,10 @@ retained partitions cannot reconstruct already-pruned historical aggregates.
 These limitations must remain explicit instead of asserting a new abstract
 exactly-once or historical-resnapshot property.
 
-Concrete evidence: `postgres_cdc::tests::pgoutput_truncate_fails_closed_on_all_decode_paths`
-checks the three decoders and uncommitted xid;
+Concrete evidence: `postgres_cdc::tests::pgoutput_truncate_row_only_paths_fail_closed_and_event_decodes`
+checks row-only rejection and relation-aware frame decoding;
+`postgres_cdc::tests::pgoutput_truncate_decodes_relations_flags_and_rejects_malformed_frames`
+checks strict relation and flag validation;
 `postgres_cdc::tests::partitioned_sources_require_root_publication_identity`
 checks the admission guard; and the real PostgreSQL 16
 `postgres_cdc_partition_retention_tests::partitioned_pgoutput_requires_root_identity_and_truncate_fails_closed`
@@ -1237,6 +1305,40 @@ coordination and acknowledgment barrier protocols adhere to the end-to-end
 guarantee matrix covered by
 `crates/rockstream-connectors/tests/postgres_cdc_guarantee_matrix_tests.rs` and
 `crates/rockstream-gateway/tests/source_ddl_postgres_kafka_tests.rs`.
+
+Issue #339 extends that **external PostgreSQL pgoutput boundary** with
+transactional `TRUNCATE` semantics. A decoded `T` message retains the enclosing
+XID, relation IDs, and CASCADE / RESTART IDENTITY flags; the source-wide gateway
+stages an ordered marker among INSERT / UPDATE / DELETE records, including when
+the transaction spills. Under the shard commit lock, it expands each affected
+relation's locally committed row images into negative deltas, first overlaying
+earlier changes in the same upstream transaction. Thus `INSERT; TRUNCATE;
+INSERT` retracts the preexisting and first inserted rows, while retaining the
+last INSERT. A multi-relation `T` must retract each imported relation and every
+reachable compiled materialized view in the **same M3 durable epoch** as the
+source checkpoint and frontier advancement; no reader may observe a partial
+truncate. An empty relation contributes no retractions.
+
+**Safety / failure boundary:** if a relation route, row image, or complete
+bounded scan is unavailable, or the expanded transaction exceeds the 65,536
+DML-op / 8 MiB bound, the gateway blocks without advancing PostgreSQL's
+confirmed slot LSN. The legacy row-only decoder cannot obtain these preimages,
+so it rejects `T` and retains the failed frame on retry rather than silently
+acknowledging its COMMIT. This is an implementation-level refinement of M1's
+atomic-WriteBatch and M3's checkpoint-coupled epoch assumptions; the abstract
+M1–M7 FizzBee models do **not** model PostgreSQL relation contents, `T` frames,
+or source-slot state, and therefore do not establish this CDC correctness claim.
+Concrete proof obligations are exercised by
+`pgoutput_truncate_decodes_relations_flags_and_rejects_malformed_frames`,
+`truncate_markers_preserve_order_in_a_spilled_envelope`,
+`truncate_expansion_retracts_preexisting_and_pending_rows_in_wire_order`,
+`truncate_preimage_scan_refuses_oversized_state_without_partial_rows`,
+`postgres_cdc_row_only_truncate_retries_same_frame_without_ack`, and the real
+PostgreSQL gateway test
+`pgoutput_truncate_retracts_nonempty_views_and_survives_gateway_restart`.
+The last test covers nonempty tables, flags, same-transaction ordering,
+multi-relation changes, dependent views, later writes and restart replay; see
+`docs/connectors.md` for the documented operating bounds.
 
 The v0.70 Kafka golden connector provides external streaming ingestion with
 partition offset watermark coordination, bounded buffer consumer groups,

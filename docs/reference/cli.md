@@ -1478,6 +1478,31 @@ Exit codes
 
 Error codes: `RS-0002`, `RS-0003`, `RS-0005`
 
+### `rockstream security recover-admin`
+
+Replace login methods for an existing administrator while the deployment is stopped
+
+Options
+
+| Name | Short | Long | Value | Required | Default | Values | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| layout | — | --layout | LAYOUT | yes | — | all, gateway | Select `all` for `--role all`, or `gateway` for `--role gateway`/`control` |
+| login_methods_file | — | --login-methods-file | LOGIN_METHODS_FILE | yes | — | — | JSON array of replacement `LoginMethod` entries; contains no plaintext password |
+| operation_id | — | --operation-id | OPERATION_ID | yes | — | — | Stable catalog operation ID to reuse if this command must be retried |
+| principal_id | — | --principal-id | PRINCIPAL_ID | yes | — | — | ID of the existing active cluster administrator to recover |
+| storage | — | --storage | STORAGE | yes | — | — | Node storage directory used by `start --storage` for this deployment |
+| yes | — | --yes | YES | no | — | true, false | Confirm the deployment is stopped and the selected durable store is correct |
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0002, RS-0003, RS-0005 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0002, RS-0003, RS-0005 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0002, RS-0003, RS-0005 |
+
+Error codes: `RS-0002`, `RS-0003`, `RS-0005`
+
 ## `rockstream shard`
 
 Shard inspection commands
@@ -1764,6 +1789,62 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 ## `rockstream support`
 
 Diagnostic support commands
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+### `rockstream support artifact`
+
+Generate or download an actor-bound management support artifact
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+#### `rockstream support artifact create`
+
+Generate a sanitized artifact through the authenticated management API
+
+Options
+
+| Name | Short | Long | Value | Required | Default | Values | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| idempotency_key | — | --idempotency-key | IDEMPOTENCY_KEY | no | — | — | Client-generated identity used to retry or reconcile this request |
+| node_id | — | --node-id | NODE_ID | no | — | — | Optional node scope; omit to capture cluster metadata |
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+#### `rockstream support artifact download`
+
+Download an artifact returned by `support artifact create`
+
+Options
+
+| Name | Short | Long | Value | Required | Default | Values | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| opaque_id | — | — | OPAQUE_ID | yes | — | — | Opaque artifact UUID returned by the management API |
+| out | — | --out | OUT | yes | — | — | Local destination for the downloaded bytes |
 
 Exit codes
 

@@ -22,12 +22,12 @@ use rockstream_cli::{
     run_interactive_shell, run_manifest_validate, run_project_apply, run_project_verify,
     run_qualify, run_resource_cluster, run_resource_usage, run_schema_create, run_schema_drop,
     run_schema_evolution_history, run_schema_evolution_status, run_schema_list, run_schema_show,
-    run_security_preprovision, run_source_drop, run_source_list, run_source_pause,
-    run_source_resume, run_source_show, run_sql_compile, run_start_with_dev_transport,
-    run_support_bundle, run_view_list, run_view_pause, run_view_query, run_view_resume,
-    run_view_show, run_view_status, run_view_subscribe, run_workload_alter, run_workload_create,
-    run_workload_drop, run_workload_list, run_workload_show, DemoOptions, DoctorOptions,
-    InitOptions, StartOptions,
+    run_security_preprovision, run_security_recover_admin, run_source_drop, run_source_list,
+    run_source_pause, run_source_resume, run_source_show, run_sql_compile,
+    run_start_with_dev_transport, run_support_bundle, run_view_list, run_view_pause,
+    run_view_query, run_view_resume, run_view_show, run_view_status, run_view_subscribe,
+    run_workload_alter, run_workload_create, run_workload_drop, run_workload_list,
+    run_workload_show, DemoOptions, DoctorOptions, InitOptions, StartOptions,
 };
 use rockstream_types::acl::Role as AclRole;
 use rockstream_types::config_resolver::CliConfigOverrides;
@@ -614,35 +614,62 @@ fn main() -> ExitCode {
             };
             handle_result(res, format)
         }
-        Command::Support { command } => {
-            let storage = StorageClient::with_identity(identity.clone());
-            let storage_path = cli
-                .storage_dir
-                .unwrap_or_else(|| std::path::PathBuf::from("."));
-            let res = match command {
-                SupportCommand::Bundle { view, since, out } => run_support_bundle(
+        Command::Support { command } => match command {
+            SupportCommand::Artifact { command } => match command {
+                SupportArtifactCommand::Create {
+                    node_id,
+                    idempotency_key,
+                } => {
+                    let key = management_idempotency_key(idempotency_key);
+                    run_management(&cli, None, format, |client| {
+                        client.generate_support_artifact(node_id, key)
+                    })
+                }
+                SupportArtifactCommand::Download { opaque_id, out } => {
+                    run_management(&cli, None, format, |client| {
+                        client.download_support_artifact(opaque_id, &out)
+                    })
+                }
+            },
+            SupportCommand::Bundle { view, since, out } => {
+                let storage = StorageClient::with_identity(identity.clone());
+                let storage_path = cli
+                    .storage_dir
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                handle_result(
+                    run_support_bundle(
+                        format,
+                        &storage,
+                        &storage_path,
+                        view.as_deref(),
+                        since.as_deref(),
+                        out.as_deref(),
+                    ),
                     format,
-                    &storage,
-                    &storage_path,
-                    view.as_deref(),
-                    since.as_deref(),
-                    out.as_deref(),
-                ),
-                SupportCommand::Diagnose {
-                    code,
-                    correlation_id,
-                    out,
-                } => rockstream_cli::run_support_diagnose(
+                )
+            }
+            SupportCommand::Diagnose {
+                code,
+                correlation_id,
+                out,
+            } => {
+                let storage = StorageClient::with_identity(identity.clone());
+                let storage_path = cli
+                    .storage_dir
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                handle_result(
+                    rockstream_cli::run_support_diagnose(
+                        format,
+                        &storage,
+                        &storage_path,
+                        code.as_deref(),
+                        correlation_id.as_deref(),
+                        out.as_deref(),
+                    ),
                     format,
-                    &storage,
-                    &storage_path,
-                    code.as_deref(),
-                    correlation_id.as_deref(),
-                    out.as_deref(),
-                ),
-            };
-            handle_result(res, format)
-        }
+                )
+            }
+        },
         Command::Resource { command } => {
             let identity = identity.clone();
             let catalog = make_catalog_client(&cli, identity);
@@ -691,6 +718,28 @@ fn main() -> ExitCode {
                         &storage,
                         layout,
                         &principal_file,
+                        operation_id,
+                        yes,
+                    )),
+                    format,
+                )
+            }
+            SecurityCommand::RecoverAdministratorCredentials {
+                layout,
+                storage,
+                principal_id,
+                login_methods_file,
+                operation_id,
+                yes,
+            } => {
+                let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+                handle_result(
+                    runtime.block_on(run_security_recover_admin(
+                        format,
+                        &storage,
+                        layout,
+                        principal_id,
+                        &login_methods_file,
                         operation_id,
                         yes,
                     )),

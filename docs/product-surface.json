@@ -3356,6 +3356,84 @@
               "RS-0003",
               "RS-0005"
             ]
+          },
+          {
+            "name": "recover-admin",
+            "about": "Replace login methods for an existing administrator while the deployment is stopped",
+            "options": [
+              {
+                "name": "layout",
+                "long": "layout",
+                "help": "Select `all` for `--role all`, or `gateway` for `--role gateway`/`control`",
+                "required": true,
+                "value_name": "LAYOUT",
+                "possible_values": [
+                  "all",
+                  "gateway"
+                ]
+              },
+              {
+                "name": "login_methods_file",
+                "long": "login-methods-file",
+                "help": "JSON array of replacement `LoginMethod` entries; contains no plaintext password",
+                "required": true,
+                "value_name": "LOGIN_METHODS_FILE"
+              },
+              {
+                "name": "operation_id",
+                "long": "operation-id",
+                "help": "Stable catalog operation ID to reuse if this command must be retried",
+                "required": true,
+                "value_name": "OPERATION_ID"
+              },
+              {
+                "name": "principal_id",
+                "long": "principal-id",
+                "help": "ID of the existing active cluster administrator to recover",
+                "required": true,
+                "value_name": "PRINCIPAL_ID"
+              },
+              {
+                "name": "storage",
+                "long": "storage",
+                "help": "Node storage directory used by `start --storage` for this deployment",
+                "required": true,
+                "value_name": "STORAGE"
+              },
+              {
+                "name": "yes",
+                "long": "yes",
+                "help": "Confirm the deployment is stopped and the selected durable store is correct",
+                "required": false,
+                "value_name": "YES",
+                "possible_values": [
+                  "true",
+                  "false"
+                ]
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0002",
+              "RS-0003",
+              "RS-0005"
+            ]
           }
         ],
         "exit_codes": [
@@ -4125,6 +4203,123 @@
         "name": "support",
         "about": "Diagnostic support commands",
         "subcommands": [
+          {
+            "name": "artifact",
+            "about": "Generate or download an actor-bound management support artifact",
+            "subcommands": [
+              {
+                "name": "create",
+                "about": "Generate a sanitized artifact through the authenticated management API",
+                "options": [
+                  {
+                    "name": "idempotency_key",
+                    "long": "idempotency-key",
+                    "help": "Client-generated identity used to retry or reconcile this request",
+                    "required": false,
+                    "value_name": "IDEMPOTENCY_KEY"
+                  },
+                  {
+                    "name": "node_id",
+                    "long": "node-id",
+                    "help": "Optional node scope; omit to capture cluster metadata",
+                    "required": false,
+                    "value_name": "NODE_ID"
+                  }
+                ],
+                "exit_codes": [
+                  {
+                    "code": 0,
+                    "title": "Success",
+                    "description": "Command completed successfully without error"
+                  },
+                  {
+                    "code": 1,
+                    "title": "Execution Error",
+                    "description": "Runtime failure or operation error during execution"
+                  },
+                  {
+                    "code": 2,
+                    "title": "Usage Error",
+                    "description": "Invalid arguments, options, or flags provided to CLI"
+                  }
+                ],
+                "error_codes": [
+                  "RS-0001",
+                  "RS-1001",
+                  "RS-1012",
+                  "RS-1013",
+                  "RS-2001"
+                ]
+              },
+              {
+                "name": "download",
+                "about": "Download an artifact returned by `support artifact create`",
+                "options": [
+                  {
+                    "name": "opaque_id",
+                    "help": "Opaque artifact UUID returned by the management API",
+                    "required": true,
+                    "value_name": "OPAQUE_ID"
+                  },
+                  {
+                    "name": "out",
+                    "long": "out",
+                    "help": "Local destination for the downloaded bytes",
+                    "required": true,
+                    "value_name": "OUT"
+                  }
+                ],
+                "exit_codes": [
+                  {
+                    "code": 0,
+                    "title": "Success",
+                    "description": "Command completed successfully without error"
+                  },
+                  {
+                    "code": 1,
+                    "title": "Execution Error",
+                    "description": "Runtime failure or operation error during execution"
+                  },
+                  {
+                    "code": 2,
+                    "title": "Usage Error",
+                    "description": "Invalid arguments, options, or flags provided to CLI"
+                  }
+                ],
+                "error_codes": [
+                  "RS-0001",
+                  "RS-1001",
+                  "RS-1012",
+                  "RS-1013",
+                  "RS-2001"
+                ]
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0001",
+              "RS-1001",
+              "RS-1012",
+              "RS-1013",
+              "RS-2001"
+            ]
+          },
           {
             "name": "bundle",
             "about": "Generate on-demand diagnostic support bundle",

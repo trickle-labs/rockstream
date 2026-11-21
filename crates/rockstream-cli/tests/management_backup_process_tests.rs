@@ -721,6 +721,8 @@ async fn release_management_backup_commits_and_restores_real_shard_data() {
             "CancelOperation",
             "MigrateShard",
             "CreateBackup",
+            "GenerateSupportArtifact",
+            "DownloadSupportArtifact",
         ]
     );
 
