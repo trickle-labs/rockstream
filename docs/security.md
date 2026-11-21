@@ -128,6 +128,12 @@ enabled SCRAM login; startup rejects an unavailable or empty store. MD5 is not
 a release authentication mode. Enabling these startup paths does not satisfy
 the v0.73 ten-case release qualification gate by itself.
 
+Gateway policy is refreshed from durable storage at most once per second.
+Active subscriptions recheck current scoped permissions before delivering rows
+at that interval. A denial stops the stream and is audited; failed revalidation
+or audit persistence fails the stream closed. Full release-process revocation
+qualification remains open.
+
 Starting in **v0.55**, RockStream enforces mutual TLS (mTLS) with cryptographically verified node identity across all internal network transport boundaries:
 
 The control-worker TCP listener used for registration, heartbeats, and shard leases requires internal mTLS and a durable security catalog for node-identity rejection audit. Control and embedded `all` roles must recover that catalog before opening the listener. Control, worker, and embedded `all` roles need a certificate, matching private key, trusted CA roots, and `client_auth_required = true`; invalid or incomplete TLS material, or an unavailable control security catalog, fails startup before the listener opens.
