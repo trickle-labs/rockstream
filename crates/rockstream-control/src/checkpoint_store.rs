@@ -102,7 +102,9 @@ impl GcPinStore {
                     .await
                     .map_err(|error| format!("read gc pin {}: {error}", meta.location))?,
                 Err(object_store::Error::NotFound { .. }) => continue,
-                Err(error) => return Err(format!("[{RS_0003}] get gc pin {}: {error}", meta.location)),
+                Err(error) => {
+                    return Err(format!("[{RS_0003}] get gc pin {}: {error}", meta.location))
+                }
             };
             let pin: GcPin = serde_json::from_slice(&bytes)
                 .map_err(|error| format!("decode gc pin {}: {error}", meta.location))?;
