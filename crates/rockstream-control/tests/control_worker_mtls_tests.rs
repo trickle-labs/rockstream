@@ -1,9 +1,10 @@
+use rockstream_runtime::client::start_worker_client_with_insecure_internal_dev_and_metadata as start_worker_client_for_test;
 use std::sync::Arc;
 use std::time::Duration;
 
 use rockstream_control::audit::FileAuditLog;
 use rockstream_control::{ControlService, ShardManager, TopologyCatalog};
-use rockstream_runtime::client::{start_worker_client, start_worker_client_with_tls};
+use rockstream_runtime::client::start_worker_client_with_tls;
 use rockstream_storage::catalog::{CatalogStore, DurableCatalogStore};
 use rockstream_test_support::pki::TestPki;
 use rockstream_types::authorization::{
@@ -357,9 +358,15 @@ async fn test_control_worker_mtls_missing_cert_rejected() {
     let storage_dir = tempfile::tempdir().unwrap();
 
     // Plaintext client connection without certificate
-    let (client, worker_handle) = start_worker_client(1, &control_url, storage_dir.path())
-        .await
-        .unwrap();
+    let (client, worker_handle) = start_worker_client_for_test(
+        1,
+        &control_url,
+        storage_dir.path(),
+        Default::default(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 

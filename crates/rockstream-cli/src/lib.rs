@@ -1975,6 +1975,15 @@ pub fn run_start_with_dev_transport(
                         opts.config.internal_tls.clone(),
                     )
                     .await
+                } else if allow_insecure_internal_dev {
+                    rockstream_runtime::client::start_worker_client_with_insecure_internal_dev_and_metadata(
+                        proposed_worker_id,
+                        url,
+                        &opts.storage,
+                        opts.worker_location.clone(),
+                        opts.worker_capabilities,
+                    )
+                    .await
                 } else {
                     rockstream_runtime::start_worker_client_with_metadata(
                         proposed_worker_id,

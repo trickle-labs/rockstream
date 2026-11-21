@@ -19,7 +19,7 @@ use rockstream_test_support::minio::{minio_object_store, start_minio, MINIO_PASS
 use rockstream_test_support::pki::TestPki;
 use rockstream_types::data_plane::WorkerExecutionStatus;
 use rockstream_types::ids::{ShardId, WorkerId, WorkloadId};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio_postgres::{Client, NoTls};
 
 #[path = "common/management_auth.rs"]
@@ -30,6 +30,15 @@ use management_auth::{
 };
 
 static PROCESS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct TestChild(Child);
+
+impl Drop for TestChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 
 struct Processes {
     control: Child,
@@ -191,6 +200,15 @@ fn assert_management_status_transcript(
             .iter()
             .find(|actual| actual.node_id == node.node_id)
             .expect("expected node is present in status");
+        if node.address == "127.0.0.1:0" {
+            let address: std::net::SocketAddr = actual.address.parse().expect("worker address");
+            assert_eq!(
+                address.ip(),
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+            );
+            assert_ne!(address.port(), 0);
+            node.address = actual.address.clone();
+        }
         assert!((0.0..=1.0).contains(&actual.capacity_headroom));
         node.capacity_headroom = actual.capacity_headroom;
         node.registered_at_ms = 0;
@@ -701,6 +719,213 @@ async fn run_cluster(worker_count: usize, kill_worker: bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupted_dispatch_blocks_distributed_reads_after_gateway_restart() {
+    use rockstream_types::topology::{ControlMessage, WorkerMessage};
+
+    let _test_guard = PROCESS_TEST_LOCK.lock().await;
+    let root = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let control_addr = listener.local_addr().unwrap().to_string();
+    let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+    let control = tokio::spawn(async move {
+        let mut request_tx = Some(request_tx);
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut line = String::new();
+            BufReader::new(read).read_line(&mut line).await.unwrap();
+            match serde_json::from_str::<WorkerMessage>(&line).unwrap() {
+                WorkerMessage::DeployWorkload(request) => {
+                    let response = ControlMessage::DeploymentReady {
+                        workload_id: request.workload_id,
+                        workers: Vec::new(),
+                    };
+                    let wire = serde_json::to_string(&response).unwrap() + "\n";
+                    write.write_all(wire.as_bytes()).await.unwrap();
+                }
+                WorkerMessage::SubmitSourceDelta(request) => {
+                    request_tx.take().unwrap().send(request).unwrap();
+                    std::future::pending::<()>().await;
+                }
+                other => panic!("unexpected request: {other:?}"),
+            }
+        }
+    });
+    let gateway_addr = free_addr();
+    let gateway_storage = root.path().join("gateway");
+    let start_gateway = || {
+        TestChild(spawn(&[
+            "start",
+            "--storage",
+            gateway_storage.to_str().unwrap(),
+            "--role",
+            "gateway",
+            "--allow-insecure-internal-dev",
+            "--control",
+            &control_addr,
+            "--listen",
+            &gateway_addr,
+        ]))
+    };
+    let mut gateway = start_gateway();
+    let client = connect_gateway(&gateway_addr).await;
+    execute(
+        &client,
+        "CREATE TABLE pending_items (id BIGINT PRIMARY KEY, value BIGINT NOT NULL)",
+    )
+    .await;
+    execute(&client, "CREATE MATERIALIZED VIEW pending_view AS SELECT id, SUM(value) AS total FROM pending_items GROUP BY id").await;
+    let insert = tokio::spawn(async move {
+        client
+            .simple_query("INSERT INTO pending_items VALUES (1, 10), (2, 20)")
+            .await
+    });
+    let request = tokio::time::timeout(Duration::from_secs(10), request_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(request.source, "pending_items");
+    assert_eq!(
+        request.rows,
+        vec![
+            rockstream_types::data_plane::RuntimeRow {
+                values_tsv: "1\t10".to_string(),
+                weight: 1
+            },
+            rockstream_types::data_plane::RuntimeRow {
+                values_tsv: "2\t20".to_string(),
+                weight: 1
+            },
+        ]
+    );
+    gateway.0.kill().unwrap();
+    gateway.0.wait().unwrap();
+    assert!(insert.await.unwrap().is_err());
+    let _gateway = start_gateway();
+    let client = connect_gateway(&gateway_addr).await;
+    let error = client
+        .simple_query("SELECT * FROM pending_view")
+        .await
+        .unwrap_err();
+    let error = error.as_db_error().unwrap();
+    assert_eq!(error.code().code(), "XX000");
+    assert_eq!(error.message(), "[RS-2026] query.query_time_execution_failed: query-time execution failed: distributed source requires recovery; preserve source input and shard storage and contact the operator before retrying. next_steps: Simplify the query, validate referenced table/view schemas, or materialize the query into a view.");
+    control.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_dispatch_blocks_distributed_reads_after_gateway_restart() {
+    let _test_guard = PROCESS_TEST_LOCK.lock().await;
+    let root = tempfile::tempdir().unwrap();
+    let catalog = rockstream_control::TopologyCatalog::new();
+    let control = rockstream_control::ControlService::new(catalog.clone())
+        .with_shard_manager(ShardManager::new())
+        .with_insecure_dev_mode()
+        .start("127.0.0.1:0")
+        .await
+        .unwrap();
+    let control_addr = control.addr.to_string();
+    let gateway_addr = free_addr();
+    let worker_storage = root.path().join("worker");
+    let gateway_storage = root.path().join("gateway");
+    let mut worker = TestChild(spawn(&[
+        "start",
+        "--storage",
+        worker_storage.to_str().unwrap(),
+        "--role",
+        "worker",
+        "--allow-insecure-internal-dev",
+        "--control",
+        &control_addr,
+        "--worker-id",
+        "1",
+    ]));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while catalog.get(WorkerId(1)).is_none() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let start_gateway = || {
+        TestChild(spawn(&[
+            "start",
+            "--storage",
+            gateway_storage.to_str().unwrap(),
+            "--role",
+            "gateway",
+            "--allow-insecure-internal-dev",
+            "--control",
+            &control_addr,
+            "--listen",
+            &gateway_addr,
+        ]))
+    };
+    let mut gateway = start_gateway();
+    let client = connect_gateway(&gateway_addr).await;
+    execute(
+        &client,
+        "CREATE TABLE dispatch_items (id BIGINT PRIMARY KEY, value BIGINT NOT NULL)",
+    )
+    .await;
+    execute(&client, "CREATE MATERIALIZED VIEW dispatch_view AS SELECT id, SUM(value) AS total FROM dispatch_items GROUP BY id").await;
+    execute(&client, "INSERT INTO dispatch_items VALUES (3, 30)").await;
+    execute(&client, "INSERT INTO dispatch_items VALUES (4, 40)").await;
+    let error = client
+        .simple_query("SELECT * FROM dispatch_view")
+        .await
+        .unwrap_err();
+    let error = error.as_db_error().unwrap();
+    assert_eq!(error.code().code(), "XX000");
+    assert_eq!(error.message(), "[RS-2026] query.query_time_execution_failed: query-time execution failed: distributed view dispatch_view output is unavailable; contact the operator before relying on this result. next_steps: Simplify the query, validate referenced table/view schemas, or materialize the query into a view.");
+    worker.0.kill().unwrap();
+    worker.0.wait().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while catalog.get(WorkerId(1)).is_some() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let error = client
+        .simple_query("INSERT INTO dispatch_items VALUES (1, 10), (2, 20)")
+        .await
+        .unwrap_err();
+    let error = error.as_db_error().unwrap();
+    assert_eq!(error.code().code(), "XX000");
+    assert_eq!(error.message(), "[RS-2026] query.query_time_execution_failed: query-time execution failed: distributed view refresh dispatch_view: RS-0001: a routed shard owner has no active worker connection; Retry after the workload and workers are ready.; preserve source input and shard storage and contact the operator before retrying. next_steps: Simplify the query, validate referenced table/view schemas, or materialize the query into a view.");
+    let assert_pending = |error: tokio_postgres::Error| {
+        let error = error.as_db_error().unwrap();
+        assert_eq!(error.code().code(), "XX000");
+        assert_eq!(error.message(), "[RS-2026] query.query_time_execution_failed: query-time execution failed: distributed source requires recovery; preserve source input and shard storage and contact the operator before retrying. next_steps: Simplify the query, validate referenced table/view schemas, or materialize the query into a view.");
+    };
+    assert_pending(
+        client
+            .simple_query("SELECT * FROM dispatch_view")
+            .await
+            .unwrap_err(),
+    );
+    drop(client);
+    gateway.0.kill().unwrap();
+    gateway.0.wait().unwrap();
+    let _gateway = start_gateway();
+    let client = connect_gateway(&gateway_addr).await;
+    assert_pending(
+        client
+            .simple_query("SELECT * FROM dispatch_view")
+            .await
+            .unwrap_err(),
+    );
+    assert_pending(
+        client
+            .simple_query("INSERT INTO dispatch_items VALUES (5, 50)")
+            .await
+            .unwrap_err(),
+    );
+    control.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires the direct gateway-to-worker source transport"]
 async fn real_workers_execute_aggregate_join_and_fenced_failover() {
     let _test_guard = PROCESS_TEST_LOCK.lock().await;
@@ -843,6 +1068,7 @@ async fn real_multi_process_management_status_is_an_exact_json_worker_lifecycle_
         }],
     );
     assert!(topology_revision(&one_worker) > topology_revision(&two_workers));
+    assert_eq!(one_worker.nodes[0].address, two_workers.nodes[1].address);
 }
 
 #[tokio::test]

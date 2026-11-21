@@ -21,6 +21,518 @@ use rockstream_types::topology::{
     CapacityHeadroom, ControlMessage, NodeRole, WorkerMessage, WorkerRegistration,
 };
 
+#[tokio::test]
+async fn source_delta_waits_for_each_routed_shard() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let catalog = TopologyCatalog::new();
+        let registrations: Vec<_> = [1, 2]
+            .into_iter()
+            .map(|id| {
+                WorkerRegistration::new(
+                    WorkerId(id),
+                    NodeRole::Worker,
+                    format!("127.0.0.1:{}", 9000 + id),
+                    CapacityHeadroom::FULL,
+                )
+            })
+            .collect();
+        for registration in &registrations {
+            catalog.register(registration);
+        }
+        let shard_manager = ShardManager::new();
+        let service =
+            ControlService::new(catalog.clone()).with_shard_manager(shard_manager.clone());
+
+        let handle = service
+            .with_insecure_dev_mode()
+            .start("127.0.0.1:0")
+            .await
+            .unwrap();
+
+        let mut workers = Vec::new();
+        for registration in registrations {
+            let stream = TcpStream::connect(handle.addr).await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut reader = BufReader::new(read);
+            write_worker_message(&mut write, &WorkerMessage::Register(registration.clone())).await;
+            loop {
+                if let ControlMessage::Registered { worker_id, .. } =
+                    read_control_message(&mut reader).await
+                {
+                    assert_eq!(worker_id, registration.worker_id);
+                    break;
+                }
+            }
+            workers.push((reader, write, registration.worker_id));
+        }
+        let stream = TcpStream::connect(handle.addr).await.unwrap();
+        let (read, mut client_write) = stream.into_split();
+        let mut client_reader = BufReader::new(read);
+        let workload_id = WorkloadId(42);
+        let request = DeploymentRequest {
+            version: 1,
+            workload_id,
+            namespace: "public".to_owned(),
+            workload_name: "test_view".to_owned(),
+            plan_json: "{}".to_owned(),
+            join_strategy: JoinStrategy::Auto,
+            schemas: vec![],
+            frontier: 0,
+            storage_root: "/tmp/storage".to_owned(),
+            sink_operator_id: OperatorId(10),
+            output_columns: vec!["val".to_owned()],
+            primary_key: vec![0],
+            merge_key_columns: vec![0],
+            routing_columns: BTreeMap::from([("src".to_owned(), 0)]),
+        };
+        write_worker_message(
+            &mut client_write,
+            &WorkerMessage::DeployWorkload(request.clone()),
+        )
+        .await;
+        for (reader, write, worker_id) in &mut workers {
+            let descriptor = loop {
+                if let ControlMessage::Deploy { descriptor } = read_control_message(reader).await {
+                    break descriptor;
+                }
+            };
+            write_worker_message(
+                write,
+                &WorkerMessage::DeploymentReady {
+                    version: 1,
+                    workload_id,
+                    shard_id: descriptor.shard.shard_id,
+                    worker_id: *worker_id,
+                    process_id: 9999,
+                    operator_ids: vec![OperatorId(10)],
+                    frontier: 1,
+                },
+            )
+            .await;
+        }
+        assert!(matches!(
+            read_control_message(&mut client_reader).await,
+            ControlMessage::DeploymentReady { workload_id: id, .. } if id == workload_id
+        ));
+
+        let rows: Vec<_> = (0..64)
+            .map(|index| RuntimeRow {
+                values_tsv: format!("{index}\tvalue-{index}"),
+                weight: 1,
+            })
+            .collect();
+        let request_id = "duplicate-progress".to_owned();
+        write_worker_message(
+            &mut client_write,
+            &WorkerMessage::SubmitSourceDelta(SourceDeltaRequest {
+                version: 1,
+                request_id: request_id.clone(),
+                workload_id,
+                epoch: 2,
+                source: "src".to_owned(),
+                rows: rows.clone(),
+            }),
+        )
+        .await;
+        let mut frames = Vec::new();
+        for (reader, _, _) in &mut workers {
+            let frame = loop {
+                if let ControlMessage::Execute { frame } = read_control_message(reader).await {
+                    break frame;
+                }
+            };
+            assert!(!frame.rows.is_empty());
+            frames.push(frame);
+        }
+        assert_ne!(frames[0].shard_id, frames[1].shard_id);
+        let mut actual_rows: Vec<_> = frames.iter().flat_map(|frame| frame.rows.clone()).collect();
+        let mut expected_rows = rows;
+        actual_rows.sort_by(|a, b| a.values_tsv.cmp(&b.values_tsv));
+        expected_rows.sort_by(|a, b| a.values_tsv.cmp(&b.values_tsv));
+        assert_eq!(actual_rows, expected_rows);
+
+        for rows in [frames[0].rows.clone(), Vec::new()] {
+            write_worker_message(
+                &mut client_write,
+                &WorkerMessage::SubmitSourceDelta(SourceDeltaRequest {
+                    version: 1,
+                    request_id: "concurrent".to_owned(),
+                    workload_id,
+                    epoch: 3,
+                    source: "src".to_owned(),
+                    rows,
+                }),
+            )
+            .await;
+            match read_control_message(&mut client_reader).await {
+                ControlMessage::OperationFailed {
+                    code,
+                    message,
+                    next_steps,
+                } => assert_eq!(
+                    (code, message, next_steps),
+                    (
+                        "RS-0001".to_owned(),
+                        "another source delta is already in flight for this workload".to_owned(),
+                        "Retry after the workload and workers are ready.".to_owned(),
+                    )
+                ),
+                other => panic!("unexpected concurrent response: {other:?}"),
+            }
+        }
+        write_worker_message(
+            &mut client_write,
+            &WorkerMessage::DeployWorkload(request.clone()),
+        )
+        .await;
+        match read_control_message(&mut client_reader).await {
+            ControlMessage::OperationFailed {
+                code,
+                message,
+                next_steps,
+            } => assert_eq!(
+                (code, message, next_steps),
+                (
+                    "RS-0001".to_owned(),
+                    "another source delta is already in flight for this workload".to_owned(),
+                    "Retry after the workload and workers are ready.".to_owned(),
+                )
+            ),
+            other => panic!("unexpected concurrent redeployment response: {other:?}"),
+        }
+
+        let progress = |frame: &RuntimeExchangeMessage| WorkerMessage::ExecutionProgress {
+            output: RuntimeOutputDelta {
+                attempt_id: None,
+                version: frame.version,
+                request_id: frame.request_id.clone(),
+                workload_id: frame.workload_id,
+                shard_id: frame.shard_id,
+                epoch: frame.epoch,
+                operator_id: frame.operator_id,
+                lease_token: frame.lease_token,
+                source: frame.source.clone(),
+                rows: frame.rows.clone(),
+            },
+            input_rows: frame.rows.len() as u64,
+            output_rows: frame.rows.len() as u64,
+        };
+        write_worker_message(&mut workers[0].1, &progress(&frames[0])).await;
+        write_worker_message(&mut workers[0].1, &progress(&frames[0])).await;
+        let early = tokio::time::timeout(
+            Duration::from_millis(250),
+            read_control_message(&mut client_reader),
+        )
+        .await;
+        assert!(
+            early.is_err(),
+            "duplicate progress completed the request: {early:?}"
+        );
+
+        write_worker_message(&mut workers[1].1, &progress(&frames[1])).await;
+        let completion = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_control_message(&mut client_reader),
+        )
+        .await
+        .unwrap();
+        match completion {
+            ControlMessage::SourceDeltaCommitted {
+                request_id: actual,
+                epoch,
+            } => {
+                assert_eq!((actual, epoch), (request_id, 2));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        let failed_request_id = "failed-progress".to_owned();
+        write_worker_message(
+            &mut client_write,
+            &WorkerMessage::SubmitSourceDelta(SourceDeltaRequest {
+                version: 1,
+                request_id: failed_request_id.clone(),
+                workload_id,
+                epoch: 3,
+                source: "src".to_owned(),
+                rows: expected_rows,
+            }),
+        )
+        .await;
+        let mut failed_frames = Vec::new();
+        for (reader, _, _) in &mut workers {
+            let frame = loop {
+                if let ControlMessage::Execute { frame } = read_control_message(reader).await {
+                    break frame;
+                }
+            };
+            failed_frames.push(frame);
+        }
+        let failed_frame = &failed_frames[0];
+        let failure = serde_json::json!({
+            "type": "execution_failed",
+            "output": {
+                "version": failed_frame.version,
+                "request_id": failed_request_id,
+                "workload_id": failed_frame.workload_id,
+                "shard_id": failed_frame.shard_id,
+                "epoch": failed_frame.epoch,
+                "operator_id": failed_frame.operator_id,
+                "lease_token": failed_frame.lease_token,
+                "source": failed_frame.source,
+                "rows": []
+            },
+            "message": "test delivery rejected"
+        });
+        let mut stale_failure = failure.clone();
+        stale_failure["output"]["epoch"] = serde_json::json!(failed_frame.epoch - 1);
+        workers[0]
+            .1
+            .write_all(format!("{stale_failure}\n").as_bytes())
+            .await
+            .unwrap();
+        assert!(tokio::time::timeout(
+            Duration::from_millis(250),
+            read_control_message(&mut client_reader),
+        )
+        .await
+        .is_err());
+        workers[0]
+            .1
+            .write_all(format!("{failure}\n").as_bytes())
+            .await
+            .unwrap();
+        let failure_reply = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_control_message(&mut client_reader),
+        )
+        .await
+        .expect("worker failure did not reach the request");
+        match failure_reply {
+            ControlMessage::OperationFailed {
+                code,
+                message,
+                next_steps,
+            } => assert_eq!(
+                (code, message, next_steps),
+                (
+                    "RS-0001".to_owned(),
+                    "worker execution failed: test delivery rejected".to_owned(),
+                    "Preserve the source input and shard storage; automatic recovery is unavailable. Contact the operator before retrying.".to_owned(),
+                )
+            ),
+            other => panic!("unexpected failure response: {other:?}"),
+        }
+        write_worker_message(&mut workers[1].1, &progress(&failed_frames[1])).await;
+        assert!(tokio::time::timeout(
+            Duration::from_millis(250),
+            read_control_message(&mut client_reader),
+        )
+        .await
+        .is_err());
+        write_worker_message(
+            &mut client_write,
+            &WorkerMessage::ReadWorkload {
+                version: rockstream_types::data_plane::WORKLOAD_SNAPSHOT_VERSION,
+                workload_id,
+            },
+        )
+        .await;
+        match read_control_message(&mut client_reader).await {
+            ControlMessage::OperationFailed { code, message, next_steps } => assert_eq!(
+                (code, message, next_steps),
+                (
+                    "RS-0001".to_owned(),
+                    "workload requires recovery after failed execution".to_owned(),
+                    "Preserve the source input and shard storage; automatic recovery is unavailable. Contact the operator before retrying.".to_owned(),
+                )
+            ),
+            other => panic!("unexpected workload response: {other:?}"),
+        }
+        for rows in [failed_frame.rows.clone(), Vec::new()] {
+            write_worker_message(
+                &mut client_write,
+                &WorkerMessage::SubmitSourceDelta(SourceDeltaRequest {
+                    version: 1,
+                    request_id: "after-failure".to_owned(),
+                    workload_id,
+                    epoch: 4,
+                    source: "src".to_owned(),
+                    rows,
+                }),
+            )
+            .await;
+            let response = tokio::time::timeout(
+                Duration::from_secs(2),
+                read_control_message(&mut client_reader),
+            )
+            .await
+            .expect("later request did not receive a failure");
+            match response {
+                ControlMessage::OperationFailed {
+                    code,
+                    message,
+                    next_steps,
+                } => assert_eq!(
+                    (code, message, next_steps),
+                    (
+                        "RS-0001".to_owned(),
+                        "workload requires recovery after failed execution".to_owned(),
+                        "Preserve the source input and shard storage; automatic recovery is unavailable. Contact the operator before retrying.".to_owned(),
+                    )
+                ),
+                other => panic!("unexpected later response: {other:?}"),
+            }
+        }
+
+        write_worker_message(&mut client_write, &WorkerMessage::DeployWorkload(request)).await;
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_control_message(&mut client_reader),
+        )
+        .await
+        .expect("redeployment did not receive a failure");
+        match response {
+            ControlMessage::OperationFailed {
+                code,
+                message,
+                next_steps,
+            } => assert_eq!(
+                (code, message, next_steps),
+                (
+                    "RS-0001".to_owned(),
+                    "workload requires recovery after failed execution".to_owned(),
+                    "Preserve the source input and shard storage; automatic recovery is unavailable. Contact the operator before retrying.".to_owned(),
+                )
+            ),
+            other => panic!("unexpected redeployment response: {other:?}"),
+        }
+
+        let workload_id = WorkloadId(43);
+        let request = DeploymentRequest {
+            version: 1,
+            workload_id,
+            namespace: "public".to_owned(),
+            workload_name: "test_view".to_owned(),
+            plan_json: "{}".to_owned(),
+            join_strategy: JoinStrategy::Auto,
+            schemas: vec![],
+            frontier: 0,
+            storage_root: "/tmp/storage".to_owned(),
+            sink_operator_id: OperatorId(10),
+            output_columns: vec!["val".to_owned()],
+            primary_key: vec![0],
+            merge_key_columns: vec![0],
+            routing_columns: BTreeMap::from([("src".to_owned(), 0)]),
+        };
+        write_worker_message(&mut client_write, &WorkerMessage::DeployWorkload(request)).await;
+        for (reader, write, worker_id) in &mut workers {
+            let descriptor = loop {
+                if let ControlMessage::Deploy { descriptor } = read_control_message(reader).await {
+                    break descriptor;
+                }
+            };
+            write_worker_message(
+                write,
+                &WorkerMessage::DeploymentReady {
+                    version: 1,
+                    workload_id,
+                    shard_id: descriptor.shard.shard_id,
+                    worker_id: *worker_id,
+                    process_id: 9999,
+                    operator_ids: vec![OperatorId(10)],
+                    frontier: 1,
+                },
+            )
+            .await;
+        }
+        assert!(matches!(
+            read_control_message(&mut client_reader).await,
+            ControlMessage::DeploymentReady { workload_id: id, .. } if id == workload_id
+        ));
+        let rows = (0..64)
+            .map(|index| RuntimeRow {
+                values_tsv: format!("{index}\tvalue-{index}"),
+                weight: 1,
+            })
+            .collect();
+        write_worker_message(
+            &mut client_write,
+            &WorkerMessage::SubmitSourceDelta(SourceDeltaRequest {
+                version: 1,
+                request_id: "disconnected".to_owned(),
+                workload_id,
+                epoch: 2,
+                source: "src".to_owned(),
+                rows,
+            }),
+        )
+        .await;
+        let mut disconnected_frames = Vec::new();
+        for (reader, _, _) in &mut workers {
+            loop {
+                if let ControlMessage::Execute { frame } = read_control_message(reader).await {
+                    disconnected_frames.push(frame);
+                    break;
+                }
+            }
+        }
+        write_worker_message(&mut workers[1].1, &progress(&disconnected_frames[1])).await;
+        workers[0].1.shutdown().await.unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_control_message(&mut client_reader),
+        )
+        .await
+        .expect("disconnected worker did not fail the request");
+        match response {
+            ControlMessage::OperationFailed {
+                code,
+                message,
+                next_steps,
+            } => assert_eq!(
+                (code, message, next_steps),
+                (
+                    "RS-0001".to_owned(),
+                    "worker disconnected before source delta completed".to_owned(),
+                    "Preserve the source input and shard storage; automatic recovery is unavailable. Contact the operator before retrying.".to_owned()
+                )
+            ),
+            other => panic!("unexpected disconnect response: {other:?}"),
+        }
+        write_worker_message(
+            &mut client_write,
+            &WorkerMessage::SubmitSourceDelta(SourceDeltaRequest {
+                version: 1,
+                request_id: "after-disconnect".to_owned(),
+                workload_id,
+                epoch: 3,
+                source: "src".to_owned(),
+                rows: Vec::new(),
+            }),
+        )
+        .await;
+        match read_control_message(&mut client_reader).await {
+            ControlMessage::OperationFailed {
+                code,
+                message,
+                next_steps,
+            } => assert_eq!(
+                (code, message, next_steps),
+                (
+                    "RS-0001".to_owned(),
+                    "workload requires recovery after failed execution".to_owned(),
+                    "Preserve the source input and shard storage; automatic recovery is unavailable. Contact the operator before retrying.".to_owned()
+                )
+            ),
+            other => panic!("unexpected post-disconnect response: {other:?}"),
+        }
+        handle.shutdown();
+    })
+    .await
+    .expect("source delta fixture did not finish");
+}
+
 async fn read_control_message<R: AsyncBufRead + Unpin>(reader: &mut R) -> ControlMessage {
     let mut line = String::new();
     assert!(reader.read_line(&mut line).await.unwrap() > 0);
@@ -157,6 +669,7 @@ async fn test_control_plane_retains_zero_row_payloads_or_output_history() {
     // 3. Worker reports execution progress with rows in delta
     let progress_msg = WorkerMessage::ExecutionProgress {
         output: RuntimeOutputDelta {
+            attempt_id: None,
             version: 1,
             request_id: "req-1".to_string(),
             workload_id,
@@ -276,6 +789,7 @@ async fn test_control_plane_retains_zero_row_payloads_or_output_history() {
     assert_eq!(
         execute,
         RuntimeExchangeMessage {
+            attempt_id: None,
             version: 1,
             request_id: "delta-1".to_string(),
             workload_id,
@@ -293,6 +807,7 @@ async fn test_control_plane_retains_zero_row_payloads_or_output_history() {
 
     let progress_msg = WorkerMessage::ExecutionProgress {
         output: RuntimeOutputDelta {
+            attempt_id: None,
             version: 1,
             request_id: "delta-1".to_string(),
             workload_id,
