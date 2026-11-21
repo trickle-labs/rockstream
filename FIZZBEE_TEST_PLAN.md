@@ -884,6 +884,18 @@ boundary outside the M1–M7 worker, lease, frontier, and sink state machines;
 the tests do not establish unbounded contention liveness, crash durability,
 or assembled release-process qualification.
 
+Issue #350 (PR #397) qualifies the four shared-slot PostgreSQL `pgoutput`
+recovery boundaries in `crates/rockstream-gateway/tests/cdc_transaction_atomicity_tests.rs`:
+pre-M3 crash (`restart-before-m3`), durable-M3/pre-slot-ACK crash
+(`restart-after-m3-before-slot-ack`), mid-envelope three-table replication
+disconnect/reconnect (`three-table-disconnect-resume`), and incompatible schema
+rejection before commit (`schema-change-before-commit`). When a transport
+disconnect occurs mid-envelope, `SharedPgOutputCoordinator::discard_interrupted_envelope`
+clears both spilled and in-memory uncommitted change buffers before
+`SourceRuntimeCoordinator::reopen_pgoutput_after_disconnect` reconnects under
+the same fenced owner lease. This refines the M3 shared-slot recovery boundary
+without altering the abstract FizzBee state machines.
+
 Issue #305 strengthens the file-backed audit append boundary in
 `crates/rockstream-control/src/audit.rs`. `FileAuditLog::append` writes each
 JSONL event and calls `sync_all` on the file before returning success. On Unix,

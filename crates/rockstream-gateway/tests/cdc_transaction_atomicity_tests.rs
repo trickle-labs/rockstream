@@ -360,7 +360,7 @@ async fn shared_slot_progress(
         .expect("shared slot requires a durable shard frontier");
     let frontier_epoch = u64::from_be_bytes(
         frontier_bytes
-            .as_slice()
+            .as_ref()
             .try_into()
             .expect("shard frontier must be an 8-byte epoch"),
     );

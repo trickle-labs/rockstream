@@ -519,7 +519,7 @@ impl PostgresCdcSource {
             .port(config.port)
             .dbname(&config.database)
             .user(&config.user)
-            .application_name(&format!("rockstream-pgoutput-{}", config.slot));
+            .application_name(format!("rockstream-pgoutput-{}", config.slot));
         if let Some(password) = &config.password {
             connection_config.password(password);
         }
