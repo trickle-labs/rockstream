@@ -195,7 +195,7 @@ async fn control_worker_mtls_rejects_protocol_without_audited_shuffle_support() 
         response.trim(),
         ControlMessage::OperationFailed {
             code: "RS-5021".to_owned(),
-            message: "RS-5021: authenticated worker shuffle requires protocol v3".to_owned(),
+            message: "RS-5021: authenticated worker shuffle requires protocol v4".to_owned(),
             next_steps: rockstream_types::error_code::next_steps(
                 rockstream_types::error_code::RS_5021,
             )
