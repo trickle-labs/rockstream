@@ -4021,6 +4021,281 @@ async fn release_process_rejects_scram_with_empty_durable_credentials_before_lis
 }
 
 #[tokio::test]
+async fn subscription_revocation_is_enforced_by_release_gateway() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("node-storage");
+    let shard_dir = storage.join("gateway-shard");
+    std::fs::create_dir_all(&shard_dir).unwrap();
+    let store =
+        rockstream_storage::build_runtime_object_store(&shard_dir, "gateway-shard").unwrap();
+    let catalog = DurableCatalogStore::new(store, "gateway");
+    let mut admin = scram_principal();
+    admin.preset_grants.extend([
+        ScopedPresetGrant {
+            preset: PermissionPreset::Builder,
+            scope: PolicyScope::Namespace {
+                namespace: "public".into(),
+            },
+        },
+        ScopedPresetGrant {
+            preset: PermissionPreset::DataReader,
+            scope: PolicyScope::Namespace {
+                namespace: "public".into(),
+            },
+        },
+    ]);
+    catalog
+        .preprovision_first_administrator(admin, 1)
+        .await
+        .unwrap();
+    let mut reader = scram_principal();
+    reader.id = PrincipalId(2);
+    reader.display_name = "subscription reader".into();
+    let LoginMethod::ScramSha256 { username, .. } = &mut reader.login_methods[0] else {
+        unreachable!()
+    };
+    *username = "bob".into();
+    reader.preset_grants = vec![ScopedPresetGrant {
+        preset: PermissionPreset::DataReader,
+        scope: PolicyScope::Namespace {
+            namespace: "public".into(),
+        },
+    }];
+    let policy = |principal: &SecurityPrincipal| {
+        serde_json::to_string(&(
+            principal.enabled,
+            &principal.preset_grants,
+            &principal.scoped_grants,
+        ))
+        .unwrap()
+    };
+    let grant_audit = |event_id: &str, revision: u64, before: AuditField<String>, after: String| {
+        SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: event_id.into(),
+            timestamp_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            actor: AuditIdentity::Verified("principal:1".into()),
+            target: AuditField::Known("principal:2".into()),
+            scope: AuditField::Known("cluster".into()),
+            action: SecurityAuditClass::GrantChange,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::Observed(event_id.into()),
+            operation_id: AuditField::Known((revision + 1).to_string()),
+            policy_revision: AuditField::Known(revision),
+            before_state: before,
+            after_state: AuditField::Known(after),
+        }
+    };
+    catalog
+        .commit_txn(
+            CatalogTxn::new(
+                2,
+                2,
+                vec![CatalogMutation::PutSecurityPrincipal {
+                    principal: reader.clone(),
+                    expected_revision: None,
+                    grantor_revision: Some((PrincipalId(1), 1)),
+                    audit: grant_audit(
+                        "seed-reader",
+                        1,
+                        AuditField::NotApplicable,
+                        format!("revision=1;policy={}", policy(&reader)),
+                    ),
+                }],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let tls_key = rcgen::KeyPair::generate().unwrap();
+    let tls_cert = rcgen::CertificateParams::new(vec!["localhost".into()])
+        .unwrap()
+        .self_signed(&tls_key)
+        .unwrap();
+    let cert_path = temp.path().join("gateway.pem");
+    let key_path = temp.path().join("gateway-key.pem");
+    std::fs::write(&cert_path, tls_cert.pem()).unwrap();
+    std::fs::write(&key_path, tls_key.serialize_pem()).unwrap();
+    let address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut process = start_gateway_process(
+        temp.path(),
+        &storage,
+        address,
+        &cert_path,
+        &key_path,
+        "scram",
+        None,
+        "",
+        "",
+        "",
+    );
+    wait_for_gateway(&mut process.0, address).await;
+    let connect = |user| {
+        format!(
+            "host=127.0.0.1 port={} user={user} password=pencil dbname=test sslmode=disable",
+            address.port()
+        )
+    };
+    let (writer, writer_connection) =
+        tokio_postgres::connect(&connect("alice"), tokio_postgres::NoTls)
+            .await
+            .unwrap();
+    let writer_task = tokio::spawn(writer_connection);
+    writer
+        .batch_execute("CREATE TABLE subscribed (id BIGINT)")
+        .await
+        .unwrap();
+    let (subscriber, subscriber_connection) =
+        tokio_postgres::connect(&connect("bob"), tokio_postgres::NoTls)
+            .await
+            .unwrap();
+    let subscriber_task = tokio::spawn(subscriber_connection);
+    let mut rows = Box::pin(
+        subscriber
+            .simple_query_raw("SUBSCRIBE subscribed AS OF NOW WITH SNAPSHOT")
+            .await
+            .unwrap(),
+    );
+    let schema = tokio::time::timeout(Duration::from_secs(10), rows.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let tokio_postgres::SimpleQueryMessage::RowDescription(columns) = schema else {
+        panic!("expected subscription columns")
+    };
+    assert_eq!(
+        columns
+            .iter()
+            .map(|column| column.name())
+            .collect::<Vec<_>>(),
+        vec!["id", "mz_timestamp", "mz_diff"]
+    );
+    writer
+        .batch_execute("INSERT INTO subscribed VALUES (1)")
+        .await
+        .unwrap();
+    let first_row = tokio::time::timeout(Duration::from_secs(10), rows.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let tokio_postgres::SimpleQueryMessage::Row(first_row) = first_row else {
+        panic!("expected subscription row")
+    };
+    assert_eq!(first_row.get(0), Some("1"));
+    assert!(first_row.get(1).unwrap().parse::<u64>().unwrap() > 0);
+    assert_eq!(first_row.get(2), Some("1"));
+    catalog.refresh().await.unwrap();
+    let before = policy(&reader);
+    reader.revision = 2;
+    reader.preset_grants.clear();
+    let revision = catalog.get_revision().await + 1;
+    catalog
+        .commit_txn(
+            CatalogTxn::new(
+                revision,
+                3,
+                vec![CatalogMutation::PutSecurityPrincipal {
+                    principal: reader.clone(),
+                    expected_revision: Some(1),
+                    grantor_revision: Some((PrincipalId(1), 1)),
+                    audit: grant_audit(
+                        "revoke-reader",
+                        2,
+                        AuditField::Known(format!("revision=1;policy={before}")),
+                        format!("revision=2;policy={}", policy(&reader)),
+                    ),
+                }],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let revoked_at = Instant::now();
+    let denial = tokio::time::timeout(Duration::from_secs(60), rows.next())
+        .await
+        .expect("subscription must reauthorize within 60 seconds")
+        .expect("subscription ended without a denial")
+        .expect_err("subscription returned another message after revocation");
+    let denial = denial
+        .as_db_error()
+        .expect("subscription denial must be a database error");
+    assert_eq!(denial.code().code(), "42501");
+    assert_eq!(denial.message(), "[RS-2401] auth.permission_denied: current subscription read permission could not be established.");
+    assert!(revoked_at.elapsed() <= Duration::from_secs(60));
+    drop(rows);
+    writer
+        .batch_execute("INSERT INTO subscribed VALUES (2)")
+        .await
+        .unwrap();
+    assert_eq!(
+        subscriber
+            .query_one("SELECT 1", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        1i64
+    );
+    let actual = writer
+        .query("SELECT id FROM subscribed ORDER BY id", &[])
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get::<_, i64>(0))
+        .collect::<Vec<_>>();
+    assert_eq!(actual, vec![1, 2]);
+    catalog.refresh().await.unwrap();
+    let audits = catalog.list_security_audit_records().await.unwrap();
+    let denials = audits
+        .iter()
+        .filter(|record| {
+            record.action == SecurityAuditClass::AuthorizationDenial
+                && record.target == AuditField::Known("public.subscribed".into())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(denials.len(), 1);
+    let audit = denials[0];
+    assert!(audit.event_id.starts_with("gateway-authz-"));
+    assert!(audit.timestamp_ms > 0);
+    assert!(matches!(&audit.correlation, AuditCorrelation::Observed(value) if !value.is_empty()));
+    assert_eq!(
+        audit,
+        &SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: audit.event_id.clone(),
+            timestamp_ms: audit.timestamp_ms,
+            actor: AuditIdentity::Verified("scram:bob".into()),
+            target: AuditField::Known("public.subscribed".into()),
+            scope: AuditField::Known(
+                serde_json::to_string(&PolicyScope::Resource {
+                    namespace: "public".into(),
+                    kind: ResourceKind::Table,
+                    name: "subscribed".into(),
+                })
+                .unwrap()
+            ),
+            action: SecurityAuditClass::AuthorizationDenial,
+            outcome: SecurityAuditOutcome::Denied,
+            correlation: audit.correlation.clone(),
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::Known(2),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
+    );
+    writer_task.abort();
+    subscriber_task.abort();
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+}
+
+#[tokio::test]
 async fn scram_failures_and_service_only_login_rejection_run_in_release_process() {
     let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
