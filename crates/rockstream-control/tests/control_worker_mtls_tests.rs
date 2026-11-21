@@ -97,7 +97,7 @@ async fn connect_registered_worker(
         response.trim(),
         ControlMessage::Registered {
             worker_id: WorkerId(worker_id),
-            protocol_version: rockstream_types::compatibility::ProtocolVersion::V3,
+            protocol_version: rockstream_types::compatibility::ProtocolVersion::V4,
         },
     );
     reader
@@ -195,7 +195,7 @@ async fn control_worker_mtls_rejects_protocol_without_audited_shuffle_support() 
         response.trim(),
         ControlMessage::OperationFailed {
             code: "RS-5021".to_owned(),
-            message: "RS-5021: authenticated worker shuffle requires protocol v3".to_owned(),
+            message: "RS-5021: authenticated worker shuffle requires protocol v4".to_owned(),
             next_steps: rockstream_types::error_code::next_steps(
                 rockstream_types::error_code::RS_5021,
             )
@@ -294,7 +294,7 @@ async fn worker_security_audit_requires_an_authenticated_peer() {
         response.trim(),
         ControlMessage::Registered {
             worker_id: WorkerId(2),
-            protocol_version: rockstream_types::compatibility::ProtocolVersion::V3,
+            protocol_version: rockstream_types::compatibility::ProtocolVersion::V4,
         },
     );
 

@@ -25,8 +25,8 @@ use tokio_util::task::AbortOnDropHandle;
 
 use rockstream_types::config::ExchangeConfig;
 use rockstream_types::data_plane::{
-    DeploymentDescriptor, RuntimeExchangeMessage, RuntimeOutputDelta, RuntimeRow,
-    DEPLOYMENT_DESCRIPTOR_VERSION,
+    DeploymentDescriptor, RuntimeExchangeMessage, RuntimeOutputDelta, RuntimeRow, ShardOutput,
+    DEPLOYMENT_DESCRIPTOR_VERSION, WORKLOAD_SNAPSHOT_VERSION,
 };
 use rockstream_types::identity::InternalTlsConfig;
 use rockstream_types::ids::{LeaseToken, OperatorId, ShardId, WorkerId, WorkloadId};
@@ -55,6 +55,80 @@ impl WorkerDeployment {
     pub fn compactor(&self) -> &Arc<EpochCompactor> {
         &self.compactor
     }
+}
+
+async fn read_workload_shards(
+    deployments: &WorkerDeployments,
+    active_shards: &Arc<RwLock<HashMap<ShardId, ShardState>>>,
+    workload_id: WorkloadId,
+    shard_ids: &[ShardId],
+) -> io::Result<Vec<ShardOutput>> {
+    let targets = {
+        let deployed = deployments.read();
+        let active = active_shards.read();
+        let mut seen = std::collections::HashSet::new();
+        let mut targets = Vec::with_capacity(shard_ids.len());
+        for shard_id in shard_ids {
+            if !seen.insert(*shard_id) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "duplicate shard in workload read request",
+                ));
+            }
+            let deployment = deployed
+                .get(&(workload_id, *shard_id))
+                .cloned()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "shard is not deployed"))?;
+            if !active.get(shard_id).is_some_and(|state| {
+                state.lease.worker_id == deployment.descriptor.shard.worker_id
+                    && state.lease.lease_token == deployment.descriptor.shard.lease_token
+                    && state.db.is_some()
+            }) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "shard lease is not active",
+                ));
+            }
+            targets.push(deployment);
+        }
+        targets
+    };
+    if targets.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "workload read requires at least one shard",
+        ));
+    }
+
+    let mut outputs = Vec::with_capacity(targets.len());
+    for deployment in targets {
+        let descriptor = &deployment.descriptor;
+        let stored = rockstream_ops::read_view_output(
+            &deployment.db,
+            descriptor.sink_operator_id,
+            descriptor.output_columns.len(),
+        )
+        .await
+        .map_err(io::Error::other)?;
+        let rows = rockstream_ops::sink::materialize_view_state(stored, &descriptor.primary_key)
+            .into_values()
+            .filter(|(_, count)| *count > 0)
+            .map(|(row, weight)| {
+                let values_tsv =
+                    String::from_utf8(rockstream_ops::sink::column_values_to_tsv_bytes(&row))
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                Ok(RuntimeRow { values_tsv, weight })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        outputs.push(ShardOutput {
+            shard_id: descriptor.shard.shard_id,
+            lease_token: Some(descriptor.shard.lease_token),
+            deltas: Vec::new(),
+            rows,
+        });
+    }
+    outputs.sort_by_key(|shard| shard.shard_id);
+    Ok(outputs)
 }
 
 pub type WorkerDeployments = Arc<RwLock<HashMap<(WorkloadId, ShardId), Arc<WorkerDeployment>>>>;
@@ -1529,7 +1603,7 @@ where
         .with_location(location.clone())
         .with_capabilities(capabilities)
         .with_compatibility(
-            rockstream_types::compatibility::SupportedVersionRange::v3_only(),
+            rockstream_types::compatibility::SupportedVersionRange::v4_only(),
             rockstream_types::compatibility::SupportedStorageFormatRange::v1_through_v2(),
         );
         let reg_msg = WorkerMessage::Register(reg);
@@ -1716,13 +1790,13 @@ where
                     worker_id: wid,
                     protocol_version,
                 } => {
-                    if !rockstream_types::compatibility::SupportedVersionRange::v3_only()
+                    if !rockstream_types::compatibility::SupportedVersionRange::v4_only()
                         .contains(protocol_version)
                     {
                         tracing::error!(
                             code = %rockstream_types::error_code::RS_5021,
                             %protocol_version,
-                            "control plane does not support the worker protocol required for audited shard ownership"
+                            "control plane does not support the worker protocol required for audited shard ownership and complete workload reads"
                         );
                         break;
                     }
@@ -1855,6 +1929,51 @@ where
                             %error,
                             "worker execution frame refused"
                         );
+                    }
+                }
+                ControlMessage::ReadWorkload {
+                    version,
+                    request_id,
+                    workload_id,
+                    shard_ids,
+                } => {
+                    let result = if version == WORKLOAD_SNAPSHOT_VERSION {
+                        read_workload_shards(
+                            &deployments_clone,
+                            &active_shards_clone,
+                            workload_id,
+                            &shard_ids,
+                        )
+                        .await
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "unsupported workload snapshot version",
+                        ))
+                    };
+                    let (available, shards) = match result {
+                        Ok(shards) => (true, shards),
+                        Err(_) => {
+                            tracing::warn!(%workload_id, "worker workload read unavailable");
+                            (false, Vec::new())
+                        }
+                    };
+                    let worker_id = *worker_id_clone.read();
+                    if let Some(worker_id) = worker_id {
+                        if msg_tx
+                            .send(WorkerMessage::WorkloadReadReport {
+                                version: WORKLOAD_SNAPSHOT_VERSION,
+                                request_id,
+                                workload_id,
+                                worker_id,
+                                available,
+                                shards,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            tracing::warn!(%worker_id, "workload read report could not be queued");
+                        }
                     }
                 }
                 ControlMessage::ReadOperatorStats {
