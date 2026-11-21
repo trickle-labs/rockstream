@@ -461,12 +461,7 @@ async fn heartbeat_replacement_schedule(delay: Delay) {
     // Voting in a higher term does not necessarily refresh C's optional
     // cached leader hint until B's first heartbeat, but it must still
     // reject all protected writes while it is only a follower.
-    assert!(matches!(
-        reply_c,
-        ControlMessage::NotLeader {
-            ..
-        }
-    ));
+    assert!(matches!(reply_c, ControlMessage::NotLeader { .. }));
     let lease = match reply_b {
         ControlMessage::ShardAssigned {
             lease,
