@@ -18,7 +18,7 @@ use rockstream_control::delegation::{
 };
 use rockstream_control::kek::EnvKekProvider;
 use rockstream_control::{ControlService, SecretStore, ShardManager, TopologyCatalog};
-use rockstream_runtime::client::start_worker_client_with_tls;
+use rockstream_runtime::client::start_worker_client_with_insecure_internal_dev_and_metadata_and_tls as start_worker_client_for_local_test;
 use rockstream_runtime::data_plane::DataPlaneClient;
 use rockstream_storage::catalog::{
     CatalogDatabase, CatalogMutation, CatalogNamespace, CatalogSourceEntry, CatalogStore,
@@ -31,7 +31,7 @@ use rockstream_types::authorization::{
     SecurityAuditOutcome, SecurityAuditRecord, SecurityPrincipal, SECURITY_AUDIT_FORMAT_VERSION,
     SECURITY_PRINCIPAL_FORMAT_VERSION,
 };
-use rockstream_types::error_code::{RS_2400, RS_2410, RS_2411, RS_2412};
+use rockstream_types::error_code::{RS_2400, RS_2410, RS_2411};
 use rockstream_types::ids::{
     DatabaseId, NamespaceId, OperatorId, PrincipalId, ShardId, SourceId, TableId, WorkerId,
     WorkloadId,
@@ -415,7 +415,7 @@ async fn gateway_data_plane_requires_actor_assertion_and_audits_wrong_role() {
     assert_eq!(
         missing_assertion.to_string(),
         format!(
-            "{RS_2400}: a valid user actor assertion is required for gateway data-plane requests"
+            "{RS_2400}: a valid user actor assertion is required for gateway data-plane requests; Provide valid credentials (Bearer token or mTLS certificate)"
         )
     );
 
@@ -447,7 +447,7 @@ async fn gateway_data_plane_requires_actor_assertion_and_audits_wrong_role() {
         .expect("wrong gateway role is durably audited");
     assert_eq!(
         wrong_role.to_string(),
-        format!("{RS_2412}: certificate identity is not authorized for the gateway data plane"),
+        "RS-2412: certificate identity is not authorized for the gateway data plane; Ensure the node ID and role presented in the internal TLS certificate Common Name / SAN match the node registration parameters."
     );
 
     assert_eq!(
@@ -490,10 +490,12 @@ async fn worker_secret_tokens_are_workload_bound_and_recheck_current_grants() {
         .with_actor_assertion_verifier(verifier);
     let handle = service.start("127.0.0.1:0").await.unwrap();
     let storage_dir = tempfile::tempdir().unwrap();
-    let (worker, worker_handle) = start_worker_client_with_tls(
+    let (worker, worker_handle) = start_worker_client_for_local_test(
         1,
         &handle.addr.to_string(),
         storage_dir.path(),
+        Default::default(),
+        Default::default(),
         auth.pki.worker_tls_config(1),
     )
     .await
@@ -631,7 +633,9 @@ async fn worker_secret_tokens_are_workload_bound_and_recheck_current_grants() {
         let active = worker
             .get_deployment(request.workload_id, ShardId(request.workload_id.0 * 16))
             .is_some();
-        panic!("periodic secret reauthorization did not revoke the cache; denials={denials}, active={active}, targets={targets:?}");
+        panic!(
+            "periodic secret reauthorization did not revoke the cache; denials={denials}, active={active}, targets={targets:?}"
+        );
     }
     let records = auth.catalog.list_security_audit_records().await.unwrap();
     let denials: Vec<_> = records
@@ -702,7 +706,7 @@ async fn gateway_actor_assertion_intersects_current_durable_policy() {
         .unwrap_err();
     assert_eq!(
         error.to_string(),
-        "RS-2401: asserted user actor is no longer authorized for this operation and scope"
+        "RS-2401: asserted user actor is no longer authorized for this operation and scope; Request elevated RBAC role from an admin or contact the namespace owner"
     );
 
     let records = auth.catalog.list_security_audit_records().await.unwrap();
@@ -744,7 +748,10 @@ async fn gateway_actor_assertion_allows_independent_scoped_grant() {
         .deploy_delegated(request.clone(), &assertion)
         .await
         .unwrap_err();
-    assert_eq!(error.to_string(), "RS-0001: no healthy workers available");
+    assert_eq!(
+        error.to_string(),
+        "RS-0001: no healthy workers available; Retry after the workload and workers are ready."
+    );
     revoke_view_author(&auth).await;
     let revoked = gateway
         .deploy_delegated(request, &assertion)
@@ -758,7 +765,7 @@ async fn gateway_actor_assertion_allows_independent_scoped_grant() {
     assert_eq!(denied.policy_revision, AuditField::Known(2));
     assert_eq!(
         revoked.to_string(),
-        "RS-2401: asserted user actor is no longer authorized for this operation and scope"
+        "RS-2401: asserted user actor is no longer authorized for this operation and scope; Request elevated RBAC role from an admin or contact the namespace owner"
     );
 
     let accepted = records
@@ -806,21 +813,42 @@ async fn test_peer_invalid_expired_absent_cert_rejected_with_audit_denial_no_dat
 
     // 1. Untrusted certificate peer connection attempt
     let untrusted_tls = pki.untrusted_worker_tls_config();
-    let (c1, h1) = start_worker_client_with_tls(1, &control_url, storage_dir.path(), untrusted_tls)
-        .await
-        .unwrap();
+    let (c1, h1) = start_worker_client_for_local_test(
+        1,
+        &control_url,
+        storage_dir.path(),
+        Default::default(),
+        Default::default(),
+        untrusted_tls,
+    )
+    .await
+    .unwrap();
 
     // 2. Expired certificate peer connection attempt
     let expired_tls = pki.expired_worker_tls_config();
-    let (c2, h2) = start_worker_client_with_tls(2, &control_url, storage_dir.path(), expired_tls)
-        .await
-        .unwrap();
+    let (c2, h2) = start_worker_client_for_local_test(
+        2,
+        &control_url,
+        storage_dir.path(),
+        Default::default(),
+        Default::default(),
+        expired_tls,
+    )
+    .await
+    .unwrap();
 
     // 3. Absent certificate (plaintext) peer connection attempt
     let absent_tls = rockstream_types::identity::InternalTlsConfig::default();
-    let (c3, h3) = start_worker_client_with_tls(3, &control_url, storage_dir.path(), absent_tls)
-        .await
-        .unwrap();
+    let (c3, h3) = start_worker_client_for_local_test(
+        3,
+        &control_url,
+        storage_dir.path(),
+        Default::default(),
+        Default::default(),
+        absent_tls,
+    )
+    .await
+    .unwrap();
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -889,10 +917,12 @@ async fn test_certificate_rotation_preserves_streams_and_accepts_gen2_worker() {
     let mut clients = Vec::new();
 
     for id in 1..=3 {
-        let (client, h) = start_worker_client_with_tls(
+        let (client, h) = start_worker_client_for_local_test(
             id,
             &control_url,
             storage_dir.path(),
+            Default::default(),
+            Default::default(),
             pki.worker_tls_config(id),
         )
         .await
@@ -939,10 +969,12 @@ async fn test_certificate_rotation_preserves_streams_and_accepts_gen2_worker() {
         .add_trusted_ca(&ca2_path)
         .unwrap();
     handle.reload_tls(ctrl2_cfg).unwrap();
-    let (gen2_client, gen2_handle) = start_worker_client_with_tls(
+    let (gen2_client, gen2_handle) = start_worker_client_for_local_test(
         4,
         &control_url,
         storage_dir.path(),
+        Default::default(),
+        Default::default(),
         pki.gen2_worker_tls_config(4),
     )
     .await
@@ -1063,10 +1095,12 @@ async fn test_mtls_cluster_durability_lfs_and_minio() {
 
     let storage_dir = tempfile::tempdir().unwrap();
 
-    let (client, h) = start_worker_client_with_tls(
+    let (client, h) = start_worker_client_for_local_test(
         1,
         &control_url,
         storage_dir.path(),
+        Default::default(),
+        Default::default(),
         pki.worker_tls_config(1),
     )
     .await

@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use rockstream_control::{ControlService, ShardManager, TopologyCatalog};
-use rockstream_runtime::start_worker_client;
+use rockstream_runtime::client::start_worker_client_with_insecure_internal_dev_and_metadata as start_test_worker_client;
 use rockstream_types::ids::{ShardId, WorkerId};
 
 #[tokio::test]
@@ -25,12 +25,26 @@ async fn test_worker_heartbeat_timeout_and_lease_reassignment() {
     // 2. Start Worker 1 (ID 101)
     let worker_storage_1 = storage.join("worker-101");
     std::fs::create_dir_all(&worker_storage_1).unwrap();
-    let (client_1, handle_1) = start_worker_client(101, &control_addr, &worker_storage_1)
-        .await
-        .unwrap();
+    let (client_1, handle_1) = start_test_worker_client(
+        101,
+        &control_addr,
+        &worker_storage_1,
+        Default::default(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
 
     // 3. Acquire shard 0 lease on Worker 1
     tokio::time::sleep(Duration::from_millis(100)).await;
+    let endpoint: std::net::SocketAddr =
+        catalog.get(WorkerId(101)).unwrap().address.parse().unwrap();
+    assert_eq!(
+        endpoint.ip(),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    );
+    assert_ne!(endpoint.port(), 0);
+    tokio::net::TcpStream::connect(endpoint).await.unwrap();
     let _ = client_1.request_shard(ShardId(0)).await;
 
     // Verify Worker 1 owns shard 0
@@ -50,6 +64,16 @@ async fn test_worker_heartbeat_timeout_and_lease_reassignment() {
     // 4. Disconnect Worker 1 (abort task) and release in control plane
     handle_1.abort();
     drop(client_1);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if tokio::net::TcpStream::connect(endpoint).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("worker exchange listener did not stop");
     catalog.deregister(WorkerId(101));
     manager.release_worker(WorkerId(101));
 
@@ -61,9 +85,15 @@ async fn test_worker_heartbeat_timeout_and_lease_reassignment() {
     // 5. Start Worker 2 (ID 102) and acquire shard 0
     let worker_storage_2 = storage.join("worker-102");
     std::fs::create_dir_all(&worker_storage_2).unwrap();
-    let (client_2, handle_2) = start_worker_client(102, &control_addr, &worker_storage_2)
-        .await
-        .unwrap();
+    let (client_2, handle_2) = start_test_worker_client(
+        102,
+        &control_addr,
+        &worker_storage_2,
+        Default::default(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
     let _ = client_2.request_shard(ShardId(0)).await;

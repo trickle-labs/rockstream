@@ -723,6 +723,21 @@ exercise the recovery gate. M1 abstracts the batch and does not model compiled
 operators, gateway cancellation, source shuffle ownership, or management
 authentication. Those boundaries require separate qualification.
 
+The gateway records pending source dispatch in the base-row batch and clears it
+after all source requests complete; reads and subsequent writes fail if a
+gateway restarts with that record. Distributed reads also fail when snapshots
+do not contain worker output, rather than report an empty result. The owned
+shuffle path records a source epoch on its anchor before dispatch and
+clears that record only after all target shards report committed execution.
+The process regression stops the gateway with a source request outstanding and
+checks the exact input and post-restart failure.
+Worker execution records distinguish matching committed replays from conflicting
+input. Distributed view reads fail while execution is incomplete or requires
+recovery. The coordinator, gateway, and runtime tests cover ordering, failure,
+restart, closed-inlet delivery, and exact replay. M1 does not model the journal or the
+transport-to-worker handoff; the bare credit-only transport and independent-host
+recovery remain unqualified by these tests.
+
 Issue #303's #309 slice binds control-worker registration to the authenticated
 certificate identity. `control_worker_mtls_tests.rs` covers missing, expired,
 and untrusted certificates, identity mismatch, and role-only rejection; the

@@ -122,8 +122,17 @@ impl DataPlaneClient {
 
     fn unexpected(response: ControlMessage) -> io::Error {
         match response {
-            ControlMessage::OperationFailed { code, message, .. } => {
-                io::Error::other(format!("{code}: {message}"))
+            ControlMessage::OperationFailed {
+                code,
+                message,
+                next_steps,
+            } => {
+                let message = if message.contains(&next_steps) {
+                    format!("{code}: {message}")
+                } else {
+                    format!("{code}: {message}; {next_steps}")
+                };
+                io::Error::other(message)
             }
             other => io::Error::new(
                 io::ErrorKind::InvalidData,

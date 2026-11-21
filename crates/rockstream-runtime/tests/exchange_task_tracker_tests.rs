@@ -10,14 +10,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 #[tokio::test]
 async fn test_exchange_service_graceful_shutdown_joins_all_tasks() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-
     let registry = ExchangeRegistry::new();
     let service = ExchangeService::new(registry).with_insecure_internal_dev();
 
-    service.start(addr).await.unwrap();
+    service.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
 
     let start_time = Instant::now();
     service.shutdown().await;
@@ -44,9 +40,7 @@ async fn test_exchange_service_reports_listener_bind_failure() {
 
 #[tokio::test]
 async fn worker_exchange_listener_lifecycle_tracks_control_connection() {
-    let exchange_reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let exchange_addr = exchange_reservation.local_addr().unwrap();
-    drop(exchange_reservation);
+    let exchange_addr = "127.0.0.1:0".parse().unwrap();
     let control_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let control_addr = control_listener.local_addr().unwrap();
 
@@ -58,7 +52,12 @@ async fn worker_exchange_listener_lifecycle_tracks_control_connection() {
         let WorkerMessage::Register(registration) = serde_json::from_str(&line).unwrap() else {
             panic!("worker must register before control messages");
         };
-        assert_eq!(registration.address, exchange_addr.to_string());
+        let exchange_addr = registration
+            .address
+            .parse::<std::net::SocketAddr>()
+            .unwrap();
+        assert_eq!(exchange_addr.ip(), std::net::Ipv4Addr::LOCALHOST);
+        assert_ne!(exchange_addr.port(), 0);
         let reply = serde_json::to_string(&ControlMessage::Registered {
             worker_id: registration.worker_id,
             protocol_version: rockstream_types::compatibility::ProtocolVersion::V3,

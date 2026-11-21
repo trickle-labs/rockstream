@@ -15,6 +15,7 @@ pub mod client;
 pub mod compaction;
 pub mod data_plane;
 pub mod epoch_compaction;
+mod owned_epoch;
 pub use epoch_compaction::{
     EpochCompactionConfig, EpochCompactionError, EpochCompactionFilter, EpochCompactionMetrics,
     EpochCompactionMetricsSnapshot, EpochCompactor, InFlightZSetAccumulator, KeyExtractionStrategy,
@@ -89,7 +90,14 @@ mod tests {
 
         let storage_dir = tempfile::tempdir().unwrap();
 
-        let (client, worker_handle) = start_worker_client(42, &control_url, storage_dir.path())
+        let (client, worker_handle) =
+            client::start_worker_client_with_insecure_internal_dev_and_metadata(
+                42,
+                &control_url,
+                storage_dir.path(),
+                Default::default(),
+                Default::default(),
+            )
             .await
             .unwrap();
 

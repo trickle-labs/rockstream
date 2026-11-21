@@ -4343,11 +4343,41 @@ impl GatewayHandler {
     }
 
     async fn ensure_local_view_consistency(&self) -> PgWireResult<()> {
-        if !self.pending_view_recovery.lock().is_empty() {
+        let pending = if let Some(db) = &self.shard_db {
+            db.get(&rockstream_storage::ShardKeyEncoder::meta_key(
+                b"distributed-source-pending",
+            ))
+            .await
+            .map_err(|e| PgWireError::ApiError(Box::new(GatewayError::Storage(e))))?
+            .is_some()
+        } else {
+            false
+        };
+        if pending || !self.pending_view_recovery.lock().is_empty() {
             let _guard = self.shard_commit_lock.lock().await;
             self.recover_pending_views_locked()
                 .await
                 .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+            self.ensure_no_pending_distributed_locked()
+                .await
+                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_no_pending_distributed_locked(&self) -> Result<(), GatewayError> {
+        if let Some(db) = &self.shard_db {
+            if db
+                .get(&rockstream_storage::ShardKeyEncoder::meta_key(
+                    b"distributed-source-pending",
+                ))
+                .await?
+                .is_some()
+            {
+                return Err(GatewayError::QueryTimeExecutionFailed {
+                    detail: "distributed source requires recovery; preserve source input and shard storage and contact the operator before retrying".to_string(),
+                });
+            }
         }
         Ok(())
     }
@@ -9681,6 +9711,15 @@ impl GatewayHandler {
         order_by: Vec<(String, bool)>,
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<Response<'static>>> {
+        let _distributed_read_guard = if self.distributed_data_plane.is_some() {
+            let guard = self.shard_commit_lock.lock().await;
+            self.ensure_no_pending_distributed_locked()
+                .await
+                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+            Some(guard)
+        } else {
+            None
+        };
         if let Some(error_responses) = self
             .select_access_error_response(view_name, conn_id)
             .await?
@@ -9781,6 +9820,14 @@ impl GatewayHandler {
                     detail: format!("read distributed view {view_name}: {error}"),
                 }))
             })?;
+            // shortcut: snapshots omit worker output, remove this gate when reads include it.
+            if snapshot.shards.iter().all(|shard| shard.deltas.is_empty()) {
+                return Err(PgWireError::ApiError(Box::new(
+                    GatewayError::QueryTimeExecutionFailed {
+                        detail: format!("distributed view {view_name} output is unavailable; contact the operator before relying on this result"),
+                    },
+                )));
+            }
             let mut rows = merge_workload_snapshot(&snapshot)
                 .map_err(|error| PgWireError::ApiError(Box::new(error)))?;
             if !order_by.is_empty() {
@@ -12750,6 +12797,9 @@ impl GatewayHandler {
         self.recover_pending_views_locked()
             .await
             .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+        self.ensure_no_pending_distributed_locked()
+            .await
+            .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
         let (epoch, ops, changes, distributed_deltas) = {
             if ops.is_empty() {
                 if let Some(conn_id) = conn_id {
@@ -12856,6 +12906,22 @@ impl GatewayHandler {
                     }
                 }
             }
+            if !distributed_deltas.is_empty() {
+                let pending = distributed_deltas
+                    .iter()
+                    .map(|(view, request, _)| {
+                        format!(
+                            "{} {} {} {}",
+                            view, request.epoch, request.source, request.request_id
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                batch.put(
+                    &rockstream_storage::ShardKeyEncoder::meta_key(b"distributed-source-pending"),
+                    pending.as_bytes(),
+                );
+            }
             *self.pending_view_recovery.lock() = views.clone();
             for view in &views {
                 if let Err(error) = self
@@ -12949,16 +13015,18 @@ impl GatewayHandler {
         // serving shard from a raw DML store into a live view serving layer.
         {
             if let Some(data_plane) = &self.distributed_data_plane {
-                for (view_name, request, assertion) in distributed_deltas {
+                for (view_name, request, assertion) in &distributed_deltas {
                     let response = match assertion {
                         Some(assertion) => {
-                            data_plane.submit_delta_delegated(request, &assertion).await
+                            data_plane
+                                .submit_delta_delegated(request.clone(), assertion)
+                                .await
                         }
-                        None => data_plane.submit_delta(request).await,
+                        None => data_plane.submit_delta(request.clone()).await,
                     };
                     response.map_err(|error| {
                         PgWireError::ApiError(Box::new(GatewayError::QueryTimeExecutionFailed {
-                            detail: format!("distributed view refresh {view_name}: {error}"),
+                            detail: format!("distributed view refresh {view_name}: {error}; preserve source input and shard storage and contact the operator before retrying"),
                         }))
                     })?;
                 }
@@ -12971,6 +13039,14 @@ impl GatewayHandler {
             shard_db.flush().await.map_err(|e| {
                 PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
             })?;
+            if !distributed_deltas.is_empty() {
+                shard_db
+                    .delete(&rockstream_storage::ShardKeyEncoder::meta_key(
+                        b"distributed-source-pending",
+                    ))
+                    .await
+                    .map_err(|e| PgWireError::ApiError(Box::new(GatewayError::Storage(e))))?;
+            }
             self.frontier_published_at_ms
                 .store(current_time_ms(), Ordering::SeqCst);
             self.pending_view_recovery.lock().clear();

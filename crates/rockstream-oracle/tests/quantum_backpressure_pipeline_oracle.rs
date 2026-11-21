@@ -510,6 +510,24 @@ async fn durable_fallback_after_fast_path_failure_incremental_equals_batch() {
         accumulate_full_rows(&agg_out, &mut incremental_agg);
     }
 
+    let committed_output = serde_json::to_vec(&incremental_agg.iter().collect::<Vec<_>>()).unwrap();
+    let mut batch = rockstream_storage::WriteBatch::new();
+    batch.put(b"oracle-aggregate-output", &committed_output);
+    batch.put(
+        &rockstream_storage::keys::ShardKeyEncoder::frontier_key(),
+        &sent_epochs.last().unwrap().to_be_bytes(),
+    );
+    target_db.write_batch(batch).await.unwrap();
+    assert_eq!(
+        target_db
+            .get(b"oracle-aggregate-output")
+            .await
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        committed_output.as_slice()
+    );
+
     // A repeat catch-up must not re-deliver (idempotent durable replay).
     for &epoch in &sent_epochs {
         multiplexer

@@ -170,6 +170,7 @@ struct DataPlaneState {
     deployments: HashMap<WorkloadId, DeploymentState>,
     source_waiters: HashMap<String, SourceWaiter>,
     operator_stats_waiters: HashMap<String, OperatorStatsWaiter>,
+    owned_shuffle_workers: HashSet<WorkerId>,
 }
 
 #[derive(Clone)]
@@ -185,6 +186,8 @@ struct DeploymentState {
     workers: HashMap<WorkerId, WorkerExecutionStatus>,
     ready_shards: HashSet<ShardId>,
     ready_waiter: Option<mpsc::Sender<ControlMessage>>,
+    // shortcut: recovery state is in memory; persist it before restart-safe admission.
+    recovery_required: bool,
 }
 
 struct AuthorizedWorkerSecret {
@@ -207,10 +210,75 @@ enum WorkerSecretAuthorizationError {
 }
 
 struct SourceWaiter {
+    attempt_id: Option<uuid::Uuid>,
     sender: mpsc::Sender<ControlMessage>,
-    expected: usize,
-    received: usize,
+    workload_id: WorkloadId,
+    version: u32,
+    source: String,
+    expected: HashSet<ShardId>,
+    received: HashSet<ShardId>,
+    dispatchers: HashMap<ShardId, WorkerId>,
+    owned_intent: Option<rockstream_types::data_plane::OwnedEpochIntent>,
+    prepare_reply: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    finish_reply: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    finishing: bool,
     epoch: u64,
+}
+
+enum SourceCompletion {
+    Immediate(mpsc::Sender<ControlMessage>, String, u64),
+    Owned(
+        WorkerId,
+        rockstream_types::data_plane::OwnedEpochIntent,
+        tokio::sync::oneshot::Receiver<Result<(), String>>,
+    ),
+    MissingAnchor(String, WorkloadId),
+}
+
+impl SourceWaiter {
+    fn record_progress(
+        &mut self,
+        output: &rockstream_types::data_plane::RuntimeOutputDelta,
+    ) -> bool {
+        if self.attempt_id != output.attempt_id
+            || self.workload_id != output.workload_id
+            || self.epoch != output.epoch
+            || self.version != output.version
+            || self.source != output.source
+            || !self.expected.contains(&output.shard_id)
+            || !self.received.insert(output.shard_id)
+        {
+            return false;
+        }
+        self.received == self.expected
+    }
+}
+
+fn take_owned_epoch_reply(
+    state: &mut DataPlaneState,
+    connected_worker: Option<WorkerId>,
+    worker_id: WorkerId,
+    intent: &rockstream_types::data_plane::OwnedEpochIntent,
+    finishing: bool,
+) -> Option<tokio::sync::oneshot::Sender<Result<(), String>>> {
+    if connected_worker != Some(worker_id)
+        || state
+            .deployments
+            .get(&intent.workload_id)
+            .and_then(|deployment| deployment.descriptors.get(&intent.anchor_shard))
+            .is_none_or(|descriptor| descriptor.shard.worker_id != worker_id)
+    {
+        return None;
+    }
+    let waiter = state.source_waiters.get_mut(&intent.request_id)?;
+    if waiter.owned_intent.as_ref() != Some(intent) || waiter.finishing != finishing {
+        return None;
+    }
+    if finishing {
+        waiter.finish_reply.take()
+    } else {
+        waiter.prepare_reply.take()
+    }
 }
 
 struct OperatorStatsWaiter {
@@ -2175,6 +2243,18 @@ fn data_plane_failure(message: impl Into<String>) -> ControlMessage {
     }
 }
 
+fn workload_recovery_failure() -> ControlMessage {
+    workload_failure("workload requires recovery after failed execution")
+}
+
+fn workload_failure(message: impl Into<String>) -> ControlMessage {
+    ControlMessage::OperationFailed {
+        code: rockstream_types::error_code::RS_0001.to_string(),
+        message: message.into(),
+        next_steps: "Preserve the source input and shard storage; automatic recovery is unavailable. Contact the operator before retrying.".to_owned(),
+    }
+}
+
 #[allow(dead_code)]
 fn stable_route(value: &str, shard_count: usize) -> usize {
     let hash = value
@@ -2243,6 +2323,30 @@ async fn deploy_workload(
         return;
     }
 
+    let mut state = data_plane.lock().await;
+    let admission_failure = if state
+        .deployments
+        .get(&request.workload_id)
+        .is_some_and(|deployment| deployment.recovery_required)
+    {
+        Some(workload_recovery_failure())
+    } else if state
+        .source_waiters
+        .values()
+        .any(|waiter| waiter.workload_id == request.workload_id)
+    {
+        Some(data_plane_failure(
+            "another source delta is already in flight for this workload",
+        ))
+    } else {
+        None
+    };
+    if let Some(failure) = admission_failure {
+        drop(state);
+        send_message(sender, &failure).await;
+        return;
+    }
+
     let mut descriptors = HashMap::new();
     let workload_id = request.workload_id;
     for (index, worker_id) in workers.into_iter().enumerate() {
@@ -2264,14 +2368,8 @@ async fn deploy_workload(
         );
     }
 
-    broadcast_message(
-        worker_senders,
-        topology_changed_message(catalog, shard_manager),
-    )
-    .await;
-
-    data_plane.lock().await.deployments.insert(
-        workload_id,
+    state.deployments.insert(
+        request.workload_id,
         DeploymentState {
             request,
             actor,
@@ -2279,8 +2377,15 @@ async fn deploy_workload(
             workers: HashMap::new(),
             ready_shards: HashSet::new(),
             ready_waiter: Some(sender.clone()),
+            recovery_required: false,
         },
     );
+    drop(state);
+    broadcast_message(
+        worker_senders,
+        topology_changed_message(catalog, shard_manager),
+    )
+    .await;
     let assigned_workers: HashSet<_> = descriptors
         .values()
         .map(|descriptor| descriptor.shard.worker_id)
@@ -2376,6 +2481,7 @@ fn route_source_delta(
             (
                 descriptor.shard.worker_id,
                 RuntimeExchangeMessage {
+                    attempt_id: None,
                     version: request.version,
                     request_id: request.request_id.clone(),
                     workload_id: request.workload_id,
@@ -2391,12 +2497,150 @@ fn route_source_delta(
         .collect())
 }
 
+async fn fail_source_request(
+    data_plane: &Arc<AsyncMutex<DataPlaneState>>,
+    request_id: &str,
+    workload_id: WorkloadId,
+    message: impl Into<String>,
+) {
+    let waiter = {
+        let mut state = data_plane.lock().await;
+        let waiter = state.source_waiters.remove(request_id);
+        if waiter.is_some() {
+            if let Some(deployment) = state.deployments.get_mut(&workload_id) {
+                deployment.recovery_required = true;
+            }
+        }
+        waiter
+    };
+    if let Some(waiter) = waiter {
+        send_message(&waiter.sender, &workload_failure(message)).await;
+    }
+}
+
+async fn finish_owned_source(
+    data_plane: Arc<AsyncMutex<DataPlaneState>>,
+    worker_senders: Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
+    anchor_worker: WorkerId,
+    intent: rockstream_types::data_plane::OwnedEpochIntent,
+    reply: tokio::sync::oneshot::Receiver<Result<(), String>>,
+) {
+    let sender = worker_senders.lock().await.get(&anchor_worker).cloned();
+    let permit = match &sender {
+        Some(sender) => sender.reserve().await.ok(),
+        None => None,
+    };
+    let Some(permit) = permit else {
+        fail_source_request(
+            &data_plane,
+            &intent.request_id,
+            intent.workload_id,
+            "owned epoch anchor disconnected before completion",
+        )
+        .await;
+        return;
+    };
+    {
+        let state = data_plane.lock().await;
+        let valid = state
+            .source_waiters
+            .get(&intent.request_id)
+            .is_some_and(|waiter| {
+                waiter.finishing && waiter.owned_intent.as_ref() == Some(&intent)
+            });
+        if !valid {
+            return;
+        }
+        permit.send(ControlMessage::FinishOwnedEpoch {
+            intent: intent.clone(),
+        });
+    }
+    match tokio::time::timeout(Duration::from_secs(60), reply).await {
+        Ok(Ok(Ok(()))) => {
+            let waiter = {
+                let mut state = data_plane.lock().await;
+                if state
+                    .source_waiters
+                    .get(&intent.request_id)
+                    .is_some_and(|waiter| {
+                        waiter.finishing && waiter.owned_intent.as_ref() == Some(&intent)
+                    })
+                {
+                    state.source_waiters.remove(&intent.request_id)
+                } else {
+                    None
+                }
+            };
+            if let Some(waiter) = waiter {
+                send_message(
+                    &waiter.sender,
+                    &ControlMessage::SourceDeltaCommitted {
+                        request_id: intent.request_id,
+                        epoch: intent.epoch,
+                    },
+                )
+                .await;
+            }
+        }
+        Ok(Ok(Err(error))) => {
+            fail_source_request(
+                &data_plane,
+                &intent.request_id,
+                intent.workload_id,
+                format!("owned epoch completion failed: {error}"),
+            )
+            .await;
+        }
+        Ok(Err(_)) | Err(_) => {
+            fail_source_request(
+                &data_plane,
+                &intent.request_id,
+                intent.workload_id,
+                "owned epoch completion did not finish",
+            )
+            .await;
+        }
+    }
+}
+
 async fn submit_source_delta(
     request: SourceDeltaRequest,
     sender: &mpsc::Sender<ControlMessage>,
+    catalog: &TopologyCatalog,
     worker_senders: &Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
     data_plane: &Arc<AsyncMutex<DataPlaneState>>,
 ) {
+    let early_failure = {
+        let state = data_plane.lock().await;
+        if state
+            .deployments
+            .get(&request.workload_id)
+            .is_some_and(|deployment| deployment.recovery_required)
+        {
+            Some(workload_recovery_failure())
+        } else if state
+            .deployments
+            .get(&request.workload_id)
+            .is_some_and(|deployment| deployment.ready_waiter.is_some())
+        {
+            Some(data_plane_failure("workload deployment is not ready"))
+        } else if request.rows.is_empty()
+            && state
+                .source_waiters
+                .values()
+                .any(|waiter| waiter.workload_id == request.workload_id)
+        {
+            Some(data_plane_failure(
+                "another source delta is already in flight for this workload",
+            ))
+        } else {
+            None
+        }
+    };
+    if let Some(failure) = early_failure {
+        send_message(sender, &failure).await;
+        return;
+    }
     if request.rows.is_empty() {
         send_message(
             sender,
@@ -2420,7 +2664,7 @@ async fn submit_source_delta(
             None => Err(format!("{}: workload is not deployed", RS_0001)),
         }
     };
-    let routed = match routed {
+    let mut routed = match routed {
         Ok(routed) => routed,
         Err(error) => {
             send_message(sender, &data_plane_failure(error)).await;
@@ -2441,63 +2685,244 @@ async fn submit_source_delta(
         return;
     }
 
-    let duplicate_request = {
+    let mut preparation = None;
+    let admission_failure = {
         let mut state = data_plane.lock().await;
-        if state.source_waiters.contains_key(&request.request_id) {
-            true
+        if state
+            .deployments
+            .get(&request.workload_id)
+            .is_some_and(|deployment| deployment.recovery_required)
+        {
+            Some(workload_recovery_failure())
+        } else if state
+            .deployments
+            .get(&request.workload_id)
+            .is_some_and(|deployment| deployment.ready_waiter.is_some())
+        {
+            Some(data_plane_failure("workload deployment is not ready"))
+        } else if state.source_waiters.contains_key(&request.request_id) {
+            Some(data_plane_failure(
+                "source delta request id is already in flight",
+            ))
+        } else if state
+            .source_waiters
+            .values()
+            .any(|waiter| waiter.workload_id == request.workload_id)
+        {
+            Some(data_plane_failure(
+                "another source delta is already in flight for this workload",
+            ))
+        } else if !state
+            .deployments
+            .get(&request.workload_id)
+            .is_some_and(|deployment| {
+                routed.iter().all(|(worker_id, frame)| {
+                    deployment
+                        .descriptors
+                        .get(&frame.shard_id)
+                        .is_some_and(|descriptor| {
+                            descriptor.shard.worker_id == *worker_id
+                                && descriptor.sink_operator_id == frame.operator_id
+                                && frame.lease_token == descriptor.shard.lease_token
+                        })
+                })
+            })
+        {
+            Some(data_plane_failure(
+                "workload deployment changed while routing the source delta",
+            ))
         } else {
+            let mut candidates: Vec<_> = state.deployments[&request.workload_id]
+                .descriptors
+                .values()
+                .map(|descriptor| descriptor.shard.worker_id)
+                .collect();
+            candidates.sort();
+            candidates.dedup();
+            let mut dispatchers: HashMap<_, _> = routed
+                .iter()
+                .filter_map(|(target, frame)| {
+                    if !state.owned_shuffle_workers.contains(target) {
+                        return None;
+                    }
+                    let target_info = catalog.get(*target)?;
+                    let source = candidates
+                        .iter()
+                        .copied()
+                        .find(|candidate| {
+                            if candidate == target
+                                || !state.owned_shuffle_workers.contains(candidate)
+                                || !senders.contains_key(candidate)
+                            {
+                                return false;
+                            }
+                            catalog.get(*candidate).is_some_and(|source_info| {
+                                let same_zone =
+                                    source_info.location.has_same_az_as(&target_info.location);
+                                let reachable =
+                                    source_info.location.has_same_host_as(&target_info.location)
+                                        || target_info
+                                            .address
+                                            .parse::<std::net::SocketAddr>()
+                                            .is_ok_and(|addr| !addr.ip().is_loopback());
+                                same_zone && reachable
+                            })
+                        })
+                        .unwrap_or(*target);
+                    Some((frame.shard_id, source))
+                })
+                .collect();
+            if dispatchers.len() != routed.len() {
+                dispatchers.clear();
+            }
+            let attempt_id = (!dispatchers.is_empty()).then(uuid::Uuid::new_v4);
+            for (_, frame) in &mut routed {
+                frame.attempt_id = attempt_id;
+            }
+            let mut target_shards: Vec<_> =
+                routed.iter().map(|(_, frame)| frame.shard_id).collect();
+            target_shards.sort();
+            target_shards.dedup();
+            let owned_intent = dispatchers.keys().min().copied().map(|anchor_shard| {
+                rockstream_types::data_plane::OwnedEpochIntent {
+                    attempt_id: attempt_id.expect("owned dispatch has an attempt"),
+                    version: request.version,
+                    request_id: request.request_id.clone(),
+                    workload_id: request.workload_id,
+                    epoch: request.epoch,
+                    source: request.source.clone(),
+                    anchor_shard,
+                    target_shards,
+                }
+            });
+            let prepare_reply = owned_intent.as_ref().map(|intent| {
+                let (reply, receiver) = tokio::sync::oneshot::channel();
+                let anchor_worker = state.deployments[&request.workload_id].descriptors
+                    [&intent.anchor_shard]
+                    .shard
+                    .worker_id;
+                preparation = Some((anchor_worker, intent.clone(), receiver));
+                reply
+            });
             state.source_waiters.insert(
                 request.request_id.clone(),
                 SourceWaiter {
+                    attempt_id,
                     sender: sender.clone(),
-                    expected: routed.len(),
-                    received: 0,
+                    workload_id: request.workload_id,
+                    version: request.version,
+                    source: request.source.clone(),
+                    expected: routed.iter().map(|(_, frame)| frame.shard_id).collect(),
+                    received: HashSet::new(),
+                    dispatchers,
+                    owned_intent,
+                    prepare_reply,
+                    finish_reply: None,
+                    finishing: false,
                     epoch: request.epoch,
                 },
             );
-            false
+            None
         }
     };
-    if duplicate_request {
-        send_message(
-            sender,
-            &data_plane_failure("source delta request id is already in flight"),
-        )
-        .await;
+    if let Some(failure) = admission_failure {
+        send_message(sender, &failure).await;
         return;
     }
 
-    for (worker_id, frame) in routed {
-        let Some(target) = senders.get(&worker_id) else {
-            data_plane
-                .lock()
-                .await
-                .source_waiters
-                .remove(&request.request_id);
-            send_message(
-                sender,
-                &data_plane_failure("routed shard owner disconnected before ingest"),
+    if let Some((anchor_worker, intent, reply)) = preparation {
+        let permit = match senders.get(&anchor_worker) {
+            Some(anchor) => anchor.reserve().await.ok(),
+            None => None,
+        };
+        let Some(permit) = permit else {
+            fail_source_request(
+                data_plane,
+                &request.request_id,
+                request.workload_id,
+                "owned epoch anchor disconnected before preparation",
             )
             .await;
             return;
         };
-        if target
-            .send(ControlMessage::Execute { frame })
-            .await
-            .is_err()
         {
-            data_plane
-                .lock()
-                .await
-                .source_waiters
-                .remove(&request.request_id);
-            send_message(
-                sender,
-                &data_plane_failure("routed shard owner disconnected before ingest"),
-            )
-            .await;
+            let state = data_plane.lock().await;
+            if !state.source_waiters.contains_key(&request.request_id) {
+                return;
+            }
+            permit.send(ControlMessage::PrepareOwnedEpoch { intent });
+        }
+        match tokio::time::timeout(Duration::from_secs(60), reply).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => {
+                fail_source_request(
+                    data_plane,
+                    &request.request_id,
+                    request.workload_id,
+                    format!("owned epoch preparation failed: {error}"),
+                )
+                .await;
+                return;
+            }
+            Ok(Err(_)) | Err(_) => {
+                fail_source_request(
+                    data_plane,
+                    &request.request_id,
+                    request.workload_id,
+                    "owned epoch preparation did not complete",
+                )
+                .await;
+                return;
+            }
+        }
+    }
+
+    for (target_worker, frame) in routed {
+        let dispatcher = {
+            let state = data_plane.lock().await;
+            let Some(waiter) = state.source_waiters.get(&request.request_id) else {
+                return;
+            };
+            waiter.dispatchers.get(&frame.shard_id).copied()
+        };
+        let target_info = dispatcher.and_then(|_| catalog.get(target_worker));
+        let destination = dispatcher.unwrap_or(target_worker);
+        let permit = match (
+            senders.get(&destination),
+            dispatcher.is_some() && target_info.is_none(),
+        ) {
+            (Some(target), false) => target.reserve().await.ok(),
+            _ => None,
+        };
+        let Some(permit) = permit else {
+            let removed = {
+                let mut state = data_plane.lock().await;
+                let removed = state.source_waiters.remove(&request.request_id).is_some();
+                if removed {
+                    if let Some(deployment) = state.deployments.get_mut(&request.workload_id) {
+                        deployment.recovery_required = true;
+                    }
+                }
+                removed
+            };
+            if removed {
+                send_message(
+                    sender,
+                    &workload_failure("routed shard owner disconnected before ingest"),
+                )
+                .await;
+            }
+            return;
+        };
+        let state = data_plane.lock().await;
+        if !state.source_waiters.contains_key(&request.request_id) {
             return;
         }
+        let message = match target_info {
+            Some(target) => ControlMessage::DispatchOwnedShuffle { target, frame },
+            None => ControlMessage::Execute { frame },
+        };
+        permit.send(message);
     }
 }
 
@@ -4344,6 +4769,65 @@ async fn handle_connection_stream<R, W>(
                     .await;
                 }
             }
+            WorkerMessage::OwnedShuffleReady { worker_id } => {
+                if connected_worker_id == Some(worker_id) {
+                    data_plane
+                        .lock()
+                        .await
+                        .owned_shuffle_workers
+                        .insert(worker_id);
+                }
+            }
+            WorkerMessage::OwnedEpochRecoveryRequired {
+                worker_id,
+                workload_id,
+                shard_id,
+            } => {
+                if connected_worker_id == Some(worker_id) {
+                    let mut state = data_plane.lock().await;
+                    if let Some(deployment) = state.deployments.get_mut(&workload_id) {
+                        if deployment
+                            .descriptors
+                            .get(&shard_id)
+                            .is_some_and(|descriptor| descriptor.shard.worker_id == worker_id)
+                        {
+                            deployment.recovery_required = true;
+                        }
+                    }
+                }
+            }
+            WorkerMessage::OwnedEpochPrepared {
+                worker_id,
+                intent,
+                error,
+            } => {
+                let reply = take_owned_epoch_reply(
+                    &mut *data_plane.lock().await,
+                    connected_worker_id,
+                    worker_id,
+                    &intent,
+                    false,
+                );
+                if let Some(reply) = reply {
+                    let _ = reply.send(error.map_or(Ok(()), Err));
+                }
+            }
+            WorkerMessage::OwnedEpochFinished {
+                worker_id,
+                intent,
+                error,
+            } => {
+                let reply = take_owned_epoch_reply(
+                    &mut *data_plane.lock().await,
+                    connected_worker_id,
+                    worker_id,
+                    &intent,
+                    true,
+                );
+                if let Some(reply) = reply {
+                    let _ = reply.send(error.map_or(Ok(()), Err));
+                }
+            }
             WorkerMessage::ReportSecurityAudit { request_id, record } => {
                 let authenticated_reporter = peer_identity.as_ref().is_some_and(|identity| {
                     connected_worker_id.is_some_and(|worker_id| {
@@ -4432,15 +4916,15 @@ async fn handle_connection_stream<R, W>(
                                 let mut workers: Vec<_> =
                                     deployment.workers.values().cloned().collect();
                                 workers.sort_by_key(|status| status.worker_id);
-                                deployment.ready_waiter.take().map(|waiter| {
-                                    (
-                                        waiter,
-                                        ControlMessage::DeploymentReady {
-                                            workload_id,
-                                            workers,
-                                        },
-                                    )
-                                })
+                                let reply = if deployment.recovery_required {
+                                    workload_recovery_failure()
+                                } else {
+                                    ControlMessage::DeploymentReady {
+                                        workload_id,
+                                        workers,
+                                    }
+                                };
+                                deployment.ready_waiter.take().map(|waiter| (waiter, reply))
                             } else {
                                 None
                             }
@@ -4451,8 +4935,144 @@ async fn handle_connection_stream<R, W>(
                 }
             }
             WorkerMessage::SubmitSourceDelta(request) => {
-                submit_source_delta(request, &sender, &worker_senders, &data_plane).await;
+                if connected_worker_id.is_some() {
+                    let sender = sender.clone();
+                    let catalog = catalog.clone();
+                    let worker_senders = worker_senders.clone();
+                    let data_plane = data_plane.clone();
+                    tokio::spawn(async move {
+                        submit_source_delta(
+                            request,
+                            &sender,
+                            &catalog,
+                            &worker_senders,
+                            &data_plane,
+                        )
+                        .await;
+                    });
+                } else {
+                    submit_source_delta(request, &sender, &catalog, &worker_senders, &data_plane)
+                        .await;
+                }
             }
+            WorkerMessage::ShuffleDispatchFailed { output, message } => {
+                let waiter = {
+                    let mut state = data_plane.lock().await;
+                    let valid_target = state
+                        .deployments
+                        .get(&output.workload_id)
+                        .and_then(|deployment| deployment.descriptors.get(&output.shard_id))
+                        .is_some_and(|descriptor| {
+                            descriptor.sink_operator_id == output.operator_id
+                                && descriptor.shard.lease_token == output.lease_token
+                        });
+                    let valid_request =
+                        state
+                            .source_waiters
+                            .get(&output.request_id)
+                            .is_some_and(|waiter| {
+                                waiter.attempt_id == output.attempt_id
+                                    && waiter.workload_id == output.workload_id
+                                    && waiter.version == output.version
+                                    && waiter.epoch == output.epoch
+                                    && waiter.source == output.source
+                                    && waiter.expected.contains(&output.shard_id)
+                                    && !waiter.received.contains(&output.shard_id)
+                                    && connected_worker_id.is_some_and(|worker| {
+                                        waiter.dispatchers.get(&output.shard_id) == Some(&worker)
+                                    })
+                            });
+                    if valid_target && valid_request && output.rows.is_empty() {
+                        if let Some(deployment) = state.deployments.get_mut(&output.workload_id) {
+                            deployment.recovery_required = true;
+                        }
+                        state.source_waiters.remove(&output.request_id)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(waiter) = waiter {
+                    send_message(
+                        &waiter.sender,
+                        &workload_failure(format!("shuffle dispatch failed: {message}")),
+                    )
+                    .await;
+                }
+            }
+            WorkerMessage::ExecutionFailed { output, message } => {
+                let assigned_worker = data_plane
+                    .lock()
+                    .await
+                    .deployments
+                    .get(&output.workload_id)
+                    .and_then(|deployment| deployment.descriptors.get(&output.shard_id))
+                    .map(|descriptor| descriptor.shard.worker_id);
+                if let (Some(identity), Some(assigned_worker)) = (&peer_identity, assigned_worker) {
+                    if identity.role != NodeRole::Worker
+                        || connected_worker_id != Some(assigned_worker)
+                        || !identity.matches_worker_id(assigned_worker.0)
+                    {
+                        let registered_id = connected_worker_id
+                            .map(|worker_id| worker_id.to_string())
+                            .unwrap_or_else(|| "unknown".to_owned());
+                        if !deny_authenticated_worker_action(
+                            &sender,
+                            audit.as_ref(),
+                            identity,
+                            format!("{}/{}", output.workload_id, output.shard_id),
+                            format!(
+                                "operation=execution_progress, registered_worker_id={registered_id}, assigned_worker_id={assigned_worker}, error_code={RS_2401}"
+                            ),
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        continue;
+                    }
+                }
+                let waiter = {
+                    let mut state = data_plane.lock().await;
+                    let valid_owner = state
+                        .deployments
+                        .get(&output.workload_id)
+                        .and_then(|deployment| deployment.descriptors.get(&output.shard_id))
+                        .is_some_and(|descriptor| {
+                            connected_worker_id == Some(descriptor.shard.worker_id)
+                                && descriptor.shard.lease_token == output.lease_token
+                                && descriptor.sink_operator_id == output.operator_id
+                        });
+                    let valid_request =
+                        state
+                            .source_waiters
+                            .get(&output.request_id)
+                            .is_some_and(|waiter| {
+                                waiter.attempt_id == output.attempt_id
+                                    && waiter.workload_id == output.workload_id
+                                    && waiter.version == output.version
+                                    && waiter.epoch == output.epoch
+                                    && waiter.source == output.source
+                                    && waiter.expected.contains(&output.shard_id)
+                                    && !waiter.received.contains(&output.shard_id)
+                            });
+                    if valid_owner && valid_request && output.rows.is_empty() {
+                        if let Some(deployment) = state.deployments.get_mut(&output.workload_id) {
+                            deployment.recovery_required = true;
+                        }
+                        state.source_waiters.remove(&output.request_id)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(waiter) = waiter {
+                    send_message(
+                        &waiter.sender,
+                        &workload_failure(format!("worker execution failed: {message}")),
+                    )
+                    .await;
+                }
+            }
+
             WorkerMessage::ExecutionProgress {
                 output,
                 input_rows,
@@ -4511,31 +5131,82 @@ async fn handle_connection_stream<R, W>(
                 let completion = {
                     let mut state = data_plane.lock().await;
                     let deployment = state.deployments.get_mut(&output.workload_id).unwrap();
+                    if deployment.recovery_required {
+                        continue;
+                    }
                     let worker_id = deployment.descriptors[&output.shard_id].shard.worker_id;
                     if let Some(status) = deployment.workers.get_mut(&worker_id) {
                         status.input_rows += input_rows;
                         status.output_rows += output_rows;
                         status.frontier = status.frontier.max(output.epoch);
                     }
-                    let waiter = state.source_waiters.get_mut(&output.request_id);
-                    waiter.and_then(|waiter| {
-                        waiter.received += 1;
-                        (waiter.received == waiter.expected).then(|| {
-                            (
-                                waiter.sender.clone(),
+                    let completed = state
+                        .source_waiters
+                        .get_mut(&output.request_id)
+                        .is_some_and(|waiter| waiter.record_progress(&output));
+                    if !completed {
+                        None
+                    } else if let Some(intent) = state.source_waiters[&output.request_id]
+                        .owned_intent
+                        .clone()
+                    {
+                        let anchor = state
+                            .deployments
+                            .get(&intent.workload_id)
+                            .and_then(|deployment| deployment.descriptors.get(&intent.anchor_shard))
+                            .map(|descriptor| descriptor.shard.worker_id);
+                        if let Some(anchor) = anchor {
+                            let (sender, receiver) = tokio::sync::oneshot::channel();
+                            let waiter = state.source_waiters.get_mut(&output.request_id).unwrap();
+                            waiter.finishing = true;
+                            waiter.finish_reply = Some(sender);
+                            Some(SourceCompletion::Owned(anchor, intent, receiver))
+                        } else {
+                            Some(SourceCompletion::MissingAnchor(
                                 output.request_id.clone(),
-                                waiter.epoch,
-                            )
-                        })
-                    })
+                                output.workload_id,
+                            ))
+                        }
+                    } else {
+                        state
+                            .source_waiters
+                            .remove(&output.request_id)
+                            .map(|waiter| {
+                                SourceCompletion::Immediate(
+                                    waiter.sender,
+                                    output.request_id.clone(),
+                                    waiter.epoch,
+                                )
+                            })
+                    }
                 };
-                if let Some((waiter, request_id, epoch)) = completion {
-                    data_plane.lock().await.source_waiters.remove(&request_id);
-                    send_message(
-                        &waiter,
-                        &ControlMessage::SourceDeltaCommitted { request_id, epoch },
-                    )
-                    .await;
+                match completion {
+                    Some(SourceCompletion::Immediate(waiter, request_id, epoch)) => {
+                        send_message(
+                            &waiter,
+                            &ControlMessage::SourceDeltaCommitted { request_id, epoch },
+                        )
+                        .await;
+                    }
+                    Some(SourceCompletion::Owned(anchor, intent, reply)) => {
+                        tokio::spawn(finish_owned_source(
+                            data_plane.clone(),
+                            worker_senders.clone(),
+                            anchor,
+                            intent,
+                            reply,
+                        ));
+                    }
+                    Some(SourceCompletion::MissingAnchor(request_id, workload_id)) => {
+                        fail_source_request(
+                            &data_plane,
+                            &request_id,
+                            workload_id,
+                            "owned epoch anchor is unavailable",
+                        )
+                        .await;
+                    }
+                    None => {}
                 }
             }
             WorkerMessage::OperatorStatsReport {
@@ -4591,30 +5262,45 @@ async fn handle_connection_stream<R, W>(
                 send_message(&sender, &reply).await;
             }
             WorkerMessage::ReadWorkload { workload_id } => {
-                let snapshot = {
+                let reply = {
                     let state = data_plane.lock().await;
-                    state.deployments.get(&workload_id).map(|deployment| {
-                        let mut shards: Vec<_> = deployment
-                            .descriptors
-                            .keys()
-                            .map(|shard_id| ShardOutput {
-                                shard_id: *shard_id,
-                                deltas: Vec::new(),
-                            })
-                            .collect();
-                        shards.sort_by_key(|shard| shard.shard_id);
-                        let mut workers: Vec<_> = deployment.workers.values().cloned().collect();
-                        workers.sort_by_key(|status| status.worker_id);
-                        WorkloadSnapshot {
-                            deployment: deployment.request.clone(),
-                            shards,
-                            workers,
+                    match state.deployments.get(&workload_id) {
+                        Some(deployment) if deployment.recovery_required => {
+                            workload_recovery_failure()
                         }
-                    })
+                        Some(deployment)
+                            if deployment.ready_waiter.is_some()
+                                || state
+                                    .source_waiters
+                                    .values()
+                                    .any(|waiter| waiter.workload_id == workload_id) =>
+                        {
+                            data_plane_failure("workload has an incomplete execution")
+                        }
+                        Some(deployment) => {
+                            let mut shards: Vec<_> = deployment
+                                .descriptors
+                                .keys()
+                                .map(|shard_id| ShardOutput {
+                                    shard_id: *shard_id,
+                                    deltas: Vec::new(),
+                                })
+                                .collect();
+                            shards.sort_by_key(|shard| shard.shard_id);
+                            let mut workers: Vec<_> =
+                                deployment.workers.values().cloned().collect();
+                            workers.sort_by_key(|status| status.worker_id);
+                            ControlMessage::WorkloadSnapshot {
+                                snapshot: WorkloadSnapshot {
+                                    deployment: deployment.request.clone(),
+                                    shards,
+                                    workers,
+                                },
+                            }
+                        }
+                        None => data_plane_failure("workload is not deployed"),
+                    }
                 };
-                let reply = snapshot
-                    .map(|snapshot| ControlMessage::WorkloadSnapshot { snapshot })
-                    .unwrap_or_else(|| data_plane_failure("workload is not deployed"));
                 send_message(&sender, &reply).await;
             }
             WorkerMessage::Heartbeat {
@@ -5526,6 +6212,48 @@ async fn handle_connection_stream<R, W>(
             ));
         }
         worker_senders.lock().await.remove(&worker_id);
+        let interrupted = {
+            let mut state = data_plane.lock().await;
+            state.owned_shuffle_workers.remove(&worker_id);
+            let requests: Vec<_> = state
+                .source_waiters
+                .iter()
+                .filter(|(_, waiter)| {
+                    waiter
+                        .dispatchers
+                        .values()
+                        .any(|source| *source == worker_id)
+                        || state
+                            .deployments
+                            .get(&waiter.workload_id)
+                            .is_some_and(|deployment| {
+                                waiter.expected.iter().any(|shard| {
+                                    deployment.descriptors.get(shard).is_some_and(|descriptor| {
+                                        descriptor.shard.worker_id == worker_id
+                                    })
+                                })
+                            })
+                })
+                .map(|(request_id, _)| request_id.clone())
+                .collect();
+            let mut interrupted = Vec::new();
+            for request_id in requests {
+                if let Some(waiter) = state.source_waiters.remove(&request_id) {
+                    if let Some(deployment) = state.deployments.get_mut(&waiter.workload_id) {
+                        deployment.recovery_required = true;
+                    }
+                    interrupted.push(waiter.sender);
+                }
+            }
+            interrupted
+        };
+        for recipient in interrupted {
+            send_message(
+                &recipient,
+                &workload_failure("worker disconnected before source delta completed"),
+            )
+            .await;
+        }
         let scheduler = ShardScheduler::new(catalog.clone(), shard_manager.clone());
         catalog.deregister(worker_id);
         let assignments = scheduler.on_worker_dead(worker_id).unwrap_or_default();
@@ -5632,6 +6360,61 @@ mod tests {
     };
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpStream;
+
+    #[test]
+    fn source_waiter_completes_only_after_each_expected_shard_reports() {
+        use rockstream_types::data_plane::RuntimeOutputDelta;
+        use rockstream_types::ids::OperatorId;
+
+        let (sender, _receiver) = mpsc::channel(1);
+        let mut waiter = SourceWaiter {
+            attempt_id: None,
+            sender,
+            workload_id: WorkloadId(7),
+            version: 1,
+            source: "input".to_owned(),
+            expected: HashSet::from([ShardId(1), ShardId(2)]),
+            received: HashSet::new(),
+            dispatchers: HashMap::new(),
+            owned_intent: None,
+            prepare_reply: None,
+            finish_reply: None,
+            finishing: false,
+            epoch: 9,
+        };
+        let mut output = RuntimeOutputDelta {
+            attempt_id: None,
+            version: 1,
+            request_id: "request".to_owned(),
+            workload_id: WorkloadId(7),
+            shard_id: ShardId(1),
+            epoch: 9,
+            operator_id: OperatorId(3),
+            lease_token: LeaseToken(4),
+            source: "input".to_owned(),
+            rows: Vec::new(),
+        };
+        let mut transcript = Vec::new();
+        output.workload_id = WorkloadId(8);
+        transcript.push(waiter.record_progress(&output));
+        output.workload_id = WorkloadId(7);
+        output.epoch = 10;
+        transcript.push(waiter.record_progress(&output));
+        output.epoch = 9;
+        output.shard_id = ShardId(3);
+        transcript.push(waiter.record_progress(&output));
+        output.shard_id = ShardId(1);
+        transcript.push(waiter.record_progress(&output));
+        transcript.push(waiter.record_progress(&output));
+        output.shard_id = ShardId(2);
+        transcript.push(waiter.record_progress(&output));
+        transcript.push(waiter.record_progress(&output));
+        assert_eq!(
+            transcript,
+            vec![false, false, false, false, false, true, false]
+        );
+        assert_eq!(waiter.received, HashSet::from([ShardId(1), ShardId(2)]));
+    }
 
     #[test]
     fn management_ack_waiters_reject_overflow_without_replacing_entries() {

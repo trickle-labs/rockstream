@@ -2,6 +2,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -27,6 +28,12 @@ use rockstream_types::ids::WorkerId;
 use rockstream_types::topology::WorkerMessage;
 
 pub type SecurityAuditWaiters = Arc<parking_lot::Mutex<HashMap<String, oneshot::Sender<bool>>>>;
+
+pub(crate) type OwnedShuffleHandler = Arc<
+    dyn Fn(ShuffleFrame, bytes::Bytes) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// Holds the input channel and Schema metadata for a local exchange target.
 #[derive(Clone)]
@@ -372,10 +379,16 @@ pub struct ExchangeService {
     internal_tls: Option<rockstream_types::identity::InternalTlsConfig>,
     tls_reloader: Option<Arc<rockstream_types::tls::TlsCertificateReloader>>,
     protocol_range: SupportedVersionRange,
+    owned_handler: Option<OwnedShuffleHandler>,
     insecure_internal_dev: bool,
 }
 
 impl ExchangeService {
+    pub(crate) fn with_owned_handler(mut self, handler: OwnedShuffleHandler) -> Self {
+        self.owned_handler = Some(handler);
+        self
+    }
+
     pub fn new(registry: ExchangeRegistry) -> Self {
         Self {
             registry,
@@ -385,6 +398,7 @@ impl ExchangeService {
             internal_tls: None,
             tls_reloader: None,
             protocol_range: SupportedVersionRange::v1_through_v3(),
+            owned_handler: None,
             insecure_internal_dev: false,
         }
     }
@@ -441,6 +455,17 @@ impl ExchangeService {
         &self,
         addr: std::net::SocketAddr,
     ) -> Result<tokio::task::JoinHandle<()>, String> {
+        let listener = tokio::net::TcpListener::bind(addr).await.map_err(|error| {
+            format!("{RS_0001}: failed to bind worker shuffle listener {addr}: {error}")
+        })?;
+        self.start_listener(listener).await
+    }
+
+    pub(crate) async fn start_listener(
+        &self,
+        listener: tokio::net::TcpListener,
+    ) -> Result<tokio::task::JoinHandle<()>, String> {
+        let addr = listener.local_addr().map_err(|error| error.to_string())?;
         let _ = rustls::crypto::ring::default_provider().install_default();
         let tls_reloader = if let Some(tls_cfg) = &self.internal_tls {
             if !tls_cfg.is_enabled() {
@@ -472,10 +497,7 @@ impl ExchangeService {
                 "{RS_2410}: plaintext worker shuffle requires explicit loopback development opt-in"
             ));
         }
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(|error| {
-            format!("{RS_0001}: failed to bind worker shuffle listener {addr}: {error}")
-        })?;
-        let server = ShuffleServer::new_with_tracker(
+        let mut server = ShuffleServer::new_with_tracker(
             self.registry.clone(),
             Some(self.task_tracker.clone()),
             Some(self.cancel_token.clone()),
@@ -483,6 +505,7 @@ impl ExchangeService {
         .with_exchange_config(self.exchange_config.clone())
         .with_supported_protocol_range(self.protocol_range)
         .with_required_worker_identity(tls_reloader.is_some());
+        server.owned_handler = self.owned_handler.clone();
         let cancel_token = self.cancel_token.clone();
         let task_tracker = self.task_tracker.clone();
 
@@ -600,6 +623,7 @@ pub struct ShuffleServer {
     exchange_config: ExchangeConfig,
     protocol_range: SupportedVersionRange,
     require_worker_identity: bool,
+    owned_handler: Option<OwnedShuffleHandler>,
 }
 
 impl ShuffleServer {
@@ -611,6 +635,7 @@ impl ShuffleServer {
             exchange_config: ExchangeConfig::default(),
             protocol_range: SupportedVersionRange::v1_through_v3(),
             require_worker_identity: false,
+            owned_handler: None,
         }
     }
 
@@ -626,6 +651,7 @@ impl ShuffleServer {
             exchange_config: ExchangeConfig::default(),
             protocol_range: SupportedVersionRange::v1_through_v3(),
             require_worker_identity: false,
+            owned_handler: None,
         }
     }
 
@@ -769,6 +795,79 @@ impl ShuffleService for ShuffleServer {
             }
         };
         self.validate_protocol_version(request.metadata())?;
+        let owned_context = request
+            .metadata()
+            .get_bin("rs-owned-context-bin")
+            .map(|value| value.to_bytes())
+            .transpose()
+            .map_err(|_| Status::invalid_argument("invalid owned shuffle context"))?;
+        if let Some(context) = owned_context {
+            let handler = self
+                .owned_handler
+                .clone()
+                .ok_or_else(|| Status::unimplemented("owned shuffle execution is unavailable"))?;
+            let mut stream = request.into_inner();
+            let (tx, rx) = mpsc::channel(2);
+            let task = async move {
+                let frame = match stream.next().await {
+                    Some(Ok(frame)) => frame,
+                    Some(Err(error)) => {
+                        let _ = tx.send(Err(error)).await;
+                        return;
+                    }
+                    None => {
+                        let _ = tx
+                            .send(Err(Status::invalid_argument(
+                                "owned shuffle requires one frame",
+                            )))
+                            .await;
+                        return;
+                    }
+                };
+                match stream.next().await {
+                    None => {}
+                    Some(Ok(_)) => {
+                        let _ = tx
+                            .send(Err(Status::invalid_argument(
+                                "owned shuffle accepts only one frame",
+                            )))
+                            .await;
+                        return;
+                    }
+                    Some(Err(error)) => {
+                        let _ = tx.send(Err(error)).await;
+                        return;
+                    }
+                }
+                let ack = ShuffleAck {
+                    exchange_id: frame.exchange_id,
+                    src_shard: frame.src_shard,
+                    target_shard: frame.target_shard,
+                    epoch: frame.epoch,
+                    seq: frame.seq,
+                    credit_grant: frame.row_count.max(1),
+                };
+                let result = handler(frame, context).await;
+                if tx.send(Ok(ack)).await.is_err() {
+                    return;
+                }
+                if let Err(error) = result {
+                    let _ = tx.send(Err(Status::failed_precondition(error))).await;
+                }
+            };
+            if let Some(tracker) = &self.task_tracker {
+                tracker.spawn(task);
+            } else {
+                tokio::spawn(task);
+            }
+            let mut response =
+                Response::new(Box::pin(RxStream { rx }) as Self::ShuffleStreamStream);
+            response.metadata_mut().insert(
+                "rs-owned-version",
+                tonic::metadata::MetadataValue::from_static("1"),
+            );
+            return Ok(response);
+        }
         let mut stream = request.into_inner();
         let registry = self.registry.clone();
         let require_local_assignment = self.require_worker_identity;
@@ -1142,6 +1241,7 @@ mod tests {
     struct DelayedAckShuffleService {
         release_first_ack: Arc<tokio::sync::Notify>,
         frames_seen: Arc<AtomicUsize>,
+        frames: Arc<parking_lot::Mutex<Vec<ShuffleFrame>>>,
     }
 
     #[tonic::async_trait]
@@ -1156,9 +1256,11 @@ mod tests {
             let (tx, rx) = mpsc::channel(8);
             let release_first_ack = self.release_first_ack.clone();
             let frames_seen = self.frames_seen.clone();
+            let frames = self.frames.clone();
             tokio::spawn(async move {
                 while let Some(frame) = stream.next().await.transpose()? {
                     let index = frames_seen.fetch_add(1, Ordering::Relaxed);
+                    frames.lock().push(frame.clone());
                     if index == 0 {
                         release_first_ack.notified().await;
                     }
@@ -1190,6 +1292,70 @@ mod tests {
             let (_tx, rx) = mpsc::channel(1);
             Ok(Response::new(Box::pin(RxStream { rx })))
         }
+    }
+
+    #[tokio::test]
+    async fn owned_shuffle_rejects_a_peer_without_execution_support_before_sending() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let old_peer = DelayedAckShuffleService::default();
+        let observed = old_peer.frames.clone();
+        let server_task = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(
+                    crate::exchange::proto::shuffle_service_server::ShuffleServiceServer::new(
+                        old_peer,
+                    ),
+                )
+                .serve(addr)
+                .await
+                .unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let peers = Arc::new(parking_lot::RwLock::new(HashMap::from([(
+            WorkerId(2),
+            addr.to_string(),
+        )])));
+        let pool = ShuffleClientPool::new(peers);
+        pool.set_local_worker_info(worker_info(
+            1,
+            "127.0.0.1:9001".into(),
+            "host-a",
+            "same-zone",
+        ));
+        pool.upsert_peer_info(worker_info(2, addr.to_string(), "host-b", "same-zone"));
+        let flow = FlowController::new();
+        let mux = WorkerStreamMultiplexer::new(pool, flow.clone());
+        let batch = ArrowZSet::from_ab_rows(&[(1, 10), (2, 20)], 1);
+        let frame = ShuffleFrame {
+            exchange_id: 100,
+            src_shard: 0,
+            target_shard: 1,
+            epoch: 1,
+            seq: 0,
+            payload: serialize_zset(&batch).unwrap().into(),
+            row_count: 2,
+        };
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                mux.send_owned_frame(WorkerId(2), frame, bytes::Bytes::from_static(b"context"))
+            )
+            .await
+            .unwrap(),
+            Err("peer does not support owned shuffle execution".to_owned())
+        );
+        assert_eq!(&*observed.lock(), &Vec::<ShuffleFrame>::new());
+        assert_eq!(
+            (
+                flow.rows_in_flight(100, 0, 1),
+                flow.batches_in_flight(100, 0, 1)
+            ),
+            (0, 0)
+        );
+        mux.shutdown().await;
+        server_task.abort();
     }
 
     #[tokio::test]
@@ -2823,7 +2989,7 @@ mod tests {
         writer.finish(&store, &path).await.unwrap();
 
         let (_target_store, target_db) = shard_db("dst-mixed-replay").await;
-        let (registry, mut inlet_rx) = make_receiver_registry(target_db);
+        let (registry, mut inlet_rx) = make_receiver_registry(target_db.clone());
         let multiplexer = WorkerStreamMultiplexer::new(
             ShuffleClientPool::new(Arc::new(parking_lot::RwLock::new(HashMap::new()))),
             FlowController::new(),
@@ -2840,6 +3006,9 @@ mod tests {
             inlet_rx.recv().await.unwrap().positive_ab_rows(),
             vec![(32, 320)]
         );
+        crate::exchange::persistence::advance_committed_frontier(&target_db, 1)
+            .await
+            .unwrap();
         multiplexer
             .catch_up_durable(100, 1, WorkerId(501), WorkerId(502), &registry, &store)
             .await

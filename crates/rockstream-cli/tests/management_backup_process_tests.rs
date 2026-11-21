@@ -457,6 +457,13 @@ fn assert_status_transcript(output: &Output, active_operations: u32, retained_op
     assert_eq!(status.nodes[0].source_version, status.source_version);
     let capacity_headroom = status.nodes[0].capacity_headroom;
     assert!((0.0..=1.0).contains(&capacity_headroom));
+    let worker_address = status.nodes[0].address.clone();
+    let address: std::net::SocketAddr = worker_address.parse().expect("worker address");
+    assert_eq!(
+        address.ip(),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    );
+    assert_ne!(address.port(), 0);
 
     status.observed_at = "<timestamp>".to_owned();
     status.source_version = "<source-revision>".to_owned();
@@ -473,7 +480,7 @@ fn assert_status_transcript(output: &Output, active_operations: u32, retained_op
             nodes: vec![ManagementNodeInfo {
                 node_id: 1,
                 role: "worker".to_owned(),
-                address: "127.0.0.1:0".to_owned(),
+                address: worker_address,
                 state: "active".to_owned(),
                 capacity_headroom,
                 host_id: String::new(),
