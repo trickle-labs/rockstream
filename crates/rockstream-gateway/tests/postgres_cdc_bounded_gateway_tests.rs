@@ -128,12 +128,15 @@ async fn run_gateway_proof() {
     tokio::spawn(async move {
         let _ = connection.await;
     });
+    // Install the empty view before attaching the CDC source. Creating a
+    // source-backed view here would invoke an empty backfill and fail coupled
+    // batch validation before this test reaches the transport under test.
     for sql in [
         "CREATE TABLE orders (id BIGINT, payload TEXT)",
+        "CREATE MATERIALIZED VIEW orders_view AS SELECT id FROM orders",
         &format!(
             "CREATE SOURCE orders TYPE postgres_cdc (credential_ref='none://trusted', host='{host}', port='{port}', database='postgres', user='postgres', publication='orders_pub', slot='bounded_gateway_slot', table='orders') FORMAT pgoutput"
         ),
-        "CREATE MATERIALIZED VIEW orders_view AS SELECT id FROM orders",
     ] {
         gateway.execute(sql, &[]).await.unwrap();
     }
