@@ -870,7 +870,11 @@ record binds the client idempotency key to one generation; its reservation and
 payload are persisted before terminal success, and the completion audit must be
 appended before success or artifact bytes are returned. Restart reconciliation
 reuses that operation and pending audit, while bounded cleanup removes expired
-artifacts. `support_artifact_reconciles_durable_boundaries_after_process_exit`,
+artifacts. If completion loses a transition race to failure or cancellation, the
+request removes its late artifact write; storage-generation checks preserve a
+concurrent replacement. Terminal state and its pending completion audit are
+persisted atomically; retries flush pending audit before returning an artifact.
+`support_artifact_reconciles_durable_boundaries_after_process_exit`,
 `support_artifact_completion_audit_failure_preserves_result_across_processes`,
 and `support_artifact_runs_in_release_process_and_recovers_after_restart` check
 the complete operation, audit, and artifact state across crash and restart
@@ -878,8 +882,12 @@ boundaries. Cleanup runs every second and caps each sweep at 29 seconds, leaving
 time for two passes and a cleanup tick within the 60-second deletion bound;
 `minio_cleanup_at_the_artifact_count_limit_finishes_within_the_bound` exercises
 the maximum count, and `cleanup_rescans_artifacts_that_expire_during_a_sweep`
-checks expiry during cleanup. M1–M7 do not model this management workflow;
-these tests are implementation evidence, not formal proof.
+checks expiry during cleanup. Each reservation records an object generation in
+ledger format v2; legacy format-v1 entries keep their original object path.
+Retries use a fresh generation path, so expiry and orphan cleanup delete only
+the generation they observed and cannot remove a concurrent retry's object;
+restart cleanup removes unreferenced late writes. M1–M7 do not model this
+management workflow; these tests are implementation evidence, not formal proof.
 
 PR #388 (issue #302) hardens the durable catalog audit-append retry
 boundary against concurrent writers. The secret-store rotation audit writer
