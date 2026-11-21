@@ -179,7 +179,7 @@ fn classic_and_factorized_work_counters_are_exact() {
                 },
                 R1ExecutionCounters {
                     input_deltas: 3,
-                    arrangement_probes: 2,
+                    arrangement_probes: 1,
                     output_deltas: 1,
                     changed_state_writes: 3,
                     factor_payload_rows: 3,

@@ -928,7 +928,7 @@ impl Drop for MemoryPermit {
 
 /// Unified Worker Budget Ledger managing memory across all 8 canonical categories
 /// with prospective admission, foreground capacity reservations, 10% allocator overhead margin,
-/// and bounded waiter queue tracking.
+/// real process RSS calibration, and bounded waiter queue tracking.
 #[derive(Debug)]
 pub struct WorkerBudgetLedger {
     total_budget_bytes: u64,
@@ -940,6 +940,9 @@ pub struct WorkerBudgetLedger {
     waiter_count: AtomicU64,
     max_waiters: u64,
     shared_cache_charged: parking_lot::Mutex<bool>,
+    rss_baseline_bytes: AtomicU64,
+    observed_rss_bytes: AtomicU64,
+    observed_disk_bytes: AtomicU64,
 }
 
 impl WorkerBudgetLedger {
@@ -970,6 +973,9 @@ impl WorkerBudgetLedger {
             waiter_count: AtomicU64::new(0),
             max_waiters: max_waiters as u64,
             shared_cache_charged: parking_lot::Mutex::new(false),
+            rss_baseline_bytes: AtomicU64::new(0),
+            observed_rss_bytes: AtomicU64::new(0),
+            observed_disk_bytes: AtomicU64::new(0),
         }
     }
 
@@ -1159,6 +1165,229 @@ impl WorkerBudgetLedger {
             }
         }
     }
+
+    /// Record the process RSS baseline at worker initialization so incremental
+    /// RSS growth can be calibrated against accounted ledger categories.
+    pub fn set_rss_calibration_baseline(&self, baseline_bytes: u64) {
+        self.rss_baseline_bytes
+            .store(baseline_bytes, Ordering::Relaxed);
+    }
+
+    /// Retrieve the configured RSS baseline bytes.
+    pub fn rss_baseline_bytes(&self) -> u64 {
+        self.rss_baseline_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Record the latest observed OS process RSS and disk occupancy.
+    pub fn sync_observed_resources(&self, rss_bytes: u64, disk_bytes: u64) {
+        self.observed_rss_bytes.store(rss_bytes, Ordering::Relaxed);
+        self.observed_disk_bytes
+            .store(disk_bytes, Ordering::Relaxed);
+    }
+
+    /// Latest observed process RSS bytes.
+    pub fn observed_rss_bytes(&self) -> u64 {
+        self.observed_rss_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Latest observed disk occupancy bytes.
+    pub fn observed_disk_bytes(&self) -> u64 {
+        self.observed_disk_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Observed process RSS delta above the recorded calibration baseline.
+    pub fn observed_rss_delta_bytes(&self) -> u64 {
+        self.observed_rss_bytes
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.rss_baseline_bytes.load(Ordering::Relaxed))
+    }
+
+    /// Effective accounted pressure bytes: maximum of gross ledger allocation and
+    /// observed RSS growth above baseline (when baseline is initialized).
+    pub fn calibrated_pressure_bytes(&self) -> u64 {
+        let gross = self.gross_bytes(self.total_allocated_bytes()) as u64;
+        if self.rss_baseline_bytes.load(Ordering::Relaxed) == 0 {
+            gross
+        } else {
+            gross.max(self.observed_rss_delta_bytes())
+        }
+    }
+
+    /// Produce an RSS and disk calibration report comparing real OS usage against
+    /// internal ledger accounting and configured worker budgets.
+    pub fn calibrate_against_rss(
+        &self,
+        worker_id: &str,
+        disk_used_bytes: u64,
+        disk_budget_bytes: u64,
+    ) -> Result<RssCalibrationReport, String> {
+        let observed_rss_bytes = sample_process_rss_bytes()?;
+        self.sync_observed_resources(observed_rss_bytes, disk_used_bytes);
+        crate::metrics::set_worker_memory_bytes(worker_id, "rss", observed_rss_bytes);
+        for category in MemoryCategory::all() {
+            crate::metrics::set_worker_memory_bytes(
+                worker_id,
+                category.name(),
+                self.category_bytes(*category),
+            );
+        }
+        let baseline_rss_bytes = self.rss_baseline_bytes();
+        let rss_delta_bytes = observed_rss_bytes.saturating_sub(baseline_rss_bytes);
+        let ledger_allocated_bytes = self.total_allocated_bytes();
+        let ledger_gross_bytes = self.gross_bytes(ledger_allocated_bytes) as u64;
+        let within_memory_budget = ledger_gross_bytes <= self.total_budget_bytes
+            && (baseline_rss_bytes == 0 || rss_delta_bytes <= self.total_budget_bytes);
+        let within_disk_budget = disk_used_bytes <= disk_budget_bytes;
+        Ok(RssCalibrationReport {
+            observed_rss_bytes,
+            baseline_rss_bytes,
+            rss_delta_bytes,
+            ledger_allocated_bytes,
+            ledger_gross_bytes,
+            total_budget_bytes: self.total_budget_bytes,
+            disk_used_bytes,
+            disk_budget_bytes,
+            within_memory_budget,
+            within_disk_budget,
+        })
+    }
+}
+
+/// Worker-wide cache budget explicitly separating RAM decoded block/meta caches
+/// from local disk raw object-store cache so multi-shard workers share one pool
+/// rather than multiplying cache memory per shard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkerCacheBudget {
+    /// Worker-wide RAM budget for SlateDB decoded SSTable data blocks.
+    pub decoded_block_cache_bytes: usize,
+    /// Worker-wide RAM budget for SlateDB SSTable index/filter/metadata blocks.
+    pub metadata_index_cache_bytes: usize,
+    /// Worker-wide disk/NVMe budget for raw object-store cache parts.
+    pub raw_object_cache_bytes: usize,
+}
+
+impl WorkerCacheBudget {
+    pub fn new(
+        decoded_block_cache_bytes: usize,
+        metadata_index_cache_bytes: usize,
+        raw_object_cache_bytes: usize,
+    ) -> Self {
+        Self {
+            decoded_block_cache_bytes,
+            metadata_index_cache_bytes,
+            raw_object_cache_bytes,
+        }
+    }
+
+    /// Total worker-wide RAM cache budget charged once to `MemoryCategory::BlockAndMetadataCaches`.
+    pub fn total_ram_bytes(&self) -> usize {
+        self.decoded_block_cache_bytes
+            .saturating_add(self.metadata_index_cache_bytes)
+    }
+}
+
+/// Point-in-time calibration comparing real OS process RSS and disk usage
+/// against `WorkerBudgetLedger` accounting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RssCalibrationReport {
+    pub observed_rss_bytes: u64,
+    pub baseline_rss_bytes: u64,
+    pub rss_delta_bytes: u64,
+    pub ledger_allocated_bytes: u64,
+    pub ledger_gross_bytes: u64,
+    pub total_budget_bytes: u64,
+    pub disk_used_bytes: u64,
+    pub disk_budget_bytes: u64,
+    pub within_memory_budget: bool,
+    pub within_disk_budget: bool,
+}
+
+/// Sample the current process's real resident set size (RSS) in bytes from the OS.
+#[cfg(target_os = "linux")]
+pub fn sample_process_rss_bytes() -> Result<u64, String> {
+    let status = std::fs::read_to_string("/proc/self/status")
+        .map_err(|e| format!("failed to read /proc/self/status: {e}"))?;
+    let kib: u64 = status
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("VmRSS:")?
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        })
+        .ok_or_else(|| "/proc/self/status has no parseable VmRSS".to_string())?;
+    Ok(kib.saturating_mul(1024))
+}
+
+/// Sample the current process's real resident set size (RSS) in bytes from macOS Mach task info.
+#[cfg(target_os = "macos")]
+pub fn sample_process_rss_bytes() -> Result<u64, String> {
+    #[repr(C)]
+    struct MachTaskBasicInfo {
+        virtual_size: u64,
+        resident_size: u64,
+        resident_size_max: u64,
+        user_time: [u32; 2],
+        system_time: [u32; 2],
+        policy: i32,
+        suspend_count: i32,
+    }
+    const MACH_TASK_BASIC_INFO: u32 = 20;
+    const MACH_TASK_BASIC_INFO_COUNT: u32 =
+        (std::mem::size_of::<MachTaskBasicInfo>() / std::mem::size_of::<u32>()) as u32;
+
+    extern "C" {
+        fn mach_task_self() -> u32;
+        fn task_info(
+            target_task: u32,
+            flavor: u32,
+            task_info_out: *mut MachTaskBasicInfo,
+            task_info_out_cnt: *mut u32,
+        ) -> i32;
+    }
+
+    let mut info = std::mem::MaybeUninit::<MachTaskBasicInfo>::zeroed();
+    let mut count = MACH_TASK_BASIC_INFO_COUNT;
+    let kr = unsafe {
+        task_info(
+            mach_task_self(),
+            MACH_TASK_BASIC_INFO,
+            info.as_mut_ptr(),
+            &mut count,
+        )
+    };
+    if kr != 0 {
+        return Err(format!("mach task_info failed with kern_return_t={kr}"));
+    }
+    let info = unsafe { info.assume_init() };
+    Ok(info.resident_size)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn sample_process_rss_bytes() -> Result<u64, String> {
+    Err("process RSS sampling is unsupported on this OS".to_string())
+}
+
+/// Recursively measure actual disk usage in bytes under `root`.
+pub fn measure_directory_bytes(root: &std::path::Path) -> std::io::Result<u64> {
+    if !root.exists() {
+        return Ok(0);
+    }
+    let mut total = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let meta = entry.metadata()?;
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else if meta.is_file() {
+                total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    Ok(total)
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

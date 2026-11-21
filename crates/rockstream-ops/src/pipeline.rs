@@ -35,6 +35,18 @@ impl LinearPipeline {
         self
     }
 
+    /// Compile and append a fused stateless kernel (`Filter -> Project -> Map`).
+    pub fn push_fused_stateless(mut self, steps: Vec<crate::fused::StatelessStep>) -> Self {
+        self.stages
+            .push(Arc::new(crate::fused::FusedStatelessKernel::compile(steps)));
+        self
+    }
+
+    /// Inspect stages currently registered in this pipeline.
+    pub fn stages(&self) -> &[Arc<dyn Operator>] {
+        &self.stages
+    }
+
     /// Process a single batch through all stages and return the result.
     pub fn process(&self, batch: ArrowZSet) -> Result<ArrowZSet, OpError> {
         let mut current = batch;

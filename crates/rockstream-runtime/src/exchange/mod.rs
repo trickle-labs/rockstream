@@ -1,3 +1,4 @@
+pub mod capsule_partition;
 pub mod classifier;
 pub mod compression_tuner;
 pub mod durable;
