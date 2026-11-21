@@ -5749,13 +5749,32 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
             record.operation_id == AuditField::Known(live_rotation_operation_id.to_string())
         })
         .unwrap();
+    assert!(live_audit.timestamp_ms > 0);
+    assert!(matches!(&live_audit.correlation, AuditCorrelation::Observed(id) if !id.is_empty()));
     assert_eq!(
-        live_audit.before_state,
-        AuditField::Known("version=1".to_string())
-    );
-    assert_eq!(
-        live_audit.after_state,
-        AuditField::Known("version=2".to_string())
+        live_audit,
+        &SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: format!("gateway-secret-rotation-{live_rotation_operation_id}"),
+            timestamp_ms: live_audit.timestamp_ms,
+            actor: AuditIdentity::Verified("principal:1".to_owned()),
+            target: AuditField::Known("secret:public/kafka_auth".to_owned()),
+            scope: AuditField::Known(
+                serde_json::to_string(&PolicyScope::Secret {
+                    namespace: "public".to_owned(),
+                    name: "kafka_auth".to_owned(),
+                    consumer: None,
+                })
+                .unwrap()
+            ),
+            action: SecurityAuditClass::SecretRotation,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: live_audit.correlation.clone(),
+            operation_id: AuditField::Known(live_rotation_operation_id.to_owned()),
+            policy_revision: AuditField::Known(1),
+            before_state: AuditField::Known("version=1".to_owned()),
+            after_state: AuditField::Known("version=2".to_owned()),
+        }
     );
     let rotation_audit = rotation_audits
         .iter()
