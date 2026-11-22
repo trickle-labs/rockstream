@@ -3498,24 +3498,59 @@ pub fn run_qualify(
             OutputFormat::Text => Ok("OK: All qualification prerequisites satisfied (Docker, network, memory, FD limits).".to_string()),
         }
     } else {
-        use rockstream_types::candidate_identity::CandidateIdentity;
-        use rockstream_types::error_code::RS_3032;
+        use rockstream_types::error_code::{RS_3032, RS_3033};
         use rockstream_types::qualification::{
-            QualificationEvidenceManifest, QualificationReleaseGate,
+            QualificationEvidenceManifest, QualificationGateRejection, QualificationReleaseGate,
         };
 
-        let suite_name = suite.unwrap_or("reference-rc1");
-        let mut candidate = CandidateIdentity::current();
-        candidate.semantic_version = "1.0.0".to_string();
+        let suite_arg = suite.ok_or_else(|| {
+            CliError::new(
+                RS_3033,
+                "Qualification requires a measured multi-process evidence manifest path (--suite <manifest.json>); synthetic reference fixtures are disallowed in release gates.",
+                "Run the multi-process qualification harness to produce a measured manifest JSON and pass its path via --suite.",
+            )
+        })?;
 
-        let manifest = QualificationEvidenceManifest::reference_rc1_manifest(candidate);
-        let gate = QualificationReleaseGate::new();
-        let decision = gate.evaluate_manifest(&manifest, None).map_err(|e| {
+        let manifest_path = Path::new(suite_arg);
+        if !manifest_path.is_file() {
+            return Err(CliError::new(
+                RS_3033,
+                format!(
+                    "Qualification suite '{}' is not a measured evidence manifest file; synthetic reference fixtures cannot pass release qualification.",
+                    suite_arg
+                ),
+                "Provide a path to a measured qualification manifest JSON produced by the qualification harness.",
+            ));
+        }
+
+        let raw_json = std::fs::read_to_string(manifest_path).map_err(|e| {
+            CliError::new(
+                RS_0001,
+                format!("Failed to read qualification manifest '{}': {e}", suite_arg),
+                "Check manifest path and file permissions",
+            )
+        })?;
+
+        let manifest = QualificationEvidenceManifest::from_json(&raw_json).map_err(|e| {
             CliError::new(
                 RS_3032,
-                format!("{e}"),
-                "Inspect qualification run failures",
+                format!(
+                    "Failed to parse qualification manifest '{}': {e}",
+                    suite_arg
+                ),
+                "Provide a valid QualificationEvidenceManifest JSON artifact",
             )
+        })?;
+
+        let gate = QualificationReleaseGate::new();
+        let decision = gate.evaluate_manifest(&manifest, None).map_err(|e| {
+            let code = match e {
+                QualificationGateRejection::SyntheticFixtureRejected(_)
+                | QualificationGateRejection::ProvenanceIncomplete(_)
+                | QualificationGateRejection::NegativeControlFailed(_) => RS_3033,
+                _ => RS_3032,
+            };
+            CliError::new(code, format!("{e}"), "Inspect qualification run failures")
         })?;
 
         if let Some(out_path) = output {
@@ -3541,7 +3576,7 @@ pub fn run_qualify(
         match format {
             OutputFormat::Json => Ok(serde_json::to_string_pretty(&serde_json::json!({
                 "status": "PASSED",
-                "suite": suite_name,
+                "suite": suite_arg,
                 "candidate_version": decision.candidate_version,
                 "manifest_seal": manifest.manifest_seal,
                 "scenarios_passed": manifest.runs.len(),
@@ -3559,7 +3594,7 @@ pub fn run_qualify(
             })?),
             OutputFormat::Text => Ok(format!(
                 "OK: Qualification suite `{}` passed ({} worker topologies qualified, 0 failed, 0 skipped).\nManifest Seal: {}\nSummary: {}",
-                suite_name,
+                suite_arg,
                 manifest.runs.len(),
                 manifest.manifest_seal,
                 decision.summary

@@ -346,6 +346,151 @@ impl Default for QualificationAggregateMetrics {
     }
 }
 
+/// Provenance of a qualification run, strictly separating unit-test fixtures
+/// from real measured multi-process executions of an ordinary `rockstream` binary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualificationProvenance {
+    /// Synthetic in-memory fixture for unit tests only.
+    /// Production release gates MUST reject this provenance.
+    SyntheticFixture,
+    /// Real measured execution of an ordinary `rockstream` binary with observed
+    /// OS worker PIDs, binary digest, oracle verification, and negative controls.
+    MeasuredExecution,
+}
+
+/// Complete itemized workload cost accounting for a measured qualification run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QualificationCostAccounting {
+    pub serving_gateways_hourly_usd: f64,
+    pub control_plane_hourly_usd: f64,
+    pub maintenance_workers_hourly_usd: f64,
+    pub compaction_hourly_usd: f64,
+    pub retained_history_storage_hourly_usd: f64,
+    pub object_store_requests_hourly_usd: f64,
+    pub backups_hourly_usd: f64,
+    pub failover_headroom_hourly_usd: f64,
+    pub cross_az_traffic_hourly_usd: f64,
+    pub total_hourly_usd: f64,
+    pub freshness_slo_ms: f64,
+    pub cost_per_million_correct_durable_changes_usd: f64,
+    pub pricing_scope: String,
+    pub pricing_date_iso: String,
+}
+
+impl QualificationCostAccounting {
+    /// Compute the exact sum of all itemized hourly cost components.
+    pub fn itemized_total_hourly_usd(&self) -> f64 {
+        self.serving_gateways_hourly_usd
+            + self.control_plane_hourly_usd
+            + self.maintenance_workers_hourly_usd
+            + self.compaction_hourly_usd
+            + self.retained_history_storage_hourly_usd
+            + self.object_store_requests_hourly_usd
+            + self.backups_hourly_usd
+            + self.failover_headroom_hourly_usd
+            + self.cross_az_traffic_hourly_usd
+    }
+
+    /// Validate that all itemized components are finite, non-negative, match
+    /// `total_hourly_usd`, and match `cost_per_million_correct_durable_changes_usd`.
+    pub fn validate(&self, achieved_changes_per_sec: f64) -> Result<(), String> {
+        let items = [
+            (
+                "serving_gateways_hourly_usd",
+                self.serving_gateways_hourly_usd,
+            ),
+            ("control_plane_hourly_usd", self.control_plane_hourly_usd),
+            (
+                "maintenance_workers_hourly_usd",
+                self.maintenance_workers_hourly_usd,
+            ),
+            ("compaction_hourly_usd", self.compaction_hourly_usd),
+            (
+                "retained_history_storage_hourly_usd",
+                self.retained_history_storage_hourly_usd,
+            ),
+            (
+                "object_store_requests_hourly_usd",
+                self.object_store_requests_hourly_usd,
+            ),
+            ("backups_hourly_usd", self.backups_hourly_usd),
+            (
+                "failover_headroom_hourly_usd",
+                self.failover_headroom_hourly_usd,
+            ),
+            (
+                "cross_az_traffic_hourly_usd",
+                self.cross_az_traffic_hourly_usd,
+            ),
+        ];
+        for (name, val) in items {
+            if !val.is_finite() || val < 0.0 {
+                return Err(format!("RS-3032: invalid cost component '{name}': {val}"));
+            }
+        }
+        if !self.total_hourly_usd.is_finite() || self.total_hourly_usd < 0.0 {
+            return Err(format!(
+                "RS-3032: invalid total_hourly_usd: {}",
+                self.total_hourly_usd
+            ));
+        }
+        let sum = self.itemized_total_hourly_usd();
+        let tol = 1e-6_f64.max(sum.abs() * 1e-9);
+        if (sum - self.total_hourly_usd).abs() > tol {
+            return Err(format!(
+                "RS-3032: itemized hourly cost sum {sum:.6} != total_hourly_usd {:.6}",
+                self.total_hourly_usd
+            ));
+        }
+        if !achieved_changes_per_sec.is_finite() || achieved_changes_per_sec <= 0.0 {
+            return Err(format!(
+                "RS-3032: invalid achieved_changes_per_sec: {achieved_changes_per_sec}"
+            ));
+        }
+        if !self.freshness_slo_ms.is_finite() || self.freshness_slo_ms <= 0.0 {
+            return Err(format!(
+                "RS-3032: invalid freshness_slo_ms: {}",
+                self.freshness_slo_ms
+            ));
+        }
+        let expected_cpm =
+            (self.total_hourly_usd * 1_000_000.0) / (achieved_changes_per_sec * 3_600.0);
+        let cpm_tol = 1e-6_f64.max(expected_cpm.abs() * 1e-9);
+        if !self
+            .cost_per_million_correct_durable_changes_usd
+            .is_finite()
+            || (expected_cpm - self.cost_per_million_correct_durable_changes_usd).abs() > cpm_tol
+        {
+            return Err(format!(
+                "RS-3032: cost_per_million {:.6} != expected {:.6}",
+                self.cost_per_million_correct_durable_changes_usd, expected_cpm
+            ));
+        }
+        if self.pricing_scope.trim().is_empty() || self.pricing_date_iso.len() != 10 {
+            return Err(
+                "RS-3032: pricing_scope and YYYY-MM-DD pricing_date_iso are required".to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Verified provenance metadata required for every `MeasuredExecution` run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeasuredExecutionMetadata {
+    pub commit_sha: String,
+    pub binary_sha256: String,
+    pub hardware_spec: String,
+    pub worker_pids: Vec<u32>,
+    pub offered_rate_rows_per_sec: f64,
+    pub achieved_rate_rows_per_sec: f64,
+    pub errors_and_timeouts: u64,
+    pub faults_injected_and_verified: Vec<String>,
+    pub negative_controls_passed: bool,
+    pub cost_accounting: Option<QualificationCostAccounting>,
+}
+
 /// Execution status of a qualification run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QualificationRunStatus {
@@ -358,6 +503,8 @@ pub enum QualificationRunStatus {
 pub struct QualificationRun {
     pub run_id: String,
     pub profile_id: String,
+    pub provenance: QualificationProvenance,
+    pub measured_metadata: Option<MeasuredExecutionMetadata>,
     pub candidate: CandidateIdentity,
     pub worker_count: usize,
     pub duration_sec: u64,
@@ -375,10 +522,22 @@ impl QualificationRun {
         self.status == QualificationRunStatus::Passed
     }
 
+    pub fn is_measured(&self) -> bool {
+        self.provenance == QualificationProvenance::MeasuredExecution
+            && self.measured_metadata.is_some()
+    }
+
     pub fn compute_run_digest(&self) -> String {
         let mut hasher = Sha256::new();
         hasher.update(self.run_id.as_bytes());
         hasher.update(self.profile_id.as_bytes());
+        hasher.update(match self.provenance {
+            QualificationProvenance::SyntheticFixture => b"synthetic_fixture".as_slice(),
+            QualificationProvenance::MeasuredExecution => b"measured_execution".as_slice(),
+        });
+        if let Some(meta) = &self.measured_metadata {
+            hasher.update(serde_json::to_vec(meta).unwrap_or_default());
+        }
         hasher.update(serde_json::to_vec(&self.candidate).unwrap_or_default());
         hasher.update(self.worker_count.to_be_bytes());
         hasher.update(self.duration_sec.to_be_bytes());
@@ -393,7 +552,10 @@ impl QualificationRun {
         hex::encode(hasher.finalize())
     }
 
-    /// Generate a valid reference run sample for testing and validation.
+    /// Generate a synthetic reference run fixture for unit tests only.
+    ///
+    /// This run is explicitly marked `QualificationProvenance::SyntheticFixture`
+    /// and is ALWAYS rejected by `QualificationReleaseGate`.
     pub fn sample_reference_run(worker_count: usize, candidate: CandidateIdentity) -> Self {
         let single_worker_throughput = 120_000.0;
         let speedup = match worker_count {
@@ -504,8 +666,10 @@ impl QualificationRun {
         };
 
         let mut run = Self {
-            run_id: format!("run_rc1_{}w", worker_count),
+            run_id: format!("sample_reference_run_{}w", worker_count),
             profile_id: "reference-rc1".to_string(),
+            provenance: QualificationProvenance::SyntheticFixture,
+            measured_metadata: None,
             candidate,
             worker_count,
             duration_sec: 1800,
@@ -515,6 +679,43 @@ impl QualificationRun {
             aggregate_metrics,
             raw_chunk_digests,
             status: QualificationRunStatus::Passed,
+            run_digest: String::new(),
+        };
+        run.run_digest = run.compute_run_digest();
+        run
+    }
+
+    /// Construct a sealed `MeasuredExecution` run from observed process, workload,
+    /// and oracle measurements.
+    #[allow(clippy::too_many_arguments)]
+    pub fn measured(
+        run_id: impl Into<String>,
+        profile_id: impl Into<String>,
+        candidate: CandidateIdentity,
+        worker_count: usize,
+        duration_sec: u64,
+        timestamp_rfc3339: impl Into<String>,
+        workload_results: Vec<WorkloadRunResult>,
+        per_worker_cpu_pct: Vec<f64>,
+        aggregate_metrics: QualificationAggregateMetrics,
+        raw_chunk_digests: Vec<String>,
+        measured_metadata: MeasuredExecutionMetadata,
+        status: QualificationRunStatus,
+    ) -> Self {
+        let mut run = Self {
+            run_id: run_id.into(),
+            profile_id: profile_id.into(),
+            provenance: QualificationProvenance::MeasuredExecution,
+            measured_metadata: Some(measured_metadata),
+            candidate,
+            worker_count,
+            duration_sec,
+            timestamp_rfc3339: timestamp_rfc3339.into(),
+            workload_results,
+            per_worker_cpu_pct,
+            aggregate_metrics,
+            raw_chunk_digests,
+            status,
             run_digest: String::new(),
         };
         run.run_digest = run.compute_run_digest();
@@ -728,6 +929,10 @@ pub enum QualificationGateRejection {
     },
     CapacityThresholdMismatch(String),
     SealedManifestCorrupted(String),
+    SyntheticFixtureRejected(String),
+    ProvenanceIncomplete(String),
+    NegativeControlFailed(String),
+    CostAccountingInvalid(String),
 }
 
 impl fmt::Display for QualificationGateRejection {
@@ -794,6 +999,18 @@ impl fmt::Display for QualificationGateRejection {
             Self::SealedManifestCorrupted(msg) => {
                 write!(f, "RS-3032: Sealed manifest corruption: {msg}")
             }
+            Self::SyntheticFixtureRejected(msg) => {
+                write!(f, "RS-3033: Synthetic fixture rejected by release gate: {msg}")
+            }
+            Self::ProvenanceIncomplete(msg) => {
+                write!(f, "RS-3033: Measured execution provenance incomplete: {msg}")
+            }
+            Self::NegativeControlFailed(msg) => {
+                write!(f, "RS-3033: Negative control verification failed: {msg}")
+            }
+            Self::CostAccountingInvalid(msg) => {
+                write!(f, "RS-3032: Invalid cost accounting: {msg}")
+            }
         }
     }
 }
@@ -809,12 +1026,51 @@ impl QualificationReleaseGate {
         Self
     }
 
+    /// Parse a JSON-encoded qualification manifest and evaluate it against the
+    /// release gate, failing closed on malformed JSON or synthetic fixtures.
+    pub fn evaluate_manifest_json(
+        &self,
+        json: &str,
+        baseline: Option<&QualificationEvidenceManifest>,
+    ) -> Result<QualificationGateDecision, QualificationGateRejection> {
+        let manifest = QualificationEvidenceManifest::from_json(json).map_err(|e| {
+            QualificationGateRejection::SealedManifestCorrupted(format!(
+                "Failed to parse qualification manifest JSON: {e}"
+            ))
+        })?;
+        self.evaluate_manifest(&manifest, baseline)
+    }
+
     /// Evaluate a full multi-run qualification evidence manifest.
     pub fn evaluate_manifest(
         &self,
         manifest: &QualificationEvidenceManifest,
         baseline: Option<&QualificationEvidenceManifest>,
     ) -> Result<QualificationGateDecision, QualificationGateRejection> {
+        // 0. Fail closed on synthetic fixture manifests before any threshold checks.
+        if manifest.manifest_id == "manifest_rc1_reference"
+            || manifest.manifest_id.contains("sample_reference_run")
+        {
+            return Err(QualificationGateRejection::SyntheticFixtureRejected(
+                format!(
+                    "manifest '{}' is a synthetic reference fixture; measured multi-process evidence is required",
+                    manifest.manifest_id
+                ),
+            ));
+        }
+        for run in &manifest.runs {
+            if run.provenance != QualificationProvenance::MeasuredExecution
+                || run.run_id.contains("sample_reference_run")
+            {
+                return Err(QualificationGateRejection::SyntheticFixtureRejected(
+                    format!(
+                        "run '{}' has provenance {:?}; synthetic fixtures are disallowed in release gates",
+                        run.run_id, run.provenance
+                    ),
+                ));
+            }
+        }
+
         // 1. Verify seal integrity
         manifest
             .verify_seal()
@@ -969,6 +1225,80 @@ impl QualificationReleaseGate {
     ) -> Result<QualificationGateDecision, QualificationGateRejection> {
         let mut checked_rules = Vec::new();
 
+        // 0. Strict provenance separation: synthetic fixtures fail closed.
+        if run.provenance != QualificationProvenance::MeasuredExecution
+            || run.run_id.contains("sample_reference_run")
+        {
+            return Err(QualificationGateRejection::SyntheticFixtureRejected(
+                format!(
+                    "run '{}' is marked {:?}; synthetic fixtures cannot satisfy release qualification",
+                    run.run_id, run.provenance
+                ),
+            ));
+        }
+
+        let meta = run.measured_metadata.as_ref().ok_or_else(|| {
+            QualificationGateRejection::ProvenanceIncomplete(format!(
+                "run '{}' missing measured_metadata",
+                run.run_id
+            ))
+        })?;
+        if !is_hex_digest(&meta.commit_sha, 40) {
+            return Err(QualificationGateRejection::ProvenanceIncomplete(format!(
+                "run '{}' has invalid 40-hex commit_sha '{}'",
+                run.run_id, meta.commit_sha
+            )));
+        }
+        if !is_hex_digest(&meta.binary_sha256, 64) {
+            return Err(QualificationGateRejection::ProvenanceIncomplete(format!(
+                "run '{}' has invalid 64-hex binary_sha256 '{}'",
+                run.run_id, meta.binary_sha256
+            )));
+        }
+        if meta.hardware_spec.trim().is_empty() {
+            return Err(QualificationGateRejection::ProvenanceIncomplete(format!(
+                "run '{}' missing hardware_spec",
+                run.run_id
+            )));
+        }
+        if meta.worker_pids.len() != run.worker_count {
+            return Err(QualificationGateRejection::ProvenanceIncomplete(format!(
+                "run '{}' recorded {} worker PIDs for {} declared workers",
+                run.run_id,
+                meta.worker_pids.len(),
+                run.worker_count
+            )));
+        }
+        let mut unique_pids = std::collections::BTreeSet::new();
+        for &pid in &meta.worker_pids {
+            if pid == 0 || !unique_pids.insert(pid) {
+                return Err(QualificationGateRejection::ProvenanceIncomplete(format!(
+                    "run '{}' has invalid or duplicate worker PID {pid}",
+                    run.run_id
+                )));
+            }
+        }
+        if !meta.negative_controls_passed {
+            return Err(QualificationGateRejection::NegativeControlFailed(format!(
+                "run '{}' did not pass independent checker negative controls",
+                run.run_id
+            )));
+        }
+        if meta.errors_and_timeouts > 0 {
+            return Err(QualificationGateRejection::IntegrityViolation(format!(
+                "run '{}' recorded {} errors/timeouts",
+                run.run_id, meta.errors_and_timeouts
+            )));
+        }
+        if let Some(cost) = &meta.cost_accounting {
+            cost.validate(meta.achieved_rate_rows_per_sec)
+                .map_err(QualificationGateRejection::CostAccountingInvalid)?;
+        }
+        checked_rules.push(format!(
+            "Measured provenance verified ({} distinct OS worker PIDs, binary digest, negative controls)",
+            meta.worker_pids.len()
+        ));
+
         // 1. Data integrity invariants (zero tolerance)
         if run.aggregate_metrics.data_loss_rows > 0 {
             return Err(QualificationGateRejection::IntegrityViolation(format!(
@@ -1093,4 +1423,8 @@ impl QualificationReleaseGate {
             evaluated_at_rfc3339: run.timestamp_rfc3339.clone(),
         })
     }
+}
+
+fn is_hex_digest(value: &str, expected_len: usize) -> bool {
+    value.len() == expected_len && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
