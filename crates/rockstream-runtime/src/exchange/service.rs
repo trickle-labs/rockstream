@@ -1142,6 +1142,8 @@ mod tests {
     static SHM_TEST_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
     static FLOW_CONTROL_TEST_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
 
+    // Keep global metric resets and snapshots isolated across async waits.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn security_audit_transport_metrics_track_pending_and_recovery() {
         let _flow_guard = FLOW_CONTROL_TEST_LOCK.lock().await;
@@ -1163,7 +1165,7 @@ mod tests {
             }
         });
 
-        let Some(WorkerMessage::ReportSecurityAudit { request_id, .. }) = receiver.recv().await
+        let Some(WorkerMessage::ReportSecurityAudit { .. }) = receiver.recv().await
         else {
             panic!("security audit transport did not receive the request");
         };
