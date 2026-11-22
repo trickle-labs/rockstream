@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -58,6 +58,10 @@ struct GenerationRecord {
     generation: String,
     checkpoint: ClusterCheckpoint,
     object_count: u64,
+    /// Legacy hand-picked exports need not contain a durable control manifest.
+    /// Prefix exports must contain exactly the selected durable manifest.
+    #[serde(default)]
+    requires_checkpoint_manifest: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -71,6 +75,13 @@ struct InventoryRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct CommitMarker {
     outcome: CheckpointExportOutcome,
+}
+
+#[derive(Default)]
+struct ExportGuard {
+    require_latest: bool,
+    require_manifest: bool,
+    metadata_baseline: Option<(Path, BTreeMap<Path, String>)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -97,8 +108,8 @@ impl CheckpointExportService {
         }
     }
 
-    /// Export an exact, already-selected object list for one committed checkpoint.
-    /// The iterator stays owned by the caller and is consumed one object at a time.
+    /// Export an exact, caller-selected object list. Unlike prefix exports,
+    /// this low-level API does not discover or require a control manifest.
     pub async fn export_objects<I>(
         &self,
         source: Arc<dyn ObjectStore>,
@@ -106,6 +117,30 @@ impl CheckpointExportService {
         checkpoint: ClusterCheckpoint,
         generation: impl Into<String>,
         objects: I,
+    ) -> Result<CheckpointExportOutcome, CheckpointExportError>
+    where
+        I: IntoIterator<Item = Path>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        self.export_objects_with_guard(
+            source,
+            destination,
+            checkpoint,
+            generation,
+            objects,
+            ExportGuard::default(),
+        )
+        .await
+    }
+
+    async fn export_objects_with_guard<I>(
+        &self,
+        source: Arc<dyn ObjectStore>,
+        destination: Arc<dyn ObjectStore>,
+        checkpoint: ClusterCheckpoint,
+        generation: impl Into<String>,
+        objects: I,
+        guard: ExportGuard,
     ) -> Result<CheckpointExportOutcome, CheckpointExportError>
     where
         I: IntoIterator<Item = Path>,
@@ -120,7 +155,7 @@ impl CheckpointExportService {
             .map_err(|_| CheckpointExportError::InFlight)?;
         rockstream_types::metrics::set_checkpoint_export_objects_in_flight(1);
         let result = self
-            .export_objects_inner(source, destination, checkpoint, generation, objects)
+            .export_objects_inner(source, destination, checkpoint, generation, objects, guard)
             .await;
         rockstream_types::metrics::set_checkpoint_export_objects_in_flight(0);
         result
@@ -156,12 +191,16 @@ impl CheckpointExportService {
                 "dr.export.after_m3_selection",
             ));
         }
-        self.export_objects(
+        self.export_objects_with_guard(
             source,
             destination,
             checkpoint.clone(),
             generation,
             select_objects(&checkpoint),
+            ExportGuard {
+                require_latest: true,
+                ..Default::default()
+            },
         )
         .await
     }
@@ -188,18 +227,72 @@ impl CheckpointExportService {
                 "dr.export.after_m3_selection",
             ));
         }
-        // The CLI must inventory the immutable shard objects named by the
-        // selected committed checkpoint, not only objects still visible under
-        // the source prefix. Missing referenced storage must fail before a
-        // generation record or terminal success marker can be written.
-        let objects = Self::list_checkpoint_objects(&source, &checkpoint, prefix).await?;
-        self.export_objects(source, destination, checkpoint, generation, objects)
+        self.export_checkpoint_prefix(source, destination, checkpoint, generation, prefix)
             .await
     }
 
-    /// Export all objects currently visible below an immutable snapshot prefix.
-    /// A snapshot prefix must be selected from the committed checkpoint before
-    /// this method is called; a live mutable database prefix is not a snapshot.
+    /// Export a checkpoint already selected by the caller (e.g. the CLI when
+    /// constructing its checkpoint-named generation). Do not reselect here:
+    /// the name, generation record, manifest and shard snapshot must agree.
+    ///
+    /// Live, unversioned control metadata is only safe while this exact
+    /// committed checkpoint stays latest and the copied metadata stays
+    /// unchanged. A concurrent publication fails before the commit marker.
+    pub async fn export_checkpoint_prefix(
+        &self,
+        source: Arc<dyn ObjectStore>,
+        destination: Arc<dyn ObjectStore>,
+        checkpoint: ClusterCheckpoint,
+        generation: impl Into<String>,
+        prefix: &Path,
+    ) -> Result<CheckpointExportOutcome, CheckpointExportError> {
+        let latest = crate::checkpoint_store::CheckpointManifestStore::new(source.clone())
+            .load_latest_manifest()
+            .await
+            .map_err(CheckpointExportError::Integrity)?;
+        if latest.as_ref() != Some(&checkpoint) {
+            return Err(CheckpointExportError::Integrity(
+                "source committed checkpoint changed before inventory; retry with the newly selected checkpoint"
+                    .to_string(),
+            ));
+        }
+        // Pin the actual manifest and shard objects to the selected epoch.
+        // Live control manifests (and changelog contributions) of other
+        // epochs must never become independently discoverable after restore.
+        // Snapshot unversioned catalog/source metadata *before* the live root
+        // scan. Membership and bytes must remain stable through the export,
+        // otherwise a concurrent writer could smuggle new control state into A.
+        let metadata_baseline = self.snapshot_live_metadata(&source, prefix).await?;
+        let objects = Self::list_checkpoint_objects(&source, &checkpoint, prefix).await?;
+        let inventoried_metadata: BTreeSet<&Path> = objects
+            .iter()
+            .filter(|path| is_unversioned_export_metadata(path))
+            .collect();
+        let selected_metadata: BTreeSet<&Path> = metadata_baseline.keys().collect();
+        if inventoried_metadata != selected_metadata {
+            return Err(CheckpointExportError::Integrity(
+                "unversioned control/catalog/source metadata changed between checkpoint selection and inventory"
+                    .to_string(),
+            ));
+        }
+        self.export_objects_with_guard(
+            source,
+            destination,
+            checkpoint,
+            generation,
+            objects,
+            ExportGuard {
+                require_latest: true,
+                require_manifest: true,
+                metadata_baseline: Some((prefix.clone(), metadata_baseline)),
+            },
+        )
+        .await
+    }
+
+    /// Export a checkpoint selected from an immutable snapshot prefix. A
+    /// prefix export also requires the matching committed control manifest,
+    /// so a live prefix cannot accidentally mix checkpoint generations.
     pub async fn export_prefix(
         &self,
         source: Arc<dyn ObjectStore>,
@@ -208,9 +301,59 @@ impl CheckpointExportService {
         generation: impl Into<String>,
         prefix: &Path,
     ) -> Result<CheckpointExportOutcome, CheckpointExportError> {
-        let objects = Self::list_checkpoint_objects(&source, &checkpoint, prefix).await?;
-        self.export_objects(source, destination, checkpoint, generation, objects)
+        self.export_checkpoint_prefix(source, destination, checkpoint, generation, prefix)
             .await
+    }
+
+    /// Capture mutable control/catalog/source names and bytes before the root
+    /// inventory can observe a subsequently committed checkpoint. An immutable
+    /// checkpoint manifest is authoritative, but the remaining legacy control
+    /// paths have no epoch qualifier, so instability must fail closed.
+    async fn snapshot_live_metadata(
+        &self,
+        source: &Arc<dyn ObjectStore>,
+        prefix: &Path,
+    ) -> Result<BTreeMap<Path, String>, CheckpointExportError> {
+        let path = prefix.as_ref();
+        let roots = if path.is_empty() {
+            vec![
+                Path::from("control"),
+                Path::from("topology"),
+                Path::from("catalog"),
+                Path::from("sources"),
+            ]
+        } else if ["control", "topology", "catalog", "sources"]
+            .iter()
+            .any(|root| path == *root || path.starts_with(&format!("{root}/")))
+        {
+            vec![prefix.clone()]
+        } else {
+            Vec::new()
+        };
+        let mut snapshot = BTreeMap::new();
+        let mut scanned = 0_usize;
+        for root in roots {
+            let mut listing = source.list(Some(&root));
+            while let Some(entry) = listing.next().await {
+                let meta =
+                    entry.map_err(|error| CheckpointExportError::ObjectStore(error.to_string()))?;
+                scanned += 1;
+                if scanned > MAX_CHECKPOINT_EXPORT_SCAN_WINDOW {
+                    return Err(CheckpointExportError::Integrity(format!(
+                        "metadata snapshot scan exceeded MAX_CHECKPOINT_EXPORT_SCAN_WINDOW={MAX_CHECKPOINT_EXPORT_SCAN_WINDOW}"
+                    )));
+                }
+                if !is_unversioned_export_metadata(&meta.location)
+                    || is_uncheckpointed_operational_path(&meta.location)
+                    || meta.location.as_ref() == "control/bootstrap/active-generation"
+                {
+                    continue;
+                }
+                let bytes = self.read_bytes(source, &meta.location).await?;
+                snapshot.insert(meta.location, digest_bytes(&bytes));
+            }
+        }
+        Ok(snapshot)
     }
 
     async fn list_checkpoint_objects(
@@ -219,7 +362,17 @@ impl CheckpointExportService {
         prefix: &Path,
     ) -> Result<Vec<Path>, CheckpointExportError> {
         let mut objects = Self::list_export_objects(source, prefix).await?;
-        objects.retain(|path| !is_shard_path(path) && !is_uncheckpointed_operational_path(path));
+        objects.retain(|path| {
+            !is_shard_path(path)
+                && !is_uncheckpointed_operational_path(path)
+                && is_selected_checkpoint_metadata(path, checkpoint)
+        });
+        // Always include the *selected* control manifest, even if prefix was
+        // scoped to a shard. The root listing must not determine its identity.
+        objects.push(Path::from(format!(
+            "control/checkpoints/{}",
+            checkpoint.checkpoint_id.0
+        )));
         for (shard_id, shard_checkpoint) in &checkpoint.shards {
             let shard_path = format!("shards/{}", shard_id.0);
             let shard_objects = match shard_checkpoint.snapshot_id.as_deref() {
@@ -328,6 +481,8 @@ impl CheckpointExportService {
 
         let mut digest = Sha256::new();
         let mut byte_count = 0_u64;
+        let mut seen_sources = BTreeSet::new();
+        let mut selected_manifest_present = false;
         for index in 0..outcome.object_count {
             let record = self
                 .read_json::<InventoryRecord>(&destination, &inventory_path(generation, index))
@@ -340,9 +495,20 @@ impl CheckpointExportService {
                     "inventory record {index} points outside the generation"
                 )));
             }
+            if !seen_sources.insert(record.source.clone()) {
+                return Err(CheckpointExportError::Integrity(format!(
+                    "duplicate restored source path {}",
+                    record.source
+                )));
+            }
             let bytes = self
                 .read_bytes(&destination, &Path::from(record.destination.clone()))
                 .await?;
+            selected_manifest_present |= validate_checkpoint_metadata_record(
+                &record.source,
+                &bytes,
+                &generation_record.checkpoint,
+            )?;
             let actual_digest = digest_bytes(&bytes);
             if bytes.len() as u64 != record.byte_len || actual_digest != record.sha256 {
                 return Err(CheckpointExportError::Integrity(format!(
@@ -360,6 +526,11 @@ impl CheckpointExportService {
         {
             return Err(CheckpointExportError::Integrity(
                 "inventory digest or byte total does not match the terminal marker".to_string(),
+            ));
+        }
+        if generation_record.requires_checkpoint_manifest && !selected_manifest_present {
+            return Err(CheckpointExportError::Integrity(
+                "selected control checkpoint manifest is missing from export inventory".to_string(),
             ));
         }
         Ok(outcome)
@@ -441,6 +612,10 @@ impl CheckpointExportService {
             .ok_or_else(|| {
                 CheckpointExportError::Integrity("generation record is missing".to_string())
             })?;
+        // A target may be partially populated even without an active pointer.
+        // Publishing A over a pre-existing B would make recovery select B.
+        self.reject_other_target_manifests(&target, &generation_record.checkpoint)
+            .await?;
         let pointer_path = Path::from("control/bootstrap/active-generation");
         if let Some(existing) = self
             .read_json::<BootstrapPointer>(&target, &pointer_path)
@@ -453,6 +628,8 @@ impl CheckpointExportService {
                     "target already has a different active generation".to_string(),
                 ));
             }
+            self.assert_restored_checkpoint(&target, &generation_record.checkpoint)
+                .await?;
             return Ok(CheckpointRestoreOutcome {
                 checkpoint_id: outcome.checkpoint_id,
                 generation: generation.to_string(),
@@ -513,6 +690,10 @@ impl CheckpointExportService {
             }
         }
 
+        // Check the exact durable discovery path a fresh recovery will use
+        // before publishing the bootstrap pointer and SUCCESS.
+        self.assert_restored_checkpoint(&target, &generation_record.checkpoint)
+            .await?;
         self.put_json(
             &target,
             &pointer_path,
@@ -532,6 +713,50 @@ impl CheckpointExportService {
         })
     }
 
+    async fn reject_other_target_manifests(
+        &self,
+        target: &Arc<dyn ObjectStore>,
+        checkpoint: &ClusterCheckpoint,
+    ) -> Result<(), CheckpointExportError> {
+        let expected_path = format!("control/checkpoints/{}", checkpoint.checkpoint_id.0);
+        let mut listing = target.list(Some(&Path::from("control/checkpoints")));
+        let mut scanned = 0_usize;
+        while let Some(entry) = listing.next().await {
+            let meta =
+                entry.map_err(|error| CheckpointExportError::ObjectStore(error.to_string()))?;
+            scanned += 1;
+            if scanned > MAX_CHECKPOINT_EXPORT_SCAN_WINDOW {
+                return Err(CheckpointExportError::Integrity(format!(
+                    "restore target manifest scan exceeded MAX_CHECKPOINT_EXPORT_SCAN_WINDOW={MAX_CHECKPOINT_EXPORT_SCAN_WINDOW}"
+                )));
+            }
+            if meta.location.as_ref() != expected_path {
+                return Err(CheckpointExportError::Integrity(format!(
+                    "restore target contains another discoverable checkpoint manifest: {}",
+                    meta.location
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    async fn assert_restored_checkpoint(
+        &self,
+        target: &Arc<dyn ObjectStore>,
+        checkpoint: &ClusterCheckpoint,
+    ) -> Result<(), CheckpointExportError> {
+        let discovered = crate::checkpoint_store::CheckpointManifestStore::new(target.clone())
+            .load_latest_manifest()
+            .await
+            .map_err(CheckpointExportError::Integrity)?;
+        if discovered.as_ref() != Some(checkpoint) {
+            return Err(CheckpointExportError::Integrity(
+                "restored latest control checkpoint does not match export generation".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn export_objects_inner<I>(
         &self,
         source: Arc<dyn ObjectStore>,
@@ -539,11 +764,17 @@ impl CheckpointExportService {
         checkpoint: ClusterCheckpoint,
         generation: String,
         objects: I,
+        guard: ExportGuard,
     ) -> Result<CheckpointExportOutcome, CheckpointExportError>
     where
         I: IntoIterator<Item = Path>,
         I::IntoIter: ExactSizeIterator,
     {
+        let ExportGuard {
+            require_latest,
+            require_manifest,
+            metadata_baseline,
+        } = guard;
         match destination.head(&commit_path(&generation)).await {
             Ok(_) => {
                 let outcome = self
@@ -573,6 +804,7 @@ impl CheckpointExportService {
             generation: generation.clone(),
             checkpoint,
             object_count: total,
+            requires_checkpoint_manifest: require_manifest,
         };
         let generation_location = generation_path(&generation);
         match self
@@ -606,9 +838,27 @@ impl CheckpointExportService {
         let mut copied = 0_u64;
         let mut byte_count = 0_u64;
         let mut inventory_digest = Sha256::new();
+        let mut selected_manifest_present = false;
+        let mut mutable_metadata = Vec::new();
         rockstream_types::metrics::set_checkpoint_export_copy_progress(0, total);
         for (index, source_path) in objects.enumerate() {
             let source_bytes = self.read_bytes(&source, &source_path).await?;
+            selected_manifest_present |= validate_checkpoint_metadata_record(
+                source_path.as_ref(),
+                &source_bytes,
+                &generation_record.checkpoint,
+            )?;
+            if require_latest && is_unversioned_export_metadata(&source_path) {
+                let source_digest = digest_bytes(&source_bytes);
+                if let Some((_, baseline)) = &metadata_baseline {
+                    if baseline.get(&source_path) != Some(&source_digest) {
+                        return Err(CheckpointExportError::Integrity(format!(
+                            "unversioned checkpoint metadata {source_path} changed since checkpoint selection"
+                        )));
+                    }
+                }
+                mutable_metadata.push((source_path.clone(), source_digest));
+            }
             let source_name = source_path.to_string();
             let destination_name = object_path(&generation, index as u64).to_string();
             let record = InventoryRecord {
@@ -666,6 +916,45 @@ impl CheckpointExportService {
             rockstream_types::metrics::set_checkpoint_export_copy_progress(copied, total);
         }
 
+        if require_manifest && !selected_manifest_present {
+            return Err(CheckpointExportError::Integrity(
+                "selected control checkpoint manifest is missing from export inventory".to_string(),
+            ));
+        }
+        if require_latest {
+            // Re-scan membership *and bytes* of unversioned metadata. Merely
+            // checking the copied paths would miss newly added source/catalog
+            // records after inventory. The durable checkpoint must also still
+            // be the one selected before the scan.
+            if let Some((prefix, baseline)) = &metadata_baseline {
+                let current = self.snapshot_live_metadata(&source, prefix).await?;
+                if &current != baseline {
+                    return Err(CheckpointExportError::Integrity(
+                        "unversioned control/catalog/source metadata changed during export"
+                            .to_string(),
+                    ));
+                }
+            } else {
+                for (path, expected_digest) in mutable_metadata {
+                    let current = self.read_bytes(&source, &path).await?;
+                    if digest_bytes(&current) != expected_digest {
+                        return Err(CheckpointExportError::Integrity(format!(
+                            "unversioned checkpoint metadata {path} changed during export"
+                        )));
+                    }
+                }
+            }
+            let latest = crate::checkpoint_store::CheckpointManifestStore::new(source.clone())
+                .load_latest_manifest()
+                .await
+                .map_err(CheckpointExportError::Integrity)?;
+            if latest.as_ref() != Some(&generation_record.checkpoint) {
+                return Err(CheckpointExportError::Integrity(
+                    "source committed checkpoint changed during export; no terminal marker published"
+                        .to_string(),
+                ));
+            }
+        }
         if rockstream_sim::buggify!("dr.export.before_terminal_marker", 1.0) {
             return Err(CheckpointExportError::Interrupted(
                 "dr.export.before_terminal_marker",
@@ -775,6 +1064,91 @@ fn is_uncheckpointed_operational_path(path: &Path) -> bool {
     path == "audit.jsonl"
         || path.starts_with("control/management-operations/")
         || path.starts_with("topology/workers/")
+}
+
+fn is_selected_checkpoint_metadata(path: &Path, checkpoint: &ClusterCheckpoint) -> bool {
+    let name = path.as_ref();
+    if name.starts_with("control/checkpoints/") {
+        return name == format!("control/checkpoints/{}", checkpoint.checkpoint_id.0);
+    }
+    if let Some(suffix) = name.strip_prefix("control/changelog-checkpoints/") {
+        return suffix.split_once('-').is_some_and(|(id, shard)| {
+            id.parse::<u64>() == Ok(checkpoint.checkpoint_id.0)
+                && shard.parse::<u64>().ok().is_some_and(|shard| {
+                    checkpoint
+                        .shards
+                        .contains_key(&rockstream_types::ids::ShardId(shard))
+                })
+        });
+    }
+    true
+}
+
+fn is_unversioned_export_metadata(path: &Path) -> bool {
+    let name = path.as_ref();
+    (name.starts_with("control/")
+        && !name.starts_with("control/checkpoints/")
+        && !name.starts_with("control/changelog-checkpoints/"))
+        || name.starts_with("catalog/")
+        || name.starts_with("sources/")
+        || name.starts_with("topology/")
+}
+
+/// Check both the restore-selected control manifest and epoch-qualified
+/// changelog records. This is called on source bytes before committing and
+/// again on exported bytes during offline validation/restore.
+fn validate_checkpoint_metadata_record(
+    path: &str,
+    bytes: &[u8],
+    checkpoint: &ClusterCheckpoint,
+) -> Result<bool, CheckpointExportError> {
+    if path.starts_with("control/checkpoints/") {
+        if path != format!("control/checkpoints/{}", checkpoint.checkpoint_id.0) {
+            return Err(CheckpointExportError::Integrity(format!(
+                "export contains a control manifest other than selected checkpoint {}: {path}",
+                checkpoint.checkpoint_id.0
+            )));
+        }
+        let restored = crate::checkpoint_store::decode_manifest(bytes).map_err(|error| {
+            CheckpointExportError::Integrity(format!(
+                "exported control checkpoint manifest is malformed: {error}"
+            ))
+        })?;
+        if restored != *checkpoint {
+            return Err(CheckpointExportError::Integrity(
+                "exported control checkpoint manifest differs from the selected checkpoint"
+                    .to_string(),
+            ));
+        }
+        return Ok(true);
+    }
+    if let Some(suffix) = path.strip_prefix("control/changelog-checkpoints/") {
+        if !is_selected_checkpoint_metadata(&Path::from(path), checkpoint) {
+            return Err(CheckpointExportError::Integrity(format!(
+                "export contains a changelog contribution outside selected checkpoint {}: {path}",
+                checkpoint.checkpoint_id.0
+            )));
+        }
+        let (epoch, _) = suffix.split_once('-').ok_or_else(|| {
+            CheckpointExportError::Integrity(format!(
+                "invalid checkpoint changelog contribution path: {path}"
+            ))
+        })?;
+        let contribution: crate::checkpoint::ChangelogCheckpointContribution =
+            serde_json::from_slice(bytes).map_err(|error| {
+                CheckpointExportError::Integrity(format!(
+                    "malformed checkpoint changelog contribution {path}: {error}"
+                ))
+            })?;
+        if contribution.checkpoint_id.0.to_string() != epoch
+            || contribution.checkpoint_id != checkpoint.checkpoint_id
+        {
+            return Err(CheckpointExportError::Integrity(format!(
+                "changelog contribution {path} identifies a different checkpoint epoch"
+            )));
+        }
+    }
+    Ok(false)
 }
 
 async fn snapshot_object_paths(
@@ -1046,6 +1420,10 @@ mod tests {
                 PerShardCheckpoint::new(CheckpointId(7), handle.shard_checkpoint_id)
                     .with_snapshot_id(handle.snapshot_id),
             );
+            crate::checkpoint_store::CheckpointManifestStore::new(source.clone())
+                .save_manifest(&cluster, false, None)
+                .await
+                .unwrap();
             let snapshot_id = cluster.shards[&ShardId(1)]
                 .snapshot_id
                 .as_deref()
@@ -1060,8 +1438,10 @@ mod tests {
             .await
             .unwrap();
             assert!(!objects.is_empty());
+            assert!(objects.contains(&Path::from("control/checkpoints/7")));
             assert!(objects
                 .iter()
+                .filter(|path| is_shard_path(path))
                 .all(|path| path.as_ref().starts_with(expected_root)));
             assert!(objects.iter().any(|path| {
                 path.as_ref().ends_with(&format!(
@@ -1116,6 +1496,142 @@ mod tests {
                 b"namespace-value"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_inventory_pins_only_selected_control_manifest() {
+        let source: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let manifests = crate::checkpoint_store::CheckpointManifestStore::new(source.clone());
+        let checkpoint_a = ClusterCheckpoint::new(CheckpointId(7));
+        let checkpoint_b = ClusterCheckpoint::new(CheckpointId(8));
+        manifests
+            .save_manifest(&checkpoint_a, false, None)
+            .await
+            .unwrap();
+        manifests
+            .save_manifest(&checkpoint_b, false, None)
+            .await
+            .unwrap();
+
+        // Even when the live root lists B, inventory of an explicitly
+        // selected A must contain exactly A's discoverable control manifest.
+        let objects = CheckpointExportService::list_checkpoint_objects(
+            &source,
+            &checkpoint_a,
+            &Path::from(""),
+        )
+        .await
+        .unwrap();
+        assert_eq!(objects, vec![Path::from("control/checkpoints/7")]);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_validator_rejects_newer_manifest_with_valid_hashes() {
+        let export: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let target: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let service = CheckpointExportService::new();
+        let generation = "tampered-manifest";
+        let selected = ClusterCheckpoint::new(CheckpointId(7));
+        let newer = ClusterCheckpoint::new(CheckpointId(8));
+        let bytes = serde_json::to_vec(&newer).unwrap();
+        let record = InventoryRecord {
+            source: "control/checkpoints/8".to_string(),
+            destination: object_path(generation, 0).to_string(),
+            byte_len: bytes.len() as u64,
+            sha256: digest_bytes(&bytes),
+        };
+        export
+            .put(&object_path(generation, 0), bytes.into())
+            .await
+            .unwrap();
+        service
+            .put_json(
+                &export,
+                &generation_path(generation),
+                &GenerationRecord {
+                    checkpoint_id: selected.checkpoint_id,
+                    generation: generation.to_string(),
+                    checkpoint: selected,
+                    object_count: 1,
+                    requires_checkpoint_manifest: true,
+                },
+            )
+            .await
+            .unwrap();
+        service
+            .put_json(&export, &inventory_path(generation, 0), &record)
+            .await
+            .unwrap();
+        let mut digest = Sha256::new();
+        update_digest(&mut digest, &record).unwrap();
+        let outcome = CheckpointExportOutcome {
+            checkpoint_id: 7,
+            generation: generation.to_string(),
+            object_count: 1,
+            byte_count: record.byte_len,
+            inventory_digest: hex::encode(digest.finalize()),
+            status: "SUCCESS".to_string(),
+        };
+        service
+            .put_json(&export, &commit_path(generation), &CommitMarker { outcome })
+            .await
+            .unwrap();
+
+        let error = service
+            .validate_generation(export.clone(), generation)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("other than selected checkpoint"));
+        assert!(service
+            .restore_generation(export, target.clone(), generation)
+            .await
+            .is_err());
+        assert!(matches!(
+            target
+                .head(&Path::from("control/bootstrap/active-generation"))
+                .await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_preexisting_newer_checkpoint_without_success_pointer() {
+        let source: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let export: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let target: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let selected = ClusterCheckpoint::new(CheckpointId(7));
+        crate::checkpoint_store::CheckpointManifestStore::new(source.clone())
+            .save_manifest(&selected, false, None)
+            .await
+            .unwrap();
+        let service = CheckpointExportService::new();
+        service
+            .export_latest_prefix(
+                source.clone(),
+                export.clone(),
+                &crate::checkpoint_store::CheckpointManifestStore::new(source),
+                "target-has-newer",
+                &Path::from(""),
+            )
+            .await
+            .unwrap();
+        crate::checkpoint_store::CheckpointManifestStore::new(target.clone())
+            .save_manifest(&ClusterCheckpoint::new(CheckpointId(8)), false, None)
+            .await
+            .unwrap();
+        let error = service
+            .restore_generation(export, target.clone(), "target-has-newer")
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("another discoverable checkpoint"));
+        assert!(matches!(
+            target
+                .head(&Path::from("control/bootstrap/active-generation"))
+                .await,
+            Err(object_store::Error::NotFound { .. })
+        ));
     }
 
     #[tokio::test]
@@ -1227,6 +1743,10 @@ mod tests {
                 .unwrap();
         }
 
+        crate::checkpoint_store::CheckpointManifestStore::new(source.clone())
+            .save_manifest(&checkpoint(), false, None)
+            .await
+            .unwrap();
         let error = CheckpointExportService::new()
             .export_prefix(
                 source,

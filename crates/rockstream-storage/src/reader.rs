@@ -56,6 +56,7 @@ impl ShardReader {
             ))
         })?;
         let reader = slatedb::DbReader::builder(path.clone(), object_store)
+            .with_merge_operator(Arc::new(crate::merge_registry::SumCountMergeOperator))
             .with_reader_mode(DbReaderMode::Checkpoint(checkpoint_id))
             .build()
             .await?;
@@ -99,7 +100,9 @@ impl ShardReader {
                 Some(std::time::Duration::from_secs(3600));
             options.object_store_cache_options.max_open_file_handles = 1000;
         }
-        let mut builder = DbReader::builder(path.clone(), object_store).with_options(options);
+        let mut builder = DbReader::builder(path.clone(), object_store)
+            .with_merge_operator(Arc::new(crate::merge_registry::SumCountMergeOperator))
+            .with_options(options);
         if let Some(bits) = filter_bits_per_key {
             builder = builder.with_filter_policies(vec![
                 crate::keys::join_arrangement_bloom_filter_policy(bits),
@@ -117,6 +120,7 @@ impl ShardReader {
     ) -> Result<Self, StorageError> {
         let path = path.into();
         let reader = DbReader::builder(path.clone(), object_store)
+            .with_merge_operator(Arc::new(crate::merge_registry::SumCountMergeOperator))
             .build()
             .await?;
         Self::from_reader(path, reader, supported_format_range).await
@@ -130,6 +134,7 @@ impl ShardReader {
     ) -> Result<Self, StorageError> {
         let path = path.into();
         let reader = DbReader::builder(path.clone(), object_store)
+            .with_merge_operator(Arc::new(crate::merge_registry::SumCountMergeOperator))
             .with_options(options)
             .build()
             .await?;

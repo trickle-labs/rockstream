@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 
 use rockstream_types::data_plane::RuntimeExchangeMessage;
 use rockstream_types::ids::{LeaseToken, ShardId};
+use rockstream_types::state_budget::{MemoryCategory, MemoryPermit, WorkerBudgetLedger};
 
 pub const SHARD_ACTOR_MAILBOX_MESSAGES: usize = 32;
 pub const SHARD_ACTOR_MAILBOX_BYTES: usize = 4 * 1024 * 1024;
@@ -64,6 +65,7 @@ struct QueuedFrame {
     frame: Option<RuntimeExchangeMessage>,
     bytes: usize,
     _credit: ExchangeCredit,
+    _budget_permit: Option<MemoryPermit>,
     on_cancel: Option<Box<dyn FnOnce() + Send>>,
     completion: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
 }
@@ -94,12 +96,21 @@ struct ActorHandle {
 #[derive(Clone, Default)]
 pub struct ShardActorRegistry {
     actors: Arc<RwLock<HashMap<ShardId, ActorHandle>>>,
+    budget_ledger: Option<Arc<WorkerBudgetLedger>>,
     on_cancel: Option<CancellationReporter>,
 }
 
 impl ShardActorRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Attach a whole-process [`WorkerBudgetLedger`] so queued exchange frames
+    /// are accounted under [`MemoryCategory::ExchangeBuffers`] and released as
+    /// soon as the shard actor finishes processing each frame (Issue #402 R4).
+    pub fn with_budget_ledger(mut self, ledger: Arc<WorkerBudgetLedger>) -> Self {
+        self.budget_ledger = Some(ledger);
+        self
     }
 
     pub(crate) fn with_cancellation_reporter(mut self, reporter: CancellationReporter) -> Self {
@@ -168,6 +179,58 @@ impl ShardActorRegistry {
                 queued_bytes,
                 abort: task.abort_handle(),
                 receipts,
+            },
+        );
+    }
+
+    /// Register a single-owner shard actor whose mutable state `S` lives
+    /// directly inside the actor task (Issue #402 R3).
+    ///
+    /// Because the shard actor exclusively owns `state: S`, `execute` receives
+    /// `&mut S` on every frame with **zero `Mutex` locking** on the hot
+    /// execution loop.
+    pub fn register_owned_state<S, F, Fut>(
+        &self,
+        shard_id: ShardId,
+        lease_token: LeaseToken,
+        mut state: S,
+        mut execute: F,
+    ) where
+        S: Send + 'static,
+        F: FnMut(&mut S, RuntimeExchangeMessage) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send,
+    {
+        if let Some(previous) = self.actors.write().remove(&shard_id) {
+            previous.abort.abort();
+        }
+
+        let (sender, mut receiver) = mpsc::channel::<QueuedFrame>(SHARD_ACTOR_MAILBOX_MESSAGES);
+        let credits =
+            ExchangeCredits::new(SHARD_ACTOR_MAILBOX_BYTES, SHARD_ACTOR_MAILBOX_COMPUTE_MS);
+        let queued_messages = Arc::new(AtomicUsize::new(0));
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
+        let messages = queued_messages.clone();
+        let bytes = queued_bytes.clone();
+        let task = tokio::spawn(async move {
+            while let Some(mut queued) = receiver.recv().await {
+                messages.fetch_sub(1, Ordering::AcqRel);
+                bytes.fetch_sub(queued.bytes, Ordering::AcqRel);
+                let frame = queued.frame.take().expect("queued frame is present");
+                execute(&mut state, frame).await;
+                queued.on_cancel.take();
+            }
+        });
+
+        self.actors.write().insert(
+            shard_id,
+            ActorHandle {
+                lease_token,
+                sender,
+                credits,
+                queued_messages,
+                queued_bytes,
+                abort: task.abort_handle(),
+                receipts: false,
             },
         );
     }
@@ -245,6 +308,25 @@ impl ShardActorRegistry {
                 });
             }
         };
+        let budget_permit = if let Some(ledger) = &self.budget_ledger {
+            match ledger.try_acquire(MemoryCategory::ExchangeBuffers, bytes as u64, false) {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    actor.queued_messages.fetch_sub(1, Ordering::AcqRel);
+                    actor.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+                    let queued_bytes = actor.queued_bytes.load(Ordering::Acquire);
+                    return Err(ShardActorError::Full {
+                        shard: shard_id,
+                        messages: actor.queued_messages.load(Ordering::Acquire),
+                        max_messages: SHARD_ACTOR_MAILBOX_MESSAGES,
+                        bytes: queued_bytes,
+                        max_bytes: SHARD_ACTOR_MAILBOX_BYTES,
+                    });
+                }
+            }
+        } else {
+            None
+        };
         let permit = match actor.sender.try_reserve() {
             Ok(permit) => permit,
             Err(_) => {
@@ -258,6 +340,7 @@ impl ShardActorRegistry {
             frame: Some(frame),
             bytes,
             _credit: credit,
+            _budget_permit: budget_permit,
             on_cancel,
             completion,
         });
