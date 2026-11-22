@@ -372,7 +372,7 @@ async fn concurrent_newer_control_manifest_is_excluded_and_rejected_on_tamper() 
         .unwrap_err();
     assert!(
         err.to_string()
-            .contains("contains control checkpoint metadata `control/checkpoints/11` newer than exported checkpoint 10"),
+            .contains("other than selected checkpoint 10"),
         "unexpected validation error: {err}"
     );
 }

@@ -418,7 +418,7 @@ fn encode_manifest(
     Ok(framed)
 }
 
-fn decode_manifest(payload: &[u8]) -> Result<ClusterCheckpoint, String> {
+pub(crate) fn decode_manifest(payload: &[u8]) -> Result<ClusterCheckpoint, String> {
     if payload.len() < MANIFEST_HEADER_LEN || &payload[..4] != MANIFEST_MAGIC {
         return serde_json::from_slice(payload)
             .map_err(|e| manifest_codec_error(format!("legacy json decode failed: {e}")));

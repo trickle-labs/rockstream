@@ -60,7 +60,7 @@ async fn worker_exchange_listener_lifecycle_tracks_control_connection() {
         assert_ne!(exchange_addr.port(), 0);
         let reply = serde_json::to_string(&ControlMessage::Registered {
             worker_id: registration.worker_id,
-            protocol_version: rockstream_types::compatibility::ProtocolVersion::V3,
+            protocol_version: rockstream_types::compatibility::ProtocolVersion::V4,
         })
         .unwrap()
             + "\n";

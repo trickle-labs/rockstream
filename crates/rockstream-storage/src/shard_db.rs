@@ -165,6 +165,7 @@ pub struct ShardDb {
     migration_pending: bool,
     storage_context: Option<Arc<crate::storage_context::WorkerStorageContext>>,
     concurrency_governor: Option<Arc<crate::concurrency_governor::ConcurrencyGovernor>>,
+    physical_writes: Arc<crate::metered_store::PhysicalWriteTracker>,
     disk_cache_dir: Option<std::path::PathBuf>,
     cleanup_on_drop: bool,
     fail_writes: Arc<std::sync::atomic::AtomicBool>,
@@ -436,11 +437,19 @@ impl ShardDbBuilder {
         }
 
         let db_cache = if let Some(ref ctx) = self.storage_context {
+            ctx.register_shard();
             ctx.db_cache()
         } else {
             crate::slatedb_metrics::instrumented_db_cache(&worker_id)
         };
-        let mut builder = Db::builder(self.path.as_str(), self.object_store.clone())
+        let physical_writes = Arc::new(crate::metered_store::PhysicalWriteTracker::new());
+        let metered_store: Arc<dyn ObjectStore> =
+            Arc::new(crate::metered_store::MeteredObjectStore::new(
+                self.path.clone(),
+                self.object_store.clone(),
+                Arc::clone(&physical_writes),
+            ));
+        let mut builder = Db::builder(self.path.as_str(), metered_store)
             .with_settings(self.settings)
             .with_merge_operator(Arc::new(SumCountMergeOperator))
             .with_db_cache(db_cache);
@@ -520,6 +529,7 @@ impl ShardDbBuilder {
             migration_pending,
             storage_context: self.storage_context,
             concurrency_governor: self.concurrency_governor,
+            physical_writes,
             disk_cache_dir: self.disk_cache_dir,
             cleanup_on_drop: self.cleanup_on_drop,
             fail_writes: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -557,6 +567,16 @@ impl ShardDb {
     /// Return the shared storage context if configured for this shard.
     pub fn storage_context(&self) -> Option<&Arc<crate::storage_context::WorkerStorageContext>> {
         self.storage_context.as_ref()
+    }
+
+    /// Snapshot actual physical WAL, SST, manifest, and GET I/O counters for this shard.
+    pub fn physical_write_stats(&self) -> rockstream_types::metrics::PhysicalPersistenceCounters {
+        self.physical_writes.snapshot()
+    }
+
+    /// Reset per-shard physical I/O counters (e.g. before measuring a single epoch commit).
+    pub fn reset_physical_write_stats(&self) {
+        self.physical_writes.reset();
     }
 
     /// Return the concurrency governor if configured for this shard.

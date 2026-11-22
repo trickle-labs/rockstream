@@ -2920,7 +2920,7 @@ impl StorageClient {
                     .ok_or_else(|| "no committed checkpoint manifest exists".to_string())?;
                 let generation = format!("checkpoint-{}", checkpoint.checkpoint_id.0);
                 rockstream_control::CheckpointExportService::new()
-                    .export_prefix(
+                    .export_checkpoint_prefix(
                         source_store,
                         destination_store,
                         checkpoint,

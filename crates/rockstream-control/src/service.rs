@@ -46,7 +46,7 @@ use rockstream_types::error_code::{
     RS_3611, RS_3612, RS_8004,
 };
 use rockstream_types::identity::{InternalTlsConfig, NodeIdentity, NodeRole};
-use rockstream_types::ids::{PrincipalId, ShardId, WorkerId, WorkloadId};
+use rockstream_types::ids::{LeaseToken, PrincipalId, ShardId, WorkerId, WorkloadId};
 use rockstream_types::lease::ShardRevokeReason;
 use rockstream_types::rendezvous::{fnv1a_64, rendezvous_hash};
 use rockstream_types::topology::{
@@ -170,6 +170,7 @@ struct DataPlaneState {
     deployments: HashMap<WorkloadId, DeploymentState>,
     source_waiters: HashMap<String, SourceWaiter>,
     operator_stats_waiters: HashMap<String, OperatorStatsWaiter>,
+    workload_read_waiters: HashMap<String, WorkloadReadWaiter>,
     owned_shuffle_workers: HashSet<WorkerId>,
     /// Shards currently paused in the brief donor-to-recipient handoff window.
     handoff_shards: HashSet<ShardId>,
@@ -298,6 +299,13 @@ struct OperatorStatsWaiter {
         WorkerId,
         Vec<rockstream_types::explain::IdentifiedOperatorStats>,
     )>,
+}
+
+struct WorkloadReadWaiter {
+    workload_id: WorkloadId,
+    expected_shards: HashMap<WorkerId, HashMap<ShardId, LeaseToken>>,
+    received_workers: HashSet<WorkerId>,
+    sender: mpsc::Sender<(WorkerId, bool, Vec<ShardOutput>)>,
 }
 
 /// Convert the internal [`RaftRole`] to its wire-serializable mirror.
@@ -3831,7 +3839,7 @@ async fn gateway_data_plane_scope(
                 },
             ))
         }
-        WorkerMessage::ReadWorkload { workload_id }
+        WorkerMessage::ReadWorkload { workload_id, .. }
         | WorkerMessage::ReadOperatorStats { workload_id, .. } => {
             let state = data_plane.lock().await;
             let deployment = state.deployments.get(workload_id)?;
@@ -4648,6 +4656,185 @@ async fn request_operator_stats(
     }
 }
 
+async fn request_workload_snapshot(
+    workload_id: WorkloadId,
+    data_plane: &Arc<AsyncMutex<DataPlaneState>>,
+    worker_senders: &Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
+    catalog: &TopologyCatalog,
+    shard_manager: &ShardManager,
+) -> ControlMessage {
+    let unavailable = || data_plane_failure("complete workload output is unavailable");
+    let (deployment_request, workers, expected_shards) = {
+        let state = data_plane.lock().await;
+        let Some(deployment) = state.deployments.get(&workload_id) else {
+            return unavailable();
+        };
+        if deployment.recovery_required {
+            return workload_recovery_failure();
+        }
+        if deployment.ready_waiter.is_some()
+            || state
+                .source_waiters
+                .values()
+                .any(|waiter| waiter.workload_id == workload_id)
+        {
+            return data_plane_failure("workload has an incomplete execution");
+        }
+        let descriptor_shards = deployment
+            .descriptors
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>();
+        if descriptor_shards.is_empty() || deployment.ready_shards != descriptor_shards {
+            return unavailable();
+        }
+        let mut expected_shards = HashMap::<WorkerId, HashMap<ShardId, LeaseToken>>::new();
+        for (shard_id, descriptor) in &deployment.descriptors {
+            if descriptor.shard.shard_id != *shard_id
+                || !shard_manager.get(*shard_id).is_some_and(|lease| {
+                    lease.worker_id == descriptor.shard.worker_id
+                        && lease.lease_token == descriptor.shard.lease_token
+                })
+            {
+                return unavailable();
+            }
+            expected_shards
+                .entry(descriptor.shard.worker_id)
+                .or_default()
+                .insert(*shard_id, descriptor.shard.lease_token);
+        }
+        for worker_id in expected_shards.keys() {
+            let Some(worker) = catalog.get(*worker_id) else {
+                return unavailable();
+            };
+            if !worker.healthy
+                || !worker.lifecycle.is_active()
+                || !worker
+                    .protocol_range
+                    .contains(rockstream_types::compatibility::ProtocolVersion::V4)
+                || !deployment
+                    .workers
+                    .get(worker_id)
+                    .is_some_and(|status| status.ready)
+            {
+                return unavailable();
+            }
+        }
+        let mut workers: Vec<_> = deployment.workers.values().cloned().collect();
+        workers.sort_by_key(|status| status.worker_id);
+        (deployment.request.clone(), workers, expected_shards)
+    };
+    let request_id = format!("workload-read:{}", uuid::Uuid::new_v4());
+    let mut worker_targets = {
+        let senders = worker_senders.lock().await;
+        let mut targets = Vec::with_capacity(expected_shards.len());
+        for (worker_id, shard_leases) in &expected_shards {
+            let Some(sender) = senders.get(worker_id).cloned() else {
+                return unavailable();
+            };
+            let mut shard_ids: Vec<_> = shard_leases.keys().copied().collect();
+            shard_ids.sort();
+            targets.push((*worker_id, sender, shard_ids));
+        }
+        targets
+    };
+    worker_targets.sort_by_key(|(worker_id, _, _)| *worker_id);
+
+    let (report_tx, mut report_rx) = mpsc::channel(expected_shards.len());
+    {
+        let mut state = data_plane.lock().await;
+        if state.workload_read_waiters.contains_key(&request_id) {
+            return unavailable();
+        }
+        state.workload_read_waiters.insert(
+            request_id.clone(),
+            WorkloadReadWaiter {
+                workload_id,
+                expected_shards: expected_shards.clone(),
+                received_workers: HashSet::new(),
+                sender: report_tx,
+            },
+        );
+    }
+    for (_, worker_sender, shard_ids) in worker_targets {
+        if worker_sender
+            .send(ControlMessage::ReadWorkload {
+                version: rockstream_types::data_plane::WORKLOAD_SNAPSHOT_VERSION,
+                request_id: request_id.clone(),
+                workload_id,
+                shard_ids,
+            })
+            .await
+            .is_err()
+        {
+            data_plane
+                .lock()
+                .await
+                .workload_read_waiters
+                .remove(&request_id);
+            return unavailable();
+        }
+    }
+
+    let expected_shard_count = expected_shards.values().map(HashMap::len).sum::<usize>();
+    let reports = tokio::time::timeout(Duration::from_secs(5), async {
+        let expected_workers = expected_shards.keys().copied().collect::<HashSet<_>>();
+        let mut received_workers = HashSet::new();
+        let mut outputs = HashMap::<ShardId, ShardOutput>::new();
+        while received_workers.len() < expected_workers.len() {
+            let (worker_id, available, shards) = report_rx.recv().await?;
+            if !expected_workers.contains(&worker_id) || !received_workers.insert(worker_id) {
+                continue;
+            }
+            if !available {
+                return None;
+            }
+            let expected = expected_shards.get(&worker_id)?;
+            if shards.len() != expected.len() {
+                return None;
+            }
+            for shard in shards {
+                if expected.get(&shard.shard_id).copied() != shard.lease_token
+                    || outputs.insert(shard.shard_id, shard).is_some()
+                {
+                    return None;
+                }
+            }
+        }
+        (received_workers == expected_workers && outputs.len() == expected_shard_count)
+            .then_some(outputs)
+    })
+    .await;
+    data_plane
+        .lock()
+        .await
+        .workload_read_waiters
+        .remove(&request_id);
+    let Ok(Some(mut outputs)) = reports else {
+        return unavailable();
+    };
+    for (worker_id, shard_leases) in &expected_shards {
+        for (shard_id, lease_token) in shard_leases {
+            if !shard_manager.get(*shard_id).is_some_and(|lease| {
+                lease.worker_id == *worker_id && lease.lease_token == *lease_token
+            }) {
+                return unavailable();
+            }
+        }
+    }
+    let mut shards: Vec<_> = outputs.drain().map(|(_, output)| output).collect();
+    shards.sort_by_key(|shard| shard.shard_id);
+    ControlMessage::WorkloadSnapshot {
+        snapshot: WorkloadSnapshot {
+            version: rockstream_types::data_plane::WORKLOAD_SNAPSHOT_VERSION,
+            complete: true,
+            deployment: deployment_request,
+            shards,
+            workers,
+        },
+    }
+}
+
 /// Handle a single worker connection over an arbitrary stream.
 async fn handle_connection_stream<R, W>(
     reader: R,
@@ -4912,7 +5099,7 @@ async fn handle_connection_stream<R, W>(
                     }
                     if !reg
                         .protocol_range
-                        .contains(rockstream_types::compatibility::ProtocolVersion::V3)
+                        .contains(rockstream_types::compatibility::ProtocolVersion::V4)
                     {
                         let record = SecurityAuditRecord {
                             format_version: SECURITY_AUDIT_FORMAT_VERSION,
@@ -4946,7 +5133,7 @@ async fn handle_connection_stream<R, W>(
                         )
                         .with_error_code(rockstream_types::error_code::RS_5021.to_string())
                         .with_detail(format!(
-                            "worker protocol range {:?} does not include v3 required for audited authenticated shard ownership",
+                            "worker protocol range {:?} does not include v4 required for complete workload reads",
                             reg.protocol_range
                         ));
                         if !append_required_security_audit(
@@ -4961,7 +5148,7 @@ async fn handle_connection_stream<R, W>(
                             &ControlMessage::OperationFailed {
                                 code: rockstream_types::error_code::RS_5021.to_string(),
                                 message:
-                                    "RS-5021: authenticated worker shuffle requires protocol v3"
+                                    "RS-5021: authenticated worker shuffle requires protocol v4"
                                         .to_owned(),
                                 next_steps: rockstream_types::error_code::next_steps(
                                     rockstream_types::error_code::RS_5021,
@@ -5009,7 +5196,7 @@ async fn handle_connection_stream<R, W>(
                 }
                 let reply = ControlMessage::Registered {
                     worker_id,
-                    protocol_version: rockstream_types::compatibility::ProtocolVersion::V3,
+                    protocol_version: rockstream_types::compatibility::ProtocolVersion::V4,
                 };
                 send_message(&sender, &reply).await;
                 broadcast_message(
@@ -5492,6 +5679,49 @@ async fn handle_connection_stream<R, W>(
                     None => {}
                 }
             }
+            WorkerMessage::WorkloadReadReport {
+                version,
+                request_id,
+                workload_id,
+                worker_id,
+                available,
+                shards,
+            } => {
+                if version == rockstream_types::data_plane::WORKLOAD_SNAPSHOT_VERSION
+                    && connected_worker_id == Some(worker_id)
+                {
+                    let report_target = {
+                        let mut state = data_plane.lock().await;
+                        state
+                            .workload_read_waiters
+                            .get_mut(&request_id)
+                            .and_then(|waiter| {
+                                if waiter.workload_id != workload_id
+                                    || waiter.received_workers.contains(&worker_id)
+                                {
+                                    return None;
+                                }
+                                let expected = waiter.expected_shards.get(&worker_id)?;
+                                let valid = if available {
+                                    shards.len() == expected.len()
+                                        && shards.iter().all(|shard| {
+                                            expected.get(&shard.shard_id).copied()
+                                                == shard.lease_token
+                                        })
+                                } else {
+                                    shards.is_empty()
+                                };
+                                if !valid || !waiter.received_workers.insert(worker_id) {
+                                    return None;
+                                }
+                                Some(waiter.sender.clone())
+                            })
+                    };
+                    if let Some(report_sender) = report_target {
+                        let _ = report_sender.send((worker_id, available, shards)).await;
+                    }
+                }
+            }
             WorkerMessage::OperatorStatsReport {
                 request_id,
                 workload_id,
@@ -5544,45 +5774,23 @@ async fn handle_connection_stream<R, W>(
                 };
                 send_message(&sender, &reply).await;
             }
-            WorkerMessage::ReadWorkload { workload_id } => {
-                let reply = {
-                    let state = data_plane.lock().await;
-                    match state.deployments.get(&workload_id) {
-                        Some(deployment) if deployment.recovery_required => {
-                            workload_recovery_failure()
-                        }
-                        Some(deployment)
-                            if deployment.ready_waiter.is_some()
-                                || state
-                                    .source_waiters
-                                    .values()
-                                    .any(|waiter| waiter.workload_id == workload_id) =>
-                        {
-                            data_plane_failure("workload has an incomplete execution")
-                        }
-                        Some(deployment) => {
-                            let mut shards: Vec<_> = deployment
-                                .descriptors
-                                .keys()
-                                .map(|shard_id| ShardOutput {
-                                    shard_id: *shard_id,
-                                    deltas: Vec::new(),
-                                })
-                                .collect();
-                            shards.sort_by_key(|shard| shard.shard_id);
-                            let mut workers: Vec<_> =
-                                deployment.workers.values().cloned().collect();
-                            workers.sort_by_key(|status| status.worker_id);
-                            ControlMessage::WorkloadSnapshot {
-                                snapshot: WorkloadSnapshot {
-                                    deployment: deployment.request.clone(),
-                                    shards,
-                                    workers,
-                                },
-                            }
-                        }
-                        None => data_plane_failure("workload is not deployed"),
-                    }
+            WorkerMessage::ReadWorkload {
+                version,
+                workload_id,
+            } => {
+                let reply = if connected_worker_id.is_none()
+                    && version == rockstream_types::data_plane::WORKLOAD_SNAPSHOT_VERSION
+                {
+                    request_workload_snapshot(
+                        workload_id,
+                        &data_plane,
+                        &worker_senders,
+                        &catalog,
+                        &shard_manager,
+                    )
+                    .await
+                } else {
+                    data_plane_failure("workload read protocol is unavailable")
                 };
                 send_message(&sender, &reply).await;
             }

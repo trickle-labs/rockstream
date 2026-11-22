@@ -5,7 +5,9 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use rockstream_types::data_plane::{DeploymentRequest, SourceDeltaRequest, WorkloadSnapshot};
+use rockstream_types::data_plane::{
+    DeploymentRequest, SourceDeltaRequest, WorkloadSnapshot, WORKLOAD_SNAPSHOT_VERSION,
+};
 use rockstream_types::identity::InternalTlsConfig;
 use rockstream_types::ids::WorkloadId;
 use rockstream_types::topology::{ControlMessage, WorkerMessage};
@@ -221,13 +223,48 @@ impl DataPlaneClient {
         actor_assertion: Option<&str>,
     ) -> io::Result<WorkloadSnapshot> {
         match self
-            .request_with_assertion(WorkerMessage::ReadWorkload { workload_id }, actor_assertion)
+            .request_with_assertion(
+                WorkerMessage::ReadWorkload {
+                    version: WORKLOAD_SNAPSHOT_VERSION,
+                    workload_id,
+                },
+                actor_assertion,
+            )
             .await?
         {
-            ControlMessage::WorkloadSnapshot { snapshot }
-                if snapshot.deployment.workload_id == workload_id =>
-            {
-                Ok(snapshot)
+            ControlMessage::WorkloadSnapshot { snapshot } => {
+                let expected_shards = snapshot
+                    .workers
+                    .iter()
+                    .flat_map(|worker| worker.shard_ids.iter().copied())
+                    .collect::<std::collections::HashSet<_>>();
+                let actual_shards = snapshot
+                    .shards
+                    .iter()
+                    .map(|shard| shard.shard_id)
+                    .collect::<std::collections::HashSet<_>>();
+                let valid = snapshot.deployment.workload_id == workload_id
+                    && snapshot.version == WORKLOAD_SNAPSHOT_VERSION
+                    && snapshot.complete
+                    && !expected_shards.is_empty()
+                    && snapshot.workers.iter().all(|worker| worker.ready)
+                    && actual_shards.len() == snapshot.shards.len()
+                    && actual_shards == expected_shards
+                    && snapshot
+                        .shards
+                        .iter()
+                        .all(|shard| shard.lease_token.is_some());
+                if valid {
+                    Ok(snapshot)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "{}: control returned an incomplete or unsupported workload snapshot",
+                            rockstream_types::error_code::RS_0001
+                        ),
+                    ))
+                }
             }
             response => Err(Self::unexpected(response)),
         }
