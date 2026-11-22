@@ -1,0 +1,60 @@
+{{- if .Values.monitoring.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ .Release.Name }}-metrics
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    {{- with .Values.monitoring.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .Chart.Name }}
+  endpoints:
+    - port: management
+      path: /metrics
+      interval: {{ .Values.monitoring.serviceMonitor.interval }}
+{{- end }}
+{{- if .Values.monitoring.grafanaDashboard.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-grafana-dashboard
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    {{- with .Values.monitoring.grafanaDashboard.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+data:
+  rockstream-overview.json: |
+    {
+      "title": "RockStream IVM Overview",
+      "uid": "rockstream-ivm-overview",
+      "schemaVersion": 39,
+      "panels": [
+        {
+          "type": "timeseries",
+          "title": "End-to-End Freshness p99 (ms)",
+          "targets": [{"expr": "histogram_quantile(0.99, sum(rate(rockstream_freshness_ms_bucket[1m])) by (le))"}]
+        },
+        {
+          "type": "timeseries",
+          "title": "Query Latency p99 (ms)",
+          "targets": [{"expr": "histogram_quantile(0.99, sum(rate(rockstream_query_latency_ms_bucket[1m])) by (le))"}]
+        },
+        {
+          "type": "timeseries",
+          "title": "Worker Process RSS (bytes)",
+          "targets": [{"expr": "process_resident_memory_bytes{app_kubernetes_io_name=\"rockstream\"}"}]
+        },
+        {
+          "type": "timeseries",
+          "title": "Compaction Debt (bytes)",
+          "targets": [{"expr": "rockstream_compaction_debt_bytes"}]
+        }
+      ]
+    }
+{{- end }}

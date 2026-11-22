@@ -2,9 +2,43 @@
 
 use rockstream_types::candidate_identity::CandidateIdentity;
 use rockstream_types::qualification::{
-    QualificationError, QualificationEvidenceManifest, QualificationGateRejection,
-    QualificationReleaseGate, QualificationRun, QualificationWorkload,
+    MeasuredExecutionMetadata, QualificationError, QualificationEvidenceManifest,
+    QualificationGateRejection, QualificationProfile, QualificationReleaseGate, QualificationRun,
+    QualificationWorkload,
 };
+
+fn measured_mutation_run(worker_count: usize, candidate: CandidateIdentity) -> QualificationRun {
+    let base = QualificationRun::sample_reference_run(worker_count, candidate);
+    let pids: Vec<u32> = (0..worker_count)
+        .map(|i| 60_000 + (worker_count as u32 * 100) + i as u32)
+        .collect();
+    let meta = MeasuredExecutionMetadata {
+        commit_sha: "a".repeat(40),
+        binary_sha256: "b".repeat(64),
+        hardware_spec: "c7i.4xlarge".to_string(),
+        worker_pids: pids,
+        offered_rate_rows_per_sec: base.aggregate_metrics.throughput_rows_per_sec,
+        achieved_rate_rows_per_sec: base.aggregate_metrics.throughput_rows_per_sec,
+        errors_and_timeouts: 0,
+        faults_injected_and_verified: vec!["worker_kill".to_string()],
+        negative_controls_passed: true,
+        cost_accounting: None,
+    };
+    QualificationRun::measured(
+        format!("measured_mutation_{worker_count}w"),
+        base.profile_id,
+        base.candidate,
+        base.worker_count,
+        base.duration_sec,
+        base.timestamp_rfc3339,
+        base.workload_results,
+        base.per_worker_cpu_pct,
+        base.aggregate_metrics,
+        base.raw_chunk_digests,
+        meta,
+        base.status,
+    )
+}
 
 #[test]
 fn single_process_simulation_rejected() {
@@ -33,7 +67,7 @@ fn idle_worker_rejected() {
     let mut candidate = CandidateIdentity::current();
     candidate.semantic_version = "1.0.0".to_string();
 
-    let mut run = QualificationRun::sample_reference_run(4, candidate);
+    let mut run = measured_mutation_run(4, candidate);
     // Worker 3 has 0% CPU work executed
     run.per_worker_cpu_pct = vec![85.0, 82.0, 0.0, 83.0];
     run.aggregate_metrics.max_worker_cpu_ratio = 85.0 / 0.001; // pathological ratio > 1.50
@@ -86,7 +120,7 @@ fn stale_oracle_result_rejected() {
     let mut candidate = CandidateIdentity::current();
     candidate.semantic_version = "1.0.0".to_string();
 
-    let mut run = QualificationRun::sample_reference_run(2, candidate);
+    let mut run = measured_mutation_run(2, candidate);
     // Injected stale query result
     run.aggregate_metrics.wrong_results = 1;
 
@@ -103,7 +137,7 @@ fn duplicate_or_lost_sink_output_rejected() {
     let mut candidate = CandidateIdentity::current();
     candidate.semantic_version = "1.0.0".to_string();
 
-    let mut run = QualificationRun::sample_reference_run(2, candidate);
+    let mut run = measured_mutation_run(2, candidate);
     run.aggregate_metrics.duplicate_deliveries = 5;
 
     let gate = QualificationReleaseGate::new();
@@ -131,7 +165,7 @@ fn skipped_workload_rejected() {
     let mut candidate = CandidateIdentity::current();
     candidate.semantic_version = "1.0.0".to_string();
 
-    let mut run = QualificationRun::sample_reference_run(4, candidate);
+    let mut run = measured_mutation_run(4, candidate);
     run.workload_results
         .retain(|w| w.workload != QualificationWorkload::FactorizedJoin);
 
@@ -148,7 +182,25 @@ fn environment_shift_rejected() {
     let mut candidate = CandidateIdentity::current();
     candidate.semantic_version = "1.0.0".to_string();
 
-    let mut manifest = QualificationEvidenceManifest::reference_rc1_manifest(candidate);
+    let profile = QualificationProfile::reference_rc1();
+    let runs = vec![
+        measured_mutation_run(1, candidate.clone()),
+        measured_mutation_run(2, candidate.clone()),
+        measured_mutation_run(4, candidate.clone()),
+        measured_mutation_run(8, candidate.clone()),
+    ];
+    let raw_chunks: Vec<String> = runs
+        .iter()
+        .flat_map(|r| r.raw_chunk_digests.clone())
+        .collect();
+    let mut manifest = QualificationEvidenceManifest::seal(
+        "manifest_measured_env_shift",
+        candidate,
+        profile,
+        runs,
+        raw_chunks,
+        "2026-11-22T12:00:00Z",
+    );
     manifest.candidate.compiler_version = "rustc 1.99.0-nightly".to_string();
 
     let gate = QualificationReleaseGate::new();
