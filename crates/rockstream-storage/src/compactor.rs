@@ -175,7 +175,7 @@ impl ShardCompactorHandle {
         let task = tokio::spawn(async move {
             tracing::info!(shard = shard_id.0, "standalone shard compactor started");
             if let Err(err) = compactor_run.run().await {
-                tracing::error!(shard = shard_id.0, error = %err, "standalone shard compactor exited with error");
+                tracing::error!(shard = shard_id.0, error = %err, "RS-0003: standalone shard compactor exited with error");
                 *last_error_clone.lock().unwrap() = Some(err.to_string());
             }
             is_running_clone.store(false, Ordering::Release);
