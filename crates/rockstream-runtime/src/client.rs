@@ -2595,6 +2595,7 @@ where
     let shard_leases = Arc::new(RwLock::new(HashMap::new()));
     let (msg_tx, mut msg_rx) = mpsc::channel::<WorkerMessage>(32);
     let security_audit_waiters = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let security_audit_capacity = msg_tx.max_capacity();
     let fence_waiters = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let frontier_report_waiter = Arc::new(parking_lot::Mutex::new(None));
     let secret_manager = Arc::new(WorkerSecretManager::new(format!(
@@ -2847,7 +2848,11 @@ where
                     request_id,
                     persisted,
                 } => {
-                    if let Some(waiter) = security_audit_waiters.lock().remove(&request_id) {
+                    if let Some(waiter) = crate::exchange::service::remove_security_audit_waiter(
+                        &security_audit_waiters,
+                        &request_id,
+                        security_audit_capacity,
+                    ) {
                         let _ = waiter.send(persisted);
                     }
                 }
@@ -3661,7 +3666,9 @@ where
         }
         topology_workers.write().clear();
         shard_leases.write().clear();
-        for (_, waiter) in std::mem::take(&mut *security_audit_waiters.lock()) {
+        for waiter in
+            crate::exchange::service::drain_security_audit_waiters(&security_audit_waiters)
+        {
             let _ = waiter.send(false);
         }
         if let Some(waiter) = frontier_report_waiter_clone.lock().take() {

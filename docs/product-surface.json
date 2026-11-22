@@ -6593,6 +6593,22 @@
         "description": "Number of retained security audit records"
       },
       {
+        "name": "security_audit_transport_capacity",
+        "metric_type": "gauge",
+        "unit": "count",
+        "labels": [],
+        "stability": "stable",
+        "description": "Maximum in-flight worker security audit acknowledgements"
+      },
+      {
+        "name": "security_audit_transport_pending",
+        "metric_type": "gauge",
+        "unit": "count",
+        "labels": [],
+        "stability": "stable",
+        "description": "Worker security audit requests awaiting durable acknowledgement"
+      },
+      {
         "name": "storage_flush_latency_ms",
         "metric_type": "histogram",
         "unit": "ms",

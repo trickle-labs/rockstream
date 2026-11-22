@@ -38,7 +38,16 @@ fn with_auto_ack_audit(registry: ExchangeRegistry) -> ExchangeRegistry {
         while let Some(WorkerMessage::ReportSecurityAudit { request_id, .. }) =
             receiver.recv().await
         {
-            if let Some(waiter) = ack_waiters.lock().remove(&request_id) {
+            let waiter = {
+                let mut waiters = ack_waiters.lock();
+                let waiter = waiters.remove(&request_id);
+                rockstream_types::metrics::set_security_audit_transport_metrics(
+                    waiters.len() as u64,
+                    32,
+                );
+                waiter
+            };
+            if let Some(waiter) = waiter {
                 let _ = waiter.send(true);
             }
         }
