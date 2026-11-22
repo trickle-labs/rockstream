@@ -10,9 +10,7 @@ use rockstream_gateway::change_log::{ChangeEntry, ChangeLogError};
 use rockstream_gateway::stateless_serving::{
     ControlShardDiscovery, ReadAdmissionController, RuntimeShardStoreResolver, StatelessReadRouter,
 };
-use rockstream_gateway::subscribe_handler::{
-    start_from_epoch, SubscribeError, SubscribeRegistry,
-};
+use rockstream_gateway::subscribe_handler::{start_from_epoch, SubscribeError, SubscribeRegistry};
 use rockstream_gateway::subscribe_parser::SubscribeRequest;
 use rockstream_gateway::GatewayError;
 use rockstream_runtime::DataPlaneClient;

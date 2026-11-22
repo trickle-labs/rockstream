@@ -9839,8 +9839,7 @@ impl GatewayHandler {
                 rows.truncate(n);
             }
             stored_rows_to_batches(&self.catalog, view_name, &rows)?
-        } else if let Some(distributed_data_plane) = distributed_data_plane
-        {
+        } else if let Some(distributed_data_plane) = distributed_data_plane {
             let namespace = conn_id
                 .and_then(|id| {
                     self.sessions

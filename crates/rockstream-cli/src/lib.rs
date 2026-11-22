@@ -69,7 +69,14 @@ pub use shutdown::{ShutdownCoordinator, SUPPRESS_PROCESS_EXIT};
 /// Node roles recognised by the single binary. v0.1 ships only the embedded
 /// `all` profile; the other roles are accepted as valid names so that scripts
 /// written against later versions parse, but they run the same embedded node.
-pub const KNOWN_ROLES: &[&str] = &["all", "control", "worker", "gateway", "frontier", "compactor"];
+pub const KNOWN_ROLES: &[&str] = &[
+    "all",
+    "control",
+    "worker",
+    "gateway",
+    "frontier",
+    "compactor",
+];
 
 /// The actor recorded for actions taken by the node itself.
 const SYSTEM_ACTOR: &str = "system";

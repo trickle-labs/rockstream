@@ -124,7 +124,9 @@ impl CompactionHorizonGuard {
         let Some(safe_horizon) = self.safe_compaction_horizon() else {
             return Vec::new();
         };
-        catalog.reclaim_unreferenced_arrangements(safe_horizon).await
+        catalog
+            .reclaim_unreferenced_arrangements(safe_horizon)
+            .await
     }
 }
 
@@ -154,7 +156,8 @@ impl ShardCompactorHandle {
             .with_merge_operator(Arc::new(SumCountMergeOperator));
 
         if let Some(bits) = config.filter_bits_per_key {
-            builder = builder.with_filter_policies(vec![join_arrangement_bloom_filter_policy(bits)]);
+            builder =
+                builder.with_filter_policies(vec![join_arrangement_bloom_filter_policy(bits)]);
         }
         if let Ok(metric_shard_id) = u16::try_from(shard_id.0) {
             builder = builder.with_metrics_recorder(instrumented_metrics_recorder(metric_shard_id));

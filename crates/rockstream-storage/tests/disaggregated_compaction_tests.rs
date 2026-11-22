@@ -67,8 +67,12 @@ async fn remote_compactor_compacts_without_inline_compaction_and_survives_crash(
     // Stateful worker ingestion continues uninterrupted even with no compactor running.
     let mut batch = WriteBatch::new();
     batch.put(b"view_output/orders/5", b"5\titem_5\t50");
-    db.write_batch(batch).await.expect("write batch after compactor stop");
-    db.flush_memtable().await.expect("flush memtable after compactor stop");
+    db.write_batch(batch)
+        .await
+        .expect("write batch after compactor stop");
+    db.flush_memtable()
+        .await
+        .expect("flush memtable after compactor stop");
 
     let debt_during_outage = inspect_compaction_debt("db", Arc::clone(&store))
         .await
@@ -108,11 +112,26 @@ async fn remote_compactor_compacts_without_inline_compaction_and_survives_crash(
     assert_eq!(
         decoded,
         vec![
-            ("view_output/orders/1".to_owned(), "1\titem_1\t10".to_owned()),
-            ("view_output/orders/2".to_owned(), "2\titem_2\t20".to_owned()),
-            ("view_output/orders/3".to_owned(), "3\titem_3\t30".to_owned()),
-            ("view_output/orders/4".to_owned(), "4\titem_4\t40".to_owned()),
-            ("view_output/orders/5".to_owned(), "5\titem_5\t50".to_owned()),
+            (
+                "view_output/orders/1".to_owned(),
+                "1\titem_1\t10".to_owned()
+            ),
+            (
+                "view_output/orders/2".to_owned(),
+                "2\titem_2\t20".to_owned()
+            ),
+            (
+                "view_output/orders/3".to_owned(),
+                "3\titem_3\t30".to_owned()
+            ),
+            (
+                "view_output/orders/4".to_owned(),
+                "4\titem_4\t40".to_owned()
+            ),
+            (
+                "view_output/orders/5".to_owned(),
+                "5\titem_5\t50".to_owned()
+            ),
         ]
     );
 

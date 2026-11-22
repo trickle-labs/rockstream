@@ -63,7 +63,8 @@ impl ShardDiscovery for ControlShardDiscovery {
 /// Resolves a discovered shard into its `ObjectStore`.
 #[async_trait]
 pub trait ShardStoreResolver: Send + Sync {
-    async fn resolve(&self, shard: &ShardServingInfo) -> Result<Arc<dyn ObjectStore>, GatewayError>;
+    async fn resolve(&self, shard: &ShardServingInfo)
+        -> Result<Arc<dyn ObjectStore>, GatewayError>;
 }
 
 /// Default runtime resolver using [`build_runtime_object_store`].
@@ -81,7 +82,10 @@ impl RuntimeShardStoreResolver {
 
 #[async_trait]
 impl ShardStoreResolver for RuntimeShardStoreResolver {
-    async fn resolve(&self, shard: &ShardServingInfo) -> Result<Arc<dyn ObjectStore>, GatewayError> {
+    async fn resolve(
+        &self,
+        shard: &ShardServingInfo,
+    ) -> Result<Arc<dyn ObjectStore>, GatewayError> {
         let local_path = self.storage_root.join(&shard.remote_prefix);
         build_runtime_object_store(&local_path, &shard.remote_prefix).map_err(|e| {
             GatewayError::QueryTimeExecutionFailed {
@@ -360,10 +364,8 @@ impl StatelessReadRouter {
             });
         }
 
-        self.serving_frontier.store(
-            min_frontier.unwrap_or(u64::MAX),
-            Ordering::Release,
-        );
+        self.serving_frontier
+            .store(min_frontier.unwrap_or(u64::MAX), Ordering::Release);
         Ok(min_frontier)
     }
 

@@ -5512,9 +5512,7 @@ async fn handle_connection_stream<R, W>(
                 send_message(&sender, &reply).await;
             }
             WorkerMessage::DiscoverShards => {
-                let cluster_frontier = frontier
-                    .as_ref()
-                    .and_then(|f| f.cluster_frontier().epoch);
+                let cluster_frontier = frontier.as_ref().and_then(|f| f.cluster_frontier().epoch);
                 let shards = shard_manager
                     .leases()
                     .into_iter()

@@ -35,8 +35,8 @@ fn standalone_role_all_works_with_zero_extra_flags() {
         storage: temp.path().to_path_buf(),
         ..StartOptions::default()
     };
-    let outcome = run_start_with_dev_transport(&opts, true)
-        .expect("standalone --role all should succeed");
+    let outcome =
+        run_start_with_dev_transport(&opts, true).expect("standalone --role all should succeed");
     assert!(outcome.audit_path.exists());
     assert!(outcome.bundle_path.exists());
 }

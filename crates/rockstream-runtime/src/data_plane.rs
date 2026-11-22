@@ -342,7 +342,10 @@ impl DataPlaneClient {
     /// frontiers from the control plane.
     pub async fn discover_shards(
         &self,
-    ) -> io::Result<(Vec<rockstream_types::topology::ShardServingInfo>, Option<u64>)> {
+    ) -> io::Result<(
+        Vec<rockstream_types::topology::ShardServingInfo>,
+        Option<u64>,
+    )> {
         match self
             .request_with_assertion(WorkerMessage::DiscoverShards, None)
             .await?
