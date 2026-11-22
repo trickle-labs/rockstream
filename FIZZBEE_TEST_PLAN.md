@@ -714,6 +714,34 @@ model; no new FizzBee transition or invariant is asserted.
 
 ### 3.6 Cross-Cutting Coverage Assertions
 
+PR #412 (issue #401) separates shared-object-store read serving and LSM
+compaction from stateful incremental-view-maintenance workers. Control-plane
+`DiscoverShards` exposes each current lease owner, token, object-store prefix,
+and the committed frontier to stateless gateways and dedicated compactors.
+The gateway opens managed-checkpoint SlateDB readers against discovered shard
+stores, refreshes the serving frontier from committed snapshots, and rejects
+queries that cannot satisfy an explicitly requested freshness epoch within a
+bounded wait. Admission limits bound queued and active reads, memory estimates,
+and estimated scanned rows independently of ingestion. In remote-compaction
+mode, workers avoid scheduling inline compaction; the compactor role discovers
+and compacts the same shard stores. Managed checkpoints and
+`CompactionHorizonGuard` are intended to retain SST state needed by serving
+readers, historical queries, backups, and replay dependencies.
+
+The corresponding implementation checks are
+`crates/rockstream-gateway/tests/stateless_serving_tests.rs` (bootstrap,
+frontier freshness, overload, and retention),
+`crates/rockstream-storage/tests/disaggregated_compaction_tests.rs`
+(compaction debt and horizon safeguards),
+`crates/rockstream-cli/tests/compactor_and_gateway_role_tests.rs` (role
+selection and standalone fallback), and
+`crates/rockstream-sim/tests/storage_pressure_admission_tests.rs` (pressure
+behavior). They complement the existing M4 lease fencing and M1/M3 committed
+epoch assumptions; none of M1–M7 currently models asynchronous manifest
+visibility, reader checkpoint renewal, compactor crashes, or SST garbage
+collection. The cited tests are implementation-level assertions, not a
+formal proof that arbitrary reader lag or object-store outages remain safe.
+
 Issue #321 applies M1-S1 to the local SQL path by placing base rows,
 compiled-view output, operator checkpoints, and the shard frontier in one
 write batch. A failed or interrupted commit must restore in-memory operator
