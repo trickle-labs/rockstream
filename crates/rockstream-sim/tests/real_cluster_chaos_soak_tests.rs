@@ -1802,8 +1802,12 @@ async fn worker_state_enospc_withholds_source_ack_and_recovers_exactly() {
     let expected_fault_sink_progress = completed_sink_progress(
         ID,
         &sink_topic,
-        manifest["sink_cursor_at_fault"]["view_epoch"].as_u64().unwrap(),
-        manifest["sink_cursor_at_fault"]["transaction"].as_u64().unwrap(),
+        manifest["sink_cursor_at_fault"]["view_epoch"]
+            .as_u64()
+            .unwrap(),
+        manifest["sink_cursor_at_fault"]["transaction"]
+            .as_u64()
+            .unwrap(),
     );
     save(&artifact_dir.join("before-fault.json"), &ready);
 
