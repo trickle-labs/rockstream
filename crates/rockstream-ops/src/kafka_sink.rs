@@ -154,13 +154,16 @@ impl KafkaViewSink {
 
         let total_rows = all_rows.len();
         let remaining = all_rows.get(chunk_offset..).unwrap_or(&[]);
-        let (envelope, chunk_rows_len) = build_bounded_envelope(
-            self.sink.connector_id().0,
-            self.view.0,
-            self.max_envelope_bytes,
-            progress.transaction,
-            envelope_view_epoch,
+        let metadata = EnvelopeMetadata {
+            connector_id: self.sink.connector_id().0,
+            view_id: self.view.0,
+            transaction: progress.transaction,
+            view_epoch: envelope_view_epoch,
             kind,
+        };
+        let (envelope, chunk_rows_len) = build_bounded_envelope(
+            &metadata,
+            self.max_envelope_bytes,
             remaining,
             chunk_offset,
             total_rows,
@@ -283,13 +286,17 @@ async fn pause_after_commit_for_test(epoch: u64) -> Result<(), SinkError> {
     Ok(())
 }
 
-fn build_bounded_envelope(
+struct EnvelopeMetadata<'a> {
     connector_id: u64,
     view_id: u64,
-    max_envelope_bytes: usize,
     transaction: u64,
     view_epoch: Option<u64>,
-    kind: &str,
+    kind: &'a str,
+}
+
+fn build_bounded_envelope(
+    metadata: &EnvelopeMetadata<'_>,
+    max_envelope_bytes: usize,
     remaining: &[(Vec<ColumnValue>, i64)],
     chunk_offset: usize,
     total_rows: usize,
@@ -307,11 +314,11 @@ fn build_bounded_envelope(
         if !is_chunked {
             json!({
                 "version": 1,
-                "connector_id": connector_id,
-                "view": view_id,
-                "epoch": transaction,
-                "view_epoch": view_epoch,
-                "kind": kind,
+                "connector_id": metadata.connector_id,
+                "view": metadata.view_id,
+                "epoch": metadata.transaction,
+                "view_epoch": metadata.view_epoch,
+                "kind": metadata.kind,
                 "rows": encoded_rows,
             })
             .to_string()
@@ -319,11 +326,11 @@ fn build_bounded_envelope(
             let chunk_end = chunk_offset + rows.len();
             json!({
                 "version": 1,
-                "connector_id": connector_id,
-                "view": view_id,
-                "epoch": transaction,
-                "view_epoch": view_epoch,
-                "kind": kind,
+                "connector_id": metadata.connector_id,
+                "view": metadata.view_id,
+                "epoch": metadata.transaction,
+                "view_epoch": metadata.view_epoch,
+                "kind": metadata.kind,
                 "chunk_offset": chunk_offset,
                 "chunk_end": chunk_end,
                 "total_rows": total_rows,
@@ -425,18 +432,16 @@ mod tests {
         let mut chunks = Vec::new();
         let mut tx = 0u64;
         while offset < rows.len() {
-            let (env, count) = build_bounded_envelope(
-                404,
-                404,
-                420,
-                tx,
-                Some(1),
-                "snapshot",
-                &rows[offset..],
-                offset,
-                rows.len(),
-            )
-            .unwrap();
+            let metadata = EnvelopeMetadata {
+                connector_id: 404,
+                view_id: 404,
+                transaction: tx,
+                view_epoch: Some(1),
+                kind: "snapshot",
+            };
+            let (env, count) =
+                build_bounded_envelope(&metadata, 420, &rows[offset..], offset, rows.len())
+                    .unwrap();
             assert!(
                 env.len() <= 420,
                 "chunk envelope {} exceeded 420 bytes",
