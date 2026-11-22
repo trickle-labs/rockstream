@@ -1165,8 +1165,7 @@ mod tests {
             }
         });
 
-        let Some(WorkerMessage::ReportSecurityAudit { .. }) = receiver.recv().await
-        else {
+        let Some(WorkerMessage::ReportSecurityAudit { .. }) = receiver.recv().await else {
             panic!("security audit transport did not receive the request");
         };
         let metric_lines = || {
