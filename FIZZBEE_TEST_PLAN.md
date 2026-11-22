@@ -1275,6 +1275,34 @@ management workflow is outside the M1–M7 FizzBee state machines, but is
 documented here to keep the runtime protocol and verification inventory
 synchronized.
 
+PR #411 (issues #406 and #352) extends the management protocol to operate
+during active workloads without relaxing shard ownership. `MigrateShard` and
+`DrainWorker` use a bounded source-delta handoff barrier while the donor
+flushes/closes its shard, the lease transfers, the recipient reopens the shard
+and redeploys active workloads, and routing is atomically updated to the new
+owner and lease token. Recovery, rollback, and pre-transfer cancellation share
+the handoff path. This preserves M4's single-authority lease fencing and M6's
+cutover/verification obligations; the implementation-level routing barrier and
+workload redeployment add no new abstract M4/M6 FizzBee action or invariant.
+`online_migrate_shard_moves_active_workload_and_updates_routing_atomically`
+and `online_drain_worker_moves_active_workload_to_healthy_recipient` in
+`crates/rockstream-control/tests/online_migration_backup_streaming_tests.rs`
+exercise the concrete live-worker handoffs.
+
+`CreateBackup` now pins each active shard's durable checkpoint snapshot and
+optional workload-specific object prefix without stopping concurrent writes.
+Its export excludes control manifests newer than the selected checkpoint,
+streams large object inventories and object bytes with bounded buffers, and
+validates hashes before restore; durable GC pins protect selected checkpoints
+and compaction horizons until release. These snapshot, object-store, and
+GC-lifetime details remain outside the M1–M7 coordination abstractions.
+`online_backup_succeeds_with_active_workload_and_concurrent_writes`,
+`concurrent_newer_control_manifest_is_excluded_and_rejected_on_tamper`,
+`gc_pin_protects_active_backup_and_compaction_horizon_until_release`, and
+`large_inventory_and_large_object_streaming_export_and_restore` in the same
+integration suite check the implementation boundaries, rather than claiming
+additional FizzBee proof.
+
 Postgres CDC polling consumes one credit for every queued change in a complete
 transaction, including changes at or before the caller's offset that are
 filtered from the returned batch. The exact boundary is covered by

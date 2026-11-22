@@ -1561,32 +1561,17 @@ mod real_leader_fencing_108 {
             .await;
         assert_ne!(old_idx, new_idx);
         assert!(new_term > old_term);
-        let new_addr = cluster.nodes[new_idx].control_addr;
 
-        // Keep original socket alive for isolation: avoid a synthetic worker
-        // disconnect that would release the original lease.
-        let mut new_worker = tc::register_worker(new_addr, 10, &cluster.pki).await;
-        let wire = serde_json::to_string(&WorkerMessage::RequestShard {
-            worker_id: WorkerId(10),
-            shard_id: ShardId(108),
-        })
-        .unwrap()
-            + "\n";
-        new_worker.write_all(wire.as_bytes()).await.unwrap();
-        let new_lease = loop {
-            let line = tokio::time::timeout(
-                Duration::from_secs(5),
-                tc::read_message_line(&mut new_worker),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            match serde_json::from_str::<ControlMessage>(line.trim()).unwrap() {
-                ControlMessage::ShardAssigned { lease, .. } => break lease,
-                ControlMessage::TopologyChanged { .. } => continue,
-                other => panic!("replacement leader did not renew ownership: {other:?}"),
-            }
-        };
+        // Keep the original socket alive for isolation: disconnecting it
+        // would synthetically release the old lease. A status probe can observe
+        // a leader just before its short quorum lease expires, so a safe
+        // NotLeader response is transient and must trigger leader rediscovery.
+        // The existing bounded helper retries, but still requires a real
+        // ShardAssigned response; the stale/new fencing assertions below remain
+        // mandatory.
+        let (lease_leader_idx, new_lease, mut new_worker) =
+            tc::register_and_request_shard(&cluster, 10, 108).await;
+        assert_ne!(lease_leader_idx, old_idx);
         assert_eq!(new_lease.worker_id, WorkerId(10));
         assert!(new_lease.lease_token.0 > old_lease.lease_token.0);
 
