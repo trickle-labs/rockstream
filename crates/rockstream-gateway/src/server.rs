@@ -2173,7 +2173,8 @@ pub struct GatewayHandler {
     /// the same source table and timestamp column (issue #404 R2).
     shared_windows: Arc<Mutex<rockstream_ops::SharedWindowFabric>>,
     /// Live SQL-wired Kafka view sinks keyed by sink name (issue #404 R4).
-    kafka_sinks: Arc<DashMap<String, Arc<tokio::sync::Mutex<rockstream_ops::kafka_sink::KafkaViewSink>>>>,
+    kafka_sinks:
+        Arc<DashMap<String, Arc<tokio::sync::Mutex<rockstream_ops::kafka_sink::KafkaViewSink>>>>,
     distributed_data_plane: Option<DataPlaneClient>,
     actor_assertion_signer: Option<Arc<rockstream_control::delegation::ActorAssertionSigner>>,
     distributed_storage_root: Option<String>,
@@ -3874,9 +3875,7 @@ impl GatewayHandler {
                 _ => None,
             }
         }
-        fn find_window_info(
-            node: &rockstream_plan::PlanNode,
-        ) -> Option<(String, usize, i64, i64)> {
+        fn find_window_info(node: &rockstream_plan::PlanNode) -> Option<(String, usize, i64, i64)> {
             match node {
                 rockstream_plan::PlanNode::HopWindow {
                     input,
@@ -3997,10 +3996,12 @@ impl GatewayHandler {
             );
             let topic = &entry.catalog;
             let brokers = &entry.path;
-            let kafka_sink = rockstream_connectors::KafkaSink::connect(connector_id, brokers, topic)
-                .map_err(|e| GatewayError::QueryTimeExecutionFailed {
-                    detail: format!("recover Kafka sink '{}': {e}", entry.name),
-                })?;
+            let kafka_sink =
+                rockstream_connectors::KafkaSink::connect(connector_id, brokers, topic).map_err(
+                    |e| GatewayError::QueryTimeExecutionFailed {
+                        detail: format!("recover Kafka sink '{}': {e}", entry.name),
+                    },
+                )?;
             let mut view_sink = rockstream_ops::kafka_sink::KafkaViewSink::new(
                 kafka_sink,
                 Arc::clone(shard_db),
@@ -4017,8 +4018,10 @@ impl GatewayHandler {
                     "recover_kafka_sinks: recovery delivery returned error"
                 );
             }
-            self.kafka_sinks
-                .insert(entry.name.clone(), Arc::new(tokio::sync::Mutex::new(view_sink)));
+            self.kafka_sinks.insert(
+                entry.name.clone(),
+                Arc::new(tokio::sync::Mutex::new(view_sink)),
+            );
         }
         Ok(())
     }
@@ -4591,7 +4594,11 @@ impl GatewayHandler {
         view_name: &str,
         shard_db: &Arc<rockstream_storage::ShardDb>,
     ) -> Result<(), GatewayError> {
-        let Some(compiled) = self.compiled_views.get(view_name).map(|v| Arc::clone(v.value())) else {
+        let Some(compiled) = self
+            .compiled_views
+            .get(view_name)
+            .map(|v| Arc::clone(v.value()))
+        else {
             return Ok(());
         };
         let single_source = if compiled.join.is_none() {
@@ -4652,9 +4659,7 @@ impl GatewayHandler {
         let Some(source_name) = single_source else {
             return Ok(());
         };
-        let input = self
-            .full_table_zset(source_name, shard_db.as_ref())
-            .await?;
+        let input = self.full_table_zset(source_name, shard_db.as_ref()).await?;
         if input.is_empty() {
             return Ok(());
         }
@@ -9397,7 +9402,7 @@ impl GatewayHandler {
         // so the planner can resolve any referenced names.
         let ctx = SessionContext::new();
         rockstream_sql::frontend::register_session_sql_udf(&ctx);
-    rockstream_sql::frontend::register_hop_sql_udf(&ctx);
+        rockstream_sql::frontend::register_hop_sql_udf(&ctx);
         for view in self.catalog.list_views() {
             let mut fields = Vec::new();
             for col in &view.columns {
@@ -10423,7 +10428,9 @@ impl GatewayHandler {
                     let compile_result = if deps_are_base_tables {
                         let table_schemas: HashMap<String, SchemaRef> = compile_deps
                             .iter()
-                            .map(|dep| (dep.clone(), query_time_relation_schema(&self.catalog, dep)))
+                            .map(|dep| {
+                                (dep.clone(), query_time_relation_schema(&self.catalog, dep))
+                            })
                             .collect();
                         self.try_compile_view(
                             &view_name,
@@ -10454,12 +10461,12 @@ impl GatewayHandler {
                             )))]);
                         }
                     };
-                    let single_source = if staging_compiled.join.is_none() && compile_deps.len() == 1
-                    {
-                        Some(compile_deps[0].clone())
-                    } else {
-                        None
-                    };
+                    let single_source =
+                        if staging_compiled.join.is_none() && compile_deps.len() == 1 {
+                            Some(compile_deps[0].clone())
+                        } else {
+                            None
+                        };
                     self.catalog.begin_replacement_backfill(&view_name, 0);
 
                     if is_async_replace {
@@ -21520,10 +21527,7 @@ fn extract_order_by(q: &str) -> Vec<(String, bool, bool)> {
             if part.is_empty() {
                 return None;
             }
-            let tokens: Vec<String> = part
-                .split_whitespace()
-                .map(|t| t.to_lowercase())
-                .collect();
+            let tokens: Vec<String> = part.split_whitespace().map(|t| t.to_lowercase()).collect();
             let col = tokens.first()?.trim_matches('"').to_string();
             let mut desc = false;
             let mut explicit_nulls_first: Option<bool> = None;
@@ -21813,7 +21817,7 @@ async fn describe_fields_for_query(
         ) {
             let ctx = SessionContext::new();
             rockstream_sql::frontend::register_session_sql_udf(&ctx);
-    rockstream_sql::frontend::register_hop_sql_udf(&ctx);
+            rockstream_sql::frontend::register_hop_sql_udf(&ctx);
             if let Ok(df) = ctx.sql(&sql).await {
                 return df
                     .schema()
@@ -22099,7 +22103,9 @@ fn parse_create_sink_ddl(q: &str) -> Result<ParsedCreateSink, String> {
                 .get("brokers")
                 .or_else(|| option_map.get("bootstrap_servers"))
             {
-                Some(CreateSinkOptionValue::String(s)) if !s.trim().is_empty() => s.trim().to_string(),
+                Some(CreateSinkOptionValue::String(s)) if !s.trim().is_empty() => {
+                    s.trim().to_string()
+                }
                 _ => {
                     return Err(
                         "[RS-4007] CREATE SINK INTO KAFKA requires brokers = '<host:port>'. Next steps: provide brokers = '...' and topic = '...' in the Kafka sink options.".to_string()
@@ -22107,7 +22113,9 @@ fn parse_create_sink_ddl(q: &str) -> Result<ParsedCreateSink, String> {
                 }
             };
             let topic = match option_map.get("topic") {
-                Some(CreateSinkOptionValue::String(s)) if !s.trim().is_empty() => s.trim().to_string(),
+                Some(CreateSinkOptionValue::String(s)) if !s.trim().is_empty() => {
+                    s.trim().to_string()
+                }
                 _ => {
                     return Err(
                         "[RS-4007] CREATE SINK INTO KAFKA requires topic = '<topic>'. Next steps: provide brokers = '...' and topic = '...' in the Kafka sink options.".to_string()
@@ -22125,7 +22133,9 @@ fn parse_create_sink_ddl(q: &str) -> Result<ParsedCreateSink, String> {
                 None => None,
             };
             let transactional_id = match option_map.get("transactional_id") {
-                Some(CreateSinkOptionValue::String(s)) if !s.trim().is_empty() => vec![s.trim().to_string()],
+                Some(CreateSinkOptionValue::String(s)) if !s.trim().is_empty() => {
+                    vec![s.trim().to_string()]
+                }
                 Some(_) => {
                     return Err(
                         "[RS-4007] CREATE SINK option transactional_id must be a non-empty string. Next steps: omit transactional_id or pass a non-empty string.".to_string()
@@ -22136,7 +22146,12 @@ fn parse_create_sink_ddl(q: &str) -> Result<ParsedCreateSink, String> {
             for key in option_map.keys() {
                 if !matches!(
                     key.as_str(),
-                    "brokers" | "bootstrap_servers" | "topic" | "max_envelope_bytes" | "secret" | "transactional_id"
+                    "brokers"
+                        | "bootstrap_servers"
+                        | "topic"
+                        | "max_envelope_bytes"
+                        | "secret"
+                        | "transactional_id"
                 ) {
                     return Err(format!(
                         "[RS-4007] CREATE SINK INTO KAFKA does not recognize option '{key}'. Next steps: use brokers, topic, optional max_envelope_bytes, transactional_id, or secret."

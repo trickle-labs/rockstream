@@ -2801,15 +2801,18 @@ impl CatalogStubs {
         let rows = views
             .into_iter()
             .map(|view| {
-                let progress = backfills.get(&view.name).cloned().unwrap_or(BackfillProgress {
-                    phase: "RUNNING",
-                    cursor_position: None,
-                    rows_remaining: 0,
-                    estimated_rows: 0,
-                    budget_state: "ADMITTED".to_string(),
-                    blocked_reason: None,
-                    replacing: false,
-                });
+                let progress = backfills
+                    .get(&view.name)
+                    .cloned()
+                    .unwrap_or(BackfillProgress {
+                        phase: "RUNNING",
+                        cursor_position: None,
+                        rows_remaining: 0,
+                        estimated_rows: 0,
+                        budget_state: "ADMITTED".to_string(),
+                        blocked_reason: None,
+                        replacing: false,
+                    });
                 vec![
                     Some(view.name),
                     Some(progress.phase.to_string()),

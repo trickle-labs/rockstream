@@ -335,7 +335,12 @@ async fn core_limit_order_by_checkpoint_recovery() {
     );
 
     // Apply post-recovery delete of id=2 -> id=1 (10) must be refilled from recovered TopK state.
-    exec_tx(&client, "topk-rec-2", &["DELETE FROM leaderboard WHERE id = 2"]).await;
+    exec_tx(
+        &client,
+        "topk-rec-2",
+        &["DELETE FROM leaderboard WHERE id = 2"],
+    )
+    .await;
     let rows = simple_rows(
         &client,
         "SELECT id, pts FROM top2_lb ORDER BY pts DESC NULLS LAST, id ASC LIMIT 2",
@@ -372,7 +377,9 @@ fn core_limit_order_by_state_growth() {
         ],
     )
     .unwrap();
-    let _ = op.process_epoch(ArrowZSet::new(batch, vec![1, 1, 1, 1]), 1).unwrap();
+    let _ = op
+        .process_epoch(ArrowZSet::new(batch, vec![1, 1, 1, 1]), 1)
+        .unwrap();
     assert_eq!(op.fill_level(), 4);
     assert!(op.state_bytes() > 0);
     assert_eq!(TOPK_BUFFER_LIMIT, 100_000);
@@ -469,7 +476,8 @@ async fn hop_and_session_windows_e2e_and_restart_recovery() {
         // ts=10000 -> windows [5000, 15000) and [10000, 20000)
         // ts=12000 -> windows [5000, 15000) and [10000, 20000)
         // ts=14000 -> windows [5000, 15000) and [10000, 20000)
-        let hop_rows = simple_rows(&client, "SELECT w, cnt, total FROM hop_mv ORDER BY w ASC").await;
+        let hop_rows =
+            simple_rows(&client, "SELECT w, cnt, total FROM hop_mv ORDER BY w ASC").await;
         assert_eq!(
             hop_rows,
             vec![
@@ -785,7 +793,10 @@ async fn zero_downtime_view_replacement_and_backfill_visibility() {
         assert_eq!(rows, post_delta);
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    assert!(converged, "async replacement view did not converge to expected output");
+    assert!(
+        converged,
+        "async replacement view did not converge to expected output"
+    );
 
     handle.abort();
 }
@@ -803,9 +814,7 @@ async fn sql_create_sink_kafka_validation_and_error_contract() {
         .await
         .unwrap();
     client
-        .simple_query(
-            "CREATE MATERIALIZED VIEW sales_mv AS SELECT id, amount FROM sales",
-        )
+        .simple_query("CREATE MATERIALIZED VIEW sales_mv AS SELECT id, amount FROM sales")
         .await
         .unwrap();
 

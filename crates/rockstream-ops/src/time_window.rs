@@ -1049,7 +1049,8 @@ impl SessionWindowOp {
         st.input_frontier = input_frontier;
         for (_key, value) in entries {
             if let Some((row_vals, weight)) = decode_window_value(&value, self.n_input_cols) {
-                let partition_key = encode_partition_key(&row_vals, self.time_col, self.partition_by.as_deref());
+                let partition_key =
+                    encode_partition_key(&row_vals, self.time_col, self.partition_by.as_deref());
                 let row_key = encode_row(&row_vals);
                 st.partitions
                     .entry(partition_key)
@@ -1142,7 +1143,8 @@ impl SessionWindowOp {
                 watermark_ms: event_time_ms,
             });
 
-            let partition_key = encode_partition_key(&row_vals, self.time_col, self.partition_by.as_deref());
+            let partition_key =
+                encode_partition_key(&row_vals, self.time_col, self.partition_by.as_deref());
             let row_key = encode_row(&row_vals);
             let partition = next.partitions.entry(partition_key.clone()).or_default();
             let entry = partition
