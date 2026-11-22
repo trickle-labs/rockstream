@@ -935,6 +935,17 @@ clears both spilled and in-memory uncommitted change buffers before
 the same fenced owner lease. This refines the M3 shared-slot recovery boundary
 without altering the abstract FizzBee state machines.
 
+Issue #348 (PR #396) enforces a coordinator-owned `pending_ack` and
+`blocked_reason` gate in `SourceRuntimeCoordinator`. After a durable M3 source
+commit succeeds, `pending_ack` blocks new snapshot or delta polling and M3
+commits until `acknowledge_recovered` reconciles the committed epoch and offset
+with the upstream source and awaits `resume`. During PostgreSQL `pgoutput`
+recovery, `open_pgoutput`, table validation, confirmed-LSN inspection, and
+credential rotation remain permitted under the active owner lease so the slot
+can be opened and validated before `acknowledge_recovered` clears `pending_ack`.
+This refines the M3 post-commit source-acknowledgement recovery boundary without
+adding new formal transitions.
+
 PR #408 (issue #303) upgrades the control-worker data-plane read protocol to
 `ProtocolVersion::V4` (`WORKLOAD_SNAPSHOT_VERSION = 1`). When the gateway reads
 a distributed workload snapshot, `ControlService` verifies that all deployment
