@@ -69,7 +69,7 @@ pub use shutdown::{ShutdownCoordinator, SUPPRESS_PROCESS_EXIT};
 /// Node roles recognised by the single binary. v0.1 ships only the embedded
 /// `all` profile; the other roles are accepted as valid names so that scripts
 /// written against later versions parse, but they run the same embedded node.
-pub const KNOWN_ROLES: &[&str] = &["all", "control", "worker", "gateway", "frontier"];
+pub const KNOWN_ROLES: &[&str] = &["all", "control", "worker", "gateway", "frontier", "compactor"];
 
 /// The actor recorded for actions taken by the node itself.
 const SYSTEM_ACTOR: &str = "system";
@@ -543,6 +543,31 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn build_control_data_plane_client(
+    control: &str,
+    internal_tls: &rockstream_types::identity::InternalTlsConfig,
+    allow_insecure_internal_dev: bool,
+) -> Result<rockstream_runtime::data_plane::DataPlaneClient, CliError> {
+    let client = rockstream_runtime::data_plane::DataPlaneClient::new(control);
+    if internal_tls.is_enabled() {
+        client.with_internal_tls(internal_tls).map_err(|error| {
+            CliError::new(
+                rockstream_types::error_code::RS_2405,
+                format!("internal mTLS setup failed: {error}"),
+                "Check the node's internal certificate, private key, and trust roots.",
+            )
+        })
+    } else if allow_insecure_internal_dev {
+        Ok(client.with_insecure_internal_dev())
+    } else {
+        Err(CliError::new(
+            rockstream_types::error_code::RS_2405,
+            "data-plane client requires internal mTLS",
+            "Configure internal TLS, or pass --allow-insecure-internal-dev only for loopback development.",
+        ))
+    }
 }
 
 /// Validate a requested role at the system boundary.
@@ -1191,33 +1216,49 @@ async fn start_gateway_with_shard_and_catalog_and_dev_transport(
         .with_join_strategy(opts.config.execution.join_strategy);
     if opts.role == "gateway" {
         if let Some(control) = &opts.control {
-            let client = rockstream_runtime::data_plane::DataPlaneClient::new(control);
-            let client = if opts.config.internal_tls.is_enabled() {
-                client
-                    .with_internal_tls(&opts.config.internal_tls)
-                    .map_err(|error| {
-                        CliError::new(
-                            rockstream_types::error_code::RS_2405,
-                            format!("gateway internal mTLS setup failed: {error}"),
-                            "Check the gateway's internal certificate, private key, and trust roots.",
-                        )
-                    })?
-            } else if allow_insecure_internal_dev {
-                client.with_insecure_internal_dev()
-            } else {
-                return Err(CliError::new(
-                    rockstream_types::error_code::RS_2405,
-                    "gateway data-plane client requires internal mTLS",
-                    "Configure internal TLS, or pass --allow-insecure-internal-dev only for loopback development.",
-                ));
-            };
-            server = server.with_distributed_data_plane(
-                client,
-                opts.storage
-                    .join("distributed-shards")
-                    .to_string_lossy()
-                    .into_owned(),
+            let client = build_control_data_plane_client(
+                control,
+                &opts.config.internal_tls,
+                allow_insecure_internal_dev,
+            )?;
+            let discovery_client = build_control_data_plane_client(
+                control,
+                &opts.config.internal_tls,
+                allow_insecure_internal_dev,
+            )?;
+            let discovery = Arc::new(
+                rockstream_gateway::stateless_serving::ControlShardDiscovery::new(Arc::new(
+                    discovery_client,
+                )),
             );
+            let resolver = Arc::new(
+                rockstream_gateway::stateless_serving::RuntimeShardStoreResolver::new(
+                    &opts.storage,
+                ),
+            );
+            let router = Arc::new(
+                rockstream_gateway::stateless_serving::StatelessReadRouter::new(
+                    discovery,
+                    resolver,
+                    &opts.config.gateway.serving,
+                ),
+            );
+            let _ = router.bootstrap().await;
+            let read_admission = Arc::new(
+                rockstream_gateway::stateless_serving::ReadAdmissionController::from_config(
+                    &opts.config.gateway.serving,
+                ),
+            );
+            server = server
+                .with_distributed_data_plane(
+                    client,
+                    opts.storage
+                        .join("distributed-shards")
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+                .with_stateless_read_router(router)
+                .with_read_admission(read_admission);
         }
     }
     if let Some(webhook_listen) = &opts.config.gateway.webhook_listen_addr {
@@ -1470,6 +1511,15 @@ pub fn run_start_with_dev_transport(
         ));
     }
 
+    // `compactor` role requires a control URL to discover active shards.
+    if opts.role == "compactor" && opts.control.is_none() {
+        return Err(CliError::new(
+            rockstream_types::error_code::RS_0002,
+            "role `compactor` requires --control=<url>",
+            "Provide the control plane URL via the --control argument.",
+        ));
+    }
+
     // Pre-validate listen_addr and metrics_addr before creating directories or binding ports
     if let Some(ref listen) = opts.listen_addr {
         listen.parse::<std::net::SocketAddr>().map_err(|e| {
@@ -1607,6 +1657,8 @@ pub fn run_start_with_dev_transport(
 
         let mut control_handle = None;
         let mut worker_handle = None;
+        let mut compactor_shutdown_tx: Option<tokio::sync::watch::Sender<bool>> = None;
+        let mut compactor_task: Option<tokio::task::JoinHandle<()>> = None;
         let mut worker_client = None;
         let mut control_url = opts.control.clone();
         let mut raft_node_guard: Option<rockstream_control::raft::RaftNodeHandleFull> = None;
@@ -2081,6 +2133,69 @@ pub fn run_start_with_dev_transport(
             );
         }
 
+        if opts.role == "compactor" {
+            let url = control_url
+                .as_deref()
+                .ok_or_else(|| CliError::new(RS_0002, "role `compactor` requires --control=<url>", ""))?;
+            let client = build_control_data_plane_client(
+                url,
+                &opts.config.internal_tls,
+                allow_insecure_internal_dev,
+            )?;
+            let compactor_cfg =
+                rockstream_storage::compactor::StandaloneCompactorConfig::from(
+                    &opts.config.storage.compaction,
+                );
+            let discovery_interval = Duration::from_millis(
+                opts.config.storage.compaction.discovery_interval_ms.max(100),
+            );
+            let storage_root = opts.storage.clone();
+            let (tx, mut rx) = tokio::sync::watch::channel(false);
+            compactor_shutdown_tx = Some(tx);
+            let handle = tokio::spawn(async move {
+                let mut active: std::collections::HashMap<
+                    rockstream_types::ids::ShardId,
+                    rockstream_storage::compactor::ShardCompactorHandle,
+                > = std::collections::HashMap::new();
+                loop {
+                    if let Ok((shards, _)) = client.discover_shards().await {
+                        for shard in shards {
+                            if let std::collections::hash_map::Entry::Vacant(e) =
+                                active.entry(shard.shard_id)
+                            {
+                                let local_path = storage_root.join(&shard.remote_prefix);
+                                if let Ok(store) = rockstream_storage::build_runtime_object_store(
+                                    &local_path,
+                                    &shard.remote_prefix,
+                                ) {
+                                    let compactor =
+                                        rockstream_storage::compactor::ShardCompactorHandle::spawn(
+                                            shard.shard_id,
+                                            shard.db_path,
+                                            store,
+                                            compactor_cfg.clone(),
+                                        );
+                                    e.insert(compactor);
+                                }
+                            }
+                        }
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(discovery_interval) => {}
+                        _ = rx.changed() => {
+                            if *rx.borrow() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                for (_, compactor) in active {
+                    compactor.stop().await;
+                }
+            });
+            compactor_task = Some(handle);
+        }
+
         if serve_gateway {
             // ── Live gateway serve mode ────────────────────────────────────
             // Build the gateway and wait for an OS shutdown signal.
@@ -2160,7 +2275,8 @@ pub fn run_start_with_dev_transport(
         } else {
             // ── Background role execution (control / worker / metrics) ──
             tracker.set_state(rockstream_types::lifecycle::LifecycleState::Ready);
-            let daemon_mode = opts.daemon || opts.role == "worker";
+            let daemon_mode =
+                opts.daemon || opts.role == "worker" || opts.role == "compactor";
             let e2e_sleep = std::env::var("ROCKSTREAM_E2E_SLEEP_MS")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok());
@@ -2189,6 +2305,12 @@ pub fn run_start_with_dev_transport(
             tracker.set_state(rockstream_types::lifecycle::LifecycleState::Draining);
         }
 
+        if let Some(tx) = compactor_shutdown_tx {
+            let _ = tx.send(true);
+        }
+        if let Some(task) = compactor_task {
+            let _ = task.await;
+        }
         if let Some(wh) = worker_handle {
             wh.abort();
         }

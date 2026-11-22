@@ -3288,12 +3288,21 @@ where
                         }
                     };
 
+                    let inline_compaction = !matches!(
+                        std::env::var("ROCKSTREAM_COMPACTION_MODE")
+                            .ok()
+                            .as_deref()
+                            .map(str::to_ascii_lowercase)
+                            .as_deref(),
+                        Some("remote")
+                    );
                     // Attempt to open the ShardDb
                     let mut builder = ShardDb::builder("db", store)
                         .with_supported_format_range(
                             rockstream_types::compatibility::SupportedStorageFormatRange::v1_through_v2(
                             ),
                         )
+                        .with_inline_compaction(inline_compaction)
                         .with_storage_context(storage_context_clone.clone());
                     if let Ok(metric_shard_id) = u16::try_from(lease.shard_id.0) {
                         builder = builder

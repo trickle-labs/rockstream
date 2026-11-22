@@ -14,6 +14,7 @@ pub enum Role {
     Gateway,
     Worker,
     Control,
+    Compactor,
 }
 
 /// Durable catalog layout used by offline security administration.
@@ -33,6 +34,7 @@ impl std::fmt::Display for Role {
                 Self::Gateway => "gateway",
                 Self::Worker => "worker",
                 Self::Control => "control",
+                Self::Compactor => "compactor",
             }
         )
     }

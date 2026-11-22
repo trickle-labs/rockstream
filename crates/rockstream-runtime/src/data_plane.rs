@@ -337,6 +337,23 @@ impl DataPlaneClient {
             response => Err(Self::unexpected(response)),
         }
     }
+
+    /// Discover active shards, their shared object-store prefixes, and published
+    /// frontiers from the control plane.
+    pub async fn discover_shards(
+        &self,
+    ) -> io::Result<(Vec<rockstream_types::topology::ShardServingInfo>, Option<u64>)> {
+        match self
+            .request_with_assertion(WorkerMessage::DiscoverShards, None)
+            .await?
+        {
+            ControlMessage::ServingTopology {
+                shards,
+                cluster_frontier,
+            } => Ok((shards, cluster_frontier)),
+            response => Err(Self::unexpected(response)),
+        }
+    }
 }
 
 fn data_plane_server_name(addr: &str) -> io::Result<rustls::pki_types::ServerName<'static>> {

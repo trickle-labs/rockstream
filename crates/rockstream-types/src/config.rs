@@ -220,10 +220,48 @@ impl Default for ExchangeConfig {
     }
 }
 
+/// Where SlateDB LSM compaction executes for stateful worker shards.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CompactionMode {
+    /// Run SlateDB compaction inline inside each stateful worker (default).
+    #[default]
+    Inline,
+    /// Disable inline compaction on stateful workers and offload to `--role compactor`.
+    Remote,
+}
+
+/// Configuration for disaggregated or inline SlateDB compaction.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CompactorConfig {
+    pub mode: CompactionMode,
+    pub max_concurrent_compactions: usize,
+    pub poll_interval_ms: u64,
+    pub manifest_poll_interval_ms: u64,
+    pub max_sst_size_bytes: usize,
+    pub discovery_interval_ms: u64,
+}
+
+impl Default for CompactorConfig {
+    fn default() -> Self {
+        Self {
+            mode: CompactionMode::Inline,
+            max_concurrent_compactions: 4,
+            poll_interval_ms: 5_000,
+            manifest_poll_interval_ms: 1_000,
+            max_sst_size_bytes: 256 * 1024 * 1024,
+            discovery_interval_ms: 2_000,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct StorageConfig {
     #[serde(default)]
     pub tiering: StorageTieringConfig,
+    #[serde(default)]
+    pub compaction: CompactorConfig,
 }
 
 /// Join implementation selected when a view is compiled.
@@ -240,6 +278,49 @@ pub enum JoinStrategy {
 #[serde(default)]
 pub struct ExecutionConfig {
     pub join_strategy: JoinStrategy,
+}
+
+/// Stateless read-serving freshness, caching, and admission control settings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ServingConfig {
+    /// How frequently stateless `ShardReader`s poll SlateDB manifests.
+    pub manifest_poll_interval_ms: u64,
+    /// Maximum concurrent read queries admitted on a stateless gateway.
+    pub max_concurrent_reads: usize,
+    /// Maximum queued read requests waiting for a concurrency permit.
+    pub max_read_queue_depth: usize,
+    /// Maximum time a read request may wait in the admission queue (ms).
+    pub max_read_queue_wait_ms: u64,
+    /// Maximum estimated/in-flight read memory budget in bytes.
+    pub max_read_memory_bytes: usize,
+    /// Maximum estimated rows scanned per interactive read query.
+    pub max_estimated_scan_rows: usize,
+    /// Maximum time a query may wait for a requested freshness epoch (ms).
+    pub freshness_wait_timeout_ms: u64,
+    /// Optional local NVMe block-cache directory for stateless gateway readers.
+    pub nvme_cache_dir: Option<std::path::PathBuf>,
+    /// Optional max NVMe block-cache size in bytes.
+    pub nvme_cache_bytes: Option<usize>,
+    /// Shared RAM block-cache capacity in bytes for gateway `ShardReader`s.
+    pub ram_cache_bytes: usize,
+}
+
+impl Default for ServingConfig {
+    fn default() -> Self {
+        Self {
+            manifest_poll_interval_ms: 100,
+            max_concurrent_reads: 64,
+            max_read_queue_depth: 128,
+            max_read_queue_wait_ms: 2_000,
+            max_read_memory_bytes: 256 * 1024 * 1024,
+            max_estimated_scan_rows: 1_000_000,
+            freshness_wait_timeout_ms: 5_000,
+            nvme_cache_dir: None,
+            nvme_cache_bytes: None,
+            ram_cache_bytes: 512 * 1024 * 1024,
+        }
+    }
 }
 
 /// v0.51.5: gateway-facing (client SQL-port) TLS termination configuration.
@@ -264,6 +345,9 @@ pub struct GatewayConfig {
     /// missing) whenever `--auth=mtls` is set.
     #[serde(default)]
     pub tls_ca_cert_path: Option<std::path::PathBuf>,
+    /// Stateless read-serving freshness, caching, and admission configuration.
+    #[serde(default)]
+    pub serving: ServingConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
