@@ -1885,3 +1885,7 @@ The CLI backup operation selects one committed control checkpoint and must enume
 ## Raft heartbeat lease age bounding (#351)
 
 `RaftControlGroup` bounds leader authority by the initiation timestamp (`round_started_at`) of each heartbeat round rather than the response completion timestamp. A delayed quorum acknowledgement whose round began more than `ELECTION_TIMEOUT_MIN` ago cannot refresh `last_quorum_ack`, and the leader steps down when no fresh majority proof remains. This tightens local leader self-fencing to match the M4 monotonic fencing contract without changing durable Raft term/vote persistence or shard lease token monotonicity.
+
+## Consistent control manifest selection during checkpoint export (#352)
+
+`CheckpointExporter` pins the control-plane SlateDB manifest that was visible when the selected `ClusterCheckpoint` was loaded rather than copying a newer control manifest that commits mid-inventory. This ensures the exported control manifest and shard object inventory represent a single consistent committed checkpoint cut under M3 recovery.

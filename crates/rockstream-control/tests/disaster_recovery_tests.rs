@@ -32,6 +32,8 @@ struct FaultInjectingStore {
     fail_put_at: Option<usize>,
     fail_get_path: Option<Path>,
     put_attempts: AtomicUsize,
+    root_list_gate: Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>,
+    root_list_gated: std::sync::atomic::AtomicBool,
 }
 
 impl FaultInjectingStore {
@@ -41,6 +43,8 @@ impl FaultInjectingStore {
             fail_put_at: Some(fail_at),
             fail_get_path: None,
             put_attempts: AtomicUsize::new(0),
+            root_list_gate: None,
+            root_list_gated: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -50,6 +54,23 @@ impl FaultInjectingStore {
             fail_put_at: None,
             fail_get_path: Some(path),
             put_attempts: AtomicUsize::new(0),
+            root_list_gate: None,
+            root_list_gated: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn gate_root_list(
+        inner: Arc<dyn ObjectStore>,
+        entered: Arc<tokio::sync::Barrier>,
+        resume: Arc<tokio::sync::Barrier>,
+    ) -> Self {
+        Self {
+            inner,
+            fail_put_at: None,
+            fail_get_path: None,
+            put_attempts: AtomicUsize::new(0),
+            root_list_gate: Some((entered, resume)),
+            root_list_gated: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -116,6 +137,27 @@ impl ObjectStore for FaultInjectingStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        if prefix.is_some_and(|path| path.as_ref().is_empty())
+            && !self.root_list_gated.swap(true, Ordering::SeqCst)
+        {
+            if let Some((entered, resume)) = &self.root_list_gate {
+                let entered = entered.clone();
+                let resume = resume.clone();
+                let source = self.inner.clone();
+                let prefix = prefix.cloned();
+                // Construct the real listing only *after* B has committed:
+                // some ObjectStore implementations snapshot on list(), not
+                // when the returned stream is first polled.
+                return Box::pin(
+                    futures::stream::once(async move {
+                        entered.wait().await;
+                        resume.wait().await;
+                        source.list(prefix.as_ref())
+                    })
+                    .flatten(),
+                );
+            }
+        }
         self.inner.list(prefix)
     }
 
@@ -254,8 +296,9 @@ async fn restore_and_assert(
         })
     );
     let restored_manifest = CheckpointManifestStore::new(target.clone())
-        .load_manifest(checkpoint.checkpoint_id)
-        .await;
+        .load_latest_manifest()
+        .await
+        .unwrap();
     assert_eq!(restored_manifest, Some(checkpoint.clone()));
     let catalog = target
         .get(&Path::from("control/catalog/views"))
@@ -274,7 +317,11 @@ async fn restore_and_assert(
         .unwrap();
     assert_eq!(source_resume.as_ref(), b"offset=42");
     let recovery = RecoveryDriver::new();
-    recovery.load_checkpoint(checkpoint.clone());
+    recovery.load_checkpoint(
+        restored_manifest
+            .clone()
+            .expect("recovery must select checkpoint from restored durable state"),
+    );
     let shard = recovery
         .recover_shard(ShardId(0), "shards/0", target, LeaseToken(1), LeaseToken(1))
         .await
@@ -340,6 +387,345 @@ async fn lfs_export_restore_fresh_cluster_is_bit_identical() {
         "lfs-bit-identical",
     )
     .await;
+}
+
+async fn assert_export_racing_new_manifest_fails_closed(
+    source: Arc<dyn ObjectStore>,
+    export: Arc<dyn ObjectStore>,
+    target: Arc<dyn ObjectStore>,
+    generation: &str,
+) {
+    let checkpoint_a = seed_checkpoint(source.clone(), 35).await;
+    let entered = Arc::new(tokio::sync::Barrier::new(2));
+    let resume = Arc::new(tokio::sync::Barrier::new(2));
+    let gated_source: Arc<dyn ObjectStore> = Arc::new(FaultInjectingStore::gate_root_list(
+        source.clone(),
+        entered.clone(),
+        resume.clone(),
+    ));
+
+    // Gate the *production* root inventory, after the latest-manifest lookup
+    // returned A. A separate writer must commit a genuinely different snapshot
+    // before the exporter starts enumerating live control objects.
+    let generation_owned = generation.to_string();
+    let export_for_task = export.clone();
+    let export_task = tokio::spawn(async move {
+        let manifests = CheckpointManifestStore::new(gated_source.clone());
+        CheckpointExportService::new()
+            .export_latest_prefix(
+                gated_source,
+                export_for_task,
+                &manifests,
+                generation_owned,
+                &Path::from(""),
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(30), entered.wait())
+        .await
+        .expect("export did not reach the gated root inventory");
+
+    let db = ShardDb::builder("shards/0", source.clone())
+        .build()
+        .await
+        .unwrap();
+    db.put(b"view/rows", b"committed-newer").await.unwrap();
+    db.put(b"view/rows/3", b"newer-second-row").await.unwrap();
+    db.put(b"view/rows/4", b"newer-only-row").await.unwrap();
+    db.put(&ShardKeyEncoder::frontier_key(), &36u64.to_be_bytes())
+        .await
+        .unwrap();
+    db.flush().await.unwrap();
+    let handle = db.create_checkpoint().await.unwrap();
+    db.close().await.unwrap();
+    let mut checkpoint_b = ClusterCheckpoint::new(CheckpointId(36));
+    checkpoint_b.record_shard(
+        ShardId(0),
+        PerShardCheckpoint::new(CheckpointId(36), handle.shard_checkpoint_id)
+            .with_snapshot_id(handle.snapshot_id),
+    );
+    assert_ne!(
+        checkpoint_a.shards[&ShardId(0)].snapshot_id,
+        checkpoint_b.shards[&ShardId(0)].snapshot_id
+    );
+    source
+        .put(
+            &Path::from("control/catalog/views"),
+            bytes::Bytes::from_static(b"view=v committed_epoch=36").into(),
+        )
+        .await
+        .unwrap();
+    source
+        .put(
+            &Path::from("control/connectors/source-resume"),
+            bytes::Bytes::from_static(b"offset=99").into(),
+        )
+        .await
+        .unwrap();
+    CheckpointManifestStore::new(source.clone())
+        .save_manifest(&checkpoint_b, false, None)
+        .await
+        .unwrap();
+    resume.wait().await;
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(120), export_task)
+        .await
+        .expect("gated exporter hung")
+        .expect("export task panicked");
+    let error = result.expect_err("export A must not succeed with checkpoint B's control metadata");
+    assert!(
+        error.to_string().contains("checkpoint"),
+        "unexpected export failure: {error}"
+    );
+    assert!(matches!(
+        export
+            .head(&Path::from(format!(
+                "checkpoint-exports/{generation}/commit"
+            )))
+            .await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+
+    // A fresh coherent B export is still possible. Restore must discover B
+    // from the restored store itself and recover B-only data and source state.
+    let generation_b = format!("{generation}-b");
+    let service = CheckpointExportService::new();
+    let outcome_b = service
+        .export_latest_prefix(
+            source.clone(),
+            export.clone(),
+            &CheckpointManifestStore::new(source),
+            &generation_b,
+            &Path::from(""),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome_b.checkpoint_id, 36);
+    assert_eq!(outcome_b.status, "SUCCESS");
+    let inventory = export_inventory_records(&export, &generation_b).await;
+    assert_eq!(inventory.len() as u64, outcome_b.object_count);
+    let inventory_sources = inventory
+        .iter()
+        .map(|entry| entry["record"]["source"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        inventory_sources
+            .iter()
+            .filter(|path| path.starts_with("control/checkpoints/"))
+            .copied()
+            .collect::<Vec<_>>(),
+        vec!["control/checkpoints/36"]
+    );
+    let record = export
+        .get(&Path::from(format!(
+            "checkpoint-exports/{generation_b}/generation"
+        )))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let record: serde_json::Value = serde_json::from_slice(&record).unwrap();
+    assert_eq!(record["checkpoint_id"], serde_json::json!(36));
+    assert_eq!(
+        record["checkpoint"],
+        serde_json::to_value(&checkpoint_b).unwrap()
+    );
+    assert_eq!(
+        record["object_count"],
+        serde_json::json!(outcome_b.object_count)
+    );
+    assert_eq!(
+        record["requires_checkpoint_manifest"],
+        serde_json::json!(true)
+    );
+    service
+        .validate_generation(export.clone(), &generation_b)
+        .await
+        .unwrap();
+    let restored = service
+        .restore_generation(export, target.clone(), &generation_b)
+        .await
+        .unwrap();
+    assert_eq!(restored.checkpoint_id, 36);
+    assert_eq!(restored.object_count, outcome_b.object_count);
+    assert_eq!(restored.byte_count, outcome_b.byte_count);
+    assert_eq!(restored.restored_shards, 1);
+    assert_eq!(restored.status, "SUCCESS");
+    let pointer = target
+        .get(&Path::from("control/bootstrap/active-generation"))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&pointer).unwrap(),
+        serde_json::json!({"checkpoint_id": 36, "generation": generation_b})
+    );
+    let selected = CheckpointManifestStore::new(target.clone())
+        .load_latest_manifest()
+        .await
+        .unwrap()
+        .expect("restored namespace must independently select checkpoint B");
+    assert_eq!(selected, checkpoint_b);
+    let recovery = RecoveryDriver::new();
+    recovery.load_checkpoint(selected);
+    let shard = recovery
+        .recover_shard(
+            ShardId(0),
+            "shards/0",
+            target.clone(),
+            LeaseToken(1),
+            LeaseToken(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        shard
+            .reader
+            .get(b"view/rows")
+            .await
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        b"committed-newer"
+    );
+    assert_eq!(
+        shard
+            .reader
+            .get(b"view/rows/1")
+            .await
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        b"committed"
+    );
+    assert_eq!(shard.reader.get(b"view/rows/2").await.unwrap(), None);
+    assert_eq!(
+        shard
+            .reader
+            .get(b"view/rows/3")
+            .await
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        b"newer-second-row"
+    );
+    assert_eq!(
+        shard
+            .reader
+            .get(b"view/rows/4")
+            .await
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        b"newer-only-row"
+    );
+    assert_eq!(
+        shard
+            .reader
+            .get(&ShardKeyEncoder::frontier_key())
+            .await
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        &36u64.to_be_bytes()
+    );
+    for (path, expected) in [
+        (
+            "control/catalog/views",
+            b"view=v committed_epoch=36".as_slice(),
+        ),
+        ("control/connectors/source-resume", b"offset=99".as_slice()),
+    ] {
+        assert_eq!(
+            target
+                .get(&Path::from(path))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .as_ref(),
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn lfs_export_racing_committed_manifest_fails_closed_and_recovers_newest() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let export_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    assert_export_racing_new_manifest_fails_closed(
+        Arc::new(LocalFileSystem::new_with_prefix(source_dir.path()).unwrap()),
+        Arc::new(LocalFileSystem::new_with_prefix(export_dir.path()).unwrap()),
+        Arc::new(LocalFileSystem::new_with_prefix(target_dir.path()).unwrap()),
+        "lfs-manifest-race",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn lfs_export_rejects_mutable_catalog_changed_during_inventory() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let export_dir = tempfile::tempdir().unwrap();
+    let source: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(source_dir.path()).unwrap());
+    let export: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(export_dir.path()).unwrap());
+    seed_checkpoint(source.clone(), 40).await;
+    let entered = Arc::new(tokio::sync::Barrier::new(2));
+    let resume = Arc::new(tokio::sync::Barrier::new(2));
+    let gated: Arc<dyn ObjectStore> = Arc::new(FaultInjectingStore::gate_root_list(
+        source.clone(),
+        entered.clone(),
+        resume.clone(),
+    ));
+    let export_for_task = export.clone();
+    let task = tokio::spawn(async move {
+        let manifests = CheckpointManifestStore::new(gated.clone());
+        CheckpointExportService::new()
+            .export_latest_prefix(
+                gated,
+                export_for_task,
+                &manifests,
+                "mutable-catalog-race",
+                &Path::from(""),
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(30), entered.wait())
+        .await
+        .expect("export did not reach root inventory");
+    // The manifest is still A. Even an uncommitted catalog/source mutation
+    // must not be misrepresented as checkpoint A's coherent control state.
+    source
+        .put(
+            &Path::from("control/catalog/views"),
+            bytes::Bytes::from_static(b"view=v committed_epoch=41").into(),
+        )
+        .await
+        .unwrap();
+    resume.wait().await;
+    let error = tokio::time::timeout(std::time::Duration::from_secs(120), task)
+        .await
+        .expect("export hung")
+        .expect("export task panicked")
+        .expect_err("mutable control metadata must invalidate pinned checkpoint A");
+    assert!(
+        error.to_string().contains("metadata"),
+        "unexpected export failure: {error}"
+    );
+    assert!(matches!(
+        export
+            .head(&Path::from(
+                "checkpoint-exports/mutable-catalog-race/commit"
+            ))
+            .await,
+        Err(object_store::Error::NotFound { .. })
+    ));
 }
 
 #[tokio::test]
@@ -546,9 +932,11 @@ async fn minio_restore_process_fixture() {
         .await
         .unwrap();
     let checkpoint = CheckpointManifestStore::new(target.clone())
-        .load_manifest(CheckpointId(12))
+        .load_latest_manifest()
         .await
-        .unwrap();
+        .unwrap()
+        .expect("fresh-process restore must select its own latest checkpoint");
+    assert_eq!(checkpoint.checkpoint_id, CheckpointId(12));
     let recovery = RecoveryDriver::new();
     recovery.load_checkpoint(checkpoint.clone());
     let shard = recovery
@@ -729,6 +1117,15 @@ async fn minio_tc_export_restore_fresh_cluster_is_bit_identical() {
         return;
     };
     export_restore_and_assert(source, export, target, "minio-bit-identical").await;
+}
+
+#[tokio::test]
+async fn minio_tc_export_racing_committed_manifest_fails_closed_and_recovers_newest() {
+    let Some((_container, source, export, target)) = minio_stores("manifest-race").await else {
+        return;
+    };
+    assert_export_racing_new_manifest_fails_closed(source, export, target, "minio-manifest-race")
+        .await;
 }
 
 #[tokio::test]
