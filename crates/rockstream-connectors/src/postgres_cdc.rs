@@ -1832,7 +1832,20 @@ impl PostgresCdcSource {
                         return Err(map_pgoutput_transport_error("finish pgoutput COPY", error));
                     }
                 }
+                // PostgreSQL can terminate the COPY backend after its response
+                // has been buffered locally. Verify this *same* socket is alive
+                // before exposing COMMIT to M3; otherwise discard and replay
+                // the entire unacknowledged transaction from the durable slot.
                 pgoutput.event_stream = None;
+                pgoutput
+                    .stream_client
+                    .simple_query("SELECT 1")
+                    .await
+                    .map_err(|error| {
+                        SourceError::Io(format!(
+                            "RS-4017: pgoutput connection disconnected: COPY backend liveness check failed: {error}"
+                        ))
+                    })?;
                 pgoutput.event_frame.transaction_bytes = 0;
             }
             return Ok(Some(payload));
