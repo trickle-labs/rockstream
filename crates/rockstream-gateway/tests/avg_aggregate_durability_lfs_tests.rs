@@ -312,8 +312,14 @@ async fn pgoutput_transitive_view_uses_base_delta_once() {
         read_pairs(&client, "outer_mv").await,
         vec![(1, 40), (2, 60)]
     );
-    coordinator.runtime.recover().await.unwrap();
-    coordinator.owner_lease = Some(coordinator.runtime.acquire_owner("retry").unwrap());
+    coordinator.runtime.resume().await.unwrap();
+    let retry_lease = coordinator.runtime.acquire_owner("retry").unwrap();
+    coordinator
+        .runtime
+        .acknowledge_recovered(&retry_lease)
+        .await
+        .unwrap();
+    coordinator.owner_lease = Some(retry_lease);
     coordinator
         .commit_envelope(envelope, &handler, &db)
         .await
