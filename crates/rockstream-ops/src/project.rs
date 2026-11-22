@@ -48,6 +48,11 @@ impl ProjectOp {
         ProjectOp { exprs }
     }
 
+    /// Borrow the projection expressions (used by stateless operator fusion).
+    pub fn exprs(&self) -> &[NamedExpr] {
+        &self.exprs
+    }
+
     /// Apply the projection to a single delta batch.
     ///
     /// The output schema is derived per-batch from each expression's actual
@@ -85,8 +90,39 @@ impl ProjectOp {
             &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(input.num_rows())),
         )
         .map_err(OpError::arrow)?;
-        Ok(ArrowZSet::new(new_data, input.weights))
+        let mut out = ArrowZSet::new(new_data, input.weights);
+        out.frontier = input.frontier;
+        out.key_capsules = remap_capsules_through_project(&input.key_capsules, &self.exprs);
+        Ok(out)
     }
+}
+
+/// Remap any attached `BatchKeyCapsule`s whose input columns are preserved verbatim
+/// as `Expr::Column(i)` entries in `exprs`, avoiding re-encoding across `Project`.
+pub(crate) fn remap_capsules_through_project(
+    capsules: &[Arc<rockstream_types::BatchKeyCapsule>],
+    exprs: &[NamedExpr],
+) -> Vec<Arc<rockstream_types::BatchKeyCapsule>> {
+    let mut remapped = Vec::new();
+    for capsule in capsules {
+        let mut new_cols = Vec::with_capacity(capsule.spec.columns.len());
+        let mut all_mapped = true;
+        for &src_col in &capsule.spec.columns {
+            if let Some(dst_idx) = exprs
+                .iter()
+                .position(|ne| matches!(ne.expr, Expr::Column(c) if c == src_col))
+            {
+                new_cols.push(dst_idx);
+            } else {
+                all_mapped = false;
+                break;
+            }
+        }
+        if all_mapped {
+            remapped.push(Arc::new(capsule.with_remapped_columns(new_cols)));
+        }
+    }
+    remapped
 }
 
 impl Operator for ProjectOp {

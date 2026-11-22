@@ -17,6 +17,7 @@
 pub mod aggregate;
 pub mod bench_regression;
 pub mod branch_scheduler;
+pub mod chunked;
 pub mod compile;
 pub mod debugger;
 pub mod distinct;
@@ -25,6 +26,7 @@ pub mod error;
 pub mod expr;
 pub mod factorized;
 pub mod filter;
+pub mod fused;
 pub mod governor;
 pub mod group_commit;
 pub mod index_arrange;
@@ -60,30 +62,34 @@ pub use view_attach::{AttachedView, AttachmentDeltaBuffer, ViewAttachmentMetrics
 pub use spill::{SerdeSpill, SpillKey, SpillValue, SpillableArrangement};
 
 pub use aggregate::{
-    bucketed_combined_key, bucketed_partial_key, load_frontier, persist_agg_state,
-    persist_bucketed_agg_state, persist_frontier, AggState, AggregateOp, BucketedAggregateOp,
+    bucketed_combined_key, bucketed_partial_key, encode_weight_add_merge_mutation, load_frontier,
+    persist_agg_state, persist_bucketed_agg_state, persist_frontier, AggState, AggregateOp,
+    AggregatePersistenceMode, AggregateStateCore, BucketedAggregateOp,
 };
 pub use branch_scheduler::{
     BranchScheduler, FnExecutor, ViewBranchExecutor, ViewDependencyGraph,
     MAX_CONCURRENT_BRANCH_TASKS,
 };
+pub use chunked::{ChunkBudget, ChunkStats, ChunkStepResult, ResumableChunkedOp};
 pub use compile::{
     compile_plan, compile_plan_with_sink_id, compile_plan_with_sink_id_and_strategy,
-    compile_plan_with_strategy, CompiledView,
+    compile_plan_with_strategy, fuse_stateless_stages, CompiledView,
 };
 pub use debugger::{
     decode_user_key, explain_view_op_ids, format_explain_op_ids, inspect_arrangement_db,
     inspect_arrangement_reader, ArrangementDebugResult, DecodedArrangementKey, OperatorNodeInfo,
 };
 pub use distinct::{
-    load_distinct_state, persist_distinct_state, DistinctOp, DualArrangement, ExceptOp, IntersectOp,
+    load_distinct_state, persist_distinct_state, DistinctOp, DistinctPersistenceMode,
+    DualArrangement, ExceptOp, IntersectOp,
 };
 pub use error::OpError;
 pub use factorized::{
-    FactorizedAggregateKind, FactorizedJoinAggregateOp, FactorizedStarJoinOp,
+    FactorizedAggregateKind, FactorizedJoinAggregateOp, FactorizedJoinCore, FactorizedStarJoinOp,
     MAX_FACTOR_PAYLOAD_BYTES, MAX_FACTOR_PAYLOAD_ROWS,
 };
 pub use filter::FilterOp;
+pub use fused::{FusedStatelessKernel, StatelessStep};
 pub use governor::{
     AmplificationDimension, DeltaAmplificationBudget, DeltaAmplificationCounters,
     DeltaAmplificationGovernor, PlanStrategy, DEFAULT_FACTORIZED_DELTA_BUDGET,
@@ -94,16 +100,16 @@ pub use group_commit::{
     MAX_GROUP_COMMIT_PENDING_BYTES, MAX_GROUP_COMMIT_RETRY_COUNT, MAX_GROUP_COMMIT_WAITERS,
     PHYSICAL_COMMIT_GROUP_MAX_EPOCHS,
 };
-pub use join::JoinOp;
+pub use join::{JoinOp, JoinStateCore, ResumableJoinEpoch};
 pub use lateral::LateralOp;
 pub use live_exec::{
-    int64_schema, next_stateful_op_id, GroupKeyPacker, JoinKind, JoinPipeline, Stage,
-    StatefulPipeline,
+    int64_schema, next_stateful_op_id, GroupKeyPacker, JoinKind, JoinPipeline, OwnedJoinKind,
+    OwnedJoinPipeline, OwnedStage, OwnedStatefulPipeline, Stage, StatefulPipeline,
 };
 pub use map::MapOp;
 pub use minmax::{persist_minmax_state, MinMaxKind, MinMaxOp, MinMaxState};
 pub use op::{EpochOutput, Operator, OperatorEpochResult};
-pub use outer_join::OuterJoinOp;
+pub use outer_join::{OuterJoinOp, OuterJoinStateCore};
 pub use pipeline::{LinearPipeline, StageTimestampTracker};
 pub use project::ProjectOp;
 pub use recursion::{
