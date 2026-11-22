@@ -3462,16 +3462,6 @@ where
                         if *worker_id_clone.read() != Some(lease.worker_id) {
                             return Err("worker identity does not match the shard lease".to_owned());
                         }
-                        if deployments_clone
-                            .read()
-                            .keys()
-                            .any(|(_, shard_id)| *shard_id == lease.shard_id)
-                        {
-                            return Err(
-                                "shard has an active workload; backup requires an idle shard"
-                                    .to_owned(),
-                            );
-                        }
                         let db = active_shards_clone
                             .read()
                             .get(&lease.shard_id)
@@ -3480,6 +3470,12 @@ where
                             .ok_or_else(|| {
                                 "worker does not hold the requested active shard lease".to_owned()
                             })?;
+                        // Flush any buffered writes before pinning a durable SlateDB checkpoint so
+                        // active workloads produce a complete, point-in-time snapshot without
+                        // blocking foreground ingestion.
+                        db.flush()
+                            .await
+                            .map_err(|error| format!("flush shard before checkpoint: {error}"))?;
                         db.create_checkpoint()
                             .await
                             .map(|handle| (handle.shard_checkpoint_id, handle.snapshot_id))
