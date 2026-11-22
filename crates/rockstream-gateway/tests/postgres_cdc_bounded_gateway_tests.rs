@@ -102,6 +102,12 @@ async fn run_gateway_proof() {
         .await
         .unwrap();
 
+    // Nonempty initial snapshot exercises normal source-backed view activation.
+    upstream
+        .execute("INSERT INTO orders VALUES (0, 'seed')", &[])
+        .await
+        .unwrap();
+
     let dir = TempDir::new().unwrap();
     let db = Arc::new(
         ShardDb::builder(
@@ -128,21 +134,20 @@ async fn run_gateway_proof() {
     tokio::spawn(async move {
         let _ = connection.await;
     });
-    // Install the empty view before attaching the CDC source. Creating a
-    // source-backed view here would invoke an empty backfill and fail coupled
-    // batch validation before this test reaches the transport under test.
+    // Creating a source-backed materialized view activates the CDC owner and
+    // slot. The upstream seed row avoids the empty-backfill validation path.
     for sql in [
         "CREATE TABLE orders (id BIGINT, payload TEXT)",
-        "CREATE MATERIALIZED VIEW orders_view AS SELECT id FROM orders",
         &format!(
             "CREATE SOURCE orders TYPE postgres_cdc (credential_ref='none://trusted', host='{host}', port='{port}', database='postgres', user='postgres', publication='orders_pub', slot='bounded_gateway_slot', table='orders') FORMAT pgoutput"
         ),
+        "CREATE MATERIALIZED VIEW orders_view AS SELECT id FROM orders",
     ] {
         gateway.execute(sql, &[]).await.unwrap();
     }
 
     let deadline = Instant::now() + Duration::from_secs(30);
-    let ack_before = loop {
+    loop {
         let row = upstream
             .query_opt(
                 "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = 'bounded_gateway_slot'",
@@ -151,15 +156,29 @@ async fn run_gateway_proof() {
             .await
             .unwrap();
         if row.is_some() {
-            break slot_lsn(&upstream).await;
+            break;
         }
         assert!(
             Instant::now() < deadline,
             "gateway never created the logical slot"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
-    };
-    assert_eq!(view_ids(&gateway).await, Vec::<i64>::new());
+    }
+    let baseline = vec![0];
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let actual = view_ids(&gateway).await;
+        if actual == baseline {
+            break;
+        }
+        assert!(actual.is_empty(), "unexpected partial initial snapshot: {actual:?}");
+        assert!(
+            Instant::now() < deadline,
+            "gateway never published seeded snapshot: {actual:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let ack_before = slot_lsn(&upstream).await;
 
     upstream
         .batch_execute("BEGIN; INSERT INTO orders SELECT generate_series(1, 2500), 'small'")
@@ -167,21 +186,21 @@ async fn run_gateway_proof() {
         .unwrap();
     assert_eq!(
         view_ids(&gateway).await,
-        Vec::<i64>::new(),
+        baseline,
         "uncommitted source data may not become visible"
     );
     upstream.batch_execute("COMMIT").await.unwrap();
 
-    let expected = (1..=2500).collect::<Vec<i64>>();
+    let expected = (0..=2500).collect::<Vec<i64>>();
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         let actual = view_ids(&gateway).await;
         if actual == expected {
             break;
         }
-        assert!(
-            actual.is_empty(),
-            "a partial M3 transaction became visible before the complete commit: {actual:?}"
+        assert_eq!(
+            actual, baseline,
+            "a partial M3 transaction became visible before the complete commit"
         );
         assert!(
             Instant::now() < deadline,
