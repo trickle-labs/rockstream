@@ -25,8 +25,8 @@ pub use kafka_source::{
 pub use postgres_cdc::{
     decode_pgoutput_event, CdcChange, CdcOperation, CdcTransactionEnvelope, CdcWireFormat, PgLsn,
     PgOutputColumn, PgOutputConfig, PgOutputEvent, PgOutputRelationMetadata,
-    PgOutputSnapshotRelation, PgOutputSourceSnapshot, PostgresCdcFailure, PostgresCdcSource,
-    PostgresCdcStatus, QuadLsnProgress, POSTGRES_CDC_MAX_IN_FLIGHT_BYTES,
+    PgOutputSnapshotRelation, PgOutputSourceSnapshot, PgOutputTransportStats, PostgresCdcFailure,
+    PostgresCdcSource, PostgresCdcStatus, QuadLsnProgress, POSTGRES_CDC_MAX_IN_FLIGHT_BYTES,
     POSTGRES_CDC_MAX_IN_FLIGHT_RECORDS, POSTGRES_CDC_MAX_RESNAPSHOT_ATTEMPTS,
     POSTGRES_CDC_MAX_TRANSACTION_BYTES, POSTGRES_CDC_MAX_WAL_LAG_BYTES,
     POSTGRES_CDC_TRANSACTION_MEMORY_BYTES,

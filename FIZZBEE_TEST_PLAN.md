@@ -1900,3 +1900,7 @@ The CLI backup operation selects one committed control checkpoint and must enume
 ## Consistent control manifest selection during checkpoint export (#352)
 
 `CheckpointExporter` pins the control-plane SlateDB manifest that was visible when the selected `ClusterCheckpoint` was loaded rather than copying a newer control manifest that commits mid-inventory. This ensures the exported control manifest and shard object inventory represent a single consistent committed checkpoint cut under M3 recovery.
+
+## Bounded pgoutput transport and streaming transaction decoding (#349)
+
+`PostgresCdcSource` bounds in-memory binary `COPY OUT` transport frames and decodes active transactions incrementally rather than re-decoding the entire buffered transaction on every event poll. This is a connector transport and memory-bounding optimization that preserves the M1/M3 source checkpoint LSN frontier, transaction boundary atomicity, and restart replay semantics.
