@@ -99,11 +99,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub storage_dir: Option<PathBuf>,
 
-    /// Principal presented to control-plane and catalog mutations.
+    /// Identity label used by legacy local CLI adapters; not the management API identity.
     #[arg(long, global = true, default_value = "rockstream")]
     pub identity_user: String,
 
-    /// RBAC role presented to control-plane and catalog mutations.
+    /// Legacy local role request; not an authenticated grant.
     #[arg(long, global = true, value_parser = ["viewer", "pipeline-owner", "admin"], default_value = "viewer")]
     pub identity_role: String,
 
