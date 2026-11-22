@@ -264,8 +264,7 @@ fn slow_subscribe_consumer_bounded_and_requires_resnapshot_when_lagged() {
     if let Some(floor) = registry.replay_floor("orders") {
         if floor > 0 {
             let err = start_from_epoch(&registry, &req, 0, vec!["v".to_owned()])
-                .err()
-                .expect("lagged consumer below replay_floor must fail/resnapshot");
+                .expect_err("lagged consumer below replay_floor must fail/resnapshot");
             assert!(
                 matches!(
                     err,

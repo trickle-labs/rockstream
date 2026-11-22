@@ -3954,7 +3954,7 @@ mod tests {
         let err = validate_role("bogus").unwrap_err();
         assert_eq!(
             err.to_string(),
-            "RS-0002 unknown node role `bogus`\n  next steps: Pass --role with one of: all, control, worker, gateway, frontier."
+            "RS-0002 unknown node role `bogus`\n  next steps: Pass --role with one of: all, control, worker, gateway, frontier, compactor."
         );
     }
 

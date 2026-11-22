@@ -646,6 +646,8 @@ pub struct GatewaySection {
     pub tls: GatewayTlsConfig,
     #[serde(default)]
     pub webhook_listen_addr: Option<String>,
+    #[serde(default)]
+    pub serving: ServingConfig,
 }
 
 fn default_gateway_listen_addr() -> String {
@@ -668,6 +670,7 @@ impl Default for GatewaySection {
             query_timeout_secs: default_gateway_query_timeout_secs(),
             tls: GatewayTlsConfig::default(),
             webhook_listen_addr: None,
+            serving: ServingConfig::default(),
         }
     }
 }
@@ -815,6 +818,8 @@ pub struct StorageSection {
     pub temp_dir: Option<std::path::PathBuf>,
     #[serde(default)]
     pub spill_dir: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub compaction: CompactorConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1014,6 +1019,7 @@ impl From<&RockstreamConfig> for NodeConfig {
                     ca_cert_path: cfg.gateway.tls_ca_cert_path.clone(),
                 },
                 webhook_listen_addr: cfg.gateway.webhook_listen_addr.clone(),
+                serving: cfg.gateway.serving.clone(),
             },
             control: ControlSection::default(),
             worker: WorkerSection {
@@ -1024,7 +1030,10 @@ impl From<&RockstreamConfig> for NodeConfig {
                 capabilities: Vec::new(),
                 ..WorkerSection::default()
             },
-            storage: StorageSection::default(),
+            storage: StorageSection {
+                compaction: cfg.storage.compaction.clone(),
+                ..StorageSection::default()
+            },
             metrics: MetricsSection::default(),
             auth: AuthSection::default(),
             logging: LoggingSection::default(),
@@ -1058,6 +1067,8 @@ impl From<&NodeConfig> for RockstreamConfig {
         cfg.gateway.tls_key_path = node.gateway.tls.key_path.clone();
         cfg.gateway.tls_ca_cert_path = node.gateway.tls.ca_cert_path.clone();
         cfg.gateway.webhook_listen_addr = node.gateway.webhook_listen_addr.clone();
+        cfg.gateway.serving = node.gateway.serving.clone();
+        cfg.storage.compaction = node.storage.compaction.clone();
         cfg
     }
 }

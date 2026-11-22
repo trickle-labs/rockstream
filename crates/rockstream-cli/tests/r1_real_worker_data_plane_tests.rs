@@ -747,6 +747,16 @@ async fn interrupted_dispatch_blocks_distributed_reads_after_gateway_restart() {
                     request_tx.take().unwrap().send(request).unwrap();
                     std::future::pending::<()>().await;
                 }
+                WorkerMessage::DiscoverShards => {
+                    // A stateless gateway now discovers shards at bootstrap.
+                    // This fixture intentionally has no serving replicas.
+                    let response = ControlMessage::ServingTopology {
+                        shards: Vec::new(),
+                        cluster_frontier: None,
+                    };
+                    let wire = serde_json::to_string(&response).unwrap() + "\n";
+                    write.write_all(wire.as_bytes()).await.unwrap();
+                }
                 other => panic!("unexpected request: {other:?}"),
             }
         }

@@ -1734,7 +1734,7 @@ Options
 | auth | — | --auth | AUTH | no | — | off, scram, md5, oidc, mtls | Authentication mode. SCRAM requires an enabled durable login; OIDC and mTLS require their configuration. MD5 is rejected. Omitted uses `[auth].mode` |
 | availability_zone | — | --availability-zone | AVAILABILITY_ZONE | no | — | — | Availability zone advertised during worker registration |
 | checkpoint_retention_count | — | --checkpoint-retention-count | CHECKPOINT_RETENTION_COUNT | no | — | — |  |
-| control | — | --control | CONTROL | no | — | — | Control service URL (required for the worker and frontier roles) |
+| control | — | --control | CONTROL | no | — | — | Control service URL (required for the worker, frontier, and compactor roles) |
 | control_bind | — | --control-bind | CONTROL_BIND | no | — | — | Override address worker-facing ControlService binds to |
 | control_shared_storage | — | --control-shared-storage | CONTROL_SHARED_STORAGE | no | — | — | Directory for state shared across control nodes in Raft group |
 | daemon | — | --daemon | DAEMON | no | false | true, false | Run the control role as a daemon |
@@ -1753,7 +1753,7 @@ Options
 | raft_bootstrap | — | --raft-bootstrap | RAFT_BOOTSTRAP | no | false | true, false | Start an election immediately on boot |
 | raft_node_id | — | --raft-node-id | RAFT_NODE_ID | no | — | — | This node's ID within its Raft group |
 | raft_peers | — | --raft-peers | RAFT_PEERS | no | — | — | Comma-separated list of other control nodes in Raft group |
-| role | — | --role | ROLE | no | all | all, gateway, worker, control | Node role |
+| role | — | --role | ROLE | no | all | all, gateway, worker, control, compactor | Node role |
 | same_host_shm_segment_bytes | — | --same-host-shm-segment-bytes | SAME_HOST_SHM_SEGMENT_BYTES | no | — | — |  |
 | same_host_shm_segments_per_peer | — | --same-host-shm-segments-per-peer | SAME_HOST_SHM_SEGMENTS_PER_PEER | no | — | — |  |
 | shutdown_timeout_secs | — | --shutdown-timeout-secs | SHUTDOWN_TIMEOUT_SECS | no | — | — | Configurable shutdown timeout deadline in seconds (default: 30) |

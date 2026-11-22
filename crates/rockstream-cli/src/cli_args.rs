@@ -231,7 +231,7 @@ pub enum Command {
         #[arg(long, value_enum, default_value_t = Role::All)]
         role: Role,
 
-        /// Control service URL (required for the worker and frontier roles).
+        /// Control service URL (required for the worker, frontier, and compactor roles).
         #[arg(long)]
         control: Option<String>,
 
