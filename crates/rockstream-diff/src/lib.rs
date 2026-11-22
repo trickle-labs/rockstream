@@ -368,6 +368,7 @@ impl DiffCtx {
                 k,
                 rank_col,
                 partition_by,
+                ..
             } => {
                 let input_id = self.diff_node(input, ops)?;
                 let id = self.next_op_id();
@@ -605,6 +606,7 @@ mod tests {
             time_col: 0,
             gap_ms: 1000,
             late_data_policy: LateDataPolicy::Drop,
+            partition_by: None,
         };
         let mut ctx = DiffCtx::new();
         let physical = ctx.differentiate(&plan).unwrap();
@@ -629,6 +631,7 @@ mod tests {
             k: 5,
             rank_col: 1,
             partition_by: vec![0],
+            order_by: vec![],
         };
         let mut ctx = DiffCtx::new();
         let physical = ctx.differentiate(&plan).unwrap();

@@ -826,6 +826,7 @@ mod tests {
             k: 10,
             rank_col: 2,
             partition_by: vec![0],
+            order_by: vec![],
         };
         let text = explain_incremental(&plan);
         assert!(text.contains("TopK"), "text: {text}");

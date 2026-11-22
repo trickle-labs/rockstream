@@ -13,6 +13,10 @@ use serde_json::{json, Value};
 
 use crate::sink::{materialize_view_state, read_view_output, ColumnValue};
 
+/// Default maximum JSON envelope size per Kafka transaction (900 KiB,
+/// comfortably under Kafka's 1 MiB default `message.max.bytes`).
+pub const DEFAULT_MAX_ENVELOPE_BYTES: usize = 900 * 1024;
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Progress {
@@ -23,6 +27,12 @@ struct Progress {
     view_epoch: Option<u64>,
     transaction: u64,
     pending: Option<SinkState>,
+    #[serde(default)]
+    snapshot_chunk_offset: usize,
+    #[serde(default)]
+    snapshot_epoch: Option<u64>,
+    #[serde(default)]
+    change_chunk_offset: usize,
 }
 
 /// One owner exports one append-only, monotonically committed view log.
@@ -33,6 +43,7 @@ pub struct KafkaViewSink {
     db: Arc<ShardDb>,
     view: OperatorId,
     columns: usize,
+    max_envelope_bytes: usize,
 }
 
 impl KafkaViewSink {
@@ -42,7 +53,15 @@ impl KafkaViewSink {
             db,
             view,
             columns,
+            max_envelope_bytes: DEFAULT_MAX_ENVELOPE_BYTES,
         }
+    }
+
+    /// Override the per-transaction envelope byte ceiling (useful for tests
+    /// and brokers with custom `message.max.bytes`).
+    pub fn with_max_envelope_bytes(mut self, max_envelope_bytes: usize) -> Self {
+        self.max_envelope_bytes = max_envelope_bytes.max(256);
+        self
     }
 
     fn key(&self) -> Vec<u8> {
@@ -61,6 +80,9 @@ impl KafkaViewSink {
                 view_epoch: None,
                 transaction: 0,
                 pending: None,
+                snapshot_chunk_offset: 0,
+                snapshot_epoch: None,
+                change_chunk_offset: 0,
             },
         };
         if progress.view != self.view.0
@@ -91,57 +113,96 @@ impl KafkaViewSink {
             .await
             .map_err(io)?;
         let kind;
-        let rows;
-        if !progress.snapshot_complete {
+        let all_rows: Vec<(Vec<ColumnValue>, i64)>;
+        let chunk_offset: usize;
+        let envelope_view_epoch: Option<u64>;
+        let is_snapshot = !progress.snapshot_complete;
+        if is_snapshot {
             kind = "snapshot";
-            progress.view_epoch = output.last().map(|row| row.0);
-            rows = materialize_view_state(output, &[])
+            let snap_epoch = if progress.snapshot_chunk_offset > 0 {
+                progress.snapshot_epoch
+            } else {
+                let latest = output.last().map(|row| row.0);
+                progress.snapshot_epoch = latest;
+                latest
+            };
+            if let Some(limit_epoch) = snap_epoch {
+                output.retain(|row| row.0 <= limit_epoch);
+            }
+            all_rows = materialize_view_state(output, &[])
                 .into_values()
                 .collect::<Vec<_>>();
-            if rows.iter().any(|(_, weight)| *weight < 0) {
+            if all_rows.iter().any(|(_, weight)| *weight < 0) {
                 return Err(io("Kafka snapshot contains a negative row multiplicity"));
             }
-            progress.snapshot_complete = true;
+            chunk_offset = progress.snapshot_chunk_offset;
+            envelope_view_epoch = snap_epoch;
         } else {
             output.retain(|row| progress.view_epoch.is_none_or(|epoch| row.0 > epoch));
             let Some(epoch) = output.first().map(|row| row.0) else {
                 return Ok(false);
             };
             kind = "changes";
-            progress.view_epoch = Some(epoch);
-            rows = output
+            all_rows = output
                 .into_iter()
                 .take_while(|row| row.0 == epoch)
                 .map(|(_, _, row, weight)| (row, weight))
                 .collect();
+            chunk_offset = progress.change_chunk_offset;
+            envelope_view_epoch = Some(epoch);
         }
-        let envelope = json!({
-            "version": 1,
-            "connector_id": self.sink.connector_id().0,
-            "view": self.view.0,
-            "epoch": progress.transaction,
-            "view_epoch": progress.view_epoch,
-            "kind": kind,
-            "rows": rows.iter().map(|(row, weight)| json!({
-                "values": row.iter().map(column).collect::<Vec<_>>(), "weight": weight,
-            })).collect::<Vec<_>>(),
-        })
-        .to_string();
-        // shortcut: one bounded envelope per epoch, add chunked transactions for larger views.
-        if envelope.len() > 900 * 1024 {
-            return Err(io("Kafka row envelope exceeds the 900 KiB delivery limit"));
+
+        let total_rows = all_rows.len();
+        let remaining = all_rows.get(chunk_offset..).unwrap_or(&[]);
+        let (envelope, chunk_rows_len) = build_bounded_envelope(
+            self.sink.connector_id().0,
+            self.view.0,
+            self.max_envelope_bytes,
+            progress.transaction,
+            envelope_view_epoch,
+            kind,
+            remaining,
+            chunk_offset,
+            total_rows,
+        )?;
+        let next_offset = chunk_offset + chunk_rows_len;
+        if is_snapshot {
+            if next_offset >= total_rows {
+                progress.snapshot_complete = true;
+                progress.view_epoch = envelope_view_epoch;
+                progress.snapshot_chunk_offset = 0;
+                progress.snapshot_epoch = None;
+            } else {
+                progress.snapshot_chunk_offset = next_offset;
+            }
+        } else if next_offset >= total_rows {
+            progress.view_epoch = envelope_view_epoch;
+            progress.change_chunk_offset = 0;
+        } else {
+            progress.change_chunk_offset = next_offset;
         }
+
         progress.transaction = progress
             .transaction
             .checked_add(1)
             .ok_or_else(|| io("Kafka view transaction counter exhausted"))?;
         progress.pending = Some(
             self.sink
-                .pre_commit_payload(progress.transaction - 1, rows.len(), envelope)
+                .pre_commit_payload(progress.transaction - 1, chunk_rows_len, envelope)
                 .await?,
         );
         self.persist(&progress).await?;
         Ok(true)
+    }
+
+    /// Deliver all pending snapshot chunks and committed view epochs until caught up.
+    /// Returns the number of Kafka transactions committed.
+    pub async fn drain_all(&mut self) -> Result<usize, SinkError> {
+        let mut delivered = 0usize;
+        while self.deliver_next().await? {
+            delivered += 1;
+        }
+        Ok(delivered)
     }
 
     /// Recover a durable pending transaction, or deliver one new transaction.
@@ -222,6 +283,89 @@ async fn pause_after_commit_for_test(epoch: u64) -> Result<(), SinkError> {
     Ok(())
 }
 
+fn build_bounded_envelope(
+    connector_id: u64,
+    view_id: u64,
+    max_envelope_bytes: usize,
+    transaction: u64,
+    view_epoch: Option<u64>,
+    kind: &str,
+    remaining: &[(Vec<ColumnValue>, i64)],
+    chunk_offset: usize,
+    total_rows: usize,
+) -> Result<(String, usize), SinkError> {
+    let format_envelope = |rows: &[(Vec<ColumnValue>, i64)], is_chunked: bool| -> String {
+        let encoded_rows = rows
+            .iter()
+            .map(|(row, weight)| {
+                json!({
+                    "values": row.iter().map(column).collect::<Vec<_>>(),
+                    "weight": weight,
+                })
+            })
+            .collect::<Vec<_>>();
+        if !is_chunked {
+            json!({
+                "version": 1,
+                "connector_id": connector_id,
+                "view": view_id,
+                "epoch": transaction,
+                "view_epoch": view_epoch,
+                "kind": kind,
+                "rows": encoded_rows,
+            })
+            .to_string()
+        } else {
+            let chunk_end = chunk_offset + rows.len();
+            json!({
+                "version": 1,
+                "connector_id": connector_id,
+                "view": view_id,
+                "epoch": transaction,
+                "view_epoch": view_epoch,
+                "kind": kind,
+                "chunk_offset": chunk_offset,
+                "chunk_end": chunk_end,
+                "total_rows": total_rows,
+                "chunk_complete": chunk_end >= total_rows,
+                "rows": encoded_rows,
+            })
+            .to_string()
+        }
+    };
+
+    if chunk_offset == 0 {
+        let full = format_envelope(remaining, false);
+        if full.len() <= max_envelope_bytes {
+            return Ok((full, remaining.len()));
+        }
+    }
+
+    if remaining.is_empty() {
+        return Ok((format_envelope(&[], chunk_offset > 0), 0));
+    }
+
+    let mut lo = 1usize;
+    let mut hi = remaining.len();
+    let mut best: Option<(String, usize)> = None;
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2;
+        let candidate = format_envelope(&remaining[..mid], true);
+        if candidate.len() <= max_envelope_bytes {
+            best = Some((candidate, mid));
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    best.ok_or_else(|| {
+        io(format!(
+            "single Kafka row exceeds the {} byte envelope limit",
+            max_envelope_bytes
+        ))
+    })
+}
+
 fn io(error: impl std::fmt::Display) -> SinkError {
     SinkError::Io(error.to_string())
 }
@@ -261,5 +405,73 @@ mod tests {
                 json!({"Float64":"7ff8000000000001"}),
             ]
         );
+    }
+
+    #[test]
+    fn chunked_snapshot_splits_deterministically_under_envelope_limit() {
+        let rows: Vec<(Vec<ColumnValue>, i64)> = (0..12i64)
+            .map(|i| {
+                (
+                    vec![
+                        ColumnValue::Int64(i),
+                        ColumnValue::Utf8(format!("payload-row-{i:03}")),
+                    ],
+                    1,
+                )
+            })
+            .collect();
+
+        let mut offset = 0usize;
+        let mut chunks = Vec::new();
+        let mut tx = 0u64;
+        while offset < rows.len() {
+            let (env, count) = build_bounded_envelope(
+                404,
+                404,
+                420,
+                tx,
+                Some(1),
+                "snapshot",
+                &rows[offset..],
+                offset,
+                rows.len(),
+            )
+            .unwrap();
+            assert!(
+                env.len() <= 420,
+                "chunk envelope {} exceeded 420 bytes",
+                env.len()
+            );
+            assert!(count >= 1);
+            let parsed: Value = serde_json::from_str(&env).unwrap();
+            assert_eq!(parsed["kind"], json!("snapshot"));
+            assert_eq!(parsed["chunk_offset"], json!(offset));
+            assert_eq!(parsed["chunk_end"], json!(offset + count));
+            assert_eq!(parsed["total_rows"], json!(rows.len()));
+            assert_eq!(
+                parsed["chunk_complete"],
+                json!(offset + count == rows.len())
+            );
+            chunks.push((offset, count, parsed));
+            offset += count;
+            tx += 1;
+        }
+        assert!(
+            chunks.len() >= 2,
+            "expected multiple chunks, got {}",
+            chunks.len()
+        );
+        let reassembled: Vec<i64> = chunks
+            .iter()
+            .flat_map(|(_, _, p)| {
+                p["rows"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| r["values"][0]["Int64"].as_i64().unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(reassembled, (0..12i64).collect::<Vec<_>>());
     }
 }

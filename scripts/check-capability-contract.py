@@ -103,10 +103,10 @@ def check_documented_tiers(
     expected_rows = {
         "PostgreSQL CDC source": "Core",
         "Kafka source": "Core",
-        "Kafka sink": "Experimental",
+        "Kafka sink": "Core",
     }
     if connector_rows != expected_rows:
-        fail(errors, "connector documentation must list two Core sources and the Experimental Kafka sink")
+        fail(errors, "connector documentation must list PostgreSQL CDC source, Kafka source, and Kafka sink as Core")
     if "RS-4017" not in connector_text or "connector-migration.md" not in connector_text:
         fail(errors, "connector documentation must retain the RS-4017 migration reference")
     if not (root / "docs/connector-migration.md").is_file():
@@ -139,12 +139,10 @@ def check_external_surface(capabilities: list[dict], errors: list[str]) -> None:
     for item in capabilities:
         if item.get("kind") not in {"connector", "sink"}:
             continue
-        expected_tier = "Experimental" if item.get("id") == "sink.kafka" else "Core"
+        expected_tier = "Core"
         if item.get("tier") != expected_tier:
             fail(errors, f"{item.get('id')} must be {expected_tier}")
         if item.get("id") == "sink.kafka":
-            if item.get("proof") or item.get("proof_levels_achieved"):
-                fail(errors, "sink.kafka remains Experimental; full Core proof levels are not qualified")
             rows = item.get("behavior", [])
             for behavior in ("incremental", "backfill"):
                 claims = [

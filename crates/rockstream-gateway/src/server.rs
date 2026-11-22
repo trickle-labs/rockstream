@@ -490,6 +490,7 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> PgWireResul
 
     let ctx = SessionContext::new();
     rockstream_sql::frontend::register_session_sql_udf(&ctx);
+    rockstream_sql::frontend::register_hop_sql_udf(&ctx);
     for view in catalog.list_views() {
         let mut fields = Vec::new();
         for col in &view.columns {
@@ -2168,6 +2169,11 @@ pub struct GatewayHandler {
     /// outright (`RS-1019`) when compilation fails — there is no
     /// materializer fallback left (v0.51.4 Slice 8).
     compiled_views: Arc<DashMap<String, Arc<rockstream_ops::CompiledView>>>,
+    /// Shared time-slice fabric for correlated HOP/TUMBLE windowed views over
+    /// the same source table and timestamp column (issue #404 R2).
+    shared_windows: Arc<Mutex<rockstream_ops::SharedWindowFabric>>,
+    /// Live SQL-wired Kafka view sinks keyed by sink name (issue #404 R4).
+    kafka_sinks: Arc<DashMap<String, Arc<tokio::sync::Mutex<rockstream_ops::kafka_sink::KafkaViewSink>>>>,
     distributed_data_plane: Option<DataPlaneClient>,
     actor_assertion_signer: Option<Arc<rockstream_control::delegation::ActorAssertionSigner>>,
     distributed_storage_root: Option<String>,
@@ -3632,6 +3638,8 @@ impl GatewayHandler {
             table_insert_metadata: Arc::new(DashMap::new()),
             frontier_published_at_ms: Arc::new(AtomicU64::new(current_time_ms())),
             compiled_views: Arc::new(DashMap::new()),
+            shared_windows: Arc::new(Mutex::new(rockstream_ops::SharedWindowFabric::new())),
+            kafka_sinks: Arc::new(DashMap::new()),
             distributed_data_plane: None,
             actor_assertion_signer: None,
             distributed_storage_root: None,
@@ -3686,6 +3694,8 @@ impl GatewayHandler {
             table_insert_metadata: Arc::new(DashMap::new()),
             frontier_published_at_ms: Arc::new(AtomicU64::new(current_time_ms())),
             compiled_views: Arc::new(DashMap::new()),
+            shared_windows: Arc::new(Mutex::new(rockstream_ops::SharedWindowFabric::new())),
+            kafka_sinks: Arc::new(DashMap::new()),
             distributed_data_plane: None,
             actor_assertion_signer: None,
             distributed_storage_root: None,
@@ -3810,6 +3820,7 @@ impl GatewayHandler {
                         },
                     );
                 }
+                self.attach_shared_window_if_applicable(view_name, &view_plan, table_schemas);
                 Ok(compiled)
             }
             Err(compile_err) => {
@@ -3828,6 +3839,188 @@ impl GatewayHandler {
                 Err(format!("[RS-1019] compile_plan: {compile_err}; next_steps: simplify the view query or verify its source schemas"))
             }
         }
+    }
+
+    /// Access the shared time-slice window fabric (for telemetry and verification).
+    pub fn shared_window_consumer_count(
+        &self,
+        spec: &rockstream_types::SharedWindowSpec,
+    ) -> Option<usize> {
+        self.shared_windows.lock().consumer_count(spec)
+    }
+
+    fn attach_shared_window_if_applicable(
+        &self,
+        view_name: &str,
+        plan: &rockstream_plan::PlanNode,
+        table_schemas: &HashMap<String, SchemaRef>,
+    ) {
+        fn resolve_source_col(
+            node: &rockstream_plan::PlanNode,
+            col_idx: usize,
+        ) -> Option<(String, usize)> {
+            match node {
+                rockstream_plan::PlanNode::Source { name } => Some((name.clone(), col_idx)),
+                rockstream_plan::PlanNode::Filter { input, .. } => {
+                    resolve_source_col(input, col_idx)
+                }
+                rockstream_plan::PlanNode::Project { input, columns } => {
+                    let mapped = match columns.get(col_idx) {
+                        Some(rockstream_plan::Expr::Column(orig)) => *orig,
+                        _ => col_idx,
+                    };
+                    resolve_source_col(input, mapped)
+                }
+                _ => None,
+            }
+        }
+        fn find_window_info(
+            node: &rockstream_plan::PlanNode,
+        ) -> Option<(String, usize, i64, i64)> {
+            match node {
+                rockstream_plan::PlanNode::HopWindow {
+                    input,
+                    time_col,
+                    window_size_ms,
+                    slide_ms,
+                    ..
+                } => {
+                    let (src, orig_col) = resolve_source_col(input, *time_col)?;
+                    Some((src, orig_col, *slide_ms, *window_size_ms))
+                }
+                rockstream_plan::PlanNode::TumbleWindow {
+                    input,
+                    time_col,
+                    window_size_ms,
+                    ..
+                } => {
+                    let (src, orig_col) = resolve_source_col(input, *time_col)?;
+                    Some((src, orig_col, *window_size_ms, *window_size_ms))
+                }
+                rockstream_plan::PlanNode::ViewSink { child, .. }
+                | rockstream_plan::PlanNode::Exchange { child, .. } => find_window_info(child),
+                rockstream_plan::PlanNode::Aggregate { input, .. }
+                | rockstream_plan::PlanNode::Project { input, .. }
+                | rockstream_plan::PlanNode::Filter { input, .. }
+                | rockstream_plan::PlanNode::TopK { input, .. }
+                | rockstream_plan::PlanNode::Distinct { input, .. }
+                | rockstream_plan::PlanNode::Window { input, .. }
+                | rockstream_plan::PlanNode::IndexArrange { input, .. } => find_window_info(input),
+                _ => None,
+            }
+        }
+
+        let Some((source_table, time_col_idx, slice_ms, window_width_ms)) = find_window_info(plan)
+        else {
+            return;
+        };
+        if slice_ms <= 0 || window_width_ms <= 0 || window_width_ms % slice_ms != 0 {
+            return;
+        }
+        let time_col_name = table_schemas
+            .get(&source_table)
+            .and_then(|schema| schema.fields().get(time_col_idx))
+            .map(|f| f.name().clone())
+            .unwrap_or_else(|| format!("col_{time_col_idx}"));
+        let Ok(spec) = rockstream_types::SharedWindowSpec::new(
+            source_table,
+            "default",
+            time_col_name,
+            slice_ms as u64,
+            None,
+            rockstream_types::merge_law::MergeLawId(2),
+            rockstream_types::merge_law::MergeLawVersion(1),
+        ) else {
+            return;
+        };
+        let mut fabric = self.shared_windows.lock();
+        let _ = fabric.register(spec.clone());
+        let _ = fabric.attach(&spec, view_name, window_width_ms as u64);
+    }
+
+    /// Deliver committed view epochs to any live SQL-wired Kafka sinks attached
+    /// to `views`.
+    async fn deliver_kafka_sinks_for_views(&self, views: &[String]) {
+        if self.kafka_sinks.is_empty() {
+            return;
+        }
+        let matching_sinks: Vec<(
+            String,
+            Arc<tokio::sync::Mutex<rockstream_ops::kafka_sink::KafkaViewSink>>,
+        )> = self
+            .catalog
+            .list_sinks()
+            .into_iter()
+            .filter(|entry| {
+                entry.format.eq_ignore_ascii_case("KAFKA") && views.contains(&entry.view)
+            })
+            .filter_map(|entry| {
+                self.kafka_sinks
+                    .get(&entry.name)
+                    .map(|sink| (entry.name, Arc::clone(sink.value())))
+            })
+            .collect();
+        for (sink_name, sink_arc) in matching_sinks {
+            let mut sink = sink_arc.lock().await;
+            if let Err(err) = sink.drain_all().await {
+                tracing::warn!(
+                    sink = %sink_name,
+                    error = %err,
+                    "deliver_kafka_sinks_for_views: failed to deliver committed view epochs to Kafka"
+                );
+            }
+        }
+    }
+
+    /// Reattach and recover persisted SQL-wired Kafka sinks after restart.
+    async fn recover_kafka_sinks(
+        &self,
+        shard_db: &Arc<rockstream_storage::ShardDb>,
+    ) -> Result<(), GatewayError> {
+        for entry in self.catalog.list_sinks() {
+            if !entry.format.eq_ignore_ascii_case("KAFKA") {
+                continue;
+            }
+            if self.kafka_sinks.contains_key(&entry.name) {
+                continue;
+            }
+            let Some(view) = self.catalog.get_view(&entry.view) else {
+                continue;
+            };
+            let Some(op_id) = view.op_id else {
+                continue;
+            };
+            let connector_id = ConnectorId(
+                entry
+                    .format_version
+                    .unwrap_or_else(|| stable_name_id("kafka-sink", &entry.name)),
+            );
+            let topic = &entry.catalog;
+            let brokers = &entry.path;
+            let kafka_sink = rockstream_connectors::KafkaSink::connect(connector_id, brokers, topic)
+                .map_err(|e| GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("recover Kafka sink '{}': {e}", entry.name),
+                })?;
+            let mut view_sink = rockstream_ops::kafka_sink::KafkaViewSink::new(
+                kafka_sink,
+                Arc::clone(shard_db),
+                OperatorId(op_id),
+                view.columns.len(),
+            );
+            if let Some(max_bytes) = entry.parquet_row_group_bytes {
+                view_sink = view_sink.with_max_envelope_bytes(max_bytes as usize);
+            }
+            if let Err(err) = view_sink.drain_all().await {
+                tracing::warn!(
+                    sink = %entry.name,
+                    error = %err,
+                    "recover_kafka_sinks: recovery delivery returned error"
+                );
+            }
+            self.kafka_sinks
+                .insert(entry.name.clone(), Arc::new(tokio::sync::Mutex::new(view_sink)));
+        }
+        Ok(())
     }
 
     /// Same as `try_compile_view`, but reuses `sink_op_id` instead of
@@ -4032,6 +4225,7 @@ impl GatewayHandler {
                 }
             }
         }
+        self.recover_kafka_sinks(&shard_db).await?;
         Ok(())
     }
 
@@ -4397,13 +4591,33 @@ impl GatewayHandler {
         view_name: &str,
         shard_db: &Arc<rockstream_storage::ShardDb>,
     ) -> Result<(), GatewayError> {
-        let Some(compiled) = self.compiled_views.get(view_name) else {
+        let Some(compiled) = self.compiled_views.get(view_name).map(|v| Arc::clone(v.value())) else {
             return Ok(());
         };
+        let single_source = if compiled.join.is_none() {
+            self.compiled_single_source(view_name)?
+        } else {
+            None
+        };
+        self.populate_compiled_view_instance(
+            view_name,
+            &compiled,
+            single_source.as_deref(),
+            shard_db,
+        )
+        .await
+    }
 
-        // v0.51.4 Slice 3: a join-shaped view's initial backfill scans both
-        // source tables' current contents (weight 1 per row) and feeds them
-        // through the join in one shot.
+    /// Backfill a specific `CompiledView` instance (either the live view or a
+    /// staging replacement view prior to atomic cutover) from current base-table
+    /// contents in `shard_db`.
+    async fn populate_compiled_view_instance(
+        &self,
+        view_name: &str,
+        compiled: &rockstream_ops::CompiledView,
+        single_source: Option<&str>,
+        shard_db: &Arc<rockstream_storage::ShardDb>,
+    ) -> Result<(), GatewayError> {
         if let Some(join) = &compiled.join {
             let left = self
                 .full_table_zset(&join.left_source, shard_db.as_ref())
@@ -4435,11 +4649,11 @@ impl GatewayHandler {
             return Ok(());
         }
 
-        let Some(source_name) = self.compiled_single_source(view_name)? else {
+        let Some(source_name) = single_source else {
             return Ok(());
         };
         let input = self
-            .full_table_zset(&source_name, shard_db.as_ref())
+            .full_table_zset(source_name, shard_db.as_ref())
             .await?;
         if input.is_empty() {
             return Ok(());
@@ -8523,11 +8737,16 @@ impl GatewayHandler {
                 self.catalog.backfill_status_response(view_name),
             ))]);
         }
+        if ql.trim_end_matches(';') == "show backfill status" {
+            return Ok(vec![promote_response(catalog_resp_to_response(
+                self.catalog.backfill_status_all_response(),
+            ))]);
+        }
         if ql.starts_with("show backfill status") {
             return Ok(vec![promote_response(Response::Error(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
                 "42601".to_owned(),
-                "[RS-2001] sql.invalid_syntax: expected SHOW BACKFILL STATUS FOR MATERIALIZED VIEW <name>. Next steps: provide a materialized view name.".to_owned(),
+                "[RS-2001] sql.invalid_syntax: expected SHOW BACKFILL STATUS or SHOW BACKFILL STATUS FOR MATERIALIZED VIEW <name>. Next steps: provide a materialized view name or omit the FOR clause to list all views.".to_owned(),
             ))))]);
         }
         if ql.trim_end_matches(';') == "show view status" {
@@ -9178,6 +9397,7 @@ impl GatewayHandler {
         // so the planner can resolve any referenced names.
         let ctx = SessionContext::new();
         rockstream_sql::frontend::register_session_sql_udf(&ctx);
+    rockstream_sql::frontend::register_hop_sql_udf(&ctx);
         for view in self.catalog.list_views() {
             let mut fields = Vec::new();
             for col in &view.columns {
@@ -9760,7 +9980,7 @@ impl GatewayHandler {
         &self,
         view_name: &str,
         limit: Option<usize>,
-        order_by: Vec<(String, bool)>,
+        order_by: Vec<(String, bool, bool)>,
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<Response<'static>>> {
         let _distributed_read_guard = if self.distributed_data_plane.is_some() {
@@ -9895,23 +10115,52 @@ impl GatewayHandler {
                         std::str::from_utf8(a).unwrap_or("").split('\t').collect();
                     let b_fields: Vec<&str> =
                         std::str::from_utf8(b).unwrap_or("").split('\t').collect();
-                    for (col, desc) in &order_by {
+                    for (col, desc, nulls_first) in &order_by {
                         let Some(&idx) = col_idx.get(col.as_str()) else {
                             continue;
                         };
-                        let av = a_fields.get(idx).copied().unwrap_or("");
-                        let bv = b_fields.get(idx).copied().unwrap_or("");
-                        let ord = if let (Ok(an), Ok(bn)) = (av.parse::<i64>(), bv.parse::<i64>()) {
-                            an.cmp(&bn)
-                        } else {
-                            av.cmp(bv)
+                        let av = a_fields.get(idx).copied().unwrap_or(r"\N");
+                        let bv = b_fields.get(idx).copied().unwrap_or(r"\N");
+                        let ord = match (av == r"\N", bv == r"\N") {
+                            (true, true) => std::cmp::Ordering::Equal,
+                            (true, false) => {
+                                if *nulls_first {
+                                    std::cmp::Ordering::Less
+                                } else {
+                                    std::cmp::Ordering::Greater
+                                }
+                            }
+                            (false, true) => {
+                                if *nulls_first {
+                                    std::cmp::Ordering::Greater
+                                } else {
+                                    std::cmp::Ordering::Less
+                                }
+                            }
+                            (false, false) => {
+                                let base = if let (Ok(an), Ok(bn)) =
+                                    (av.parse::<i64>(), bv.parse::<i64>())
+                                {
+                                    an.cmp(&bn)
+                                } else if let (Ok(af), Ok(bf)) =
+                                    (av.parse::<f64>(), bv.parse::<f64>())
+                                {
+                                    af.partial_cmp(&bf).unwrap_or(std::cmp::Ordering::Equal)
+                                } else {
+                                    av.cmp(bv)
+                                };
+                                if *desc {
+                                    base.reverse()
+                                } else {
+                                    base
+                                }
+                            }
                         };
-                        let ord = if *desc { ord.reverse() } else { ord };
                         if ord != std::cmp::Ordering::Equal {
                             return ord;
                         }
                     }
-                    std::cmp::Ordering::Equal
+                    a.cmp(b)
                 });
             }
             if let Some(n) = limit {
@@ -9947,26 +10196,55 @@ impl GatewayHandler {
                         std::str::from_utf8(a).unwrap_or("").split('\t').collect();
                     let b_fields: Vec<&str> =
                         std::str::from_utf8(b).unwrap_or("").split('\t').collect();
-                    for (col, desc) in &order_by {
+                    for (col, desc, nulls_first) in &order_by {
                         let idx = match col_idx.get(col.as_str()) {
                             Some(&i) => i,
                             None => continue,
                         };
-                        let av = a_fields.get(idx).copied().unwrap_or("");
-                        let bv = b_fields.get(idx).copied().unwrap_or("");
-                        let ord = if let (Ok(an), Ok(bn)) = (av.parse::<i64>(), bv.parse::<i64>()) {
-                            an.cmp(&bn)
-                        } else if let (Ok(af), Ok(bf)) = (av.parse::<f64>(), bv.parse::<f64>()) {
-                            af.partial_cmp(&bf).unwrap_or(std::cmp::Ordering::Equal)
-                        } else {
-                            av.cmp(bv)
+                        let av = a_fields.get(idx).copied().unwrap_or(r"\N");
+                        let bv = b_fields.get(idx).copied().unwrap_or(r"\N");
+                        let a_null = av == r"\N";
+                        let b_null = bv == r"\N";
+                        let ord = match (a_null, b_null) {
+                            (true, true) => std::cmp::Ordering::Equal,
+                            (true, false) => {
+                                if *nulls_first {
+                                    std::cmp::Ordering::Less
+                                } else {
+                                    std::cmp::Ordering::Greater
+                                }
+                            }
+                            (false, true) => {
+                                if *nulls_first {
+                                    std::cmp::Ordering::Greater
+                                } else {
+                                    std::cmp::Ordering::Less
+                                }
+                            }
+                            (false, false) => {
+                                let base = if let (Ok(an), Ok(bn)) =
+                                    (av.parse::<i64>(), bv.parse::<i64>())
+                                {
+                                    an.cmp(&bn)
+                                } else if let (Ok(af), Ok(bf)) =
+                                    (av.parse::<f64>(), bv.parse::<f64>())
+                                {
+                                    af.partial_cmp(&bf).unwrap_or(std::cmp::Ordering::Equal)
+                                } else {
+                                    av.cmp(bv)
+                                };
+                                if *desc {
+                                    base.reverse()
+                                } else {
+                                    base
+                                }
+                            }
                         };
-                        let ord = if *desc { ord.reverse() } else { ord };
                         if ord != std::cmp::Ordering::Equal {
                             return ord;
                         }
                     }
-                    std::cmp::Ordering::Equal
+                    a.cmp(b)
                 });
             }
             if let Some(n) = limit {
@@ -10045,7 +10323,10 @@ impl GatewayHandler {
 
         // Extract view name and query SQL for cycle detection.
         if let Some(view_name) = parse_create_view_name(q) {
-            if self.catalog.get_view(&view_name).is_some() {
+            let existing_view = self.catalog.get_view(&view_name);
+            let is_replacement = or_replace && existing_view.is_some();
+            let is_async_replace = parse_create_view_async(q);
+            if existing_view.is_some() {
                 if if_not_exists {
                     return Ok(vec![Response::Execution(Tag::new(tag).with_rows(0))]);
                 }
@@ -10123,6 +10404,188 @@ impl GatewayHandler {
                     if let Some(table) = self.catalog.get_table(&deps[0]) {
                         initial_columns = table.columns.clone();
                     }
+                }
+            }
+
+            // Zero-downtime view replacement (issue #404 R3): when replacing an
+            // existing view on a shard-backed gateway, compile and backfill the
+            // replacement under a fresh staging operator ID while keeping the
+            // live view continuously queryable, then atomically cut over under
+            // `shard_commit_lock` so zero committed epochs are missed.
+            if is_replacement && self.distributed_data_plane.is_none() {
+                if let Some(shard_db) = self.shard_db.clone() {
+                    let inlined_sql =
+                        inline_view_dependencies(&select_sql, &self.catalog, MAX_VIEW_INLINE_DEPTH);
+                    let compile_deps = extract_sql_refs(&inlined_sql);
+                    let deps_are_base_tables = compile_deps
+                        .iter()
+                        .all(|dep| self.catalog.get_table(dep).is_some());
+                    let compile_result = if deps_are_base_tables {
+                        let table_schemas: HashMap<String, SchemaRef> = compile_deps
+                            .iter()
+                            .map(|dep| (dep.clone(), query_time_relation_schema(&self.catalog, dep)))
+                            .collect();
+                        self.try_compile_view(
+                            &view_name,
+                            &inlined_sql,
+                            initial_columns.len(),
+                            &table_schemas,
+                            shard_db.clone(),
+                        )
+                        .await
+                    } else {
+                        Err(format!(
+                            "[RS-1019] view.compile_failed: view depends on non-base-table \
+                             relation(s) {compile_deps:?} that could not be inlined to base tables"
+                        ))
+                    };
+                    let staging_compiled = match compile_result {
+                        Ok(compiled) => Arc::new(compiled),
+                        Err(e) => {
+                            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                                "ERROR".to_owned(),
+                                "42601".to_owned(),
+                                format!(
+                                    "[RS-1019] view.compile_failed: {tag} '{view_name}' could not be \
+                                     compiled into an executable operator pipeline: {e}. Next steps: \
+                                     simplify the query to a supported shape (see \
+                                     docs/language-features.md), or reference only base tables."
+                                ),
+                            )))]);
+                        }
+                    };
+                    let single_source = if staging_compiled.join.is_none() && compile_deps.len() == 1
+                    {
+                        Some(compile_deps[0].clone())
+                    } else {
+                        None
+                    };
+                    self.catalog.begin_replacement_backfill(&view_name, 0);
+
+                    if is_async_replace {
+                        let weak_self = self.self_ref.lock().clone();
+                        let view_name_bg = view_name.clone();
+                        let select_sql_bg = select_sql.clone();
+                        let initial_columns_bg = initial_columns.clone();
+                        let deps_bg = deps.clone();
+                        let workload_bg = workload_name.clone();
+                        let shard_db_bg = shard_db.clone();
+                        tokio::spawn(async move {
+                            let Some(handler) = weak_self.upgrade() else {
+                                return;
+                            };
+                            let _commit_guard = handler.shard_commit_lock.lock().await;
+                            handler.catalog.catch_up_replacement_backfill(&view_name_bg);
+                            if let Err(err) = handler
+                                .populate_compiled_view_instance(
+                                    &view_name_bg,
+                                    &staging_compiled,
+                                    single_source.as_deref(),
+                                    &shard_db_bg,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    view = %view_name_bg,
+                                    error = %err,
+                                    "async CREATE OR REPLACE MATERIALIZED VIEW backfill failed; keeping existing live view"
+                                );
+                                handler.catalog.publish_backfill(&view_name_bg);
+                                return;
+                            }
+                            let op_id = staging_compiled.sink_op_id.0;
+                            let pk = staging_compiled.pk.clone();
+                            let _ = rockstream_ops::sink::write_view_directory_entry(
+                                &shard_db_bg,
+                                &view_name_bg,
+                                OperatorId(op_id),
+                                initial_columns_bg.len(),
+                                &pk,
+                            )
+                            .await;
+                            let _ = shard_db_bg.flush().await;
+                            handler
+                                .compiled_views
+                                .insert(view_name_bg.clone(), staging_compiled);
+                            use crate::catalog_stubs::CatalogView;
+                            handler.catalog.add_view_with_deps(
+                                CatalogView {
+                                    name: view_name_bg.clone(),
+                                    sql: select_sql_bg,
+                                    columns: initial_columns_bg,
+                                    namespace: "public".to_string(),
+                                    op_id: Some(op_id),
+                                },
+                                deps_bg,
+                            );
+                            if let Some(wl) = workload_bg {
+                                handler.catalog.assign_view_workload(&view_name_bg, &wl);
+                            }
+                            handler.catalog.publish_backfill(&view_name_bg);
+                        });
+                        return Ok(vec![Response::Execution(Tag::new(tag).with_rows(0))]);
+                    }
+
+                    // Synchronous inline atomic cutover: hold `shard_commit_lock`
+                    // across backfill + swap so zero committed epochs are missed
+                    // while concurrent readers continue reading the live view.
+                    let _commit_guard = self.shard_commit_lock.lock().await;
+                    self.catalog.catch_up_replacement_backfill(&view_name);
+                    if let Err(error) = self
+                        .populate_compiled_view_instance(
+                            &view_name,
+                            &staging_compiled,
+                            single_source.as_deref(),
+                            &shard_db,
+                        )
+                        .await
+                    {
+                        self.catalog.publish_backfill(&view_name);
+                        return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                            "ERROR".to_owned(),
+                            "55000".to_owned(),
+                            format!(
+                                "[RS-4022] backfill.not_published: replacement backfill for '{view_name}' failed (existing live view preserved): {error}"
+                            ),
+                        )))]);
+                    }
+                    let op_id = staging_compiled.sink_op_id.0;
+                    let pk = staging_compiled.pk.clone();
+                    let _ = rockstream_ops::sink::write_view_directory_entry(
+                        &shard_db,
+                        &view_name,
+                        OperatorId(op_id),
+                        initial_columns.len(),
+                        &pk,
+                    )
+                    .await;
+                    let _ = shard_db.flush().await;
+                    self.compiled_views
+                        .insert(view_name.clone(), staging_compiled);
+                    use crate::catalog_stubs::CatalogView;
+                    self.catalog.add_view_with_deps(
+                        CatalogView {
+                            name: view_name.clone(),
+                            sql: select_sql,
+                            columns: initial_columns,
+                            namespace: "public".to_string(),
+                            op_id: Some(op_id),
+                        },
+                        deps,
+                    );
+                    if let Some(workload_name) = workload_name {
+                        self.catalog
+                            .assign_view_workload(&view_name, &workload_name);
+                    }
+                    self.catalog.publish_backfill(&view_name);
+                    if let Some(log) = &self.audit_log {
+                        let _ = log.append(&rockstream_types::audit::AuditEvent::now(
+                            "system",
+                            "replace_view",
+                            &view_name,
+                        ));
+                    }
+                    return Ok(vec![Response::Execution(Tag::new(tag).with_rows(0))]);
                 }
             }
 
@@ -11139,10 +11602,13 @@ impl GatewayHandler {
             ))]);
         }
 
-        if !matches!(
-            parsed.catalog.as_str(),
-            "filesystem" | "glue" | "rest" | "hive" | "ducklake"
-        ) {
+        let is_kafka_sink = parsed.format.eq_ignore_ascii_case("KAFKA");
+        if !is_kafka_sink
+            && !matches!(
+                parsed.catalog.as_str(),
+                "filesystem" | "glue" | "rest" | "hive" | "ducklake"
+            )
+        {
             return Ok(vec![create_sink_error_response(format!(
                 "[RS-4007] CREATE SINK catalog '{}' is invalid; expected filesystem|glue|rest|hive|ducklake. Next steps: {CREATE_SINK_NEXT_STEPS}",
                 parsed.catalog
@@ -11233,6 +11699,52 @@ impl GatewayHandler {
             last_snapshot_epoch: None,
             state: "OK".to_string(),
         };
+
+        if is_kafka_sink {
+            if let Some(shard_db) = self.shard_db.clone() {
+                if let Some(view) = self.catalog.get_view(&parsed.view) {
+                    if let Some(op_id) = view.op_id {
+                        let connector_id = ConnectorId(
+                            parsed
+                                .format_version
+                                .unwrap_or_else(|| stable_name_id("kafka-sink", &parsed.name)),
+                        );
+                        let kafka_sink = match rockstream_connectors::KafkaSink::connect(
+                            connector_id,
+                            &entry.path,
+                            &entry.catalog,
+                        ) {
+                            Ok(sink) => sink,
+                            Err(err) => {
+                                return Ok(vec![create_sink_error_response(format!(
+                                    "[RS-4008] sink.kafka_connect_failed: failed to connect Kafka sink '{}' to '{}': {err}. Next steps: verify Kafka broker reachability and topic configuration.",
+                                    parsed.name, entry.path
+                                ))]);
+                            }
+                        };
+                        let mut view_sink = rockstream_ops::kafka_sink::KafkaViewSink::new(
+                            kafka_sink,
+                            shard_db,
+                            OperatorId(op_id),
+                            view.columns.len(),
+                        );
+                        if let Some(max_bytes) = entry.parquet_row_group_bytes {
+                            view_sink = view_sink.with_max_envelope_bytes(max_bytes as usize);
+                        }
+                        if let Err(err) = view_sink.drain_all().await {
+                            return Ok(vec![create_sink_error_response(format!(
+                                "[RS-4008] sink.kafka_delivery_failed: initial snapshot delivery for Kafka sink '{}' failed: {err}. Next steps: verify Kafka topic '{}' exists and broker is healthy.",
+                                parsed.name, entry.catalog
+                            ))]);
+                        }
+                        self.kafka_sinks.insert(
+                            parsed.name.clone(),
+                            Arc::new(tokio::sync::Mutex::new(view_sink)),
+                        );
+                    }
+                }
+            }
+        }
 
         let secret_reference_added = if let Some(secret_name) = secret_name {
             match self
@@ -11378,7 +11890,9 @@ impl GatewayHandler {
             })
         };
         match remove_result {
-            Ok(true) => {}
+            Ok(true) => {
+                self.kafka_sinks.remove(&name);
+            }
             Ok(false) => {
                 return Ok(vec![Response::Execution(
                     Tag::new("DROP SINK").with_rows(0),
@@ -13005,6 +13519,7 @@ impl GatewayHandler {
                     }
                 }
             }
+            self.deliver_kafka_sinks_for_views(&views).await;
             // Publish a complete committed epoch per table under one registry
             // lock. Readers cannot poll half an UPDATE or half an epoch.
             let mut changes: std::collections::HashMap<
@@ -17062,6 +17577,22 @@ async fn relay_negotiated_3_2_connection(
 // ── GatewayServer ─────────────────────────────────────────────────────────────
 
 /// A running PostgreSQL-wire-protocol server.
+/// Cloneable read-only handle to a gateway's shared time-slice window fabric.
+#[derive(Clone)]
+pub struct SharedWindowHandle {
+    fabric: Arc<Mutex<rockstream_ops::SharedWindowFabric>>,
+}
+
+impl SharedWindowHandle {
+    pub fn consumer_count(&self, spec: &rockstream_types::SharedWindowSpec) -> Option<usize> {
+        self.fabric.lock().consumer_count(spec)
+    }
+
+    pub fn slice_count(&self, spec: &rockstream_types::SharedWindowSpec) -> Option<usize> {
+        self.fabric.lock().slice_count(spec)
+    }
+}
+
 pub struct GatewayServer {
     addr: std::net::SocketAddr,
     handler: Arc<GatewayHandler>,
@@ -17198,6 +17729,13 @@ impl GatewayServer {
             addr,
             GatewayHandler::with_shard_db(catalog, view_reader, shard_db),
         )
+    }
+
+    /// Return a cloneable handle to inspect the shared time-slice window fabric.
+    pub fn shared_window_handle(&self) -> SharedWindowHandle {
+        SharedWindowHandle {
+            fabric: Arc::clone(&self.handler.shared_windows),
+        }
     }
 
     /// Create a shard-backed gateway whose query-time reads scatter across the
@@ -20525,6 +21063,7 @@ async fn query_time_datafusion_select(
 ) -> Result<Vec<RecordBatch>, GatewayError> {
     let ctx = SessionContext::new();
     rockstream_sql::frontend::register_session_sql_udf(&ctx);
+    rockstream_sql::frontend::register_hop_sql_udf(&ctx);
 
     for relation_name in referenced_tables {
         let schema = query_time_relation_schema(catalog, relation_name);
@@ -20960,8 +21499,9 @@ fn extract_limit(q: &str) -> Option<usize> {
 }
 
 /// Extract ORDER BY columns from a query string.
-/// Returns a list of `(column_name, descending)` pairs.
-fn extract_order_by(q: &str) -> Vec<(String, bool)> {
+/// Returns a list of `(column_name, descending, nulls_first)` tuples following
+/// PostgreSQL defaults (`ASC` -> `NULLS LAST`, `DESC` -> `NULLS FIRST`).
+fn extract_order_by(q: &str) -> Vec<(String, bool, bool)> {
     let ql = q.to_lowercase();
     let ob_pos = match ql.find(" order by ") {
         Some(p) => p,
@@ -20980,13 +21520,35 @@ fn extract_order_by(q: &str) -> Vec<(String, bool)> {
             if part.is_empty() {
                 return None;
             }
-            let tokens: Vec<&str> = part.split_whitespace().collect();
-            let col = tokens.first()?.to_lowercase();
-            let desc = tokens
-                .last()
-                .map(|t| t.to_lowercase() == "desc")
-                .unwrap_or(false);
-            Some((col, desc))
+            let tokens: Vec<String> = part
+                .split_whitespace()
+                .map(|t| t.to_lowercase())
+                .collect();
+            let col = tokens.first()?.trim_matches('"').to_string();
+            let mut desc = false;
+            let mut explicit_nulls_first: Option<bool> = None;
+            let mut idx = 1usize;
+            while idx < tokens.len() {
+                match tokens[idx].as_str() {
+                    "desc" => desc = true,
+                    "asc" => desc = false,
+                    "nulls" => {
+                        if let Some(next) = tokens.get(idx + 1) {
+                            match next.as_str() {
+                                "first" => explicit_nulls_first = Some(true),
+                                "last" => explicit_nulls_first = Some(false),
+                                _ => {}
+                            }
+                            idx += 1;
+                        }
+                    }
+                    _ => {}
+                }
+                idx += 1;
+            }
+            // PostgreSQL standard: DESC defaults to NULLS FIRST, ASC defaults to NULLS LAST.
+            let nulls_first = explicit_nulls_first.unwrap_or(desc);
+            Some((col, desc, nulls_first))
         })
         .collect()
 }
@@ -21251,6 +21813,7 @@ async fn describe_fields_for_query(
         ) {
             let ctx = SessionContext::new();
             rockstream_sql::frontend::register_session_sql_udf(&ctx);
+    rockstream_sql::frontend::register_hop_sql_udf(&ctx);
             if let Ok(df) = ctx.sql(&sql).await {
                 return df
                     .schema()
@@ -21496,6 +22059,106 @@ fn parse_create_sink_ddl(q: &str) -> Result<ParsedCreateSink, String> {
         raw_after_create
     };
     let after_create_lower = after_create.to_lowercase();
+
+    // SQL-wired Kafka sink syntax (issue #404 R4):
+    //   CREATE SINK [IF NOT EXISTS] <name> FROM <view> INTO KAFKA [WITH] (brokers = '...', topic = '...', ...)
+    if let Some(from_pos) = after_create_lower.find(" from ") {
+        if after_create_lower.contains(" into kafka") {
+            let name = after_create[..from_pos]
+                .trim()
+                .trim_matches('"')
+                .to_lowercase();
+            if name.is_empty() {
+                return Err(format!(
+                    "[RS-4007] CREATE SINK requires a sink name. Next steps: use CREATE SINK <name> FROM <view> INTO KAFKA (brokers = '...', topic = '...')."
+                ));
+            }
+            let after_from = after_create[from_pos + " from ".len()..].trim();
+            let after_from_lower = after_from.to_lowercase();
+            let into_pos = after_from_lower.find(" into kafka").ok_or_else(|| {
+                "[RS-4007] CREATE SINK FROM <view> requires INTO KAFKA (...). Next steps: specify INTO KAFKA (brokers = '...', topic = '...').".to_string()
+            })?;
+            let view = after_from[..into_pos]
+                .trim()
+                .trim_matches('"')
+                .rsplit('.')
+                .next()
+                .unwrap_or("")
+                .to_lowercase();
+            if view.is_empty() {
+                return Err(
+                    "[RS-4007] CREATE SINK requires a referenced view name. Next steps: use CREATE SINK <name> FROM <view> INTO KAFKA (brokers = '...', topic = '...').".to_string()
+                );
+            }
+            let mut after_kafka = after_from[into_pos + " into kafka".len()..].trim();
+            if after_kafka.to_lowercase().starts_with("with") {
+                after_kafka = after_kafka["with".len()..].trim();
+            }
+            let option_map = parse_create_sink_options(after_kafka)?;
+            let brokers = match option_map
+                .get("brokers")
+                .or_else(|| option_map.get("bootstrap_servers"))
+            {
+                Some(CreateSinkOptionValue::String(s)) if !s.trim().is_empty() => s.trim().to_string(),
+                _ => {
+                    return Err(
+                        "[RS-4007] CREATE SINK INTO KAFKA requires brokers = '<host:port>'. Next steps: provide brokers = '...' and topic = '...' in the Kafka sink options.".to_string()
+                    );
+                }
+            };
+            let topic = match option_map.get("topic") {
+                Some(CreateSinkOptionValue::String(s)) if !s.trim().is_empty() => s.trim().to_string(),
+                _ => {
+                    return Err(
+                        "[RS-4007] CREATE SINK INTO KAFKA requires topic = '<topic>'. Next steps: provide brokers = '...' and topic = '...' in the Kafka sink options.".to_string()
+                    );
+                }
+            };
+            let max_envelope_bytes = parse_optional_u64_option(&option_map, "max_envelope_bytes")?;
+            let secret = match option_map.get("secret") {
+                Some(CreateSinkOptionValue::String(s)) => Some(s.clone()),
+                Some(_) => {
+                    return Err(
+                        "[RS-4007] CREATE SINK option secret must be a string. Next steps: use secret = '<name>'.".to_string()
+                    );
+                }
+                None => None,
+            };
+            let transactional_id = match option_map.get("transactional_id") {
+                Some(CreateSinkOptionValue::String(s)) if !s.trim().is_empty() => vec![s.trim().to_string()],
+                Some(_) => {
+                    return Err(
+                        "[RS-4007] CREATE SINK option transactional_id must be a non-empty string. Next steps: omit transactional_id or pass a non-empty string.".to_string()
+                    );
+                }
+                None => Vec::new(),
+            };
+            for key in option_map.keys() {
+                if !matches!(
+                    key.as_str(),
+                    "brokers" | "bootstrap_servers" | "topic" | "max_envelope_bytes" | "secret" | "transactional_id"
+                ) {
+                    return Err(format!(
+                        "[RS-4007] CREATE SINK INTO KAFKA does not recognize option '{key}'. Next steps: use brokers, topic, optional max_envelope_bytes, transactional_id, or secret."
+                    ));
+                }
+            }
+            return Ok(ParsedCreateSink {
+                name: name.clone(),
+                view,
+                format: "KAFKA".to_string(),
+                path: brokers,
+                snapshot_interval_epochs: None,
+                snapshot_interval_ms: None,
+                parquet_row_group_bytes: max_envelope_bytes,
+                format_version: Some(stable_name_id("kafka-sink", &name)),
+                partition_by: transactional_id,
+                catalog: topic,
+                secret,
+            });
+        }
+    }
+
     let for_view_pos = after_create_lower.find(" for view ").ok_or_else(|| {
         format!(
             "[RS-4007] CREATE SINK requires FOR VIEW clause. Next steps: {CREATE_SINK_NEXT_STEPS}"
@@ -22592,15 +23255,15 @@ fn parse_create_view_name(q: &str) -> Option<String> {
     }
     // Take up to " AS" followed by any whitespace (handles AS\n, AS\t, AS )
     let as_pos = find_as_separator(&after.to_lowercase())?;
-    let raw = after[..as_pos]
-        .split_once(" WITH WORKLOAD ")
-        .map(|(before, _)| before)
-        .or_else(|| {
-            after[..as_pos]
-                .split_once(" with workload ")
-                .map(|(before, _)| before)
-        })
-        .unwrap_or(&after[..as_pos])
+    let header_slice = &after[..as_pos];
+    let header_lower = header_slice.to_lowercase();
+    let cut_pos = header_lower
+        .find(" with workload ")
+        .or_else(|| header_lower.find(" with ("))
+        .or_else(|| header_lower.find(" with("));
+    let raw = cut_pos
+        .map(|pos| &header_slice[..pos])
+        .unwrap_or(header_slice)
         .trim()
         .trim_matches('"');
     let name = raw.rsplit('.').next().unwrap_or(raw).trim_matches('"');
@@ -22639,6 +23302,28 @@ fn parse_create_view_workload(q: &str) -> Option<String> {
     } else {
         Some(workload.to_string())
     }
+}
+
+fn parse_create_view_async(q: &str) -> bool {
+    let ql = q.trim().to_lowercase();
+    let name_start: usize = if ql.starts_with("create or replace materialized view ") {
+        36
+    } else if ql.starts_with("create materialized view ") {
+        25
+    } else if ql.starts_with("create or replace view ") {
+        23
+    } else if ql.starts_with("create view ") {
+        12
+    } else {
+        return false;
+    };
+    let after_lower = &ql[name_start..];
+    let Some(as_pos) = find_as_separator(after_lower) else {
+        return false;
+    };
+    let header = &after_lower[..as_pos];
+    let compact: String = header.chars().filter(|c| !c.is_whitespace()).collect();
+    compact.contains("with(async=true)")
 }
 
 /// Extract the SELECT SQL from `CREATE … AS <select>`.

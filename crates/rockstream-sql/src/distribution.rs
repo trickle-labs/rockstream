@@ -376,6 +376,7 @@ fn distribute(plan: PlanNode) -> (PlanNode, DistributionAnnotation) {
             time_col,
             gap_ms,
             late_data_policy,
+            partition_by,
         } => {
             let (new_input, _) = distribute(*input);
             (
@@ -387,6 +388,7 @@ fn distribute(plan: PlanNode) -> (PlanNode, DistributionAnnotation) {
                     time_col,
                     gap_ms,
                     late_data_policy,
+                    partition_by,
                 },
                 DistributionAnnotation::unpartitioned(),
             )
@@ -398,6 +400,7 @@ fn distribute(plan: PlanNode) -> (PlanNode, DistributionAnnotation) {
             k,
             rank_col,
             partition_by,
+            order_by,
         } => {
             let (new_input, _) = distribute(*input);
             (
@@ -409,6 +412,7 @@ fn distribute(plan: PlanNode) -> (PlanNode, DistributionAnnotation) {
                     k,
                     rank_col,
                     partition_by,
+                    order_by,
                 },
                 DistributionAnnotation::unpartitioned(),
             )
@@ -663,6 +667,7 @@ mod tests {
             k: 3,
             rank_col: 0,
             partition_by: vec![],
+            order_by: vec![],
         };
         // Should not panic; should insert a Loopback exchange.
         let result = apply_distribution(plan);

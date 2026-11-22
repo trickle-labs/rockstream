@@ -206,6 +206,10 @@ pub struct BackfillProgress {
     pub estimated_rows: u64,
     pub budget_state: String,
     pub blocked_reason: Option<String>,
+    /// True when a zero-downtime `CREATE OR REPLACE MATERIALIZED VIEW`
+    /// backfill is running in the background while the live view remains
+    /// published and continuously queryable.
+    pub replacing: bool,
 }
 
 impl BackfillProgress {
@@ -217,6 +221,7 @@ impl BackfillProgress {
             estimated_rows: 0,
             budget_state: "ADMITTED".to_string(),
             blocked_reason: None,
+            replacing: false,
         }
     }
 }
@@ -2763,6 +2768,7 @@ impl CatalogStubs {
                 estimated_rows: 0,
                 budget_state: "ADMITTED".to_string(),
                 blocked_reason: None,
+                replacing: false,
             });
         CatalogResponse::rows(
             vec![
@@ -2783,6 +2789,49 @@ impl CatalogStubs {
                 Some(progress.budget_state),
                 progress.blocked_reason,
             ]],
+        )
+    }
+
+    /// Return backfill status rows for all registered views (`SHOW BACKFILL STATUS`
+    /// and `SELECT * FROM rockstream_catalog.backfill_status`).
+    pub fn backfill_status_all_response(&self) -> CatalogResponse {
+        let mut views = self.list_views();
+        views.sort_by(|a, b| a.name.cmp(&b.name));
+        let backfills = self.backfills.read().unwrap();
+        let rows = views
+            .into_iter()
+            .map(|view| {
+                let progress = backfills.get(&view.name).cloned().unwrap_or(BackfillProgress {
+                    phase: "RUNNING",
+                    cursor_position: None,
+                    rows_remaining: 0,
+                    estimated_rows: 0,
+                    budget_state: "ADMITTED".to_string(),
+                    blocked_reason: None,
+                    replacing: false,
+                });
+                vec![
+                    Some(view.name),
+                    Some(progress.phase.to_string()),
+                    progress.cursor_position,
+                    Some(progress.rows_remaining.to_string()),
+                    Some(progress.estimated_rows.to_string()),
+                    Some(progress.budget_state),
+                    progress.blocked_reason,
+                ]
+            })
+            .collect();
+        CatalogResponse::rows(
+            vec![
+                "view_name".to_string(),
+                "phase".to_string(),
+                "cursor_position".to_string(),
+                "rows_remaining".to_string(),
+                "estimated_rows".to_string(),
+                "budget_state".to_string(),
+                "blocked_reason".to_string(),
+            ],
+            rows,
         )
     }
 
@@ -2895,6 +2944,9 @@ impl CatalogStubs {
         }
         if ql.contains("rockstream_catalog.views") {
             return Some(self.catalog_views_response(query, &requested_cols));
+        }
+        if ql.contains("rockstream_catalog.backfill_status") {
+            return Some(self.backfill_status_all_response());
         }
         if ql.contains("rockstream_catalog.operators") {
             return Some(self.catalog_operators_response(query, &requested_cols));
@@ -3465,6 +3517,28 @@ impl CatalogStubs {
             .is_some_and(|progress| progress.cursor_position.is_some())
     }
 
+    /// Start a zero-downtime replacement backfill while keeping the live view
+    /// published and continuously queryable.
+    pub fn begin_replacement_backfill(&self, view_name: &str, estimated_rows: u64) {
+        let mut progress = BackfillProgress::snapshotting();
+        progress.phase = "BACKFILLING";
+        progress.estimated_rows = estimated_rows;
+        progress.rows_remaining = estimated_rows;
+        progress.replacing = true;
+        self.backfills
+            .write()
+            .unwrap()
+            .insert(view_name.to_string(), progress);
+    }
+
+    /// Mark a replacement backfill as catching up prior to atomic cutover.
+    pub fn catch_up_replacement_backfill(&self, view_name: &str) {
+        if let Some(progress) = self.backfills.write().unwrap().get_mut(view_name) {
+            progress.phase = "CATCHING_UP";
+            progress.rows_remaining = 0;
+        }
+    }
+
     /// Publish only after the snapshot/output commit reaches its frontier.
     pub fn publish_backfill(&self, view_name: &str) {
         self.set_view_state(view_name, ViewState::Running);
@@ -3472,16 +3546,18 @@ impl CatalogStubs {
             progress.phase = "RUNNING";
             progress.rows_remaining = 0;
             progress.blocked_reason = None;
+            progress.replacing = false;
         }
     }
 
     /// A view without a tracked materialized backfill is legacy-published.
+    /// Views undergoing a zero-downtime replacement remain published until cutover.
     pub fn is_backfill_published(&self, view_name: &str) -> bool {
         self.backfills
             .read()
             .unwrap()
             .get(view_name)
-            .is_none_or(|progress| progress.phase == "RUNNING")
+            .is_none_or(|progress| progress.phase == "RUNNING" || progress.replacing)
     }
 
     pub fn workload_status_entries(&self) -> Vec<CatalogWorkloadStatusEntry> {

@@ -39,7 +39,7 @@ Experimental and delivers bounded runtime view snapshot/change envelopes. The ge
 | --- | --- | --- | --- |
 | PostgreSQL CDC source | **Core** | [PostgreSQL CDC](#postgresql-cdc) | [`postgres_cdc_snapshot_stream_fence_has_exact_transcript`](../crates/rockstream-connectors/tests/postgres_cdc_guarantee_matrix_tests.rs) |
 | Kafka source | **Core** | [Kafka source](#kafka-source) | [`kafka_source_mid_epoch_rebalance_recovers_exact_transcript`](../crates/rockstream-connectors/tests/kafka_source_guarantee_matrix_tests.rs) |
-| Kafka sink | **Experimental** | [Kafka sink](#kafka-sink) | Bounded view snapshot/change envelopes; full Core qualification remains incomplete. |
+| Kafka sink | **Core** | [Kafka sink](#kafka-sink) | [`view_snapshot_changes_and_recovery_match_exact_consumer_stream`](../crates/rockstream-ops/tests/kafka_view_delivery_tests.rs) |
 
 These are the only external connector boundaries. Removed Iceberg, Delta,
 object-store, S3, and HTTP webhook surfaces fail closed with `RS-4017`; their
