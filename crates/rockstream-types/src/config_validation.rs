@@ -272,7 +272,13 @@ const KNOWN_GATEWAY_SECTION_KEYS: &[&str] = &[
     "serving",
 ];
 const KNOWN_GATEWAY_TLS_KEYS: &[&str] = &["cert_path", "key_path", "ca_cert_path"];
-const KNOWN_CONTROL_SECTION_KEYS: &[&str] = &["listen_addr", "url", "shared_storage", "raft"];
+const KNOWN_CONTROL_SECTION_KEYS: &[&str] = &[
+    "listen_addr",
+    "management_addr",
+    "url",
+    "shared_storage",
+    "raft",
+];
 const KNOWN_CONTROL_RAFT_KEYS: &[&str] = &["peers", "node_id", "bind", "bootstrap"];
 const KNOWN_WORKER_SECTION_KEYS: &[&str] = &[
     "worker_id",
