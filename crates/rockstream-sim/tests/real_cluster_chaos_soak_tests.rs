@@ -875,6 +875,25 @@ enum AckGapFailure {
     SinkOutput,
 }
 
+// Persisted KafkaViewSink checkpoints include chunk cursors even when the
+// snapshot and all change epochs are fully committed. Compare the complete
+// schema so chaos recovery checks still catch stale or partially committed
+// cursors instead of rejecting the new fields as unexpected output.
+fn completed_sink_progress(view: u64, topic: &str, view_epoch: u64, transaction: u64) -> Value {
+    json!({
+        "view": view,
+        "columns": 2,
+        "topic": topic,
+        "snapshot_complete": true,
+        "view_epoch": view_epoch,
+        "transaction": transaction,
+        "pending": null,
+        "snapshot_chunk_offset": 0,
+        "snapshot_epoch": null,
+        "change_chunk_offset": 0,
+    })
+}
+
 fn validate_source_ack_gap(
     e: &SourceAckGapEvidence,
     manifest: &Value,
@@ -952,10 +971,8 @@ fn validate_source_ack_gap(
     let expected_before_sink = json!(&manifest["expected_sink"].as_array().unwrap()[..2]);
     if e.sink_records_before != expected_before_sink
         || e.sink_records.as_ref() != Some(&manifest["expected_sink"])
-        || after.sink_progress
-            != json!({"view":126,"columns":2,"topic":e.sink_topic,"snapshot_complete":true,"view_epoch":6,"transaction":6,"pending":null})
-        || e.before.sink_progress
-            != json!({"view":126,"columns":2,"topic":e.sink_topic,"snapshot_complete":true,"view_epoch":2,"transaction":2,"pending":null})
+        || after.sink_progress != completed_sink_progress(ID, &e.sink_topic, 6, 6)
+        || e.before.sink_progress != completed_sink_progress(ID, &e.sink_topic, 2, 2)
     {
         return Err(AckGapFailure::SinkOutput);
     }
@@ -1500,7 +1517,7 @@ async fn sink_transaction_cursor_gap_recovers_exactly_once() {
     );
     assert_eq!(
         after.sink_progress,
-        json!({"view":126,"columns":2,"topic":sink_topic,"snapshot_complete":true,"view_epoch":5,"transaction":5,"pending":null})
+        completed_sink_progress(ID, &sink_topic, 5, 5)
     );
     assert_eq!(recovered_sink_progress, after.sink_progress);
     for (name, elapsed) in [
@@ -1782,15 +1799,12 @@ async fn worker_state_enospc_withholds_source_ack_and_recovers_exactly() {
         .iter()
         .map(|row| row.as_str().unwrap().to_owned())
         .collect();
-    let expected_fault_sink_progress = json!({
-        "view":ID,
-        "columns":2,
-        "topic":sink_topic,
-        "snapshot_complete":true,
-        "view_epoch":manifest["sink_cursor_at_fault"]["view_epoch"],
-        "transaction":manifest["sink_cursor_at_fault"]["transaction"],
-        "pending":null
-    });
+    let expected_fault_sink_progress = completed_sink_progress(
+        ID,
+        &sink_topic,
+        manifest["sink_cursor_at_fault"]["view_epoch"].as_u64().unwrap(),
+        manifest["sink_cursor_at_fault"]["transaction"].as_u64().unwrap(),
+    );
     save(&artifact_dir.join("before-fault.json"), &ready);
 
     match failure["outcome"].as_str().unwrap() {
@@ -1903,15 +1917,12 @@ async fn worker_state_enospc_withholds_source_ack_and_recovers_exactly() {
         .output()
         .unwrap();
     assert!(revision.status.success());
-    let expected_final_sink_progress = json!({
-        "view":ID,
-        "columns":2,
-        "topic":sink_topic,
-        "snapshot_complete":true,
-        "view_epoch":manifest["required_frontier"],
-        "transaction":manifest["required_frontier"],
-        "pending":null
-    });
+    let expected_final_sink_progress = completed_sink_progress(
+        ID,
+        &sink_topic,
+        manifest["required_frontier"].as_u64().unwrap(),
+        manifest["required_frontier"].as_u64().unwrap(),
+    );
     let evidence = json!({
         "scenario_id":manifest["scenario_id"],
         "manifest_sha256":format!("{:x}",Sha256::digest(ENOSPC_MANIFEST)),
