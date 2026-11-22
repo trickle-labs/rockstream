@@ -273,4 +273,3 @@ test worker_shuffle_mtls_rollover_preserves_release_process_stream ... ok
 test wrong_node_certificate_is_rejected_by_release_control_process ... ok
 
 test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 138.14s
-

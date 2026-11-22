@@ -252,4 +252,3 @@ test test_cli_md5_mode_fails_closed_before_storage_or_listener_start ... ok
 test test_startup_log_contains_auth_mode ... ok
 
 test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.15s
-

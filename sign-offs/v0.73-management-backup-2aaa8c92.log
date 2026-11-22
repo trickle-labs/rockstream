@@ -248,4 +248,3 @@ test release_management_backup_idempotency_survives_role_all_restart ... ok
 test release_management_backups_allocate_distinct_checkpoints_concurrently ... ok
 
 test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.29s
-

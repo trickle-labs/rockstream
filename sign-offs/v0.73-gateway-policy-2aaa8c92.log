@@ -334,4 +334,3 @@ test show_security_audit_returns_stable_pages_and_denies_operator_only_access ..
 test viewer_cannot_bypass_mutation_policy_with_multi_statement_sql ... ok
 
 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.75s
-
