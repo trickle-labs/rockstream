@@ -294,7 +294,8 @@ const KNOWN_WORKER_SECTION_KEYS: &[&str] = &[
     "disk_cache_bytes",
     "capabilities",
 ];
-const KNOWN_STORAGE_SECTION_KEYS: &[&str] = &["url", "temp_dir", "spill_dir", "tiering", "compaction"];
+const KNOWN_STORAGE_SECTION_KEYS: &[&str] =
+    &["url", "temp_dir", "spill_dir", "tiering", "compaction"];
 const KNOWN_METRICS_SECTION_KEYS: &[&str] = &["listen_addr", "enabled", "scrape_interval_secs"];
 const KNOWN_AUTH_SECTION_KEYS: &[&str] = &[
     "mode",
@@ -1058,7 +1059,13 @@ pub fn validate_node_config_semantic_bounds(
 
     let role_norm = node_cfg.node.role.trim().to_lowercase();
     let valid_roles = [
-        "all", "control", "worker", "gateway", "metrics", "frontier", "compactor",
+        "all",
+        "control",
+        "worker",
+        "gateway",
+        "metrics",
+        "frontier",
+        "compactor",
     ];
     if !valid_roles.contains(&role_norm.as_str()) {
         diagnostics.push(ConfigDiagnostic {

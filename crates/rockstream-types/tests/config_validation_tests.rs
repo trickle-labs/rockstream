@@ -400,12 +400,20 @@ fn serving_and_compaction_settings_are_validated_for_both_config_formats() {
     legacy.storage.compaction.mode = CompactionMode::Remote;
     legacy.gateway.serving.manifest_poll_interval_ms = 50;
     let report = validate_config_str(&legacy.to_string().unwrap(), false);
-    assert!(report.valid, "legacy config diagnostics: {:?}", report.diagnostics);
+    assert!(
+        report.valid,
+        "legacy config diagnostics: {:?}",
+        report.diagnostics
+    );
 
     let node = NodeConfig::from(&legacy);
     let serialized = node.to_string().unwrap();
     let report = validate_config_str(&serialized, false);
-    assert!(report.valid, "node config diagnostics: {:?}", report.diagnostics);
+    assert!(
+        report.valid,
+        "node config diagnostics: {:?}",
+        report.diagnostics
+    );
     let round_trip = RockstreamConfig::from(&node);
     assert_eq!(round_trip.storage.compaction.mode, CompactionMode::Remote);
     assert_eq!(round_trip.gateway.serving.manifest_poll_interval_ms, 50);
@@ -418,20 +426,28 @@ fn serving_and_compaction_settings_are_validated_for_both_config_formats() {
     ] {
         let report = validate_config_str(toml, false);
         assert!(!report.valid, "unknown config key was accepted: {toml}");
-        assert!(report.diagnostics.iter().any(|d| d.path.ends_with("unknown_setting")));
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|d| d.path.ends_with("unknown_setting")));
     }
 }
 
 #[test]
 fn compactor_role_requires_control_url_in_node_config() {
     let missing = validate_config_str("version = 1\n[node]\nrole = \"compactor\"\n", false);
-    assert!(missing.diagnostics.iter().any(|d| {
-        d.path == "node.role" && d.message.contains("requires `control.url`")
-    }));
+    assert!(missing
+        .diagnostics
+        .iter()
+        .any(|d| { d.path == "node.role" && d.message.contains("requires `control.url`") }));
 
     let configured = validate_config_str(
         "version = 1\n[node]\nrole = \"compactor\"\n[control]\nurl = \"127.0.0.1:9200\"\n",
         false,
     );
-    assert!(configured.valid, "diagnostics: {:?}", configured.diagnostics);
+    assert!(
+        configured.valid,
+        "diagnostics: {:?}",
+        configured.diagnostics
+    );
 }
