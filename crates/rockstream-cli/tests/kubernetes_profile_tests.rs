@@ -83,7 +83,9 @@ fn test_kubernetes_manifests_and_helm_chart_conformance() {
     let chart_yaml =
         fs::read_to_string(helm_dir.join("Chart.yaml")).expect("Chart.yaml must exist");
     assert!(chart_yaml.contains("name: rockstream"));
-    assert!(chart_yaml.contains("version: 0.59.22"));
+    let package_version = env!("CARGO_PKG_VERSION");
+    assert!(chart_yaml.contains(&format!("\nversion: {package_version}\n")));
+    assert!(chart_yaml.contains(&format!("\nappVersion: \"{package_version}\"\n")));
 
     let values_yaml =
         fs::read_to_string(helm_dir.join("values.yaml")).expect("values.yaml must exist");
