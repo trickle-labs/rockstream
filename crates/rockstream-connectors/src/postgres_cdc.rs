@@ -1718,9 +1718,13 @@ impl PostgresCdcSource {
         result
     }
 
-    /// Once decoding has failed, neither API may skip the rejected frame or
-    /// acknowledge a later COMMIT. Abort COPY to stop receiving the payload.
+    /// Decode and protocol failures are sticky: neither API may skip a
+    /// rejected frame or acknowledge a later COMMIT. Transport disconnects,
+    /// however, must retain the gateway's RS-4017 replay/reopen path.
     fn block_pgoutput_transport(&mut self, error: &SourceError) {
+        if matches!(error, SourceError::Io(reason) if reason.starts_with("RS-4017: pgoutput connection disconnected:")) {
+            return;
+        }
         self.pgoutput_transport_failure = Some(error.to_string());
         self.replication_read_paused = true;
         if let Some(pgoutput) = self.pgoutput.as_mut() {
