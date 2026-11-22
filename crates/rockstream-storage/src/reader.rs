@@ -169,11 +169,13 @@ impl ShardReader {
         cache: Option<&SharedServingCache>,
     ) -> Result<Self, StorageError> {
         let path = path.into();
-        let mut options = DbReaderOptions::default();
-        options.manifest_poll_interval = serving_opts.manifest_poll_interval;
         // SlateDB requires checkpoint_lifetime > manifest_poll_interval * 2.
         let min_lifetime = serving_opts.manifest_poll_interval * 4;
-        options.checkpoint_lifetime = serving_opts.checkpoint_lifetime.max(min_lifetime);
+        let mut options = DbReaderOptions {
+            manifest_poll_interval: serving_opts.manifest_poll_interval,
+            checkpoint_lifetime: serving_opts.checkpoint_lifetime.max(min_lifetime),
+            ..DbReaderOptions::default()
+        };
         if let Some(dir) = serving_opts.nvme_cache_dir {
             options.object_store_cache_options.root_folder = Some(dir);
             if let Some(max) = serving_opts.nvme_cache_bytes {

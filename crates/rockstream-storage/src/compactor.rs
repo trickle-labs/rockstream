@@ -147,9 +147,11 @@ impl ShardCompactorHandle {
         object_store: Arc<dyn ObjectStore>,
         config: StandaloneCompactorConfig,
     ) -> Self {
-        let mut options = CompactorOptions::default();
-        options.max_concurrent_compactions = config.max_concurrent_compactions;
-        options.poll_interval = config.poll_interval;
+        let options = CompactorOptions {
+            max_concurrent_compactions: config.max_concurrent_compactions,
+            poll_interval: config.poll_interval,
+            ..CompactorOptions::default()
+        };
 
         let mut builder = CompactorBuilder::new(path.into(), object_store)
             .with_options(options)
