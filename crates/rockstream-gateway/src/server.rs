@@ -4343,11 +4343,41 @@ impl GatewayHandler {
     }
 
     async fn ensure_local_view_consistency(&self) -> PgWireResult<()> {
-        if !self.pending_view_recovery.lock().is_empty() {
+        let pending = if let Some(db) = &self.shard_db {
+            db.get(&rockstream_storage::ShardKeyEncoder::meta_key(
+                b"distributed-source-pending",
+            ))
+            .await
+            .map_err(|e| PgWireError::ApiError(Box::new(GatewayError::Storage(e))))?
+            .is_some()
+        } else {
+            false
+        };
+        if pending || !self.pending_view_recovery.lock().is_empty() {
             let _guard = self.shard_commit_lock.lock().await;
             self.recover_pending_views_locked()
                 .await
                 .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+            self.ensure_no_pending_distributed_locked()
+                .await
+                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_no_pending_distributed_locked(&self) -> Result<(), GatewayError> {
+        if let Some(db) = &self.shard_db {
+            if db
+                .get(&rockstream_storage::ShardKeyEncoder::meta_key(
+                    b"distributed-source-pending",
+                ))
+                .await?
+                .is_some()
+            {
+                return Err(GatewayError::QueryTimeExecutionFailed {
+                    detail: "distributed source requires recovery; preserve source input and shard storage and contact the operator before retrying".to_string(),
+                });
+            }
         }
         Ok(())
     }
@@ -9729,6 +9759,15 @@ impl GatewayHandler {
         order_by: Vec<(String, bool)>,
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<Response<'static>>> {
+        let _distributed_read_guard = if self.distributed_data_plane.is_some() {
+            let guard = self.shard_commit_lock.lock().await;
+            self.ensure_no_pending_distributed_locked()
+                .await
+                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+            Some(guard)
+        } else {
+            None
+        };
         if let Some(error_responses) = self
             .select_access_error_response(view_name, conn_id)
             .await?
@@ -9797,8 +9836,10 @@ impl GatewayHandler {
                 })
                 .unwrap_or_else(|| "public".to_owned());
             let workload_id = WorkloadId(stable_name_id("workload", view_name));
-            let worker_request =
-                rockstream_types::topology::WorkerMessage::ReadWorkload { workload_id };
+            let worker_request = rockstream_types::topology::WorkerMessage::ReadWorkload {
+                version: rockstream_types::data_plane::WORKLOAD_SNAPSHOT_VERSION,
+                workload_id,
+            };
             let assertion = self
                 .actor_assertion_for_request(
                     conn_id,
@@ -9829,6 +9870,14 @@ impl GatewayHandler {
                     detail: format!("read distributed view {view_name}: {error}"),
                 }))
             })?;
+            // shortcut: snapshots omit worker output, remove this gate when reads include it.
+            if snapshot.shards.iter().all(|shard| shard.deltas.is_empty()) {
+                return Err(PgWireError::ApiError(Box::new(
+                    GatewayError::QueryTimeExecutionFailed {
+                        detail: format!("distributed view {view_name} output is unavailable; contact the operator before relying on this result"),
+                    },
+                )));
+            }
             let mut rows = merge_workload_snapshot(&snapshot)
                 .map_err(|error| PgWireError::ApiError(Box::new(error)))?;
             if !order_by.is_empty() {
@@ -12798,6 +12847,9 @@ impl GatewayHandler {
         self.recover_pending_views_locked()
             .await
             .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+        self.ensure_no_pending_distributed_locked()
+            .await
+            .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
         let (epoch, ops, changes, distributed_deltas) = {
             if ops.is_empty() {
                 if let Some(conn_id) = conn_id {
@@ -12904,6 +12956,22 @@ impl GatewayHandler {
                     }
                 }
             }
+            if !distributed_deltas.is_empty() {
+                let pending = distributed_deltas
+                    .iter()
+                    .map(|(view, request, _)| {
+                        format!(
+                            "{} {} {} {}",
+                            view, request.epoch, request.source, request.request_id
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                batch.put(
+                    &rockstream_storage::ShardKeyEncoder::meta_key(b"distributed-source-pending"),
+                    pending.as_bytes(),
+                );
+            }
             *self.pending_view_recovery.lock() = views.clone();
             for view in &views {
                 if let Err(error) = self
@@ -12997,16 +13065,18 @@ impl GatewayHandler {
         // serving shard from a raw DML store into a live view serving layer.
         {
             if let Some(data_plane) = &self.distributed_data_plane {
-                for (view_name, request, assertion) in distributed_deltas {
+                for (view_name, request, assertion) in &distributed_deltas {
                     let response = match assertion {
                         Some(assertion) => {
-                            data_plane.submit_delta_delegated(request, &assertion).await
+                            data_plane
+                                .submit_delta_delegated(request.clone(), assertion)
+                                .await
                         }
-                        None => data_plane.submit_delta(request).await,
+                        None => data_plane.submit_delta(request.clone()).await,
                     };
                     response.map_err(|error| {
                         PgWireError::ApiError(Box::new(GatewayError::QueryTimeExecutionFailed {
-                            detail: format!("distributed view refresh {view_name}: {error}"),
+                            detail: format!("distributed view refresh {view_name}: {error}; preserve source input and shard storage and contact the operator before retrying"),
                         }))
                     })?;
                 }
@@ -13019,6 +13089,14 @@ impl GatewayHandler {
             shard_db.flush().await.map_err(|e| {
                 PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
             })?;
+            if !distributed_deltas.is_empty() {
+                shard_db
+                    .delete(&rockstream_storage::ShardKeyEncoder::meta_key(
+                        b"distributed-source-pending",
+                    ))
+                    .await
+                    .map_err(|e| PgWireError::ApiError(Box::new(GatewayError::Storage(e))))?;
+            }
             self.frontier_published_at_ms
                 .store(current_time_ms(), Ordering::SeqCst);
             self.pending_view_recovery.lock().clear();
@@ -19195,29 +19273,71 @@ fn runtime_rows_for_table(table: &str, ops: &[DmlOp]) -> Vec<RuntimeRow> {
 }
 
 fn merge_workload_snapshot(snapshot: &WorkloadSnapshot) -> Result<Vec<Vec<u8>>, GatewayError> {
-    let mut shard_rows = Vec::new();
-    for shard in &snapshot.shards {
-        let mut state = BTreeMap::<String, i64>::new();
-        for delta in &shard.deltas {
-            for row in &delta.rows {
-                *state.entry(row.values_tsv.clone()).or_default() += row.weight;
-            }
-        }
-        shard_rows.extend(
-            state
-                .into_iter()
-                .filter_map(|(row, weight)| (weight > 0).then_some(row)),
-        );
+    let invalid_snapshot = || GatewayError::QueryTimeExecutionFailed {
+        detail: "distributed workload snapshot is incomplete or unsupported".to_owned(),
+    };
+    if snapshot.version != rockstream_types::data_plane::WORKLOAD_SNAPSHOT_VERSION
+        || !snapshot.complete
+    {
+        return Err(invalid_snapshot());
+    }
+    let column_count = snapshot.deployment.output_columns.len();
+    let merge_keys = &snapshot.deployment.merge_key_columns;
+    if column_count == 0 || merge_keys.iter().any(|column| *column >= column_count) {
+        return Err(invalid_snapshot());
     }
 
-    let merge_keys = &snapshot.deployment.merge_key_columns;
+    let mut shard_rows = Vec::new();
+    for shard in &snapshot.shards {
+        if shard.lease_token.is_none() || !shard.deltas.is_empty() {
+            return Err(invalid_snapshot());
+        }
+        let mut state = BTreeMap::<String, i64>::new();
+        for row in &shard.rows {
+            let weight = state.entry(row.values_tsv.clone()).or_default();
+            *weight = weight.checked_add(row.weight).ok_or_else(|| {
+                GatewayError::QueryTimeExecutionFailed {
+                    detail: "distributed row multiplicity overflow".to_owned(),
+                }
+            })?;
+        }
+        for (row, weight) in state {
+            if weight <= 0 {
+                continue;
+            }
+            let fields = row.split('\t').count();
+            if fields != column_count {
+                return Err(invalid_snapshot());
+            }
+            let copies =
+                usize::try_from(weight).map_err(|_| GatewayError::QueryTimeExecutionFailed {
+                    detail: "distributed row multiplicity exceeds addressable memory".to_owned(),
+                })?;
+            shard_rows.try_reserve(copies).map_err(|error| {
+                GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("distributed result allocation failed: {error}"),
+                }
+            })?;
+            let row = row.into_bytes();
+            for _ in 0..copies {
+                shard_rows.push(row.clone());
+            }
+        }
+    }
+
     if merge_keys.is_empty() {
-        return Ok(shard_rows.into_iter().map(|row| row.into_bytes()).collect());
+        return Ok(shard_rows);
     }
 
     let mut merged = BTreeMap::<String, Vec<String>>::new();
     for row in shard_rows {
-        let fields = row.split('\t').map(str::to_string).collect::<Vec<_>>();
+        let fields = std::str::from_utf8(&row)
+            .map_err(|error| GatewayError::QueryTimeExecutionFailed {
+                detail: format!("distributed result row is not UTF-8: {error}"),
+            })?
+            .split('\t')
+            .map(str::to_string)
+            .collect::<Vec<_>>();
         let key = merge_keys
             .iter()
             .filter_map(|column| fields.get(*column))
@@ -19258,6 +19378,73 @@ fn merge_workload_snapshot(snapshot: &WorkloadSnapshot) -> Result<Vec<Vec<u8>>, 
         .into_values()
         .map(|fields| fields.join("\t").into_bytes())
         .collect())
+}
+
+#[cfg(test)]
+mod distributed_workload_snapshot_tests {
+    use super::*;
+    use rockstream_types::data_plane::{ShardOutput, WorkerExecutionStatus};
+    use rockstream_types::ids::{LeaseToken, WorkerId};
+
+    fn snapshot(complete: bool) -> WorkloadSnapshot {
+        WorkloadSnapshot {
+            version: rockstream_types::data_plane::WORKLOAD_SNAPSHOT_VERSION,
+            complete,
+            deployment: DeploymentRequest {
+                version: DEPLOYMENT_DESCRIPTOR_VERSION,
+                workload_id: WorkloadId(7),
+                namespace: "public".to_owned(),
+                workload_name: "view".to_owned(),
+                plan_json: "{}".to_owned(),
+                join_strategy: JoinStrategy::Auto,
+                schemas: Vec::new(),
+                frontier: 0,
+                storage_root: "/tmp/view".to_owned(),
+                sink_operator_id: OperatorId(1),
+                output_columns: vec!["value".to_owned()],
+                primary_key: vec![0],
+                merge_key_columns: Vec::new(),
+                routing_columns: BTreeMap::new(),
+            },
+            shards: vec![ShardOutput {
+                shard_id: ShardId(1),
+                lease_token: Some(LeaseToken(1)),
+                deltas: Vec::new(),
+                rows: vec![
+                    RuntimeRow {
+                        values_tsv: "1".to_owned(),
+                        weight: 2,
+                    },
+                    RuntimeRow {
+                        values_tsv: "\\N".to_owned(),
+                        weight: 1,
+                    },
+                ],
+            }],
+            workers: vec![WorkerExecutionStatus {
+                worker_id: WorkerId(1),
+                process_id: 1,
+                shard_ids: vec![ShardId(1)],
+                input_rows: 0,
+                output_rows: 0,
+                frontier: 0,
+                ready: true,
+            }],
+        }
+    }
+
+    #[test]
+    fn complete_snapshot_preserves_duplicate_and_null_rows() {
+        assert!(matches!(
+            merge_workload_snapshot(&snapshot(true)),
+            Ok(rows) if rows == vec![b"1".to_vec(), b"1".to_vec(), b"\\N".to_vec()]
+        ));
+    }
+
+    #[test]
+    fn incomplete_snapshot_is_rejected() {
+        assert!(merge_workload_snapshot(&snapshot(false)).is_err());
+    }
 }
 
 /// v0.51.4 Slice 0: build a signed-weight `ArrowZSet` from the commit's own

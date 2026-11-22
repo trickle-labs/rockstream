@@ -1,4 +1,5 @@
 //! Image entry point compiled against each release's production crates.
+#![allow(unexpected_cfgs)] // This fixture is also compiled in an older workspace.
 use arrow::datatypes::{DataType, Field, Schema};
 use rockstream_connectors::{
     KafkaSink, KafkaSource, OffsetToken, SourceCheckpointStore, SourceConnector,
@@ -9,7 +10,10 @@ use rockstream_ops::{
     ArrowZSet,
 };
 use rockstream_plan::PlanNode;
-use rockstream_runtime::start_worker_client;
+#[cfg(feature = "current_worker_api")]
+use rockstream_runtime::client::start_worker_client_with_insecure_internal_dev_and_metadata as start_test_worker_client;
+#[cfg(not(feature = "current_worker_api"))]
+use rockstream_runtime::start_worker_client as start_test_worker_client;
 use rockstream_storage::{keys::ShardKeyEncoder, WriteBatch};
 use rockstream_types::{
     arrow_batch::split_weight_column,
@@ -45,9 +49,21 @@ async fn main() {
         .unwrap();
     let control = std::env::var("ROCKSTREAM_RECOVERY_CONTROL").unwrap();
     let bootstrap = std::env::var("ROCKSTREAM_RECOVERY_KAFKA").unwrap();
-    let (worker, _task) = start_worker_client(id, &control, &root.join(format!("worker-{id}")))
-        .await
-        .unwrap();
+    #[cfg(feature = "current_worker_api")]
+    let (worker, _task) = start_test_worker_client(
+        id,
+        &control,
+        &root.join(format!("worker-{id}")),
+        Default::default(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    #[cfg(not(feature = "current_worker_api"))]
+    let (worker, _task) =
+        start_test_worker_client(id, &control, &root.join(format!("worker-{id}")))
+            .await
+            .unwrap();
     let deadline = Instant::now() + Duration::from_secs(60);
     while worker.worker_id().is_none() {
         assert!(Instant::now() < deadline, "registration deadline");

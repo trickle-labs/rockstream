@@ -723,6 +723,21 @@ exercise the recovery gate. M1 abstracts the batch and does not model compiled
 operators, gateway cancellation, source shuffle ownership, or management
 authentication. Those boundaries require separate qualification.
 
+The gateway records pending source dispatch in the base-row batch and clears it
+after all source requests complete; reads and subsequent writes fail if a
+gateway restarts with that record. Distributed reads also fail when snapshots
+do not contain worker output, rather than report an empty result. The owned
+shuffle path records a source epoch on its anchor before dispatch and
+clears that record only after all target shards report committed execution.
+The process regression stops the gateway with a source request outstanding and
+checks the exact input and post-restart failure.
+Worker execution records distinguish matching committed replays from conflicting
+input. Distributed view reads fail while execution is incomplete or requires
+recovery. The coordinator, gateway, and runtime tests cover ordering, failure,
+restart, closed-inlet delivery, and exact replay. M1 does not model the journal or the
+transport-to-worker handoff; the bare credit-only transport and independent-host
+recovery remain unqualified by these tests.
+
 Issue #303's #309 slice binds control-worker registration to the authenticated
 certificate identity. `control_worker_mtls_tests.rs` covers missing, expired,
 and untrusted certificates, identity mismatch, and role-only rejection; the
@@ -930,6 +945,18 @@ credential rotation remain permitted under the active owner lease so the slot
 can be opened and validated before `acknowledge_recovered` clears `pending_ack`.
 This refines the M3 post-commit source-acknowledgement recovery boundary without
 adding new formal transitions.
+
+PR #408 (issue #303) upgrades the control-worker data-plane read protocol to
+`ProtocolVersion::V4` (`WORKLOAD_SNAPSHOT_VERSION = 1`). When the gateway reads
+a distributed workload snapshot, `ControlService` verifies that all deployment
+shards are ready, checks each shard's active `ShardManager` lease owner and
+token, and fans `ControlMessage::ReadWorkload` out to the owning workers. Each
+worker verifies its local deployment and active shard lease before materializing
+the durable SlateDB view rows and returning `WorkerMessage::WorkloadReadReport`.
+Control rejects incomplete or lease-mismatched reports and returns the complete
+snapshot to the gateway, preserving duplicate multiplicities and NULL values.
+This read-path coordination does not alter the M1–M7 commit, frontier, sink, or
+lease state machines.
 
 Issue #305 strengthens the file-backed audit append boundary in
 `crates/rockstream-control/src/audit.rs`. `FileAuditLog::append` writes each
@@ -1226,6 +1253,33 @@ sequential and both barrier-synchronized concurrent schedules are asserted by
 `concurrent_changelog_confirmations_commit_complete_contributions_in_either_order`
 in `crates/rockstream-control/src/checkpoint.rs`: exactly one complete callback,
 matching latest committed manifest, and zero remaining alignment credits.
+
+Issue #402 aligns worker execution, storage persistence, and resource control
+with O(affected data) work without altering the abstract M1–M7 coordination
+state machines. In `rockstream-storage`, `MergeTag::SumCount` (`0x05`) extends
+the ADR 0004 merge operator across `ShardDb` and every `ShardReader` path so
+aggregate sum/count deltas persist via blind merge operands within the existing
+M1 atomic `WriteBatch` commit boundary, while `MeteredObjectStore` and
+`PhysicalWriteTracker` on `ShardDb` / `StorageContext` measure physical
+object-store bytes without changing durable prefixes or commit ordering. In
+`rockstream-runtime`, `WorkerResourceController` and RSS-calibrated
+`SourcePressureController` account for process RSS, local disk usage, and
+shared SlateDB cache budgets; `FairChunkScheduler` cooperatively schedules
+`ResumableChunkedOp` tasks (such as `ResumableJoinEpoch`, which commits
+arrangement updates atomically only upon completion and leaves arrangements
+unchanged on cancellation); `ShardActorRegistry::register_owned` runs
+single-owner pipelines without per-batch `Mutex` contention; and
+`partition_batch_by_capsule` reuses pre-encoded `BatchKeyCapsule` hashes for
+exchange routing. Exactness, recovery, blind-merge persistence, budget
+calibration, and cancellation rollback are verified by
+`crates/rockstream-storage/tests/issue_402_adr0004_merge_proof_tests.rs`,
+`crates/rockstream-ops/tests/issue_402_scale_invariance_tests.rs`,
+`crates/rockstream-ops/tests/issue_402_fusion_lock_profile_tests.rs`, and
+`crates/rockstream-runtime/tests/issue_402_rss_fairness_stress_tests.rs`.
+These are worker-local storage, execution, and scheduling refinements under the
+DC.2 coupling rule; epoch-commit atomicity, frontier publication, and fencing
+transitions in `formal/m1_epoch_commit.fizz`–`formal/m7_control_plane_ha.fizz`
+remain unchanged.
 
 The v0.59.9 physical-commit-group extension is modeled by M1-S8 in
 `formal/m1_epoch_commit.fizz`: logical epochs may stage independently, but the
@@ -1838,3 +1892,11 @@ complete/truncated/row-over-budget responses and v3 logical-key/failure behavior
 ## v0.72 CLI checkpoint export integrity (#221)
 
 The CLI backup operation selects one committed control checkpoint and must enumerate its required immutable shard manifest, WAL and SST objects before exporting. A merely visible-prefix inventory is insufficient: missing referenced shard storage must fail with a checkpoint-integrity error and must not create a terminal success marker. The management and CLI export paths now share the existing checkpoint-aware inventory; this does not alter M3 cluster checkpoint durability, lease fencing or the committed checkpoint itself. Concrete coverage: `cli_prefix_export_rejects_missing_committed_shard_objects_before_success` deletes a real checkpointed shard before CLI export and requires failure without a commit marker; `lfs_export_restore_fresh_cluster_is_bit_identical` preserves the positive committed state recovery contract. Checkpoint-export error-code aliasing has been corrected: RS-3613 identifies export-in-progress and RS-3614 identifies export/restore failure; RS-5035 remains the cataloged skew-SLO error. This is an operator diagnostics change, not a new checkpoint durability claim.
+
+## Raft heartbeat lease age bounding (#351)
+
+`RaftControlGroup` bounds leader authority by the initiation timestamp (`round_started_at`) of each heartbeat round rather than the response completion timestamp. A delayed quorum acknowledgement whose round began more than `ELECTION_TIMEOUT_MIN` ago cannot refresh `last_quorum_ack`, and the leader steps down when no fresh majority proof remains. This tightens local leader self-fencing to match the M4 monotonic fencing contract without changing durable Raft term/vote persistence or shard lease token monotonicity.
+
+## Consistent control manifest selection during checkpoint export (#352)
+
+`CheckpointExporter` pins the control-plane SlateDB manifest that was visible when the selected `ClusterCheckpoint` was loaded rather than copying a newer control manifest that commits mid-inventory. This ensures the exported control manifest and shard object inventory represent a single consistent committed checkpoint cut under M3 recovery.

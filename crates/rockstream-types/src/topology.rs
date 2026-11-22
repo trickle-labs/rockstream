@@ -181,7 +181,7 @@ impl WorkerRegistration {
             capacity_headroom,
             location: WorkerLocation::default(),
             capabilities: WorkerCapabilities::default(),
-            protocol_range: SupportedVersionRange::v3_only(),
+            protocol_range: SupportedVersionRange::v4_only(),
             storage_format_range: SupportedStorageFormatRange::default(),
             registered_at_ms,
         }
@@ -295,6 +295,16 @@ pub enum ControlMessage {
     Execute {
         frame: crate::data_plane::RuntimeExchangeMessage,
     },
+    DispatchOwnedShuffle {
+        target: WorkerInfo,
+        frame: crate::data_plane::RuntimeExchangeMessage,
+    },
+    PrepareOwnedEpoch {
+        intent: crate::data_plane::OwnedEpochIntent,
+    },
+    FinishOwnedEpoch {
+        intent: crate::data_plane::OwnedEpochIntent,
+    },
     DeploymentReady {
         workload_id: crate::ids::WorkloadId,
         workers: Vec<crate::data_plane::WorkerExecutionStatus>,
@@ -305,6 +315,12 @@ pub enum ControlMessage {
     },
     WorkloadSnapshot {
         snapshot: crate::data_plane::WorkloadSnapshot,
+    },
+    ReadWorkload {
+        version: u32,
+        request_id: String,
+        workload_id: crate::ids::WorkloadId,
+        shard_ids: Vec<ShardId>,
     },
     ReadOperatorStats {
         request_id: String,
@@ -835,6 +851,24 @@ pub enum WorkerMessage {
     },
     /// Initial registration request.
     Register(WorkerRegistration),
+    OwnedShuffleReady {
+        worker_id: WorkerId,
+    },
+    OwnedEpochRecoveryRequired {
+        worker_id: WorkerId,
+        workload_id: crate::ids::WorkloadId,
+        shard_id: ShardId,
+    },
+    OwnedEpochPrepared {
+        worker_id: WorkerId,
+        intent: crate::data_plane::OwnedEpochIntent,
+        error: Option<String>,
+    },
+    OwnedEpochFinished {
+        worker_id: WorkerId,
+        intent: crate::data_plane::OwnedEpochIntent,
+        error: Option<String>,
+    },
     DeployWorkload(crate::data_plane::DeploymentRequest),
     DeploymentReady {
         version: u32,
@@ -851,8 +885,26 @@ pub enum WorkerMessage {
         input_rows: u64,
         output_rows: u64,
     },
+    ExecutionFailed {
+        output: crate::data_plane::RuntimeOutputDelta,
+        message: String,
+    },
+    ShuffleDispatchFailed {
+        output: crate::data_plane::RuntimeOutputDelta,
+        message: String,
+    },
     ReadWorkload {
+        #[serde(default)]
+        version: u32,
         workload_id: crate::ids::WorkloadId,
+    },
+    WorkloadReadReport {
+        version: u32,
+        request_id: String,
+        workload_id: crate::ids::WorkloadId,
+        worker_id: WorkerId,
+        available: bool,
+        shards: Vec<crate::data_plane::ShardOutput>,
     },
     ReadOperatorStats {
         request_id: String,
@@ -1040,7 +1092,7 @@ mod tests {
     fn control_message_registered_roundtrip() {
         let msg = ControlMessage::Registered {
             worker_id: WorkerId(3),
-            protocol_version: ProtocolVersion::V3,
+            protocol_version: ProtocolVersion::V4,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let decoded: ControlMessage = serde_json::from_str(&json).unwrap();
@@ -1050,7 +1102,7 @@ mod tests {
                 protocol_version,
             } => {
                 assert_eq!(worker_id, WorkerId(3));
-                assert_eq!(protocol_version, ProtocolVersion::V3);
+                assert_eq!(protocol_version, ProtocolVersion::V4);
             }
             _ => panic!("unexpected message variant"),
         }

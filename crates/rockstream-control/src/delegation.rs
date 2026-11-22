@@ -354,6 +354,7 @@ mod tests {
             name: "orders_view".to_owned(),
         };
         let request = WorkerMessage::ReadWorkload {
+            version: rockstream_types::data_plane::WORKLOAD_SNAPSHOT_VERSION,
             workload_id: WorkloadId(42),
         };
         let digest = request_digest(&request).unwrap();

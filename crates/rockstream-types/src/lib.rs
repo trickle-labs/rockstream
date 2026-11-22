@@ -88,7 +88,11 @@ pub use ids::{
     LeaseToken, NamespaceId, OperatorId, PrincipalId, ShardId, SinkId, SourceId, TableId, TenantId,
     ViewId, WorkerId, WorkloadId,
 };
-pub use key_capsule::{KeyCapsule, KeyCapsuleError, KeyValue};
+pub use key_capsule::{
+    batch_key_capsule_encodings_global, batch_key_capsule_encodings_local,
+    measure_batch_key_capsule_encodings, reset_batch_key_capsule_encodings_local, BatchKeyCapsule,
+    KeyCapsule, KeyCapsuleError, KeySpec, KeyValue,
+};
 pub use lifecycle::{
     DependencyHealthReport, DependencyStatus, HealthDimensionObservation, HealthDimensionStatus,
     HealthDimensions, HealthReason, HealthReport, LifecycleState, LifecycleTracker, LiveResponse,

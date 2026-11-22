@@ -5263,6 +5263,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-postgres",
+ "tokio-util",
  "tracing",
 ]
 
@@ -5507,6 +5508,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "hex",
+ "libc",
  "lru",
  "parking_lot",
  "proptest",

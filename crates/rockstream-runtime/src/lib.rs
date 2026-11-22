@@ -15,6 +15,7 @@ pub mod client;
 pub mod compaction;
 pub mod data_plane;
 pub mod epoch_compaction;
+mod owned_epoch;
 pub use epoch_compaction::{
     EpochCompactionConfig, EpochCompactionError, EpochCompactionFilter, EpochCompactionMetrics,
     EpochCompactionMetricsSnapshot, EpochCompactor, InFlightZSetAccumulator, KeyExtractionStrategy,
@@ -43,6 +44,12 @@ pub use shard_actor::{
 };
 
 pub mod exchange;
+pub use exchange::capsule_partition::partition_batch_by_capsule;
+pub mod fair_scheduler;
+pub use fair_scheduler::{
+    ChunkedTaskOutcome, FairChunkScheduler, FairSchedulerHandle, WorkloadFreshnessStats,
+    WorkloadPriority,
+};
 pub mod migration;
 pub use migration::{DualWriteRouter, RoutedWrite, RoutingError};
 
@@ -58,6 +65,9 @@ pub use recovery::{
 
 pub mod quota;
 pub use quota::WorkerQuotaManager;
+
+pub mod resource_controller;
+pub use resource_controller::{WorkerResourceConfig, WorkerResourceController};
 
 pub mod source_pressure;
 pub use source_pressure::{SourcePressureController, SourcePressureState};
@@ -89,7 +99,14 @@ mod tests {
 
         let storage_dir = tempfile::tempdir().unwrap();
 
-        let (client, worker_handle) = start_worker_client(42, &control_url, storage_dir.path())
+        let (client, worker_handle) =
+            client::start_worker_client_with_insecure_internal_dev_and_metadata(
+                42,
+                &control_url,
+                storage_dir.path(),
+                Default::default(),
+                Default::default(),
+            )
             .await
             .unwrap();
 

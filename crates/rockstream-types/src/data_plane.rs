@@ -96,8 +96,23 @@ pub struct SourceDeltaRequest {
     pub rows: Vec<RuntimeRow>,
 }
 
+/// Durable record of a source epoch that has not yet been fully reconciled.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OwnedEpochIntent {
+    pub attempt_id: uuid::Uuid,
+    pub version: u32,
+    pub request_id: String,
+    pub workload_id: WorkloadId,
+    pub epoch: Epoch,
+    pub source: String,
+    pub anchor_shard: ShardId,
+    pub target_shards: Vec<ShardId>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeExchangeMessage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<uuid::Uuid>,
     pub version: u32,
     pub request_id: String,
     pub workload_id: WorkloadId,
@@ -139,6 +154,8 @@ impl RuntimeExchangeMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeOutputDelta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<uuid::Uuid>,
     pub version: u32,
     pub request_id: String,
     pub workload_id: WorkloadId,
@@ -164,11 +181,22 @@ pub struct WorkerExecutionStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ShardOutput {
     pub shard_id: ShardId,
+    #[serde(default)]
+    pub lease_token: Option<LeaseToken>,
+    #[serde(default)]
     pub deltas: Vec<RuntimeOutputDelta>,
+    #[serde(default)]
+    pub rows: Vec<RuntimeRow>,
 }
+
+pub const WORKLOAD_SNAPSHOT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkloadSnapshot {
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
+    pub complete: bool,
     pub deployment: DeploymentRequest,
     pub shards: Vec<ShardOutput>,
     pub workers: Vec<WorkerExecutionStatus>,
@@ -213,6 +241,7 @@ mod tests {
             "lfs:worker-5/shard-2".into(),
         );
         let output = RuntimeOutputDelta {
+            attempt_id: None,
             version: 1,
             request_id: "request-9".into(),
             workload_id: WorkloadId(7),
@@ -227,10 +256,14 @@ mod tests {
             }],
         };
         let snapshot = WorkloadSnapshot {
+            version: WORKLOAD_SNAPSHOT_VERSION,
+            complete: true,
             deployment: request.clone(),
             shards: vec![ShardOutput {
                 shard_id: ShardId(2),
+                lease_token: Some(LeaseToken(13)),
                 deltas: vec![output.clone()],
+                rows: vec![],
             }],
             workers: vec![WorkerExecutionStatus {
                 worker_id: WorkerId(5),
@@ -251,6 +284,7 @@ mod tests {
             rows: output.rows.clone(),
         };
         let exchange = RuntimeExchangeMessage {
+            attempt_id: None,
             version: output.version,
             request_id: output.request_id.clone(),
             workload_id: output.workload_id,
@@ -295,6 +329,7 @@ mod tests {
             weight: 1,
         }];
         let output = RuntimeOutputDelta {
+            attempt_id: None,
             version: 1,
             request_id: "request-9".into(),
             workload_id: WorkloadId(7),
@@ -315,14 +350,19 @@ mod tests {
             ready: true,
         };
         let snapshot = WorkloadSnapshot {
+            version: WORKLOAD_SNAPSHOT_VERSION,
+            complete: true,
             deployment: request.clone(),
             shards: vec![ShardOutput {
                 shard_id: ShardId(2),
+                lease_token: Some(LeaseToken(13)),
                 deltas: vec![output.clone()],
+                rows: vec![],
             }],
             workers: vec![status.clone()],
         };
         let frame = RuntimeExchangeMessage {
+            attempt_id: None,
             version: 1,
             request_id: "request-9".into(),
             workload_id: WorkloadId(7),
@@ -343,6 +383,12 @@ mod tests {
             ControlMessage::SourceDeltaCommitted {
                 request_id: "request-9".into(),
                 epoch: 12,
+            },
+            ControlMessage::ReadWorkload {
+                version: WORKLOAD_SNAPSHOT_VERSION,
+                request_id: "read-9".into(),
+                workload_id: WorkloadId(7),
+                shard_ids: vec![ShardId(2)],
             },
             ControlMessage::WorkloadSnapshot { snapshot },
         ];
@@ -374,7 +420,24 @@ mod tests {
                 output_rows: 4,
             },
             WorkerMessage::ReadWorkload {
+                version: WORKLOAD_SNAPSHOT_VERSION,
                 workload_id: WorkloadId(7),
+            },
+            WorkerMessage::WorkloadReadReport {
+                version: WORKLOAD_SNAPSHOT_VERSION,
+                request_id: "read-9".into(),
+                workload_id: WorkloadId(7),
+                worker_id: WorkerId(5),
+                available: true,
+                shards: vec![ShardOutput {
+                    shard_id: ShardId(2),
+                    lease_token: Some(LeaseToken(13)),
+                    deltas: vec![],
+                    rows: vec![RuntimeRow {
+                        values_tsv: "42".into(),
+                        weight: 2,
+                    }],
+                }],
             },
         ];
 

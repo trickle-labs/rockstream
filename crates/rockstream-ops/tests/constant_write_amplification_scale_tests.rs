@@ -12,7 +12,10 @@ use rockstream_ops::aggregate::AggregateOp;
 use rockstream_ops::op::OperatorEpochResult;
 use rockstream_ops::zset::ArrowZSet;
 use rockstream_storage::keys::{ShardKeyEncoder, ShardPrefix};
+use rockstream_storage::MergeOperatorRegistry;
 use rockstream_types::ids::OperatorId;
+use rockstream_types::laws::sum_count::SUM_COUNT_VERSION;
+use rockstream_types::laws::SUM_COUNT_ID;
 use rockstream_types::metrics::{self, R1PersistenceCounters};
 use rockstream_types::state_mutation::{OperatorEpochMetrics, StateMutation};
 use std::sync::Arc;
@@ -41,12 +44,21 @@ fn state_key(operator_id: OperatorId, key: i64) -> Vec<u8> {
 }
 
 fn put(operator_id: OperatorId, key: i64, sum: i64, count: i64) -> StateMutation {
-    let mut value = Vec::with_capacity(16);
-    value.extend_from_slice(&sum.to_be_bytes());
-    value.extend_from_slice(&count.to_be_bytes());
     StateMutation::Put {
         key: state_key(operator_id, key),
-        value: Bytes::from(value),
+        value: Bytes::from(MergeOperatorRegistry::encode_sum_count(sum, count)),
+    }
+}
+
+fn merge(operator_id: OperatorId, key: i64, delta_sum: i64, delta_count: i64) -> StateMutation {
+    StateMutation::Merge {
+        key: state_key(operator_id, key),
+        law: SUM_COUNT_ID,
+        law_version: SUM_COUNT_VERSION,
+        operand: Bytes::from(MergeOperatorRegistry::encode_sum_count(
+            delta_sum,
+            delta_count,
+        )),
     }
 }
 
@@ -125,7 +137,7 @@ fn test_constant_write_amplification_across_scales() {
                 output_records: 1,
                 dirty_keys: 1,
                 state_mutations: 1,
-                logical_mutation_bytes: 33,
+                logical_mutation_bytes: 34,
                 full_state_entries_visited: 0,
                 state_bytes: (scale + 1) * 24,
             },
@@ -139,13 +151,13 @@ fn test_constant_write_amplification_across_scales() {
             &[vec![42, 42], vec![42, 99], vec![1, 1]],
             &[42.0, 99.0],
             &[-1, 1],
-            vec![put(operator_id, 42, 99, 1)],
+            vec![merge(operator_id, 42, 57, 0)],
             OperatorEpochMetrics {
                 input_records: 2,
                 output_records: 2,
                 dirty_keys: 1,
                 state_mutations: 1,
-                logical_mutation_bytes: 33,
+                logical_mutation_bytes: 38,
                 full_state_entries_visited: 0,
                 state_bytes: (scale + 1) * 24,
             },
@@ -181,7 +193,7 @@ fn test_constant_write_amplification_across_scales() {
                 operator_id,
                 R1PersistenceCounters {
                     state_mutations: 3,
-                    logical_mutation_bytes: 83,
+                    logical_mutation_bytes: 89,
                     dirty_keys: 3,
                     full_state_entries_visited: 0,
                 },
@@ -212,13 +224,13 @@ fn test_v0612_repeated_keys_intermediate_rows_reduction() {
         &[vec![1, 1], vec![10, 40], vec![1, 1]],
         &[10.0, 40.0],
         &[-1, 1],
-        vec![put(operator_id, 1, 40, 1)],
+        vec![merge(operator_id, 1, 30, 0)],
         OperatorEpochMetrics {
             input_records: 4,
             output_records: 2,
             dirty_keys: 1,
             state_mutations: 1,
-            logical_mutation_bytes: 33,
+            logical_mutation_bytes: 38,
             full_state_entries_visited: 0,
             state_bytes: 24,
         },
@@ -248,13 +260,13 @@ fn test_v0612_dirty_keys_proportional_to_distinct_keys() {
         &[vec![2, 2, 97, 97], vec![2, 22, 97, 197], vec![1, 1, 1, 1]],
         &[2.0, 22.0, 97.0, 197.0],
         &[-1, 1, -1, 1],
-        vec![put(operator_id, 2, 22, 1), put(operator_id, 97, 197, 1)],
+        vec![merge(operator_id, 2, 20, 0), merge(operator_id, 97, 100, 0)],
         OperatorEpochMetrics {
             input_records: 4,
             output_records: 4,
             dirty_keys: 2,
             state_mutations: 2,
-            logical_mutation_bytes: 66,
+            logical_mutation_bytes: 76,
             full_state_entries_visited: 0,
             state_bytes: 2_400,
         },

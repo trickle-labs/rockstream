@@ -631,7 +631,7 @@ fn fanout_100_classic_and_factorized_outputs_and_work_are_exact() {
                 },
                 R1ExecutionCounters {
                     input_deltas: 104,
-                    arrangement_probes: 400,
+                    arrangement_probes: 3,
                     output_deltas: 4,
                     changed_state_writes: 104,
                     factor_payload_rows: 100,
@@ -650,7 +650,7 @@ fn fanout_100_classic_and_factorized_outputs_and_work_are_exact() {
         factorized_op.governor().counters(),
         rockstream_ops::DeltaAmplificationCounters {
             input_deltas: 104,
-            probes: 400,
+            probes: 3,
             shuffled_bytes: 0,
             intermediate_tuples: 0,
             output_deltas: 4,
