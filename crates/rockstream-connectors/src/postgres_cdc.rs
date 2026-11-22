@@ -630,7 +630,7 @@ impl PostgresCdcSource {
             .port(config.port)
             .dbname(&config.database)
             .user(&config.user)
-            .application_name(format!("rockstream-pgoutput-{}", config.slot));
+            .application_name(format!("rockstream-pgoutput-control-{}", config.slot));
         if let Some(password) = &config.password {
             connection_config.password(password);
         }
@@ -711,6 +711,10 @@ impl PostgresCdcSource {
         let event_copy_sql = format!(
             "COPY (SELECT CASE WHEN piece.piece_no = 0 THEN octet_length(decoded.data) ELSE NULL::integer END, substring(decoded.data FROM piece.piece_no * {PGOUTPUT_COPY_CHUNK_BYTES} + 1 FOR {PGOUTPUT_COPY_CHUNK_BYTES}) FROM pg_logical_slot_peek_binary_changes({slot_literal}, NULL, 1, 'proto_version', '1', 'publication_names', {publication_literal}) WITH ORDINALITY AS decoded(lsn, xid, data, ordinality) CROSS JOIN LATERAL generate_series(0, (octet_length(decoded.data) - 1) / {PGOUTPUT_COPY_CHUNK_BYTES}) AS piece(piece_no) ORDER BY decoded.ordinality, piece.piece_no) TO STDOUT (FORMAT binary)"
         );
+        // The metadata/control socket must not impersonate the single
+        // physical shared-slot reader. Recovery probes identify and terminate
+        // the COPY backend by its historical application name.
+        connection_config.application_name(format!("rockstream-pgoutput-{}", config.slot));
         let (stream_client, stream_connection) = connection_config
             .connect(NoTls)
             .await
