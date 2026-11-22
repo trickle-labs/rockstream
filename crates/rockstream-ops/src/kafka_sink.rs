@@ -439,14 +439,9 @@ mod tests {
                 view_epoch: Some(1),
                 kind: "snapshot",
             };
-            let (env, count) = build_bounded_envelope(
-                &metadata,
-                420,
-                &rows[offset..],
-                offset,
-                rows.len(),
-            )
-            .unwrap();
+            let (env, count) =
+                build_bounded_envelope(&metadata, 420, &rows[offset..], offset, rows.len())
+                    .unwrap();
             assert!(
                 env.len() <= 420,
                 "chunk envelope {} exceeded 420 bytes",
