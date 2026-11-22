@@ -171,7 +171,10 @@ async fn run_gateway_proof() {
         if actual == baseline {
             break;
         }
-        assert!(actual.is_empty(), "unexpected partial initial snapshot: {actual:?}");
+        assert!(
+            actual.is_empty(),
+            "unexpected partial initial snapshot: {actual:?}"
+        );
         assert!(
             Instant::now() < deadline,
             "gateway never published seeded snapshot: {actual:?}"

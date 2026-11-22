@@ -1722,7 +1722,8 @@ impl PostgresCdcSource {
     /// rejected frame or acknowledge a later COMMIT. Transport disconnects,
     /// however, must retain the gateway's RS-4017 replay/reopen path.
     fn block_pgoutput_transport(&mut self, error: &SourceError) {
-        if matches!(error, SourceError::Io(reason) if reason.starts_with("RS-4017: pgoutput connection disconnected:")) {
+        if matches!(error, SourceError::Io(reason) if reason.starts_with("RS-4017: pgoutput connection disconnected:"))
+        {
             return;
         }
         self.pgoutput_transport_failure = Some(error.to_string());
@@ -1775,6 +1776,16 @@ impl PostgresCdcSource {
                     || self.native_xid.is_some()
                     || self.native_transaction.is_some()
                 {
+                    // A killed PostgreSQL COPY socket can terminate the
+                    // stream after earlier frames were already delivered.
+                    // That is recoverable from the durable slot position,
+                    // unlike a well-formed connection ending mid-transaction.
+                    if pgoutput.stream_client.is_closed() {
+                        return Err(SourceError::Io(
+                            "RS-4017: pgoutput connection disconnected: COPY ended mid-transaction"
+                                .to_string(),
+                        ));
+                    }
                     return Err(pgoutput_transport_error(
                         "pgoutput COPY ended mid-transaction",
                     ));
@@ -1816,9 +1827,9 @@ impl PostgresCdcSource {
                         ));
                     }
                     Some(Err(error)) => {
-                        return Err(pgoutput_transport_error(&format!(
-                            "finish pgoutput COPY: {error}"
-                        )));
+                        // A disconnect while finishing COPY must reopen the
+                        // source, not become a sticky protocol failure.
+                        return Err(map_pgoutput_transport_error("finish pgoutput COPY", error));
                     }
                 }
                 pgoutput.event_stream = None;
