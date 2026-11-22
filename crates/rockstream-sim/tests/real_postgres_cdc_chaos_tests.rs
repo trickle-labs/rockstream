@@ -1208,6 +1208,9 @@ fn validate_postgres_recovery(
                 "view_epoch": 4,
                 "transaction": 4,
                 "pending": null,
+                "snapshot_chunk_offset": 0,
+                "snapshot_epoch": null,
+                "change_chunk_offset": 0,
             }))
     {
         return Err(QualificationFailure::SinkOutput);
