@@ -18,6 +18,8 @@ refusal behavior where one exists, and one executable proof.
 | SQL injection and malformed ingress | SQL parser state, gateway process, decoder memory | Arbitrary network bytes to parser and protocol decoder | Per-statement dispatch plus fuzz and property replay of live decoders | Invalid input returns an error or closes safely; it cannot bypass policy or panic | `crates/rockstream-gateway/tests/protocol_fuzzer_tests.rs::protocol_fuzzer_no_panics_no_hangs` |
 | Dependency supply chain | Build inputs, shipped binaries, advisory status | External crate registry to CI build graph | cargo audit, cargo deny, reviewed exception records, and Dependabot updates | Vulnerable or expired-exception inputs fail the dependency gate | `scripts/check-dependency-audit.test.sh` |
 
+The authoritative audit stream keeps verified, unverified, unknown, and not-applicable identity and field states explicit, with action, scope, result, correlation, and safe before/after metadata; credentials are excluded. Required events use the durable catalog and recover with it after restart. Retain records for 90 days under a 1 GiB deployment-wide cap without early eviction. When required storage is full or unavailable, reject the protected mutation, stop admitting new sessions if authentication cannot be recorded, and close an existing session when a required denial cannot be recorded. Metrics and health expose retained fill and degraded state; release qualification must verify these outcomes across process recovery.
+
 The commissioned independent review has no report artifact yet; any received
 P0/P1 finding is added here with its issue identifier, fix, and regression
 proof before sign-off.
