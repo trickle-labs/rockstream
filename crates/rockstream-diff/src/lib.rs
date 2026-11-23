@@ -167,7 +167,7 @@ impl DiffCtx {
 
             // ── Exchange stub ─────────────────────────────────────────────
             // In v0.4, Exchange is always Loopback: data passes through.
-            PlanNode::Exchange { kind, child } => {
+            PlanNode::Exchange { kind, child, .. } => {
                 let input_id = self.diff_node(child, ops)?;
                 let id = self.next_op_id();
                 ops.push(OpNode {
@@ -510,6 +510,7 @@ mod tests {
         let src = PlanNode::Source { name: "t".into() };
         let exchange = PlanNode::Exchange {
             kind: ExchangeKind::Loopback,
+            partition_key: vec![],
             child: Box::new(src),
         };
         let mut ctx = DiffCtx::new();

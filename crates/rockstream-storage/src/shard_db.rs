@@ -1625,6 +1625,57 @@ impl ShardDb {
         Ok(ShardFrontierReport { shard_id, epoch })
     }
 
+    /// Persist a monotonic lease fencing token at the storage boundary
+    /// (Issue #400 R4).
+    ///
+    /// If a strictly higher `LeaseToken` is already recorded in this shard,
+    /// fails closed with `RS-1702` without mutating state.
+    pub async fn fence_lease_token(
+        &self,
+        token: rockstream_types::ids::LeaseToken,
+    ) -> Result<(), StorageError> {
+        let key = ShardKeyEncoder::meta_key(b"lease-fence-token");
+        if let Some(existing) = self.get(&key).await? {
+            if existing.len() == 8 {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&existing);
+                let current = u64::from_be_bytes(buf);
+                if token.0 < current {
+                    return Err(StorageError::StaleLeaseToken {
+                        provided: token.0,
+                        current,
+                    });
+                }
+            }
+        }
+        self.put(&key, &token.0.to_be_bytes()).await?;
+        self.flush().await?;
+        Ok(())
+    }
+
+    /// Verify that `token` is not fenced by a strictly higher persisted
+    /// `LeaseToken` in this shard's storage (control-free hot-path fencing).
+    pub async fn verify_lease_token(
+        &self,
+        token: rockstream_types::ids::LeaseToken,
+    ) -> Result<(), StorageError> {
+        let key = ShardKeyEncoder::meta_key(b"lease-fence-token");
+        if let Some(existing) = self.get(&key).await? {
+            if existing.len() == 8 {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&existing);
+                let current = u64::from_be_bytes(buf);
+                if token.0 < current {
+                    return Err(StorageError::StaleLeaseToken {
+                        provided: token.0,
+                        current,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Create a SlateDB checkpoint for this shard and return a [`CheckpointHandle`].
     ///
     /// Called by the worker after a `CheckpointBarrier` epoch completes for all

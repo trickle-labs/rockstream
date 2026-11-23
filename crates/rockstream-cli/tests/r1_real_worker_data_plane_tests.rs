@@ -538,11 +538,6 @@ async fn run_cluster(worker_count: usize, kill_worker: bool) {
         .read_workload(workload_id)
         .await
         .unwrap();
-    let shard_base = workload_id.0.wrapping_mul(16);
-    let mut routed = vec![0_u64; worker_count];
-    for group in 0..values.len() {
-        routed[stable_route(&group.to_string(), worker_count)] += 1;
-    }
     let mut assigned_shards = BTreeMap::new();
     for status in &snapshot.workers {
         assert_eq!(status.shard_ids.len(), 1);
@@ -558,26 +553,33 @@ async fn run_cluster(worker_count: usize, kill_worker: bool) {
         assigned_shards.keys().copied().collect::<Vec<_>>(),
         (1..=worker_count as u64).map(WorkerId).collect::<Vec<_>>()
     );
+    let mut shard_ids: Vec<ShardId> = assigned_shards.values().copied().collect();
+    shard_ids.sort();
     assert_eq!(
-        assigned_shards
-            .values()
+        shard_ids
+            .iter()
             .copied()
-            .collect::<std::collections::BTreeSet<_>>(),
-        (0..worker_count)
-            .map(|index| ShardId(shard_base.wrapping_add(index as u64)))
-            .collect()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        worker_count
     );
+    let mut routed_by_shard = BTreeMap::<ShardId, u64>::new();
+    for group in 0..values.len() {
+        let bucket = rockstream_types::rendezvous::fnv1a_64(group.to_string().as_bytes()) % 4096;
+        let target = rockstream_types::rendezvous::rendezvous_hash(bucket, &shard_ids, 1).unwrap();
+        *routed_by_shard.entry(target).or_default() += 1;
+    }
     let expected_statuses = (1..=worker_count as u64)
         .map(|worker_id| {
             let worker_id = WorkerId(worker_id);
             let shard_id = assigned_shards[&worker_id];
-            let shard_index = shard_id.0.wrapping_sub(shard_base) as usize;
+            let expected_rows = routed_by_shard.get(&shard_id).copied().unwrap_or(0);
             WorkerExecutionStatus {
                 worker_id,
                 process_id: processes.workers[worker_id.0 as usize - 1].id(),
                 shard_ids: vec![shard_id],
-                input_rows: routed[shard_index],
-                output_rows: routed[shard_index],
+                input_rows: expected_rows,
+                output_rows: expected_rows,
                 frontier: 2,
                 ready: true,
             }

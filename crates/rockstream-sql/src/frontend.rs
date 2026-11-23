@@ -107,6 +107,7 @@ pub struct SqlFrontend {
     // Audit: this set is updated synchronously before planning; retaining an
     // inserted name after a holder panic is valid and no guard crosses an await.
     snapshot_tables: Mutex<std::collections::HashSet<String>>,
+    distribution_config: Mutex<crate::distribution::DistributionConfig>,
 }
 
 pub fn register_session_sql_udf(ctx: &SessionContext) {
@@ -158,7 +159,30 @@ impl SqlFrontend {
         Self {
             ctx,
             snapshot_tables: Mutex::new(std::collections::HashSet::new()),
+            distribution_config: Mutex::new(crate::distribution::DistributionConfig::single_shard()),
         }
+    }
+
+    /// Configure distributed physical planning for this frontend.
+    ///
+    /// When `config.shard_count > 1`, `sql_to_plan_node`,
+    /// `sql_to_plan_node_with_catalog`, `create_view`, and
+    /// `explain_incremental_for_sql` automatically invoke
+    /// [`crate::distribution::apply_distribution_with_config`] to emit real
+    /// distributed physical plans with hash/broadcast/single exchanges.
+    pub fn with_distribution_config(self, config: crate::distribution::DistributionConfig) -> Self {
+        *self.distribution_config.lock() = config;
+        self
+    }
+
+    /// Update the active distribution configuration in place.
+    pub fn set_distribution_config(&self, config: crate::distribution::DistributionConfig) {
+        *self.distribution_config.lock() = config;
+    }
+
+    /// Return the active distribution configuration.
+    pub fn distribution_config(&self) -> crate::distribution::DistributionConfig {
+        self.distribution_config.lock().clone()
     }
 
     /// Register an empty in-memory table with the given Arrow schema.
@@ -189,7 +213,43 @@ impl SqlFrontend {
         })?;
         let logical = df.into_optimized_plan()?;
         let snapshot_sources = self.snapshot_tables.lock().clone();
-        lower_with_views(&logical, &Default::default(), &snapshot_sources)
+        let lowered = lower_with_views(&logical, &Default::default(), &snapshot_sources)?;
+        let dist_cfg = self.distribution_config.lock().clone();
+        if dist_cfg.is_distributed() {
+            Ok(crate::distribution::apply_distribution_with_config(lowered, &dist_cfg)?.plan)
+        } else {
+            Ok(lowered)
+        }
+    }
+
+    /// Parse SQL and produce a full [`crate::distribution::DistributedPlan`]
+    /// using the supplied [`crate::distribution::DistributionConfig`].
+    pub async fn sql_to_distributed_plan(
+        &self,
+        sql: &str,
+        config: &crate::distribution::DistributionConfig,
+    ) -> Result<crate::distribution::DistributedPlan, SqlError> {
+        let df = self.ctx.sql(sql).await.map_err(|e| SqlError::ParseError {
+            message: e.to_string(),
+        })?;
+        let logical = df.into_optimized_plan()?;
+        let snapshot_sources = self.snapshot_tables.lock().clone();
+        let lowered = lower_with_views(&logical, &Default::default(), &snapshot_sources)?;
+        crate::distribution::apply_distribution_with_config(lowered, config)
+    }
+
+    /// Render `EXPLAIN INCREMENTAL` for the real distributed physical plan
+    /// (partition keys, network exchanges, worker placement, estimated state,
+    /// and expected shuffle).
+    pub async fn explain_incremental_distributed_for_sql(
+        &self,
+        sql: &str,
+        config: &crate::distribution::DistributionConfig,
+    ) -> Result<String, SqlError> {
+        let distributed = self.sql_to_distributed_plan(sql, config).await?;
+        Ok(crate::explain_incremental::explain_incremental_distributed(
+            &distributed,
+        ))
     }
 
     /// Parse a DML statement (INSERT, UPDATE, DELETE) into typed AST IR.
@@ -271,7 +331,13 @@ impl SqlFrontend {
         let registered_views: std::collections::HashSet<String> =
             catalog.list_view_names().await?.into_iter().collect();
         let snapshot_sources = self.snapshot_tables.lock().clone();
-        lower_with_views(&logical, &registered_views, &snapshot_sources)
+        let lowered = lower_with_views(&logical, &registered_views, &snapshot_sources)?;
+        let dist_cfg = self.distribution_config.lock().clone();
+        if dist_cfg.is_distributed() {
+            Ok(crate::distribution::apply_distribution_with_config(lowered, &dist_cfg)?.plan)
+        } else {
+            Ok(lowered)
+        }
     }
 
     /// Parse SQL with catalog-defined views and return the **unoptimized** `PlanNode`.
@@ -287,7 +353,13 @@ impl SqlFrontend {
         let registered_views: std::collections::HashSet<String> =
             catalog.list_view_names().await?.into_iter().collect();
         let snapshot_sources = self.snapshot_tables.lock().clone();
-        lower_with_views(&logical, &registered_views, &snapshot_sources)
+        let lowered = lower_with_views(&logical, &registered_views, &snapshot_sources)?;
+        let dist_cfg = self.distribution_config.lock().clone();
+        if dist_cfg.is_distributed() {
+            Ok(crate::distribution::apply_distribution_with_config(lowered, &dist_cfg)?.plan)
+        } else {
+            Ok(lowered)
+        }
     }
 
     /// Parse a `CREATE VIEW name AS <query>` statement and store the view in

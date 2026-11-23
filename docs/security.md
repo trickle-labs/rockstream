@@ -154,9 +154,10 @@ of acknowledged. Application-level identity and source-ownership denials are
 correlated and durably audited through the authenticated worker-control stream;
 the shuffle stream fails closed if that append is unavailable. TLS handshake
 failures such as an expired certificate or wrong CA are not covered by this
-application-level audit path. The CLI worker also does not yet wire exchange
-inlets into its application data path. These gaps and the release
-negative-case/rollover matrix keep #303 open.
+application-level audit path. Workload deployment on CLI workers registers
+bounded application exchange inlets in `ExchangeRegistry` and propagates
+receiver credits/backpressure end-to-end back to upstream senders while
+preserving internal mTLS, lease fencing, replay identity, and durable audit.
 
 When a gateway connects to `--control`, its cross-process SQL data-plane client uses internal mTLS and presents a CA-verified `Gateway` node identity. For authenticated gateway configurations, each deploy, source-delta, workload-read, and operator-stats request carries a short-lived RS256 actor assertion. Version 2 claims include explicit `SecretUse` scopes for secret-backed sources in a deployment, limited to scopes the actor is authorized to use when the assertion is issued. Control retains those scopes with the workload; each worker secret refresh must match the retained allowance and the actor's current scoped policy. A later grant applies to a workload only after a fresh authorized deployment assertion includes that scope. The gateway signs assertions with the dedicated deployment-managed private key at `auth.actor_assertion_signing_key_path`; control verifies them with the matching RSA public JWK at `auth.actor_assertion_public_key_path`. Both nodes require the same `node.deployment_id`. The assertion audience is exactly `rockstream-control:<deployment_id>`, and its lifetime is 60 seconds. Control verifies the gateway certificate role, signature, deployment, request digest, action and scope, then checks the actor's current durable grants. Effective authority is the intersection of the asserted allowance and those current grants. Version 1 assertions remain valid for their original action and scope and carry no delegated secret-use scopes. Missing keys, invalid assertions, disabled actors, and revoked grants are rejected and audited before the data-plane request is dispatched. The signing key pair must be distinct from both gateway and internal TLS key pairs.
 

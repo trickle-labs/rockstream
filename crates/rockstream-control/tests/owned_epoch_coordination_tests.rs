@@ -405,7 +405,7 @@ async fn owned_epoch_is_prepared_before_dispatch_and_finished_before_reply() {
                 intent.epoch,
                 intent.anchor_shard
             ),
-            ("prepare-failure", 2, ShardId(144))
+            ("prepare-failure", 2, ShardId(1))
         );
         send(
             &mut worker_write,

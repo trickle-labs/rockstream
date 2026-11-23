@@ -536,9 +536,9 @@ async fn worker_secret_tokens_are_workload_bound_and_recheck_current_grants() {
         )
         .await
         .unwrap();
-    assert!(worker
-        .get_deployment(request.workload_id, ShardId(request.workload_id.0 * 16))
-        .is_some());
+    assert!(worker.leases().iter().any(|lease| worker
+        .get_deployment(request.workload_id, lease.shard_id)
+        .is_some()));
 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -630,9 +630,11 @@ async fn worker_secret_tokens_are_workload_bound_and_recheck_current_grants() {
         let targets = worker
             .secret_manager()
             .refresh_targets(&std::collections::HashSet::from([request.workload_id]));
-        let active = worker
-            .get_deployment(request.workload_id, ShardId(request.workload_id.0 * 16))
-            .is_some();
+        let active = worker.leases().iter().any(|lease| {
+            worker
+                .get_deployment(request.workload_id, lease.shard_id)
+                .is_some()
+        });
         panic!(
             "periodic secret reauthorization did not revoke the cache; denials={denials}, active={active}, targets={targets:?}"
         );

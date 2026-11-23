@@ -335,15 +335,16 @@ pub enum PlanNode {
         child: Box<PlanNode>,
     },
 
-    /// Exchange operator stub (v0.4).
+    /// Exchange operator (hash / broadcast / single / range / loopback).
     ///
-    /// In the embedded single-process runtime (v0.4), Exchange is always
-    /// `Loopback`: data passes through without any network call or shuffle
-    /// object.  Full hash/broadcast/range exchange over gRPC + durable
-    /// shuffle objects is implemented in v0.16.
+    /// Carries the physical `kind` and, for `Hash`/`Range` exchanges, the
+    /// column indices (`partition_key`) used to partition rows across shards.
     Exchange {
         /// How this exchange partitions data.
         kind: ExchangeKind,
+        /// Column indices used to hash- or range-partition rows.
+        #[serde(default)]
+        partition_key: Vec<usize>,
         /// The input plan to re-partition.
         child: Box<PlanNode>,
     },
