@@ -802,6 +802,16 @@ authorization and version lookup, so this release test is the concrete evidence
 for that boundary; the remaining #304 policy and bounded-resource criteria stay
 open.
 
+The worker audit append handoff bounds pending acknowledgements by the worker
+message-channel capacity, matches replies to registered request IDs, and clears
+waiters after acknowledgement, enqueue failure, timeout, cancellation, or
+transport shutdown. Only a successful durable acknowledgement lets the append
+return success; capacity exhaustion and other failed outcomes fail closed. The
+runtime tests check the pending/capacity metrics, saturation, and capacity
+recovery after cancellation and acknowledgement. M1–M7 do not model this waiter
+map or channel state, so this is implementation evidence rather than formal
+proof of the append transport or the durable audit store.
+
 `runtime/src/exchange` now provides a worker mTLS listener and client pool.
 `shuffle_mtls_tests.rs` covers invalid peer credentials, worker identity and
 source-shard authorization, audited denial without inlet delivery, and active
