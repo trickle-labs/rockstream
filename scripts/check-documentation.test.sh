@@ -24,6 +24,7 @@ setup_tree() {
   cp "$ROOT/scripts/check-qualification-mutations.test.sh" "$ROOT/scripts/check-qualification-mutations.sh" "$ROOT/scripts/run-release-qualification.sh" "$TMP_ROOT/scripts/"
   cp "$ROOT/crates/rockstream-cli/tests/documentation_transcript_tests.rs" "$TMP_ROOT/crates/rockstream-cli/tests/"
   cp "$ROOT/crates/rockstream-gateway/tests/gateway_dml_tests.rs" "$TMP_ROOT/crates/rockstream-gateway/tests/"
+  cp "$ROOT/crates/rockstream-gateway/tests/everyday_ivm_sql_ux_404_tests.rs" "$TMP_ROOT/crates/rockstream-gateway/tests/"
   cp "$ROOT/crates/rockstream-gateway/tests/gateway_proof_tests.rs" "$TMP_ROOT/crates/rockstream-gateway/tests/"
   cp "$ROOT/crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs" "$TMP_ROOT/crates/rockstream-gateway/tests/"
   cp "$ROOT/crates/rockstream-gateway/tests/v072_durable_subscription_publication_tests.rs" "$TMP_ROOT/crates/rockstream-gateway/tests/"
