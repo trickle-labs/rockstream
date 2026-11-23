@@ -517,13 +517,13 @@ async fn done_cleanup_is_scan_and_delete_never_range_delete() {
 }
 
 #[tokio::test]
-async fn verify_scan_window_is_bounded_with_fill_level_metric() {
+async fn verify_scan_streams_beyond_legacy_key_ceiling_and_detects_divergence() {
     let store = Arc::new(InMemory::new());
     let donor = make_shard(1, "migration/donor-window", store.clone(), 42).await;
     let recipient = make_shard(2, "migration/recipient-window", store.clone(), 42).await;
     let mut donor_batch = WriteBatch::new();
     let mut recipient_batch = WriteBatch::new();
-    for i in 0..1025usize {
+    for i in 0..2050usize {
         let key = make_key(7, &format!("k{i:04}"));
         donor_batch.put(&key, b"v");
         recipient_batch.put(&key, b"v");
@@ -536,13 +536,29 @@ async fn verify_scan_window_is_bounded_with_fill_level_metric() {
     let mut record = make_record();
     step_to_cutover(&mut record);
     let coordinator = MigrationCoordinator::new();
-    let fill = coordinator.verify_scan_fill_level(1025);
-    assert_eq!(fill.used, 1025);
-    let err = coordinator
+    coordinator
         .verify_or_rollback(&mut record, &donor, &recipient, None)
         .await
+        .expect("streaming verification must handle >1024 keys without RS-5031");
+    assert_eq!(record.state, MigrationState::Verifying);
+
+    // Mutate one key past the legacy 1,024-key ceiling and confirm divergence is caught.
+    let diverging_key = make_key(7, "k1800");
+    recipient.db.put(&diverging_key, b"corrupt").await.unwrap();
+    recipient.db.flush().await.unwrap();
+    let mut record2 = make_record();
+    step_to_cutover(&mut record2);
+    let err = coordinator
+        .verify_or_rollback(&mut record2, &donor, &recipient, None)
+        .await
         .unwrap_err();
-    assert!(err.to_string().contains("RS-5031"));
+    assert_eq!(
+        err,
+        rockstream_control::MigrationError::VerificationDiverged {
+            key_hex: hex::encode(&diverging_key),
+        }
+    );
+    assert_eq!(record2.state, MigrationState::DualWriting);
 }
 
 #[tokio::test]

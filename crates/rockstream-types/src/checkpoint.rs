@@ -78,6 +78,11 @@ pub struct PerShardCheckpoint {
     /// mutable latest reader.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_id: Option<String>,
+    /// Optional object-store-relative shard database prefix (e.g.
+    /// `workload-1/shard-0` for an active workload deployment). When `None`,
+    /// defaults to `shards/{shard_id}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_path: Option<String>,
 }
 
 impl PerShardCheckpoint {
@@ -87,11 +92,17 @@ impl PerShardCheckpoint {
             checkpoint_id,
             shard_checkpoint_id,
             snapshot_id: None,
+            shard_path: None,
         }
     }
 
     pub fn with_snapshot_id(mut self, snapshot_id: impl Into<String>) -> Self {
         self.snapshot_id = Some(snapshot_id.into());
+        self
+    }
+
+    pub fn with_shard_path(mut self, shard_path: impl Into<String>) -> Self {
+        self.shard_path = Some(shard_path.into());
         self
     }
 }

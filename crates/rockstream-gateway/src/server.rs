@@ -2178,6 +2178,8 @@ pub struct GatewayHandler {
     distributed_data_plane: Option<DataPlaneClient>,
     actor_assertion_signer: Option<Arc<rockstream_control::delegation::ActorAssertionSigner>>,
     distributed_storage_root: Option<String>,
+    stateless_read_router: Option<Arc<crate::stateless_serving::StatelessReadRouter>>,
+    read_admission: Arc<crate::stateless_serving::ReadAdmissionController>,
     backfill_admission: Arc<crate::admission::BackfillAdmissionController>,
     /// Bound only by `GatewayServer`; source tasks upgrade it per poll and
     /// exit when the server releases its handler.
@@ -3809,6 +3811,8 @@ impl GatewayHandler {
             distributed_data_plane: None,
             actor_assertion_signer: None,
             distributed_storage_root: None,
+            stateless_read_router: None,
+            read_admission: Arc::new(crate::stateless_serving::ReadAdmissionController::default()),
             backfill_admission: Arc::new(crate::admission::BackfillAdmissionController::default()),
             self_ref: Arc::new(Mutex::new(Weak::new())),
             source_workers: Arc::new(DashMap::new()),
@@ -3865,6 +3869,8 @@ impl GatewayHandler {
             distributed_data_plane: None,
             actor_assertion_signer: None,
             distributed_storage_root: None,
+            stateless_read_router: None,
+            read_admission: Arc::new(crate::stateless_serving::ReadAdmissionController::default()),
             backfill_admission: Arc::new(crate::admission::BackfillAdmissionController::default()),
             self_ref: Arc::new(Mutex::new(Weak::new())),
             source_workers: Arc::new(DashMap::new()),
@@ -10237,6 +10243,24 @@ impl GatewayHandler {
             )]
         };
 
+        let _read_admission_permit = self
+            .read_admission
+            .admit(limit, limit.unwrap_or(1024).saturating_mul(256))
+            .await
+            .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+
+        // Prefer reading directly from stateless ShardReader replicas over
+        // shared object storage when configured, bypassing control-routed reads.
+        let stateless_rows = if let Some(router) = &self.stateless_read_router {
+            if self.catalog.get_view(view_name).is_some() {
+                router.read_view(view_name, None, None, None).await.ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Prefer reading directly from ShardDb when available.  ShardDb reads
         // from its in-memory memtable (WAL + SSTs), which reflects the latest
         // committed writes immediately after the post-COMMIT flush.  The
@@ -10246,8 +10270,44 @@ impl GatewayHandler {
             .distributed_data_plane
             .as_ref()
             .filter(|_| self.catalog.get_view(view_name).is_some());
-        let batches: Vec<RecordBatch> = if let Some(distributed_data_plane) = distributed_data_plane
+        let batches: Vec<RecordBatch> = if let Some(mut rows) =
+            stateless_rows.filter(|r| !r.is_empty() || distributed_data_plane.is_none())
         {
+            if !order_by.is_empty() {
+                let col_idx: std::collections::HashMap<String, usize> = schema_fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| (f.name().to_lowercase(), i))
+                    .collect();
+                rows.sort_by(|a, b| {
+                    let a_fields: Vec<&str> =
+                        std::str::from_utf8(a).unwrap_or("").split('\t').collect();
+                    let b_fields: Vec<&str> =
+                        std::str::from_utf8(b).unwrap_or("").split('\t').collect();
+                    for (col, desc) in &order_by {
+                        let Some(&idx) = col_idx.get(col.as_str()) else {
+                            continue;
+                        };
+                        let av = a_fields.get(idx).copied().unwrap_or("");
+                        let bv = b_fields.get(idx).copied().unwrap_or("");
+                        let ord = if let (Ok(an), Ok(bn)) = (av.parse::<i64>(), bv.parse::<i64>()) {
+                            an.cmp(&bn)
+                        } else {
+                            av.cmp(bv)
+                        };
+                        let ord = if *desc { ord.reverse() } else { ord };
+                        if ord != std::cmp::Ordering::Equal {
+                            return ord;
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+            }
+            if let Some(n) = limit {
+                rows.truncate(n);
+            }
+            stored_rows_to_batches(&self.catalog, view_name, &rows)?
+        } else if let Some(distributed_data_plane) = distributed_data_plane {
             let namespace = conn_id
                 .and_then(|id| {
                     self.sessions
@@ -17891,6 +17951,26 @@ impl GatewayServer {
         if let Some(handler) = Arc::get_mut(&mut self.handler) {
             handler.distributed_data_plane = Some(client);
             handler.distributed_storage_root = Some(storage_root.into());
+        }
+        self
+    }
+
+    pub fn with_stateless_read_router(
+        mut self,
+        router: Arc<crate::stateless_serving::StatelessReadRouter>,
+    ) -> Self {
+        if let Some(handler) = Arc::get_mut(&mut self.handler) {
+            handler.stateless_read_router = Some(router);
+        }
+        self
+    }
+
+    pub fn with_read_admission(
+        mut self,
+        admission: Arc<crate::stateless_serving::ReadAdmissionController>,
+    ) -> Self {
+        if let Some(handler) = Arc::get_mut(&mut self.handler) {
+            handler.read_admission = admission;
         }
         self
     }

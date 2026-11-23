@@ -26,6 +26,52 @@ pub struct ShardReader {
     migration_pending: bool,
 }
 
+/// Shared RAM block+meta cache for stateless serving `ShardReader` replicas.
+#[derive(Clone)]
+pub struct SharedServingCache {
+    inner: Arc<dyn slatedb::db_cache::DbCache>,
+}
+
+impl SharedServingCache {
+    /// Create a new shared RAM cache with `ram_bytes` total capacity
+    /// (split 75% block cache / 25% meta cache).
+    pub fn new(id: &str, ram_bytes: u64) -> Self {
+        let block_cap = (ram_bytes * 3) / 4;
+        let meta_cap = ram_bytes.saturating_sub(block_cap);
+        Self {
+            inner: crate::slatedb_metrics::instrumented_db_cache_with_capacities(
+                id,
+                block_cap.max(1024 * 1024),
+                meta_cap.max(256 * 1024),
+            ),
+        }
+    }
+}
+
+/// Options for opening a stateless serving `ShardReader`.
+#[derive(Debug, Clone)]
+pub struct ServingReaderOptions {
+    pub manifest_poll_interval: std::time::Duration,
+    pub checkpoint_lifetime: std::time::Duration,
+    pub nvme_cache_dir: Option<std::path::PathBuf>,
+    pub nvme_cache_bytes: Option<usize>,
+    pub filter_bits_per_key: Option<u32>,
+    pub use_managed_checkpoint: bool,
+}
+
+impl Default for ServingReaderOptions {
+    fn default() -> Self {
+        Self {
+            manifest_poll_interval: std::time::Duration::from_millis(100),
+            checkpoint_lifetime: std::time::Duration::from_secs(60),
+            nvme_cache_dir: None,
+            nvme_cache_bytes: None,
+            filter_bits_per_key: Some(10),
+            use_managed_checkpoint: true,
+        }
+    }
+}
+
 impl ShardReader {
     /// Open a reader for a shard from the latest manifest.
     pub async fn open(
@@ -104,6 +150,54 @@ impl ShardReader {
             .with_merge_operator(Arc::new(crate::merge_registry::SumCountMergeOperator))
             .with_options(options);
         if let Some(bits) = filter_bits_per_key {
+            builder = builder.with_filter_policies(vec![
+                crate::keys::join_arrangement_bloom_filter_policy(bits),
+            ]);
+        }
+        let reader = builder.build().await?;
+        Self::from_reader(path, reader, SupportedStorageFormatRange::v1_through_v2()).await
+    }
+
+    /// Open a stateless serving reader with sub-second manifest polling,
+    /// shared RAM `SharedServingCache`, optional NVMe disk cache, optional
+    /// `ManagedCheckpoint` mode (for ADR 0006 compaction-horizon protection),
+    /// and optional Bloom filter policy.
+    pub async fn open_for_serving(
+        path: impl Into<String>,
+        object_store: Arc<dyn ObjectStore>,
+        serving_opts: ServingReaderOptions,
+        cache: Option<&SharedServingCache>,
+    ) -> Result<Self, StorageError> {
+        let path = path.into();
+        // SlateDB requires checkpoint_lifetime > manifest_poll_interval * 2.
+        let min_lifetime = serving_opts.manifest_poll_interval * 4;
+        let mut options = DbReaderOptions {
+            manifest_poll_interval: serving_opts.manifest_poll_interval,
+            checkpoint_lifetime: serving_opts.checkpoint_lifetime.max(min_lifetime),
+            ..DbReaderOptions::default()
+        };
+        if let Some(dir) = serving_opts.nvme_cache_dir {
+            options.object_store_cache_options.root_folder = Some(dir);
+            if let Some(max) = serving_opts.nvme_cache_bytes {
+                options.object_store_cache_options.max_cache_size_bytes = Some(max);
+            }
+            options.object_store_cache_options.part_size_bytes = 4 * 1024 * 1024;
+            options.object_store_cache_options.cache_on_flush = true;
+            options.object_store_cache_options.cache_on_compaction = true;
+            options.object_store_cache_options.scan_interval =
+                Some(std::time::Duration::from_secs(3600));
+            options.object_store_cache_options.max_open_file_handles = 1000;
+        }
+        let mut builder = DbReader::builder(path.clone(), object_store)
+            .with_merge_operator(Arc::new(crate::merge_registry::SumCountMergeOperator))
+            .with_options(options);
+        if serving_opts.use_managed_checkpoint {
+            builder = builder.with_reader_mode(DbReaderMode::ManagedCheckpoint);
+        }
+        if let Some(cache) = cache {
+            builder = builder.with_db_cache(Arc::clone(&cache.inner));
+        }
+        if let Some(bits) = serving_opts.filter_bits_per_key {
             builder = builder.with_filter_policies(vec![
                 crate::keys::join_arrangement_bloom_filter_policy(bits),
             ]);

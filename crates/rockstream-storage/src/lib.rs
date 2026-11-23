@@ -14,6 +14,7 @@
 
 pub mod arrangement_catalog;
 pub mod catalog;
+pub mod compactor;
 pub mod concurrency_governor;
 pub mod error;
 pub mod format_migration;

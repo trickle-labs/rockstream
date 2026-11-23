@@ -1,0 +1,67 @@
+# Lightweight values for k3d/kind + MinIO smoke test (Verification #4)
+image:
+  repository: rockstream
+  tag: "local"
+  pullPolicy: IfNotPresent
+
+minio:
+  enabled: true
+
+objectStore:
+  enabled: true
+  endpoint: "http://rockstream-minio:9000"
+  bucket: "rockstream"
+  region: "us-east-1"
+
+control:
+  replicas: 1
+  storageSize: 1Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+worker:
+  replicas: 2
+  storageSize: 1Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+gateway:
+  replicas: 1
+  autoscaling:
+    enabled: true
+    minReplicas: 1
+    maxReplicas: 5
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+compactor:
+  enabled: true
+  replicas: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+monitoring:
+  serviceMonitor:
+    enabled: false
+  grafanaDashboard:
+    enabled: true

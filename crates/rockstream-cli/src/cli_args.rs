@@ -14,6 +14,7 @@ pub enum Role {
     Gateway,
     Worker,
     Control,
+    Compactor,
 }
 
 /// Durable catalog layout used by offline security administration.
@@ -33,6 +34,7 @@ impl std::fmt::Display for Role {
                 Self::Gateway => "gateway",
                 Self::Worker => "worker",
                 Self::Control => "control",
+                Self::Compactor => "compactor",
             }
         )
     }
@@ -99,11 +101,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub storage_dir: Option<PathBuf>,
 
-    /// Principal presented to control-plane and catalog mutations.
+    /// Identity label used by legacy local CLI adapters; not the management API identity.
     #[arg(long, global = true, default_value = "rockstream")]
     pub identity_user: String,
 
-    /// RBAC role presented to control-plane and catalog mutations.
+    /// Legacy local role request; not an authenticated grant.
     #[arg(long, global = true, value_parser = ["viewer", "pipeline-owner", "admin"], default_value = "viewer")]
     pub identity_role: String,
 
@@ -229,7 +231,7 @@ pub enum Command {
         #[arg(long, value_enum, default_value_t = Role::All)]
         role: Role,
 
-        /// Control service URL (required for the worker and frontier roles).
+        /// Control service URL (required for the worker, frontier, and compactor roles).
         #[arg(long)]
         control: Option<String>,
 

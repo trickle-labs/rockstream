@@ -105,8 +105,9 @@ pub use logging::{
 };
 pub use platform::{ClassificationTier, PlatformClassification, PlatformClassifier};
 pub use qualification::{
-    QualificationAggregateMetrics, QualificationError, QualificationEvidenceManifest,
-    QualificationGateDecision, QualificationGateRejection, QualificationProfile,
+    MeasuredExecutionMetadata, QualificationAggregateMetrics, QualificationCostAccounting,
+    QualificationError, QualificationEvidenceManifest, QualificationGateDecision,
+    QualificationGateRejection, QualificationProfile, QualificationProvenance,
     QualificationReleaseGate, QualificationRun, QualificationRunStatus, QualificationWorkload,
     TopologySpec, WorkloadRunResult,
 };

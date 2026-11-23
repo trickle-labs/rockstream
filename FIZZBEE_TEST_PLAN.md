@@ -714,6 +714,34 @@ model; no new FizzBee transition or invariant is asserted.
 
 ### 3.6 Cross-Cutting Coverage Assertions
 
+PR #412 (issue #401) separates shared-object-store read serving and LSM
+compaction from stateful incremental-view-maintenance workers. Control-plane
+`DiscoverShards` exposes each current lease owner, token, object-store prefix,
+and the committed frontier to stateless gateways and dedicated compactors.
+The gateway opens managed-checkpoint SlateDB readers against discovered shard
+stores, refreshes the serving frontier from committed snapshots, and rejects
+queries that cannot satisfy an explicitly requested freshness epoch within a
+bounded wait. Admission limits bound queued and active reads, memory estimates,
+and estimated scanned rows independently of ingestion. In remote-compaction
+mode, workers avoid scheduling inline compaction; the compactor role discovers
+and compacts the same shard stores. Managed checkpoints and
+`CompactionHorizonGuard` are intended to retain SST state needed by serving
+readers, historical queries, backups, and replay dependencies.
+
+The corresponding implementation checks are
+`crates/rockstream-gateway/tests/stateless_serving_tests.rs` (bootstrap,
+frontier freshness, overload, and retention),
+`crates/rockstream-storage/tests/disaggregated_compaction_tests.rs`
+(compaction debt and horizon safeguards),
+`crates/rockstream-cli/tests/compactor_and_gateway_role_tests.rs` (role
+selection and standalone fallback), and
+`crates/rockstream-sim/tests/storage_pressure_admission_tests.rs` (pressure
+behavior). They complement the existing M4 lease fencing and M1/M3 committed
+epoch assumptions; none of M1–M7 currently models asynchronous manifest
+visibility, reader checkpoint renewal, compactor crashes, or SST garbage
+collection. The cited tests are implementation-level assertions, not a
+formal proof that arbitrary reader lag or object-store outages remain safe.
+
 Issue #321 applies M1-S1 to the local SQL path by placing base rows,
 compiled-view output, operator checkpoints, and the shard frontier in one
 write batch. A failed or interrupted commit must restore in-memory operator
@@ -1336,6 +1364,34 @@ paired process-level assertion is
 management workflow is outside the M1–M7 FizzBee state machines, but is
 documented here to keep the runtime protocol and verification inventory
 synchronized.
+
+PR #411 (issues #406 and #352) extends the management protocol to operate
+during active workloads without relaxing shard ownership. `MigrateShard` and
+`DrainWorker` use a bounded source-delta handoff barrier while the donor
+flushes/closes its shard, the lease transfers, the recipient reopens the shard
+and redeploys active workloads, and routing is atomically updated to the new
+owner and lease token. Recovery, rollback, and pre-transfer cancellation share
+the handoff path. This preserves M4's single-authority lease fencing and M6's
+cutover/verification obligations; the implementation-level routing barrier and
+workload redeployment add no new abstract M4/M6 FizzBee action or invariant.
+`online_migrate_shard_moves_active_workload_and_updates_routing_atomically`
+and `online_drain_worker_moves_active_workload_to_healthy_recipient` in
+`crates/rockstream-control/tests/online_migration_backup_streaming_tests.rs`
+exercise the concrete live-worker handoffs.
+
+`CreateBackup` now pins each active shard's durable checkpoint snapshot and
+optional workload-specific object prefix without stopping concurrent writes.
+Its export excludes control manifests newer than the selected checkpoint,
+streams large object inventories and object bytes with bounded buffers, and
+validates hashes before restore; durable GC pins protect selected checkpoints
+and compaction horizons until release. These snapshot, object-store, and
+GC-lifetime details remain outside the M1–M7 coordination abstractions.
+`online_backup_succeeds_with_active_workload_and_concurrent_writes`,
+`concurrent_newer_control_manifest_is_excluded_and_rejected_on_tamper`,
+`gc_pin_protects_active_backup_and_compaction_horizon_until_release`, and
+`large_inventory_and_large_object_streaming_export_and_restore` in the same
+integration suite check the implementation boundaries, rather than claiming
+additional FizzBee proof.
 
 Postgres CDC polling consumes one credit for every queued change in a complete
 transaction, including changes at or before the caller's offset that are

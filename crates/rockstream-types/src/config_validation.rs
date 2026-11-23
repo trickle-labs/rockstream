@@ -214,6 +214,7 @@ const KNOWN_GATEWAY_KEYS: &[&str] = &[
     "tls_cert_path",
     "tls_key_path",
     "tls_ca_cert_path",
+    "serving",
 ];
 
 const KNOWN_INTERNAL_TLS_KEYS: &[&str] = &[
@@ -224,7 +225,29 @@ const KNOWN_INTERNAL_TLS_KEYS: &[&str] = &[
     "reload_enabled",
 ];
 
-const KNOWN_STORAGE_KEYS: &[&str] = &["tiering"];
+const KNOWN_STORAGE_KEYS: &[&str] = &["tiering", "compaction"];
+
+const KNOWN_GATEWAY_SERVING_KEYS: &[&str] = &[
+    "manifest_poll_interval_ms",
+    "max_concurrent_reads",
+    "max_read_queue_depth",
+    "max_read_queue_wait_ms",
+    "max_read_memory_bytes",
+    "max_estimated_scan_rows",
+    "freshness_wait_timeout_ms",
+    "nvme_cache_dir",
+    "nvme_cache_bytes",
+    "ram_cache_bytes",
+];
+
+const KNOWN_STORAGE_COMPACTION_KEYS: &[&str] = &[
+    "mode",
+    "max_concurrent_compactions",
+    "poll_interval_ms",
+    "manifest_poll_interval_ms",
+    "max_sst_size_bytes",
+    "discovery_interval_ms",
+];
 
 const KNOWN_EXECUTION_KEYS: &[&str] = &["join_strategy"];
 
@@ -246,9 +269,16 @@ const KNOWN_GATEWAY_SECTION_KEYS: &[&str] = &[
     "query_timeout_secs",
     "tls",
     "webhook_listen_addr",
+    "serving",
 ];
 const KNOWN_GATEWAY_TLS_KEYS: &[&str] = &["cert_path", "key_path", "ca_cert_path"];
-const KNOWN_CONTROL_SECTION_KEYS: &[&str] = &["listen_addr", "url", "shared_storage", "raft"];
+const KNOWN_CONTROL_SECTION_KEYS: &[&str] = &[
+    "listen_addr",
+    "management_addr",
+    "url",
+    "shared_storage",
+    "raft",
+];
 const KNOWN_CONTROL_RAFT_KEYS: &[&str] = &["peers", "node_id", "bind", "bootstrap"];
 const KNOWN_WORKER_SECTION_KEYS: &[&str] = &[
     "worker_id",
@@ -264,7 +294,8 @@ const KNOWN_WORKER_SECTION_KEYS: &[&str] = &[
     "disk_cache_bytes",
     "capabilities",
 ];
-const KNOWN_STORAGE_SECTION_KEYS: &[&str] = &["url", "temp_dir", "spill_dir", "tiering"];
+const KNOWN_STORAGE_SECTION_KEYS: &[&str] =
+    &["url", "temp_dir", "spill_dir", "tiering", "compaction"];
 const KNOWN_METRICS_SECTION_KEYS: &[&str] = &["listen_addr", "enabled", "scrape_interval_secs"];
 const KNOWN_AUTH_SECTION_KEYS: &[&str] = &[
     "mode",
@@ -388,6 +419,13 @@ fn validate_keys_in_table(
                     toml_str,
                     diagnostics,
                 ),
+                "gateway.serving" => validate_keys_in_table(
+                    sub,
+                    "gateway.serving",
+                    KNOWN_GATEWAY_SERVING_KEYS,
+                    toml_str,
+                    diagnostics,
+                ),
                 "internal_tls" => validate_keys_in_table(
                     sub,
                     "internal_tls",
@@ -399,6 +437,13 @@ fn validate_keys_in_table(
                     sub,
                     "storage",
                     KNOWN_STORAGE_KEYS,
+                    toml_str,
+                    diagnostics,
+                ),
+                "storage.compaction" => validate_keys_in_table(
+                    sub,
+                    "storage.compaction",
+                    KNOWN_STORAGE_COMPACTION_KEYS,
                     toml_str,
                     diagnostics,
                 ),
@@ -500,6 +545,13 @@ fn validate_node_config_keys(
                     toml_str,
                     diagnostics,
                 ),
+                "gateway.serving" => validate_node_config_keys(
+                    sub,
+                    "gateway.serving",
+                    KNOWN_GATEWAY_SERVING_KEYS,
+                    toml_str,
+                    diagnostics,
+                ),
                 "control" => validate_node_config_keys(
                     sub,
                     "control",
@@ -525,6 +577,13 @@ fn validate_node_config_keys(
                     sub,
                     "storage",
                     KNOWN_STORAGE_SECTION_KEYS,
+                    toml_str,
+                    diagnostics,
+                ),
+                "storage.compaction" => validate_node_config_keys(
+                    sub,
+                    "storage.compaction",
+                    KNOWN_STORAGE_COMPACTION_KEYS,
                     toml_str,
                     diagnostics,
                 ),
@@ -999,14 +1058,22 @@ pub fn validate_node_config_semantic_bounds(
     }
 
     let role_norm = node_cfg.node.role.trim().to_lowercase();
-    let valid_roles = ["all", "control", "worker", "gateway", "metrics", "frontier"];
+    let valid_roles = [
+        "all",
+        "control",
+        "worker",
+        "gateway",
+        "metrics",
+        "frontier",
+        "compactor",
+    ];
     if !valid_roles.contains(&role_norm.as_str()) {
         diagnostics.push(ConfigDiagnostic {
             path: "node.role".to_string(),
             severity: ConfigDiagnosticSeverity::Error,
             code: "RS-0002".to_string(),
             message: format!(
-                "unknown role `{}`; supported: all, control, worker, gateway, metrics",
+                "unknown role `{}`; supported: all, control, worker, gateway, metrics, frontier, compactor",
                 node_cfg.node.role
             ),
             suggestion: Some("Set `role = \"all\"` or one of the supported roles".to_string()),
@@ -1015,7 +1082,9 @@ pub fn validate_node_config_semantic_bounds(
         });
     }
 
-    if (role_norm == "worker" || role_norm == "frontier") && node_cfg.control.url.is_none() {
+    if (role_norm == "worker" || role_norm == "frontier" || role_norm == "compactor")
+        && node_cfg.control.url.is_none()
+    {
         diagnostics.push(ConfigDiagnostic {
             path: "node.role".to_string(),
             severity: ConfigDiagnosticSeverity::Error,
