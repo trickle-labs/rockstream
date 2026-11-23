@@ -3262,7 +3262,7 @@ impl GatewayHandler {
         };
         let secret = self.resolve_sink_secret(sink, reference).await?;
         if secret.secret_type != rockstream_types::secret::SecretType::SaslPlain {
-            return Err("Kafka sink secret must use type sasl_plain".into());
+            return Err("[RS-2424] Kafka sink secret must use type sasl_plain".into());
         }
         let username = secret
             .payload
@@ -3293,7 +3293,7 @@ impl GatewayHandler {
         let (bound_name, active_version) = sink.secret_binding();
         let Some(bound_name) = bound_name.map(str::to_string) else {
             if entry.secret_name.is_some() {
-                return Err("Kafka sink secret binding is unavailable".into());
+                return Err("[RS-2425] Kafka sink secret binding is unavailable".into());
             }
             if entry.security_protocol.is_some() {
                 return Err(
@@ -3308,7 +3308,7 @@ impl GatewayHandler {
             .ok_or_else(|| "Kafka sink secret reference is unavailable".to_string())?;
         let secret_name = self.authorize_sink_secret_use(entry, reference).await?;
         if secret_name != bound_name {
-            return Err("Kafka sink secret binding changed".into());
+            return Err("[RS-2425] Kafka sink secret binding changed".into());
         }
         let namespace = entry
             .secret_namespace
@@ -3321,7 +3321,7 @@ impl GatewayHandler {
             .await
             .map_err(|error| error.to_string())?;
         if metadata.version < active_version {
-            return Err("Kafka sink secret version moved backwards".into());
+            return Err("[RS-2425] Kafka sink secret version moved backwards".into());
         }
         if metadata.version == active_version {
             return Ok(false);
@@ -3331,7 +3331,7 @@ impl GatewayHandler {
             .await?
             .ok_or_else(|| "Kafka sink secret credentials are unavailable".to_string())?;
         if credentials.2 < metadata.version {
-            return Err("Kafka sink secret changed during credential resolution".into());
+            return Err("[RS-2425] Kafka sink secret changed during credential resolution".into());
         }
         sink.rotate_sasl_plain_credentials(
             &credentials.1,
