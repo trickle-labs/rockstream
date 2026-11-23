@@ -7675,6 +7675,7 @@ impl GatewayHandler {
         {
             return Ok(denied);
         }
+        let authorization_check_at = tokio::time::Instant::now() + SECURITY_POLICY_REFRESH_INTERVAL;
 
         let catalog_columns = self
             .catalog
@@ -7817,20 +7818,100 @@ impl GatewayHandler {
         let schema = Arc::new(fields);
         let stream_schema = schema.clone();
         let registry = self.subscribe_registry.clone();
+        let authorization = (
+            self.self_ref.lock().clone(),
+            request.view_name.clone(),
+            conn_id.map(str::to_owned),
+            authorization_check_at,
+        );
         let data_stream = Box::pin(stream::unfold(
-            (registry, handle, pending, stream_schema, false, stream_slot),
-            |(registry, mut handle, mut pending, schema, failed, stream_slot)| async move {
+            (
+                registry,
+                handle,
+                pending,
+                stream_schema,
+                false,
+                stream_slot,
+                authorization,
+            ),
+            |(
+                registry,
+                mut handle,
+                mut pending,
+                schema,
+                failed,
+                stream_slot,
+                mut authorization,
+            )| async move {
                 if failed {
                     return None;
                 }
                 loop {
+                    if tokio::time::Instant::now() >= authorization.3 {
+                        authorization.3 =
+                            tokio::time::Instant::now() + SECURITY_POLICY_REFRESH_INTERVAL;
+                        let Some(handler) = authorization.0.upgrade() else {
+                            return None;
+                        };
+                        match handler
+                            .select_access_error_response(
+                                &authorization.1,
+                                authorization.2.as_deref(),
+                            )
+                            .await
+                        {
+                            Ok(None) => {}
+                            Ok(Some(denied)) => {
+                                let error = match denied.into_iter().next() {
+                                    Some(Response::Error(error)) => PgWireError::UserError(error),
+                                    _ => PgWireError::ApiError(Box::new(std::io::Error::other(
+                                        "subscription reauthorization returned no error response",
+                                    ))),
+                                };
+                                return Some((
+                                    Err(error),
+                                    (
+                                        registry,
+                                        handle,
+                                        pending,
+                                        schema,
+                                        true,
+                                        stream_slot,
+                                        authorization,
+                                    ),
+                                ));
+                            }
+                            Err(error) => {
+                                return Some((
+                                    Err(error),
+                                    (
+                                        registry,
+                                        handle,
+                                        pending,
+                                        schema,
+                                        true,
+                                        stream_slot,
+                                        authorization,
+                                    ),
+                                ));
+                            }
+                        }
+                    }
                     if let Some(row) = pending.pop_front() {
                         let mut encoder = DataRowEncoder::new(schema.clone());
                         for value in String::from_utf8_lossy(&row.encoded_row).split('\t') {
                             if let Err(error) = encoder.encode_field(&Some(value)) {
                                 return Some((
                                     Err(error),
-                                    (registry, handle, pending, schema, true, stream_slot),
+                                    (
+                                        registry,
+                                        handle,
+                                        pending,
+                                        schema,
+                                        true,
+                                        stream_slot,
+                                        authorization,
+                                    ),
                                 ));
                             }
                         }
@@ -7838,14 +7919,30 @@ impl GatewayHandler {
                         if let Err(error) = encoder.encode_field(&Some(timestamp.as_str())) {
                             return Some((
                                 Err(error),
-                                (registry, handle, pending, schema, true, stream_slot),
+                                (
+                                    registry,
+                                    handle,
+                                    pending,
+                                    schema,
+                                    true,
+                                    stream_slot,
+                                    authorization,
+                                ),
                             ));
                         }
                         let diff = row.mz_diff.to_string();
                         if let Err(error) = encoder.encode_field(&Some(diff.as_str())) {
                             return Some((
                                 Err(error),
-                                (registry, handle, pending, schema, true, stream_slot),
+                                (
+                                    registry,
+                                    handle,
+                                    pending,
+                                    schema,
+                                    true,
+                                    stream_slot,
+                                    authorization,
+                                ),
                             ));
                         }
                         let encoded = match encoder.finish() {
@@ -7853,13 +7950,29 @@ impl GatewayHandler {
                             Err(error) => {
                                 return Some((
                                     Err(error),
-                                    (registry, handle, pending, schema, true, stream_slot),
+                                    (
+                                        registry,
+                                        handle,
+                                        pending,
+                                        schema,
+                                        true,
+                                        stream_slot,
+                                        authorization,
+                                    ),
                                 ));
                             }
                         };
                         return Some((
                             Ok(encoded),
-                            (registry, handle, pending, schema, false, stream_slot),
+                            (
+                                registry,
+                                handle,
+                                pending,
+                                schema,
+                                false,
+                                stream_slot,
+                                authorization,
+                            ),
                         ));
                     }
                     match handle.poll(&registry) {
@@ -7868,7 +7981,15 @@ impl GatewayHandler {
                         Err(error) => {
                             return Some((
                                 Err(PgWireError::ApiError(Box::new(error))),
-                                (registry, handle, pending, schema, true, stream_slot),
+                                (
+                                    registry,
+                                    handle,
+                                    pending,
+                                    schema,
+                                    true,
+                                    stream_slot,
+                                    authorization,
+                                ),
                             ));
                         }
                     }
@@ -24992,7 +25113,7 @@ mod s4_tests {
         Arc::new(GatewayHandler::new(catalog, reader))
     }
 
-    async fn make_handler_with_admin() -> (Arc<GatewayHandler>, String) {
+    pub(super) async fn make_handler_with_admin() -> (Arc<GatewayHandler>, String) {
         use rockstream_storage::catalog::{
             CatalogMutation, CatalogNamespace, CatalogStore, CatalogTxn, DurableCatalogStore,
         };
@@ -26587,6 +26708,215 @@ mod source_batch_tests {
             ),
             ("10.25".to_string(), "5.50".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod v073_subscription_policy_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn live_subscriptions_reauthorize_and_keep_other_principals_streaming() {
+        use crate::catalog_stubs::CatalogView;
+        use crate::change_log::ChangeEntry;
+        use rockstream_storage::catalog::{CatalogMutation, CatalogStore, CatalogTxn};
+        use rockstream_types::authorization::{PermissionPreset, ScopedPresetGrant};
+        use rockstream_types::ids::PrincipalId;
+
+        async fn subscribe(
+            handler: &GatewayHandler,
+            conn_id: &str,
+        ) -> futures::stream::BoxStream<'static, PgWireResult<pgwire::messages::data::DataRow>>
+        {
+            match handler
+                .handle_subscribe(
+                    "SUBSCRIBE v072_live_auth AS OF NOW WITH SNAPSHOT",
+                    Some(conn_id),
+                )
+                .await
+                .unwrap()
+                .pop()
+            {
+                Some(Response::Query(response)) => response.data_rows(),
+                _ => panic!("authorized subscription must return a row stream"),
+            }
+        }
+
+        let (handler, admin_conn_id) = super::s4_tests::make_handler_with_admin().await;
+        handler.bind_server(&handler);
+        handler.catalog.add_view_in_namespace(CatalogView {
+            name: "v072_live_auth".to_string(),
+            sql: "SELECT value FROM source".to_string(),
+            columns: vec![CatalogColumn {
+                name: "value".to_string(),
+                data_type: "Utf8".to_string(),
+            }],
+            namespace: "public".to_string(),
+            op_id: None,
+        });
+        let durable = handler
+            .catalog
+            .get_durable_store()
+            .expect("durable security store");
+        let salt = vec![2; 16];
+        let (_, stored_key, server_key) =
+            crate::role_catalog::gen_scram_verifiers("reader-password", &salt, 4096);
+        let mut reader = SecurityPrincipal {
+            format_version: rockstream_types::authorization::SECURITY_PRINCIPAL_FORMAT_VERSION,
+            id: PrincipalId(2),
+            display_name: "Subscription reader".to_string(),
+            enabled: true,
+            revision: 1,
+            login_methods: vec![LoginMethod::ScramSha256 {
+                username: "subscription-reader".to_string(),
+                salt,
+                iterations: 4096,
+                stored_key: stored_key.to_vec(),
+                server_key: server_key.to_vec(),
+            }],
+            preset_grants: vec![ScopedPresetGrant {
+                preset: PermissionPreset::DataReader,
+                scope: PolicyScope::Namespace {
+                    namespace: "public".to_string(),
+                },
+            }],
+            scoped_grants: vec![],
+        };
+        let reader_policy =
+            serde_json::to_string(&(reader.enabled, &reader.preset_grants, &reader.scoped_grants))
+                .unwrap();
+        let grant_audit = SecurityAuditRecord {
+            format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: "subscription-reader-grant".to_string(),
+            timestamp_ms: current_time_ms(),
+            actor: AuditIdentity::Verified("principal:1".to_string()),
+            target: AuditField::Known("principal:2".to_string()),
+            scope: AuditField::Known("cluster".to_string()),
+            action: SecurityAuditClass::GrantChange,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::Known("3".to_string()),
+            policy_revision: AuditField::Known(1),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::Known(format!("revision=1;policy={reader_policy}")),
+        };
+        durable
+            .commit_txn(
+                CatalogTxn::new(
+                    3,
+                    3,
+                    vec![CatalogMutation::PutSecurityPrincipal {
+                        principal: reader.clone(),
+                        expected_revision: None,
+                        grantor_revision: Some((PrincipalId(1), 1)),
+                        audit: grant_audit,
+                    }],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let reader_conn_id = "subscription-reader-session";
+        handler
+            .sessions
+            .entry(reader_conn_id.to_string())
+            .or_default()
+            .principal = Principal::ScramUser {
+            username: "subscription-reader".to_string(),
+        };
+        let mut admin_rows = subscribe(&handler, &admin_conn_id).await;
+        let mut reader_rows = subscribe(&handler, reader_conn_id).await;
+
+        reader.enabled = false;
+        reader.revision = 2;
+        reader.preset_grants.clear();
+        let revoked_policy =
+            serde_json::to_string(&(reader.enabled, &reader.preset_grants, &reader.scoped_grants))
+                .unwrap();
+        let revoke_audit = SecurityAuditRecord {
+            format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: "subscription-reader-revoked".to_string(),
+            timestamp_ms: current_time_ms(),
+            actor: AuditIdentity::Verified("principal:1".to_string()),
+            target: AuditField::Known("principal:2".to_string()),
+            scope: AuditField::Known("cluster".to_string()),
+            action: SecurityAuditClass::GrantChange,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::Known("4".to_string()),
+            policy_revision: AuditField::Known(1),
+            before_state: AuditField::Known(format!("revision=1;policy={reader_policy}")),
+            after_state: AuditField::Known(format!("revision=2;policy={revoked_policy}")),
+        };
+        durable
+            .commit_txn(
+                CatalogTxn::new(
+                    4,
+                    4,
+                    vec![CatalogMutation::PutSecurityPrincipal {
+                        principal: reader,
+                        expected_revision: Some(1),
+                        grantor_revision: Some((PrincipalId(1), 1)),
+                        audit: revoke_audit,
+                    }],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        handler
+            .subscribe_registry
+            .push_epoch(
+                "v072_live_auth",
+                vec![ChangeEntry {
+                    epoch: 1,
+                    row_key: Bytes::from_static(b"1"),
+                    mz_diff: 1,
+                    encoded_row: Bytes::from_static(b"live"),
+                }],
+            )
+            .unwrap();
+        tokio::time::sleep(SECURITY_POLICY_REFRESH_INTERVAL + Duration::from_millis(100)).await;
+
+        let row = tokio::time::timeout(Duration::from_secs(2), admin_rows.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.field_count, 3);
+        assert_eq!(row.data.as_ref(), b"\0\0\0\x04live\0\0\0\x011\0\0\0\x011");
+
+        let error = tokio::time::timeout(Duration::from_secs(2), reader_rows.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        match error {
+            PgWireError::UserError(error) => {
+                assert_eq!(error.severity, "ERROR");
+                assert_eq!(error.code, "42501");
+                assert_eq!(
+                    error.message,
+                    "[RS-2401] auth.permission_denied: principal 'subscription-reader' is not authorized for action 'DataRead' on public.v072_live_auth. next_steps: Request an authorized scoped grant, then retry."
+                );
+            }
+            error => panic!("revoked subscription must return a user denial: {error:?}"),
+        }
+        assert!(reader_rows.next().await.is_none());
+        assert!(handler.sessions.contains_key(reader_conn_id));
+        assert!(durable
+            .list_security_audit_records()
+            .await
+            .unwrap()
+            .iter()
+            .any(|record| {
+                record.action == SecurityAuditClass::AuthorizationDenial
+                    && record.actor
+                        == AuditIdentity::Verified("scram:subscription-reader".to_string())
+                    && record.target == AuditField::Known("public.v072_live_auth".to_string())
+                    && record.correlation == AuditCorrelation::Observed(reader_conn_id.to_string())
+            }));
     }
 }
 
