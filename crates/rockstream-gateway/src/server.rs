@@ -25490,13 +25490,16 @@ mod v073_secret_policy_refresh_tests {
         writer
             .preprovision_first_administrator(administrator.clone(), 1)
             .await
-            .unwrap();
+            .unwrap_or_else(|error| panic!("failed to provision test administrator: {error}"));
 
         let stale_store = Arc::new(DurableCatalogStore::new(
             object_store,
             "secret-policy-refresh",
         ));
-        stale_store.refresh().await.unwrap();
+        stale_store
+            .refresh()
+            .await
+            .unwrap_or_else(|error| panic!("failed to refresh test catalog: {error}"));
         let mut revoked = administrator.clone();
         revoked.revision = 2;
         revoked.scoped_grants.clear();
@@ -25505,13 +25508,13 @@ mod v073_secret_policy_refresh_tests {
             &administrator.preset_grants,
             &administrator.scoped_grants,
         ))
-        .unwrap();
+        .unwrap_or_else(|error| panic!("failed to serialize test policy: {error}"));
         let after_policy = serde_json::to_string(&(
             revoked.enabled,
             &revoked.preset_grants,
             &revoked.scoped_grants,
         ))
-        .unwrap();
+        .unwrap_or_else(|error| panic!("failed to serialize revoked test policy: {error}"));
         writer
             .commit_txn(
                 CatalogTxn::new(
@@ -25543,12 +25546,15 @@ mod v073_secret_policy_refresh_tests {
                         },
                     }],
                 )
-                .unwrap(),
+                .unwrap_or_else(|error| panic!("invalid test catalog transaction: {error}")),
             )
             .await
-            .unwrap();
+            .unwrap_or_else(|error| panic!("failed to revoke test policy: {error}"));
         assert_eq!(
-            stale_store.list_security_principals().await.unwrap(),
+            stale_store
+                .list_security_principals()
+                .await
+                .unwrap_or_else(|error| panic!("failed to read stale test policy: {error}")),
             vec![administrator]
         );
 
@@ -25571,8 +25577,8 @@ mod v073_secret_policy_refresh_tests {
             handler
                 .authorize_source_secret_use(&source, "secret://kafka")
                 .await
-                .unwrap_err(),
-            "[RS-2401] source secret consumer is no longer authorized"
+                .map_err(|error| error.to_string()),
+            Err("[RS-2401] source secret consumer is no longer authorized".to_string())
         );
     }
 }
