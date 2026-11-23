@@ -12,7 +12,9 @@ policy fails closed. The gateway rechecks a source or sink consumer's current
 grant before resolving credentials. Older secret-bound sink entries without a
 persisted SASL protocol fail closed. The Docker-backed
 [`kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_consumers`](../crates/rockstream-cli/tests/oidc_release_process_tests.rs)
-release proof checks sink records across secret rotation and gateway restart.
+release proof checks source and sink records through live rotation and
+lost-response gateway recovery, with pending rows across two views and three
+partitions plus an unaffected consumer.
 
 The gateway pgoutput source checks the durable secret version before a source
 transaction and after its committed epoch. If it changes during the transaction,
@@ -20,11 +22,9 @@ the worker commits the complete result and slot checkpoint, then opens a new
 upstream connection with the authorized replacement while keeping the source
 worker alive. A Kafka source uses an explicit SASL transport and PLAIN credentials;
 at the next source epoch it replaces the consumer with the authorized credentials,
-seeking from the durable source checkpoint while keeping the worker alive. Kafka
-source rotation still needs release-process qualification across views and
-partitions. A Kafka sink checks its bound secret version before each committed
-view delivery and recreates its transactional producer at an epoch boundary
-when credentials rotate.
+seeking from the durable source checkpoint while keeping the worker alive. A Kafka
+sink checks its bound secret version before each committed view delivery and
+recreates its transactional producer at an epoch boundary when credentials rotate.
 
 RockStream supports exactly three external connector boundaries: PostgreSQL
 CDC, Kafka source, and Kafka sink. `object_store` is internal durable state,
