@@ -26845,7 +26845,7 @@ mod v073_subscription_policy_tests {
             outcome: SecurityAuditOutcome::Success,
             correlation: AuditCorrelation::Unknown,
             operation_id: AuditField::Known("4".to_string()),
-            policy_revision: AuditField::Known(1),
+            policy_revision: AuditField::Known(2),
             before_state: AuditField::Known(format!("revision=1;policy={reader_policy}")),
             after_state: AuditField::Known(format!("revision=2;policy={revoked_policy}")),
         };
