@@ -111,13 +111,16 @@ async fn backfill_publication_gate_blocks_partial_relation() {
 }
 
 #[tokio::test]
-async fn show_backfill_status_rejects_missing_name_with_rs2001() {
+async fn show_backfill_status_rejects_incomplete_for_clause_with_rs2001() {
     let (addr, _handle) = start_gateway(CatalogStubs::new()).await;
     let client = connect(&addr).await;
-    let error = client.query("SHOW BACKFILL STATUS", &[]).await.unwrap_err();
+    let error = client
+        .query("SHOW BACKFILL STATUS FOR", &[])
+        .await
+        .unwrap_err();
     assert_eq!(
         error.as_db_error().unwrap().message(),
-        "[RS-2001] sql.invalid_syntax: expected SHOW BACKFILL STATUS FOR MATERIALIZED VIEW <name>. Next steps: provide a materialized view name."
+        "[RS-2001] sql.invalid_syntax: expected SHOW BACKFILL STATUS or SHOW BACKFILL STATUS FOR MATERIALIZED VIEW <name>. Next steps: provide a materialized view name or omit the FOR clause to list all views."
     );
 }
 
