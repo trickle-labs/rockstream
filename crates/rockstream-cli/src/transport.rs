@@ -23,7 +23,8 @@ use rockstream_types::diagnostic::{
 };
 use rockstream_types::error_code::{
     RS_0003, RS_0004, RS_0005, RS_1001, RS_1004, RS_1005, RS_1006, RS_1007, RS_1008, RS_1014,
-    RS_2006, RS_2401, RS_2410, RS_2411, RS_3612, RS_3613, RS_3614, RS_3615, RS_3616, RS_4009,
+    RS_2006, RS_2400, RS_2401, RS_2410, RS_2411, RS_3612, RS_3613, RS_3614, RS_3615, RS_3616,
+    RS_4009,
 };
 use rockstream_types::mutation_policy::cli_mutation_policy;
 pub use rockstream_types::mutation_policy::CLI_MUTATION_POLICY;
@@ -4020,6 +4021,14 @@ impl RemoteStorageAdminClient {
         Self { identity }
     }
 
+    fn checkpoint_unavailable<T>(&self, operation: &str) -> Result<T, CliError> {
+        Err(CliError::new(
+            RS_2400,
+            format!("authenticated checkpoint {operation} is unavailable from the management API"),
+            "Do not use --identity-role as authorization; use an authenticated checkpoint endpoint when one is available.",
+        ))
+    }
+
     fn unavailable<T>(&self, operation: &str) -> Result<T, CliError> {
         let _ = &self.identity;
         Err(remote_query_unavailable(operation))
@@ -4032,7 +4041,7 @@ impl StorageAdminApi for RemoteStorageAdminClient {
         _storage_path: &Path,
         _destination: &str,
     ) -> Result<CheckpointExportOutcome, CliError> {
-        self.unavailable("checkpoint export")
+        self.checkpoint_unavailable("export")
     }
 
     fn restore_checkpoint(
@@ -4041,11 +4050,11 @@ impl StorageAdminApi for RemoteStorageAdminClient {
         _source: &str,
         _target: &str,
     ) -> Result<RestoreOutcome, CliError> {
-        self.unavailable("checkpoint restore")
+        self.checkpoint_unavailable("restore")
     }
 
     fn list_checkpoints(&self, _storage_path: &Path) -> Result<Vec<CheckpointSummary>, CliError> {
-        self.unavailable("checkpoint listing")
+        self.checkpoint_unavailable("listing")
     }
 
     fn show_checkpoint(
@@ -4053,7 +4062,7 @@ impl StorageAdminApi for RemoteStorageAdminClient {
         _storage_path: &Path,
         _checkpoint_id: u64,
     ) -> Result<CheckpointAlignmentInfo, CliError> {
-        self.unavailable("checkpoint inspection")
+        self.checkpoint_unavailable("inspection")
     }
 
     fn generate_support_bundle(

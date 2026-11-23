@@ -14,8 +14,7 @@ use rockstream_cli::transport::{
     RemoteTopologyClient, StorageClient,
 };
 use rockstream_cli::{
-    run_admin_backup_create, run_admin_backup_inspect, run_admin_backup_verify, run_admin_restore,
-    run_audit_query, run_audit_tail, run_checkpoint_export, run_checkpoint_list,
+    run_admin_backup_inspect, run_admin_backup_verify, run_checkpoint_export, run_checkpoint_list,
     run_checkpoint_restore, run_checkpoint_show, run_cluster_quotas, run_cluster_status,
     run_completions, run_config_print_effective, run_config_validate, run_debug_arrangement,
     run_demo, run_doctor, run_embedded_query, run_explain_view, run_format_migrate, run_init,
@@ -24,10 +23,10 @@ use rockstream_cli::{
     run_schema_evolution_history, run_schema_evolution_status, run_schema_list, run_schema_show,
     run_security_preprovision, run_security_recover_admin, run_source_drop, run_source_list,
     run_source_pause, run_source_resume, run_source_show, run_sql_compile,
-    run_start_with_dev_transport, run_support_bundle, run_view_list, run_view_pause,
-    run_view_query, run_view_resume, run_view_show, run_view_status, run_view_subscribe,
-    run_workload_alter, run_workload_create, run_workload_drop, run_workload_list,
-    run_workload_show, DemoOptions, DoctorOptions, InitOptions, StartOptions,
+    run_start_with_dev_transport, run_view_list, run_view_pause, run_view_query, run_view_resume,
+    run_view_show, run_view_status, run_view_subscribe, run_workload_alter, run_workload_create,
+    run_workload_drop, run_workload_list, run_workload_show, DemoOptions, DoctorOptions,
+    InitOptions, StartOptions,
 };
 use rockstream_types::acl::Role as AclRole;
 use rockstream_types::config_resolver::CliConfigOverrides;
@@ -47,6 +46,17 @@ fn management_idempotency_key(idempotency_key: Option<uuid::Uuid>) -> uuid::Uuid
     let key = idempotency_key.unwrap_or_else(uuid::Uuid::new_v4);
     eprintln!("Idempotency-Key: {key}");
     key
+}
+
+fn authenticated_cli_endpoint_unavailable(
+    operation: &str,
+    next_steps: &str,
+) -> rockstream_cli::CliError {
+    rockstream_cli::CliError::new(
+        rockstream_types::error_code::RS_2400,
+        format!("{operation} is unavailable without an authenticated endpoint"),
+        next_steps,
+    )
 }
 
 fn main() -> ExitCode {
@@ -173,37 +183,30 @@ fn main() -> ExitCode {
                         )
                     });
                 }
-                let storage = StorageClient::with_identity(identity.clone());
                 let res = match command {
-                    BackupCommand::Create { destination, .. } => {
-                        let storage_path = cli
-                            .storage_dir
-                            .as_deref()
-                            .unwrap_or_else(|| std::path::Path::new("."));
-                        run_admin_backup_create(format, &storage, storage_path, destination)
-                    }
+                    BackupCommand::Create { .. } => Err(authenticated_cli_endpoint_unavailable(
+                        "local backup creation",
+                        "Configure an authenticated --management endpoint; do not use --identity-role as authorization.",
+                    )),
                     BackupCommand::Inspect { destination } => {
+                        let storage = StorageClient::with_identity(identity.clone());
                         run_admin_backup_inspect(format, &storage, destination)
                     }
                     BackupCommand::Verify { destination } => {
+                        let storage = StorageClient::with_identity(identity.clone());
                         run_admin_backup_verify(format, &storage, destination)
                     }
                 };
                 handle_result(res, format)
             }
             AdminCommand::Restore {
-                ref source,
-                ref target,
-                yes,
+                ..
             } => {
-                let storage = StorageClient::with_identity(identity.clone());
-                let target_path = target
-                    .as_ref()
-                    .map(PathBuf::from)
-                    .or_else(|| cli.storage_dir.clone())
-                    .unwrap_or_else(|| PathBuf::from("."));
                 handle_result(
-                    run_admin_restore(format, &storage, source, &target_path, *yes),
+                    Err(authenticated_cli_endpoint_unavailable(
+                        "backup restore",
+                        "The CLI has no authenticated backup-restore endpoint; do not use --identity-role as authorization.",
+                    )),
                     format,
                 )
             }
@@ -594,7 +597,7 @@ fn main() -> ExitCode {
             }),
         },
         Command::Checkpoint { command } => {
-            let storage = StorageClient::with_identity(identity.clone());
+            let storage = RemoteStorageAdminClient::with_identity(identity.clone());
             let storage_path = cli
                 .storage_dir
                 .unwrap_or_else(|| std::path::PathBuf::from("."));
@@ -631,44 +634,13 @@ fn main() -> ExitCode {
                     })
                 }
             },
-            SupportCommand::Bundle { view, since, out } => {
-                let storage = StorageClient::with_identity(identity.clone());
-                let storage_path = cli
-                    .storage_dir
-                    .unwrap_or_else(|| std::path::PathBuf::from("."));
-                handle_result(
-                    run_support_bundle(
-                        format,
-                        &storage,
-                        &storage_path,
-                        view.as_deref(),
-                        since.as_deref(),
-                        out.as_deref(),
-                    ),
-                    format,
-                )
-            }
-            SupportCommand::Diagnose {
-                code,
-                correlation_id,
-                out,
-            } => {
-                let storage = StorageClient::with_identity(identity.clone());
-                let storage_path = cli
-                    .storage_dir
-                    .unwrap_or_else(|| std::path::PathBuf::from("."));
-                handle_result(
-                    rockstream_cli::run_support_diagnose(
-                        format,
-                        &storage,
-                        &storage_path,
-                        code.as_deref(),
-                        correlation_id.as_deref(),
-                        out.as_deref(),
-                    ),
-                    format,
-                )
-            }
+            SupportCommand::Bundle { .. } | SupportCommand::Diagnose { .. } => handle_result(
+                Err(authenticated_cli_endpoint_unavailable(
+                    "local support bundle and diagnosis",
+                    "Use support artifact create/download through an authenticated management connection; do not use --identity-role as authorization.",
+                )),
+                format,
+            ),
         },
         Command::Resource { command } => {
             let identity = identity.clone();
@@ -690,19 +662,13 @@ fn main() -> ExitCode {
             };
             handle_result(res, format)
         }
-        Command::Audit { command } => {
-            let storage = StorageClient::with_identity(identity.clone());
-            let storage_path = cli
-                .storage_dir
-                .unwrap_or_else(|| std::path::PathBuf::from("."));
-            let res = match command {
-                AuditCommand::Tail { max } => run_audit_tail(format, &storage, &storage_path, max),
-                AuditCommand::Query { filter, max } => {
-                    run_audit_query(format, &storage, &storage_path, filter.as_deref(), max)
-                }
-            };
-            handle_result(res, format)
-        }
+        Command::Audit { .. } => handle_result(
+            Err(authenticated_cli_endpoint_unavailable(
+                "local audit history",
+                "Use an authenticated pgwire client with SHOW SECURITY AUDIT; local audit output is not scoped to a durable principal.",
+            )),
+            format,
+        ),
         Command::Security { command } => match command {
             SecurityCommand::PreprovisionAdministrator {
                 layout,
