@@ -461,6 +461,34 @@ pub enum ControlMessage {
         /// This node's current Raft term (`0` if Raft is not attached).
         term: u64,
     },
+    /// Response to [`WorkerMessage::DiscoverShards`]: active shard object-store
+    /// locations and published frontiers for stateless gateways and compactors.
+    ServingTopology {
+        /// Active shards with their object-store prefix and published frontier.
+        shards: Vec<ShardServingInfo>,
+        /// Minimum published cluster frontier across active shards, if known.
+        #[serde(default)]
+        cluster_frontier: Option<u64>,
+    },
+}
+
+/// Metadata describing an active shard's shared object-store location and
+/// published frontier for stateless read-serving gateways and compactors.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardServingInfo {
+    /// Shard identifier.
+    pub shard_id: ShardId,
+    /// Object-store key prefix for this shard (e.g., `"shards/0"`).
+    pub remote_prefix: String,
+    /// SlateDB database path inside the shard prefix (e.g., `"db"`).
+    pub db_path: String,
+    /// Worker currently holding the shard write lease.
+    pub worker_id: WorkerId,
+    /// Current monotonic lease token for the shard.
+    pub lease_token: crate::ids::LeaseToken,
+    /// Latest committed frontier epoch reported for this shard, if known.
+    #[serde(default)]
+    pub published_frontier: Option<u64>,
 }
 
 /// Wire-serializable mirror of `rockstream_control::raft::RaftRole`
@@ -1017,6 +1045,9 @@ pub enum WorkerMessage {
         workload_id: crate::ids::WorkloadId,
         secret_name: String,
     },
+    /// Discover active shards, their shared object-store prefixes, and
+    /// published frontiers (used by stateless gateways and dedicated compactors).
+    DiscoverShards,
 }
 
 #[cfg(test)]

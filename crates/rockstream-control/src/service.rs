@@ -5794,6 +5794,29 @@ async fn handle_connection_stream<R, W>(
                 };
                 send_message(&sender, &reply).await;
             }
+            WorkerMessage::DiscoverShards => {
+                let cluster_frontier = frontier.as_ref().and_then(|f| f.cluster_frontier().epoch);
+                let shards = shard_manager
+                    .leases()
+                    .into_iter()
+                    .map(|lease| rockstream_types::topology::ShardServingInfo {
+                        shard_id: lease.shard_id,
+                        remote_prefix: format!("shards/{}", lease.shard_id.0),
+                        db_path: "db".to_owned(),
+                        worker_id: lease.worker_id,
+                        lease_token: lease.lease_token,
+                        published_frontier: cluster_frontier,
+                    })
+                    .collect();
+                send_message(
+                    &sender,
+                    &ControlMessage::ServingTopology {
+                        shards,
+                        cluster_frontier,
+                    },
+                )
+                .await;
+            }
             WorkerMessage::Heartbeat {
                 worker_id,
                 capacity_headroom,

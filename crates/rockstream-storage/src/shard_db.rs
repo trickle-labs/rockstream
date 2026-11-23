@@ -203,6 +203,7 @@ pub struct ShardDbBuilder {
     cleanup_on_drop: bool,
     filter_bits_per_key: Option<u32>,
     filter_policies: Option<Vec<Arc<dyn slatedb::filter_policy::FilterPolicy>>>,
+    inline_compaction: bool,
 }
 
 /// Specification for a partial aggregation query.
@@ -233,7 +234,17 @@ impl ShardDbBuilder {
             cleanup_on_drop: false,
             filter_bits_per_key: None,
             filter_policies: None,
+            inline_compaction: true,
         }
+    }
+
+    /// Enable or disable inline SlateDB LSM compaction inside this writer process.
+    ///
+    /// Defaults to `true` (zero-config for `--role all` and small clusters).
+    /// Set to `false` when offloading compaction to `--role compactor`.
+    pub fn with_inline_compaction(mut self, enabled: bool) -> Self {
+        self.inline_compaction = enabled;
+        self
     }
 
     /// Set custom database settings.
@@ -449,6 +460,9 @@ impl ShardDbBuilder {
                 self.object_store.clone(),
                 Arc::clone(&physical_writes),
             ));
+        if !self.inline_compaction {
+            self.settings.compactor_options = None;
+        }
         let mut builder = Db::builder(self.path.as_str(), metered_store)
             .with_settings(self.settings)
             .with_merge_operator(Arc::new(SumCountMergeOperator))
@@ -1334,6 +1348,16 @@ impl ShardDb {
             ));
         }
         self.db.flush().await?;
+        Ok(())
+    }
+
+    /// Flush the active memtable to an L0 SSTable in durable object storage.
+    pub async fn flush_memtable(&self) -> Result<(), StorageError> {
+        self.db
+            .flush_with_options(slatedb::config::FlushOptions {
+                flush_type: slatedb::config::FlushType::MemTable,
+            })
+            .await?;
         Ok(())
     }
 

@@ -3936,7 +3936,7 @@
           {
             "name": "control",
             "long": "control",
-            "help": "Control service URL (required for the worker and frontier roles)",
+            "help": "Control service URL (required for the worker, frontier, and compactor roles)",
             "required": false,
             "value_name": "CONTROL"
           },
@@ -4093,7 +4093,8 @@
               "all",
               "gateway",
               "worker",
-              "control"
+              "control",
+              "compactor"
             ]
           },
           {
