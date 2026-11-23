@@ -10273,36 +10273,7 @@ impl GatewayHandler {
         let batches: Vec<RecordBatch> = if let Some(mut rows) =
             stateless_rows.filter(|r| !r.is_empty() || distributed_data_plane.is_none())
         {
-            if !order_by.is_empty() {
-                let col_idx: std::collections::HashMap<String, usize> = schema_fields
-                    .iter()
-                    .enumerate()
-                    .map(|(i, f)| (f.name().to_lowercase(), i))
-                    .collect();
-                rows.sort_by(|a, b| {
-                    let a_fields: Vec<&str> =
-                        std::str::from_utf8(a).unwrap_or("").split('\t').collect();
-                    let b_fields: Vec<&str> =
-                        std::str::from_utf8(b).unwrap_or("").split('\t').collect();
-                    for (col, desc) in &order_by {
-                        let Some(&idx) = col_idx.get(col.as_str()) else {
-                            continue;
-                        };
-                        let av = a_fields.get(idx).copied().unwrap_or("");
-                        let bv = b_fields.get(idx).copied().unwrap_or("");
-                        let ord = if let (Ok(an), Ok(bn)) = (av.parse::<i64>(), bv.parse::<i64>()) {
-                            an.cmp(&bn)
-                        } else {
-                            av.cmp(bv)
-                        };
-                        let ord = if *desc { ord.reverse() } else { ord };
-                        if ord != std::cmp::Ordering::Equal {
-                            return ord;
-                        }
-                    }
-                    std::cmp::Ordering::Equal
-                });
-            }
+            sort_rows_by_order(&mut rows, &schema_fields, &order_by);
             if let Some(n) = limit {
                 rows.truncate(n);
             }
@@ -10360,65 +10331,7 @@ impl GatewayHandler {
             }
             let mut rows = merge_workload_snapshot(&snapshot)
                 .map_err(|error| PgWireError::ApiError(Box::new(error)))?;
-            if !order_by.is_empty() {
-                let col_idx: std::collections::HashMap<String, usize> = schema_fields
-                    .iter()
-                    .enumerate()
-                    .map(|(i, f)| (f.name().to_lowercase(), i))
-                    .collect();
-                rows.sort_by(|a, b| {
-                    let a_fields: Vec<&str> =
-                        std::str::from_utf8(a).unwrap_or("").split('\t').collect();
-                    let b_fields: Vec<&str> =
-                        std::str::from_utf8(b).unwrap_or("").split('\t').collect();
-                    for (col, desc, nulls_first) in &order_by {
-                        let Some(&idx) = col_idx.get(col.as_str()) else {
-                            continue;
-                        };
-                        let av = a_fields.get(idx).copied().unwrap_or(r"\N");
-                        let bv = b_fields.get(idx).copied().unwrap_or(r"\N");
-                        let ord = match (av == r"\N", bv == r"\N") {
-                            (true, true) => std::cmp::Ordering::Equal,
-                            (true, false) => {
-                                if *nulls_first {
-                                    std::cmp::Ordering::Less
-                                } else {
-                                    std::cmp::Ordering::Greater
-                                }
-                            }
-                            (false, true) => {
-                                if *nulls_first {
-                                    std::cmp::Ordering::Greater
-                                } else {
-                                    std::cmp::Ordering::Less
-                                }
-                            }
-                            (false, false) => {
-                                let base = if let (Ok(an), Ok(bn)) =
-                                    (av.parse::<i64>(), bv.parse::<i64>())
-                                {
-                                    an.cmp(&bn)
-                                } else if let (Ok(af), Ok(bf)) =
-                                    (av.parse::<f64>(), bv.parse::<f64>())
-                                {
-                                    af.partial_cmp(&bf).unwrap_or(std::cmp::Ordering::Equal)
-                                } else {
-                                    av.cmp(bv)
-                                };
-                                if *desc {
-                                    base.reverse()
-                                } else {
-                                    base
-                                }
-                            }
-                        };
-                        if ord != std::cmp::Ordering::Equal {
-                            return ord;
-                        }
-                    }
-                    a.cmp(b)
-                });
-            }
+            sort_rows_by_order(&mut rows, &schema_fields, &order_by);
             if let Some(n) = limit {
                 rows.truncate(n);
             }
@@ -10439,70 +10352,7 @@ impl GatewayHandler {
                     .await
                     .map_err(|error| PgWireError::ApiError(Box::new(error)))?
             };
-            // Apply ORDER BY if specified
-            if !order_by.is_empty() {
-                // Build column-name → index map from schema_fields
-                let col_idx: std::collections::HashMap<String, usize> = schema_fields
-                    .iter()
-                    .enumerate()
-                    .map(|(i, f)| (f.name().to_lowercase(), i))
-                    .collect();
-                rows.sort_by(|a, b| {
-                    let a_fields: Vec<&str> =
-                        std::str::from_utf8(a).unwrap_or("").split('\t').collect();
-                    let b_fields: Vec<&str> =
-                        std::str::from_utf8(b).unwrap_or("").split('\t').collect();
-                    for (col, desc, nulls_first) in &order_by {
-                        let idx = match col_idx.get(col.as_str()) {
-                            Some(&i) => i,
-                            None => continue,
-                        };
-                        let av = a_fields.get(idx).copied().unwrap_or(r"\N");
-                        let bv = b_fields.get(idx).copied().unwrap_or(r"\N");
-                        let a_null = av == r"\N";
-                        let b_null = bv == r"\N";
-                        let ord = match (a_null, b_null) {
-                            (true, true) => std::cmp::Ordering::Equal,
-                            (true, false) => {
-                                if *nulls_first {
-                                    std::cmp::Ordering::Less
-                                } else {
-                                    std::cmp::Ordering::Greater
-                                }
-                            }
-                            (false, true) => {
-                                if *nulls_first {
-                                    std::cmp::Ordering::Greater
-                                } else {
-                                    std::cmp::Ordering::Less
-                                }
-                            }
-                            (false, false) => {
-                                let base = if let (Ok(an), Ok(bn)) =
-                                    (av.parse::<i64>(), bv.parse::<i64>())
-                                {
-                                    an.cmp(&bn)
-                                } else if let (Ok(af), Ok(bf)) =
-                                    (av.parse::<f64>(), bv.parse::<f64>())
-                                {
-                                    af.partial_cmp(&bf).unwrap_or(std::cmp::Ordering::Equal)
-                                } else {
-                                    av.cmp(bv)
-                                };
-                                if *desc {
-                                    base.reverse()
-                                } else {
-                                    base
-                                }
-                            }
-                        };
-                        if ord != std::cmp::Ordering::Equal {
-                            return ord;
-                        }
-                    }
-                    a.cmp(b)
-                });
-            }
+            sort_rows_by_order(&mut rows, &schema_fields, &order_by);
             if let Some(n) = limit {
                 rows.truncate(n);
             }
@@ -19929,6 +19779,67 @@ fn query_time_relation_schema(catalog: &CatalogStubs, relation_name: &str) -> Sc
     )]))
 }
 
+fn sort_rows_by_order(
+    rows: &mut [Vec<u8>],
+    schema_fields: &[FieldInfo],
+    order_by: &[(String, bool, bool)],
+) {
+    if order_by.is_empty() {
+        return;
+    }
+    let col_idx: std::collections::HashMap<String, usize> = schema_fields
+        .iter()
+        .enumerate()
+        .map(|(i, field)| (field.name().to_lowercase(), i))
+        .collect();
+    rows.sort_by(|a, b| {
+        let a_fields: Vec<&str> = std::str::from_utf8(a).unwrap_or("").split('\t').collect();
+        let b_fields: Vec<&str> = std::str::from_utf8(b).unwrap_or("").split('\t').collect();
+        for (col, desc, nulls_first) in order_by {
+            let Some(&idx) = col_idx.get(col.as_str()) else {
+                continue;
+            };
+            let av = a_fields.get(idx).copied().unwrap_or(r"\N");
+            let bv = b_fields.get(idx).copied().unwrap_or(r"\N");
+            let ord = match (av == r"\N", bv == r"\N") {
+                (true, true) => std::cmp::Ordering::Equal,
+                (true, false) => {
+                    if *nulls_first {
+                        std::cmp::Ordering::Less
+                    } else {
+                        std::cmp::Ordering::Greater
+                    }
+                }
+                (false, true) => {
+                    if *nulls_first {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        std::cmp::Ordering::Less
+                    }
+                }
+                (false, false) => {
+                    let base = if let (Ok(an), Ok(bn)) = (av.parse::<i64>(), bv.parse::<i64>()) {
+                        an.cmp(&bn)
+                    } else if let (Ok(af), Ok(bf)) = (av.parse::<f64>(), bv.parse::<f64>()) {
+                        af.partial_cmp(&bf).unwrap_or(std::cmp::Ordering::Equal)
+                    } else {
+                        av.cmp(bv)
+                    };
+                    if *desc {
+                        base.reverse()
+                    } else {
+                        base
+                    }
+                }
+            };
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        a.cmp(b)
+    });
+}
+
 fn stored_rows_to_batches(
     catalog: &CatalogStubs,
     relation_name: &str,
@@ -25021,6 +24932,39 @@ mod s4_tests {
             )
             .unwrap(),
             "SELECT 'ø $20' AS \"id$30\", /* $40 */\r\n 'x$1'::VARCHAR(4) AS v -- $50",
+        );
+    }
+
+    #[test]
+    fn stored_row_sort_honors_null_order_and_numeric_values() {
+        let schema = vec![
+            FieldInfo::new("id".to_string(), None, None, Type::INT8, FieldFormat::Text),
+            FieldInfo::new(
+                "score".to_string(),
+                None,
+                None,
+                Type::INT8,
+                FieldFormat::Text,
+            ),
+        ];
+        let order_by = [("score".to_string(), false, true)];
+        let mut rows = vec![
+            b"1\t\\N".to_vec(),
+            b"2\t10".to_vec(),
+            b"3\t2".to_vec(),
+            b"4\t2".to_vec(),
+        ];
+
+        sort_rows_by_order(&mut rows, &schema, &order_by);
+
+        assert_eq!(
+            rows,
+            vec![
+                b"1\t\\N".to_vec(),
+                b"3\t2".to_vec(),
+                b"4\t2".to_vec(),
+                b"2\t10".to_vec(),
+            ]
         );
     }
 
