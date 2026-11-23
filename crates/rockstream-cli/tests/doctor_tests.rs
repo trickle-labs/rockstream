@@ -251,16 +251,15 @@ async fn test_check_docker_daemon() {
 #[test]
 fn test_doctor_secret_redaction() {
     let raw = "Connect with s3://user:secret=super_secret_token123&password=my_secret_password@bucket/prefix";
-    let redacted = redact_secrets(raw);
-    assert!(!redacted.contains("super_secret_token123"));
-    assert!(!redacted.contains("my_secret_password"));
-    assert!(redacted.contains("[REDACTED]"));
+    assert_eq!(
+        redact_secrets(raw),
+        "Connect with s3://user:secret=[REDACTED]&password=[REDACTED]"
+    );
+    assert_eq!(redact_secrets("token=dXNlcjpwYXNz"), "token=[REDACTED]");
 
     let cert_key =
         "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA0...\n-----END RSA PRIVATE KEY-----";
-    let key_redacted = redact_secrets(cert_key);
-    assert!(!key_redacted.contains("MIIEowIBAAKCAQEA0"));
-    assert!(key_redacted.contains("[REDACTED_PRIVATE_KEY_MATERIAL]"));
+    assert_eq!(redact_secrets(cert_key), "[REDACTED_PRIVATE_KEY_MATERIAL]");
 }
 
 #[tokio::test]
