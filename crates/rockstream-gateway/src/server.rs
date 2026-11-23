@@ -7850,9 +7850,7 @@ impl GatewayHandler {
                     if tokio::time::Instant::now() >= authorization.3 {
                         authorization.3 =
                             tokio::time::Instant::now() + SECURITY_POLICY_REFRESH_INTERVAL;
-                        let Some(handler) = authorization.0.upgrade() else {
-                            return None;
-                        };
+                        let handler = authorization.0.upgrade()?;
                         match handler
                             .select_access_error_response(
                                 &authorization.1,
@@ -26759,7 +26757,7 @@ mod v073_subscription_policy_tests {
         let durable = handler
             .catalog
             .get_durable_store()
-            .expect("durable security store");
+            .unwrap_or_else(|| panic!("durable security store"));
         let salt = vec![2; 16];
         let (_, stored_key, server_key) =
             crate::role_catalog::gen_scram_verifiers("reader-password", &salt, 4096);
