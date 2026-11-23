@@ -10,6 +10,8 @@ not establish a durable principal or grant. The binary now fails closed with
 local command path from the v0.56.1 drill as a current recovery procedure.
 An authenticated management operation is required before this runbook can be used for v0.73.
 
+Backup creation requires `--management` so the request reaches the authenticated management API. Local `admin backup create` and `admin restore` fail closed because caller-selected `--identity-role` does not establish authority and no authenticated restore endpoint is exposed. Local backup inspect and verify only check files selected by the operator; they do not restore application state.
+
 ## Historical v0.56.1 drill
 
 The measured local-filesystem drill exported checkpoint 56 and restored it with

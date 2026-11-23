@@ -180,7 +180,7 @@ Inspect shard lease ownership and key ranges, and trigger shard migrations.
 
 For management drain, migration, and backup operations, RockStream prints `Idempotency-Key: <key>` to stderr before submitting the request. The key is also the operation ID, so after a lost response, retry with the same `--idempotency-key <key>` or inspect it with `rockstream admin operation show <key>`.
 
-Management mutations accept `--idempotency-key <UUID>`. For backup creation, set `--management` to select the management service. If the key is omitted, the CLI prints a generated key to stderr before submitting the request. If the response is lost, repeat the same command with that key, then reconcile with `rockstream admin operation show <UUID>`; the key is also the operation ID.
+Management mutations accept `--idempotency-key <UUID>`. Backup creation requires `--management`; without it the local CLI path fails closed with `RS-2400`. Backup inspect and verify remain local file checks. `admin restore` is unavailable until an authenticated restore endpoint exists. If a backup-creation response is lost, repeat the command with the same key, then reconcile with `rockstream admin operation show <UUID>`; the key is also the operation ID.
 
 ---
 
@@ -204,15 +204,13 @@ runbook records the current limitation.
 
 ### `rockstream support`
 
-Generate on-demand diagnostic support bundles. Local bundles contain sanitized
-operational metadata only: diagnostic context values and the selected view name
-are omitted, and each bundle is limited to 10 MiB. The authenticated management
-API also creates actor- and scope-bound artifacts with opaque IDs.
-Generation outcomes are durably recorded in the local `audit.jsonl`; an audit
-failure returns an error, though a bundle written just before that failure can
-remain at the requested local path.
+The legacy local `support bundle` and `support diagnose` commands fail closed
+with `RS-2400` because their caller-asserted identity cannot authorize support
+data access. Generate and download actor- and scope-bound artifacts through the
+authenticated management API instead.
 
-- `rockstream support bundle [--view <name>] [--since <duration>] [--out <path>]` — Write a sanitized diagnostic bundle to a local path, subject to the 10 MiB limit.
+- `rockstream support bundle [--view <name>] [--since <duration>] [--out <path>]` — Unavailable without authenticated support authorization.
+- `rockstream support diagnose (--code <RS-XXXX> | --correlation-id <uuid>) [--out <path>]` — Unavailable without authenticated diagnostic authorization.
 - `rockstream --management <addr> support artifact create [--node-id <id>] [--idempotency-key <uuid>]` — Create a sanitized cluster- or node-scoped artifact through the authenticated management API. The client prints its idempotency UUID before sending the request; reuse that UUID to retry or reconcile.
 - `rockstream --management <addr> support artifact download <opaque-id> --out <path>` — Download the artifact to a local file while it remains available.
 
@@ -238,10 +236,12 @@ Inspect online schema evolution versions and history.
 
 ### `rockstream audit`
 
-Inspect security and lifecycle audit log events.
+Local `audit tail` and `audit query` fail closed with `RS-2400`; their JSONL
+reader is not scoped to a durable principal. For authorized retained security
+history, use an authenticated pgwire client with `SHOW SECURITY AUDIT`.
 
-- `rockstream audit tail [--max=<n>]` — Tail recent audit log events (bounded by default, maximum 1000).
-- `rockstream audit query [--filter=<pattern>] [--max=<n>]` — Query audit log events matching a filter substring.
+- `rockstream audit tail [--max=<n>]` — Unavailable for local audit logs.
+- `rockstream audit query [--filter=<pattern>] [--max=<n>]` — Unavailable for local audit logs.
 
 ---
 

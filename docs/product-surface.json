@@ -14,11 +14,11 @@
         "subcommands": [
           {
             "name": "backup",
-            "about": "Point-in-time durable backup operations (create, inspect, verify)",
+            "about": "Create backups through authenticated management; inspect or verify local backup files",
             "subcommands": [
               {
                 "name": "create",
-                "about": "Create a full point-in-time backup",
+                "about": "Create a full point-in-time backup through authenticated management",
                 "options": [
                   {
                     "name": "destination",
@@ -654,7 +654,7 @@
           },
           {
             "name": "restore",
-            "about": "Restore a database backup into a clean or authorized destination",
+            "about": "Unavailable until the CLI exposes an authenticated backup-restore endpoint",
             "options": [
               {
                 "name": "source",
@@ -736,11 +736,11 @@
       },
       {
         "name": "audit",
-        "about": "Audit log inspection commands",
+        "about": "Local audit-history commands are unavailable; use authenticated `SHOW SECURITY AUDIT`",
         "subcommands": [
           {
             "name": "query",
-            "about": "Query audit log events matching a filter",
+            "about": "Unavailable for local logs; use authenticated `SHOW SECURITY AUDIT`",
             "options": [
               {
                 "name": "filter",
@@ -785,7 +785,7 @@
           },
           {
             "name": "tail",
-            "about": "Tail recent audit log events",
+            "about": "Unavailable for local logs; use authenticated `SHOW SECURITY AUDIT`",
             "options": [
               {
                 "name": "max",
@@ -4202,7 +4202,7 @@
       },
       {
         "name": "support",
-        "about": "Diagnostic support commands",
+        "about": "Generate actor-bound support artifacts through the authenticated management API",
         "subcommands": [
           {
             "name": "artifact",
@@ -4323,7 +4323,7 @@
           },
           {
             "name": "bundle",
-            "about": "Generate on-demand diagnostic support bundle",
+            "about": "Unavailable without authenticated support authorization; use `support artifact create`",
             "options": [
               {
                 "name": "out",
@@ -4374,7 +4374,7 @@
           },
           {
             "name": "diagnose",
-            "about": "Look up one runtime diagnostic and write its support bundle",
+            "about": "Unavailable without authenticated diagnostic authorization; use `support artifact create`",
             "options": [
               {
                 "name": "code",

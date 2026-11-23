@@ -369,12 +369,12 @@ pub enum Command {
         #[command(subcommand)]
         command: SchemaEvolutionCommand,
     },
-    /// Audit log inspection commands.
+    /// Local audit-history commands are unavailable; use authenticated `SHOW SECURITY AUDIT`.
     Audit {
         #[command(subcommand)]
         command: AuditCommand,
     },
-    /// Diagnostic support commands.
+    /// Generate actor-bound support artifacts through the authenticated management API.
     Support {
         #[command(subcommand)]
         command: SupportCommand,
@@ -792,7 +792,7 @@ pub enum SupportCommand {
         #[command(subcommand)]
         command: SupportArtifactCommand,
     },
-    /// Generate on-demand diagnostic support bundle.
+    /// Unavailable without authenticated support authorization; use `support artifact create`.
     Bundle {
         /// Optional view name filter.
         #[arg(long)]
@@ -804,7 +804,7 @@ pub enum SupportCommand {
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// Look up one runtime diagnostic and write its support bundle.
+    /// Unavailable without authenticated diagnostic authorization; use `support artifact create`.
     Diagnose {
         /// Look up the most recent occurrence for this catalog code.
         #[arg(long, conflicts_with = "correlation_id")]
@@ -861,13 +861,13 @@ pub enum SchemaEvolutionCommand {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum AuditCommand {
-    /// Tail recent audit log events.
+    /// Unavailable for local logs; use authenticated `SHOW SECURITY AUDIT`.
     Tail {
         /// Maximum events to return (max 1000).
         #[arg(long, default_value_t = 100)]
         max: usize,
     },
-    /// Query audit log events matching a filter.
+    /// Unavailable for local logs; use authenticated `SHOW SECURITY AUDIT`.
     Query {
         /// Substring filter for actor, action, or resource.
         #[arg(long)]
@@ -963,12 +963,12 @@ pub enum AdminCommand {
         #[command(subcommand)]
         command: CheckpointCommand,
     },
-    /// Point-in-time durable backup operations (create, inspect, verify).
+    /// Create backups through authenticated management; inspect or verify local backup files.
     Backup {
         #[command(subcommand)]
         command: BackupCommand,
     },
-    /// Restore a database backup into a clean or authorized destination.
+    /// Unavailable until the CLI exposes an authenticated backup-restore endpoint.
     Restore {
         /// Source backup directory or object-store URI.
         source: String,
@@ -1038,7 +1038,7 @@ pub enum OperationCommand {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum BackupCommand {
-    /// Create a full point-in-time backup.
+    /// Create a full point-in-time backup through authenticated management.
     Create {
         /// Destination directory or URI.
         destination: String,

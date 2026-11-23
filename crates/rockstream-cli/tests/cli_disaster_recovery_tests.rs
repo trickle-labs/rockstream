@@ -82,3 +82,90 @@ fn checkpoint_cli_does_not_treat_identity_role_as_authorization() {
     assert!(!export.exists());
     assert!(!target.exists());
 }
+
+#[test]
+fn local_privileged_cli_routes_fail_closed_without_authenticated_endpoints() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = root.path().join("storage");
+    std::fs::create_dir_all(&storage).unwrap();
+    let backup = root.path().join("backup");
+    let restore_source = root.path().join("restore-source");
+    let restore_target = root.path().join("restore-target");
+    let bundle = root.path().join("support.json");
+    let diagnosis = root.path().join("diagnosis.json");
+    let cases = [
+        (
+            "local backup creation",
+            "Configure an authenticated --management endpoint; do not use --identity-role as authorization.",
+            vec!["admin", "backup", "create", backup.to_str().unwrap()],
+        ),
+        (
+            "backup restore",
+            "The CLI has no authenticated backup-restore endpoint; do not use --identity-role as authorization.",
+            vec![
+                "admin",
+                "restore",
+                restore_source.to_str().unwrap(),
+                "--target",
+                restore_target.to_str().unwrap(),
+                "--yes",
+            ],
+        ),
+        (
+            "local support bundle and diagnosis",
+            "Use support artifact create/download through an authenticated management connection; do not use --identity-role as authorization.",
+            vec!["support", "bundle", "--out", bundle.to_str().unwrap()],
+        ),
+        (
+            "local support bundle and diagnosis",
+            "Use support artifact create/download through an authenticated management connection; do not use --identity-role as authorization.",
+            vec![
+                "support",
+                "diagnose",
+                "--code",
+                "RS-0001",
+                "--out",
+                diagnosis.to_str().unwrap(),
+            ],
+        ),
+        (
+            "local audit history",
+            "Use an authenticated pgwire client with SHOW SECURITY AUDIT; local audit output is not scoped to a durable principal.",
+            vec!["audit", "tail"],
+        ),
+        (
+            "local audit history",
+            "Use an authenticated pgwire client with SHOW SECURITY AUDIT; local audit output is not scoped to a durable principal.",
+            vec!["audit", "query", "--filter", "admin"],
+        ),
+    ];
+    let binary = env!("CARGO_BIN_EXE_rockstream");
+    for (operation, next_steps, tail) in cases {
+        let detail = format!("{operation} is unavailable without an authenticated endpoint");
+        let output = Command::new(binary)
+            .args([
+                "--storage-dir",
+                storage.to_str().unwrap(),
+                "--identity-user",
+                "dr-admin",
+                "--identity-role",
+                "admin",
+            ])
+            .args(tail)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
+        assert_eq!(
+            normalize_correlation_id(output.stderr),
+            format!(
+                "[RS-2400] auth.unauthenticated: Unauthenticated: request missing or carrying invalid credentials (detail={detail}) (correlation_id=<correlation_id> context=detail={detail}) next_steps: Provide valid credentials (Bearer token or mTLS certificate)\n  next steps: {next_steps}\n"
+            )
+        );
+    }
+    assert!(!backup.exists());
+    assert!(!restore_target.exists());
+    assert!(!bundle.exists());
+    assert!(!diagnosis.exists());
+    assert!(!storage.join("audit.jsonl").exists());
+}
