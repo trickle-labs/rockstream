@@ -57,10 +57,23 @@ pub struct DeploymentDescriptor {
     pub routing_columns: BTreeMap<String, usize>,
     pub shard: ShardLease,
     pub storage_identity: String,
+    /// Logical workload-relative shard index (`0..shard_count`), independent of
+    /// the globally allocated [`ShardId`].
+    #[serde(default)]
+    pub shard_index: u32,
 }
 
 impl DeploymentDescriptor {
     pub fn new(request: DeploymentRequest, shard: ShardLease, storage_identity: String) -> Self {
+        Self::with_shard_index(request, shard, storage_identity, 0)
+    }
+
+    pub fn with_shard_index(
+        request: DeploymentRequest,
+        shard: ShardLease,
+        storage_identity: String,
+        shard_index: u32,
+    ) -> Self {
         Self {
             version: request.version,
             workload_id: request.workload_id,
@@ -76,8 +89,46 @@ impl DeploymentDescriptor {
             routing_columns: request.routing_columns,
             shard,
             storage_identity,
+            shard_index,
         }
     }
+}
+
+/// Placement metadata for one deployed shard of a workload, used by direct
+/// data-plane routers to partition and stream Arrow IPC batches straight to
+/// shard owners without routing row payloads through `ControlService`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkloadShardPlacement {
+    pub shard_id: ShardId,
+    pub shard_index: u32,
+    pub worker_id: WorkerId,
+    pub worker_address: String,
+    pub lease_token: LeaseToken,
+    pub operator_id: OperatorId,
+    pub storage_identity: String,
+    pub frontier: Epoch,
+}
+
+/// Cached, versioned placement table for a deployed workload.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkloadTopologySnapshot {
+    pub topology_epoch: u64,
+    pub workload_id: WorkloadId,
+    pub routing_columns: BTreeMap<String, usize>,
+    pub schemas: Vec<DeploymentSchema>,
+    pub shards: Vec<WorkloadShardPlacement>,
+    pub workers: Vec<crate::topology::WorkerInfo>,
+}
+
+/// Explicit single-owner lease for a source connector task so multiple gateway
+/// replicas never duplicate ingestion for the same connector.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConnectorLease {
+    pub connector_id: crate::ids::ConnectorId,
+    pub owner_id: String,
+    pub lease_token: LeaseToken,
+    pub acquired_at_ms: u64,
+    pub expires_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

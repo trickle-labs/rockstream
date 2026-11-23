@@ -453,6 +453,7 @@ pub(crate) fn find_source_name(node: &PlanNode) -> Option<String> {
         PlanNode::Window { input, .. } => find_source_name(input),
         PlanNode::TopK { input, .. } => find_source_name(input),
         PlanNode::Distinct { input, .. } => find_source_name(input),
+        PlanNode::Exchange { child, .. } => find_source_name(child),
         _ => None,
     }
 }
@@ -1820,6 +1821,8 @@ pub(crate) fn compile_node(
                 }
             }
         }
+
+        PlanNode::Exchange { child, .. } => compile_node(child, source_schema),
 
         other => Err(OpError::unsupported_plan_node(plan_node_kind(other))),
     }

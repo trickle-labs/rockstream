@@ -470,6 +470,29 @@ pub enum ControlMessage {
         #[serde(default)]
         cluster_frontier: Option<u64>,
     },
+    /// Response to [`WorkerMessage::GetWorkloadTopology`]: versioned placement
+    /// table for direct Arrow IPC routing to shard owners.
+    WorkloadTopology {
+        snapshot: crate::data_plane::WorkloadTopologySnapshot,
+    },
+    /// Response to [`WorkerMessage::AcquireConnectorLease`] /
+    /// [`WorkerMessage::RenewConnectorLease`]: explicit single-owner connector lease.
+    ConnectorLeaseGranted {
+        lease: crate::data_plane::ConnectorLease,
+    },
+    /// Connector lease acquisition or renewal was denied because another
+    /// replica owns the connector or the fencing token is stale.
+    ConnectorLeaseDenied {
+        connector_id: crate::ids::ConnectorId,
+        current_owner: Option<String>,
+        code: String,
+        message: String,
+    },
+    /// Confirmation that a connector lease was released.
+    ConnectorLeaseReleased {
+        connector_id: crate::ids::ConnectorId,
+        released: bool,
+    },
 }
 
 /// Metadata describing an active shard's shared object-store location and
@@ -1048,6 +1071,37 @@ pub enum WorkerMessage {
     /// Discover active shards, their shared object-store prefixes, and
     /// published frontiers (used by stateless gateways and dedicated compactors).
     DiscoverShards,
+    /// Deploy a workload with an explicit logical shard count decoupled from
+    /// the current healthy worker count.
+    DeployWorkloadSharded {
+        request: crate::data_plane::DeploymentRequest,
+        shard_count: usize,
+    },
+    /// Fetch the cached, versioned shard placement table for a workload so
+    /// gateways and connectors can stream Arrow IPC batches directly to shard
+    /// owners without routing row payloads through `ControlService`.
+    GetWorkloadTopology {
+        workload_id: crate::ids::WorkloadId,
+    },
+    /// Acquire an explicit single-owner lease for a source connector task.
+    AcquireConnectorLease {
+        connector_id: crate::ids::ConnectorId,
+        owner_id: String,
+        ttl_ms: u64,
+    },
+    /// Renew an active single-owner connector lease.
+    RenewConnectorLease {
+        connector_id: crate::ids::ConnectorId,
+        owner_id: String,
+        lease_token: crate::ids::LeaseToken,
+        ttl_ms: u64,
+    },
+    /// Release a held single-owner connector lease.
+    ReleaseConnectorLease {
+        connector_id: crate::ids::ConnectorId,
+        owner_id: String,
+        lease_token: crate::ids::LeaseToken,
+    },
 }
 
 #[cfg(test)]

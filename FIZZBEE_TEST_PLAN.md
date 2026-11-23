@@ -714,6 +714,38 @@ model; no new FizzBee transition or invariant is asserted.
 
 ### 3.6 Cross-Cutting Coverage Assertions
 
+PR #420 (issue #400) completes the direct distributed execution path across
+`rockstream-control`, `rockstream-runtime`, `rockstream-storage`, and
+`rockstream-sql`. Control-plane `GetWorkloadTopology` exposes a versioned
+`WorkloadTopologySnapshot` (`topology_epoch`, routing columns, schemas, shard
+placements, and worker endpoints) so `DataPlaneClient` partitions rows and
+native `ArrowZSet` batches client-side and streams Arrow IPC `ShuffleFrame`s
+directly to shard owners over `ShuffleClientPool` without routing row payloads
+through `ControlService`. `ConnectorLeaseManager` enforces single-owner
+connector leases (`RS-1701` / `RS-1702`) across gateway replicas.
+`ShardManager::allocate_shard_ids` and `PlacementAlgorithm::assign_shards`
+decouple logical shard counts from worker counts without `workload_id * 16`
+collisions. On the worker hot path, synchronous per-frame `FenceWrite` RPCs are
+replaced by local lease checks plus durable storage-boundary monotonic lease
+fencing (`ShardDb::fence_lease_token` / `ShardDb::verify_lease_token`,
+`RS-1702`), allowing active direct ingestion to continue across control-node
+restarts while rejecting stale-lease writers without mutating committed state.
+Workload deployment also wires bounded application `ExchangeInlet` channels
+into each CLI worker's shared `ExchangeRegistry`.
+
+The corresponding implementation checks are
+`crates/rockstream-control/tests/direct_distributed_execution_400_tests.rs`
+(R1–R6 end-to-end: zero control row payloads, worker exchange inlets,
+single-owner connector leases, distributed SQL planning & `EXPLAIN
+INCREMENTAL`, control-outage ingestion continuity, storage-boundary
+stale-lease fencing, >16-shard collision-free allocation, and stale-topology
+redirect), `crates/rockstream-runtime/tests/worker_heartbeat_and_lease_tests.rs`
+(listener teardown and lease reassignment), and
+`crates/rockstream-cli/tests/r1_real_worker_data_plane_tests.rs` (real CLI
+worker process recovery and dispatch failure boundaries). These extend the
+existing M4 lease fencing and M5/M7 topology assumptions; they are
+implementation-level assertions rather than new FizzBee model transitions.
+
 PR #412 (issue #401) separates shared-object-store read serving and LSM
 compaction from stateful incremental-view-maintenance workers. Control-plane
 `DiscoverShards` exposes each current lease owner, token, object-store prefix,

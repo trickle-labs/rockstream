@@ -764,6 +764,11 @@ impl ShuffleServer {
                 ));
             }
         };
+        if identity.role == NodeRole::Gateway
+            && request.metadata().contains_key("rs-owned-context-bin")
+        {
+            return Ok(None);
+        }
         if identity.role != NodeRole::Worker {
             return Err((
                 Status::permission_denied(format!(
@@ -862,6 +867,7 @@ impl ShuffleService for ShuffleServer {
                 .owned_handler
                 .clone()
                 .ok_or_else(|| Status::unimplemented("owned shuffle execution is unavailable"))?;
+            let registry = self.registry.clone();
             let mut stream = request.into_inner();
             let (tx, rx) = mpsc::channel(2);
             let task = async move {
@@ -880,6 +886,9 @@ impl ShuffleService for ShuffleServer {
                         return;
                     }
                 };
+                registry
+                    .grpc_frames_received
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 match stream.next().await {
                     None => {}
                     Some(Ok(_)) => {

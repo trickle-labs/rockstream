@@ -2460,9 +2460,9 @@ async fn delegated_worker_secret_uses_durable_store_in_release_control_process()
         .deploy_delegated(request.clone(), &assertion)
         .await
         .unwrap();
-    assert!(worker
-        .get_deployment(request.workload_id, ShardId(request.workload_id.0 * 16))
-        .is_some());
+    assert!(worker.leases().iter().any(|lease| worker
+        .get_deployment(request.workload_id, lease.shard_id)
+        .is_some()));
 
     let resolved = tokio::time::timeout(Duration::from_secs(10), async {
         loop {

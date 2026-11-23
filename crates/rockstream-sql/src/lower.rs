@@ -1575,8 +1575,13 @@ fn resolve_views_and_snapshots(
                 snapshot_sources,
             )),
         },
-        PlanNode::Exchange { kind, child } => PlanNode::Exchange {
+        PlanNode::Exchange {
             kind,
+            partition_key,
+            child,
+        } => PlanNode::Exchange {
+            kind,
+            partition_key,
             child: Box::new(resolve_views_and_snapshots(
                 *child,
                 registered_views,

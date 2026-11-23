@@ -362,13 +362,6 @@ fn stable_name_id(namespace: &str, name: &str) -> u64 {
         })
 }
 
-fn stable_route(value: &str, shard_count: usize) -> usize {
-    value.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
-    }) as usize
-        % shard_count
-}
-
 async fn query_text_rows(client: &Client, sql: &str) -> Vec<Vec<String>> {
     tokio::time::timeout(Duration::from_secs(10), client.query(sql, &[]))
         .await
@@ -538,11 +531,6 @@ async fn run_cluster(worker_count: usize, kill_worker: bool) {
         .read_workload(workload_id)
         .await
         .unwrap();
-    let shard_base = workload_id.0.wrapping_mul(16);
-    let mut routed = vec![0_u64; worker_count];
-    for group in 0..values.len() {
-        routed[stable_route(&group.to_string(), worker_count)] += 1;
-    }
     let mut assigned_shards = BTreeMap::new();
     for status in &snapshot.workers {
         assert_eq!(status.shard_ids.len(), 1);
@@ -558,26 +546,33 @@ async fn run_cluster(worker_count: usize, kill_worker: bool) {
         assigned_shards.keys().copied().collect::<Vec<_>>(),
         (1..=worker_count as u64).map(WorkerId).collect::<Vec<_>>()
     );
+    let mut shard_ids: Vec<ShardId> = assigned_shards.values().copied().collect();
+    shard_ids.sort();
     assert_eq!(
-        assigned_shards
-            .values()
+        shard_ids
+            .iter()
             .copied()
-            .collect::<std::collections::BTreeSet<_>>(),
-        (0..worker_count)
-            .map(|index| ShardId(shard_base.wrapping_add(index as u64)))
-            .collect()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        worker_count
     );
+    let mut routed_by_shard = BTreeMap::<ShardId, u64>::new();
+    for group in 0..values.len() {
+        let bucket = rockstream_types::rendezvous::fnv1a_64(group.to_string().as_bytes()) % 4096;
+        let target = rockstream_types::rendezvous::rendezvous_hash(bucket, &shard_ids, 1).unwrap();
+        *routed_by_shard.entry(target).or_default() += 1;
+    }
     let expected_statuses = (1..=worker_count as u64)
         .map(|worker_id| {
             let worker_id = WorkerId(worker_id);
             let shard_id = assigned_shards[&worker_id];
-            let shard_index = shard_id.0.wrapping_sub(shard_base) as usize;
+            let expected_rows = routed_by_shard.get(&shard_id).copied().unwrap_or(0);
             WorkerExecutionStatus {
                 worker_id,
                 process_id: processes.workers[worker_id.0 as usize - 1].id(),
                 shard_ids: vec![shard_id],
-                input_rows: routed[shard_index],
-                output_rows: routed[shard_index],
+                input_rows: expected_rows,
+                output_rows: expected_rows,
                 frontier: 2,
                 ready: true,
             }
@@ -657,8 +652,16 @@ async fn run_cluster(worker_count: usize, kill_worker: bool) {
     }
 
     if kill_worker {
+        let worker1_shard = assigned_shards[&WorkerId(1)];
+        let worker2_shard = assigned_shards[&WorkerId(2)];
+        let worker2_rows = routed_by_shard.get(&worker2_shard).copied().unwrap_or(0);
         let dead_route = (0..16)
-            .find(|id| stable_route(&id.to_string(), worker_count) == 0)
+            .find(|id| {
+                let bucket =
+                    rockstream_types::rendezvous::fnv1a_64(id.to_string().as_bytes()) % 4096;
+                rockstream_types::rendezvous::rendezvous_hash(bucket, &shard_ids, 1)
+                    == Some(worker1_shard)
+            })
             .unwrap();
         processes.workers[0].kill().unwrap();
         processes.workers[0].wait().unwrap();
@@ -673,9 +676,9 @@ async fn run_cluster(worker_count: usize, kill_worker: bool) {
                 == vec![WorkerExecutionStatus {
                     worker_id: WorkerId(2),
                     process_id: processes.workers[1].id(),
-                    shard_ids: vec![ShardId(shard_base), ShardId(shard_base.wrapping_add(1))],
-                    input_rows: routed[1],
-                    output_rows: routed[1],
+                    shard_ids: shard_ids.clone(),
+                    input_rows: worker2_rows,
+                    output_rows: worker2_rows,
                     frontier: 2,
                     ready: true,
                 }]
@@ -758,6 +761,23 @@ async fn interrupted_dispatch_blocks_distributed_reads_after_gateway_restart() {
                     let response = ControlMessage::ServingTopology {
                         shards: Vec::new(),
                         cluster_frontier: None,
+                    };
+                    let wire = serde_json::to_string(&response).unwrap() + "\n";
+                    write.write_all(wire.as_bytes()).await.unwrap();
+                }
+                WorkerMessage::GetWorkloadTopology { workload_id } => {
+                    // This mock fixture has no live workers; returning an empty
+                    // shard list lets the gateway fall back to the interrupted
+                    // SubmitSourceDelta path under test.
+                    let response = ControlMessage::WorkloadTopology {
+                        snapshot: rockstream_types::data_plane::WorkloadTopologySnapshot {
+                            topology_epoch: 1,
+                            workload_id,
+                            routing_columns: BTreeMap::new(),
+                            schemas: Vec::new(),
+                            shards: Vec::new(),
+                            workers: Vec::new(),
+                        },
                     };
                     let wire = serde_json::to_string(&response).unwrap() + "\n";
                     write.write_all(wire.as_bytes()).await.unwrap();

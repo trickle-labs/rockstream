@@ -70,6 +70,23 @@ impl PlacementAlgorithm {
         });
         sorted.iter().take(n).map(|w| w.worker_id).collect()
     }
+
+    /// Assign `shard_count` logical shards across `candidates`, decoupled from
+    /// `candidates.len()`.
+    ///
+    /// Workers are ordered by descending capacity headroom (tie-breaking by
+    /// lowest `WorkerId`) and assigned round-robin so `shard_count` may exceed
+    /// `candidates.len()` (e.g. virtual-bucket / multi-shard placement) or be
+    /// smaller than `candidates.len()`.
+    pub fn assign_shards(candidates: &[WorkerInfo], shard_count: usize) -> Vec<WorkerId> {
+        if candidates.is_empty() || shard_count == 0 {
+            return Vec::new();
+        }
+        let ordered = Self::assign_n(candidates, candidates.len());
+        (0..shard_count)
+            .map(|idx| ordered[idx % ordered.len()])
+            .collect()
+    }
 }
 
 #[cfg(test)]

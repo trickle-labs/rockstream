@@ -68,6 +68,9 @@ struct ShardManagerInner {
     /// `raft::control_leader_epoch(term, leader_id)` whenever the
     /// control-plane Raft term or leader identity changes.
     leader_epoch: u64,
+    /// Monotonic, collision-free global shard-ID allocator independent of
+    /// worker count or workload ID (Issue #400 R5).
+    next_shard_id: u64,
 }
 
 /// Mint the next [`LeaseToken`], mixing in the current control-leader epoch
@@ -105,8 +108,34 @@ impl ShardManager {
                 leases: HashMap::new(),
                 next_token: 1,
                 leader_epoch: 0,
+                next_shard_id: 1,
             })),
         }
+    }
+
+    /// Allocate `count` globally unique, collision-free [`ShardId`]s from the
+    /// durable shard-ID namespace, independent of worker count or workload ID.
+    ///
+    /// Guarantees zero collisions across concurrent workloads and clusters well
+    /// beyond 16 workers/shards.
+    pub fn allocate_shard_ids(&self, count: usize) -> Vec<ShardId> {
+        let mut guard = self.inner.write();
+        let mut ids = Vec::with_capacity(count);
+        for _ in 0..count {
+            while guard.leases.contains_key(&ShardId(guard.next_shard_id)) {
+                guard.next_shard_id = guard
+                    .next_shard_id
+                    .checked_add(1)
+                    .expect("RS-0003: shard ID space exhausted");
+            }
+            let id = ShardId(guard.next_shard_id);
+            guard.next_shard_id = guard
+                .next_shard_id
+                .checked_add(1)
+                .expect("RS-0003: shard ID space exhausted");
+            ids.push(id);
+        }
+        ids
     }
 
     /// Set the control-leader epoch to mix into every subsequently minted
@@ -342,6 +371,7 @@ impl ShardManager {
             leases: guard.leases.clone(),
             next_token: guard.next_token,
             leader_epoch: guard.leader_epoch,
+            next_shard_id: guard.next_shard_id,
         }
     }
 
@@ -354,6 +384,7 @@ impl ShardManager {
         guard.leases = snapshot.leases;
         guard.next_token = snapshot.next_token;
         guard.leader_epoch = snapshot.leader_epoch;
+        guard.next_shard_id = snapshot.next_shard_id.max(1);
     }
 }
 
@@ -363,6 +394,10 @@ impl Default for ShardManager {
     }
 }
 
+fn default_next_shard_id() -> u64 {
+    1
+}
+
 /// A serializable point-in-time snapshot of [`ShardManager`]'s state
 /// (v0.45.2 M7-S4/S5).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -370,6 +405,8 @@ pub struct ShardManagerSnapshot {
     pub leases: HashMap<ShardId, ShardLease>,
     pub next_token: u64,
     pub leader_epoch: u64,
+    #[serde(default = "default_next_shard_id")]
+    pub next_shard_id: u64,
 }
 
 impl Default for ShardManagerSnapshot {
@@ -378,7 +415,126 @@ impl Default for ShardManagerSnapshot {
             leases: HashMap::new(),
             next_token: 1,
             leader_epoch: 0,
+            next_shard_id: 1,
         }
+    }
+}
+
+/// Explicit single-owner lease manager for source connector tasks (Issue #400 R1).
+///
+/// Prevents duplicate ingestion when multiple gateway replicas are deployed:
+/// at most one owner holds an unexpired lease for any `ConnectorId`, guarded
+/// by monotonically increasing [`LeaseToken`]s.
+#[derive(Clone, Default)]
+pub struct ConnectorLeaseManager {
+    inner: Arc<RwLock<ConnectorLeaseManagerInner>>,
+}
+
+struct ConnectorLeaseManagerInner {
+    leases:
+        HashMap<rockstream_types::ids::ConnectorId, rockstream_types::data_plane::ConnectorLease>,
+    next_token: u64,
+}
+
+impl Default for ConnectorLeaseManagerInner {
+    fn default() -> Self {
+        Self {
+            leases: HashMap::new(),
+            next_token: 1,
+        }
+    }
+}
+
+impl ConnectorLeaseManager {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Acquire or take over an expired single-owner lease for `connector_id`.
+    pub fn acquire(
+        &self,
+        connector_id: rockstream_types::ids::ConnectorId,
+        owner_id: &str,
+        ttl_ms: u64,
+        now_ms: u64,
+    ) -> Result<rockstream_types::data_plane::ConnectorLease, (Option<String>, String)> {
+        if owner_id.trim().is_empty() || ttl_ms == 0 {
+            return Err((
+                None,
+                "RS-1703: connector lease requires non-empty owner_id and positive ttl_ms"
+                    .to_owned(),
+            ));
+        }
+        let mut guard = self.inner.write();
+        if let Some(existing) = guard.leases.get(&connector_id) {
+            if existing.expires_at_ms > now_ms && existing.owner_id != owner_id {
+                return Err((
+                    Some(existing.owner_id.clone()),
+                    format!(
+                        "RS-1701: connector {} is already leased by {}",
+                        connector_id.0, existing.owner_id
+                    ),
+                ));
+            }
+        }
+        let token = LeaseToken(guard.next_token);
+        guard.next_token += 1;
+        let lease = rockstream_types::data_plane::ConnectorLease {
+            connector_id,
+            owner_id: owner_id.to_owned(),
+            lease_token: token,
+            acquired_at_ms: now_ms,
+            expires_at_ms: now_ms.saturating_add(ttl_ms),
+        };
+        guard.leases.insert(connector_id, lease.clone());
+        Ok(lease)
+    }
+
+    /// Renew an active connector lease if `owner_id` and `lease_token` match.
+    pub fn renew(
+        &self,
+        connector_id: rockstream_types::ids::ConnectorId,
+        owner_id: &str,
+        lease_token: LeaseToken,
+        ttl_ms: u64,
+        now_ms: u64,
+    ) -> Result<rockstream_types::data_plane::ConnectorLease, (Option<String>, String)> {
+        let mut guard = self.inner.write();
+        let Some(existing) = guard.leases.get_mut(&connector_id) else {
+            return Err((
+                None,
+                format!("RS-1703: connector {} has no active lease", connector_id.0),
+            ));
+        };
+        if existing.owner_id != owner_id || existing.lease_token != lease_token {
+            return Err((
+                Some(existing.owner_id.clone()),
+                format!(
+                    "RS-1702: stale connector lease token for connector {}",
+                    connector_id.0
+                ),
+            ));
+        }
+        existing.expires_at_ms = now_ms.saturating_add(ttl_ms);
+        Ok(existing.clone())
+    }
+
+    /// Release a connector lease if held by `(owner_id, lease_token)`.
+    pub fn release(
+        &self,
+        connector_id: rockstream_types::ids::ConnectorId,
+        owner_id: &str,
+        lease_token: LeaseToken,
+    ) -> bool {
+        let mut guard = self.inner.write();
+        let matches = guard
+            .leases
+            .get(&connector_id)
+            .is_some_and(|l| l.owner_id == owner_id && l.lease_token == lease_token);
+        if matches {
+            guard.leases.remove(&connector_id);
+        }
+        matches
     }
 }
 

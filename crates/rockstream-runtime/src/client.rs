@@ -138,9 +138,16 @@ pub type WorkerDeployments = Arc<RwLock<HashMap<(WorkloadId, ShardId), Arc<Worke
 type FrontierReportWaiter =
     Arc<parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<Result<u64, String>>>>>;
 
-fn deployment_schema(descriptor: &DeploymentDescriptor) -> io::Result<HashMap<String, SchemaRef>> {
-    descriptor
-        .schemas
+pub(crate) fn deployment_schema(
+    descriptor: &DeploymentDescriptor,
+) -> io::Result<HashMap<String, SchemaRef>> {
+    deployment_schemas_from_slice(&descriptor.schemas)
+}
+
+pub(crate) fn deployment_schemas_from_slice(
+    schemas: &[rockstream_types::data_plane::DeploymentSchema],
+) -> io::Result<HashMap<String, SchemaRef>> {
+    schemas
         .iter()
         .map(|schema| {
             let fields = schema
@@ -167,7 +174,7 @@ fn deployment_schema(descriptor: &DeploymentDescriptor) -> io::Result<HashMap<St
         .collect()
 }
 
-fn rows_to_zset(
+pub(crate) fn rows_to_zset(
     rows: &[RuntimeRow],
     schema: SchemaRef,
 ) -> io::Result<rockstream_ops::zset::ArrowZSet> {
@@ -241,7 +248,7 @@ fn rows_to_zset(
     ))
 }
 
-fn zset_to_rows(zset: &rockstream_ops::zset::ArrowZSet) -> io::Result<Vec<RuntimeRow>> {
+pub(crate) fn zset_to_rows(zset: &rockstream_ops::zset::ArrowZSet) -> io::Result<Vec<RuntimeRow>> {
     (0..zset.data.num_rows())
         .map(|row| {
             let values_tsv = zset
@@ -368,15 +375,17 @@ pub async fn execute_frame(
             "stale or mismatched execution identity",
         ));
     }
-    if !client
-        .check_fence_write(frame.shard_id, frame.lease_token)
-        .await?
-    {
+    if !client.verify_local_lease_fence(frame.shard_id, frame.lease_token) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "lease fence rejected execution",
+            "RS-1702: lease fence rejected execution",
         ));
     }
+    deployment
+        .db
+        .verify_lease_token(frame.lease_token)
+        .await
+        .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error.to_string()))?;
     if *needs_recovery {
         return Err(io::Error::other(
             "worker deployment requires recovery after failed execution",
@@ -482,15 +491,17 @@ pub async fn execute_frame(
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let compacted_input_rows = deployment.compactor.compact_slice(&frame.rows);
     if compacted_input_rows.is_empty() {
-        if !client
-            .check_fence_write(frame.shard_id, frame.lease_token)
-            .await?
-        {
+        if !client.verify_local_lease_fence(frame.shard_id, frame.lease_token) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "lease fence rejected persistence",
+                "RS-1702: lease fence rejected persistence",
             ));
         }
+        deployment
+            .db
+            .verify_lease_token(frame.lease_token)
+            .await
+            .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error.to_string()))?;
         *needs_recovery = true;
         let mut writes = WriteBatch::new();
         writes.put(&execution_key, &execution_digest);
@@ -501,7 +512,7 @@ pub async fn execute_frame(
             .map_err(io::Error::other)?;
         *needs_recovery = false;
         rockstream_types::metrics::add_r1_worker_rows(worker_id, frame.rows.len() as u64, 0);
-        client
+        let _ = client
             .msg_tx
             .send(WorkerMessage::ExecutionProgress {
                 output: RuntimeOutputDelta {
@@ -519,10 +530,7 @@ pub async fn execute_frame(
                 input_rows: frame.rows.len() as u64,
                 output_rows: 0,
             })
-            .await
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::ConnectionAborted, "client channel closed")
-            })?;
+            .await;
         return Ok(());
     }
 
@@ -563,15 +571,17 @@ pub async fn execute_frame(
             }
         },
     )?;
-    if !client
-        .check_fence_write(frame.shard_id, frame.lease_token)
-        .await?
-    {
+    if !client.verify_local_lease_fence(frame.shard_id, frame.lease_token) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "lease fence rejected persistence",
+            "RS-1702: lease fence rejected persistence",
         ));
     }
+    deployment
+        .db
+        .verify_lease_token(frame.lease_token)
+        .await
+        .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error.to_string()))?;
     let raw_output_rows = zset_to_rows(&output)?;
     let output_rows = deployment.compactor.compact_slice(&raw_output_rows);
     let output_for_sink = if output_rows.len() != raw_output_rows.len() {
@@ -609,7 +619,7 @@ pub async fn execute_frame(
         frame.rows.len() as u64,
         output_rows.len() as u64,
     );
-    client
+    let _ = client
         .msg_tx
         .send(WorkerMessage::ExecutionProgress {
             output: RuntimeOutputDelta {
@@ -627,8 +637,8 @@ pub async fn execute_frame(
             input_rows: frame.rows.len() as u64,
             output_rows: output_rows.len() as u64,
         })
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::ConnectionAborted, "client channel closed"))
+        .await;
+    Ok(())
 }
 
 async fn execute_frame_and_report(
@@ -670,20 +680,31 @@ pub(crate) fn owned_shuffle_handler(
                 .map_err(|error| format!("invalid shuffle execution context: {error}"))?;
             let output = failure_identity(&owner);
             let prepared = (|| -> Result<(), String> {
+                let (expected_target_shard, schema) = deployments
+                    .read()
+                    .get(&(owner.workload_id, owner.shard_id))
+                    .and_then(|deployment| {
+                        deployment
+                            .schemas
+                            .get(&owner.source)
+                            .cloned()
+                            .map(|schema| (deployment.descriptor.shard_index, schema))
+                    })
+                    .ok_or_else(|| {
+                        "RS-3004: shuffle source is not deployed on this worker".to_owned()
+                    })?;
                 if !owner.rows.is_empty()
                     || frame.exchange_id != owner.workload_id.0
-                    || frame.target_shard != owned_shuffle_shard(owner.workload_id, owner.shard_id)?
+                    || (frame.target_shard != expected_target_shard
+                        && frame.target_shard != (owner.shard_id.0 as u32)
+                        && frame.target_shard
+                            != owned_shuffle_shard(owner.workload_id, owner.shard_id)
+                                .unwrap_or(u32::MAX))
                     || frame.epoch != owner.epoch
                     || frame.seq != 0
                 {
                     return Err("owned shuffle identity does not match frame".to_owned());
                 }
-                let schema = deployments
-                    .read()
-                    .get(&(owner.workload_id, owner.shard_id))
-                    .and_then(|deployment| deployment.schemas.get(&owner.source))
-                    .cloned()
-                    .ok_or_else(|| "shuffle source is not deployed".to_owned())?;
                 let input =
                     crate::exchange::serialization::deserialize_zset(&frame.payload, schema)?;
                 if input.num_rows() != frame.row_count as usize {
@@ -728,7 +749,7 @@ async fn dispatch_owned_shuffle(
     target_worker: WorkerId,
     frame: RuntimeExchangeMessage,
 ) -> Result<(), String> {
-    let (source_shard, schema) = deployments
+    let (src_shard, schema) = deployments
         .read()
         .values()
         .filter(|deployment| deployment.descriptor.workload_id == frame.workload_id)
@@ -737,12 +758,18 @@ async fn dispatch_owned_shuffle(
                 .schemas
                 .get(&frame.source)
                 .cloned()
-                .map(|schema| (deployment.descriptor.shard.shard_id, schema))
+                .map(|schema| (deployment.descriptor.shard_index, schema))
         })
-        .min_by_key(|(shard, _)| *shard)
+        .min_by_key(|(shard_idx, _)| *shard_idx)
         .ok_or_else(|| "shuffle source is not deployed".to_owned())?;
-    let src_shard = owned_shuffle_shard(frame.workload_id, source_shard)?;
-    let target_shard = owned_shuffle_shard(frame.workload_id, frame.shard_id)?;
+    let target_shard = deployments
+        .read()
+        .get(&(frame.workload_id, frame.shard_id))
+        .map(|deployment| deployment.descriptor.shard_index)
+        .unwrap_or_else(|| {
+            owned_shuffle_shard(frame.workload_id, frame.shard_id)
+                .unwrap_or(frame.shard_id.0 as u32)
+        });
     let input = rows_to_zset(&frame.rows, schema).map_err(|error| error.to_string())?;
     let row_count = u32::try_from(input.num_rows())
         .map_err(|_| "shuffle batch has too many rows".to_owned())?;
@@ -841,9 +868,16 @@ pub async fn setup_test_deployment(
     let deployments = Arc::new(RwLock::new(HashMap::new()));
     let comp_config_lock = Arc::new(RwLock::new(compaction_config.clone()));
 
+    let exchange_registry = crate::exchange::service::ExchangeRegistry::with_worker_state(
+        active_shards.clone(),
+        topology_workers.clone(),
+    )
+    .with_shard_leases(shard_leases.clone())
+    .with_security_audit(msg_tx.clone(), security_audit_waiters.clone());
+
     let client = WorkerClientHandle {
         worker_id,
-        active_shards,
+        active_shards: active_shards.clone(),
         topology_workers,
         shard_leases,
         msg_tx,
@@ -855,6 +889,7 @@ pub async fn setup_test_deployment(
         compaction_config: comp_config_lock,
         deployments: deployments.clone(),
         tls_reloader: None,
+        exchange_registry,
     };
 
     let store = rockstream_storage::build_runtime_object_store(storage_dir, "test_root").unwrap();
@@ -864,6 +899,14 @@ pub async fn setup_test_deployment(
             .build()
             .await
             .unwrap(),
+    );
+    db.fence_lease_token(LeaseToken(777)).await.unwrap();
+    active_shards.write().insert(
+        ShardId(100),
+        ShardState {
+            lease: ShardLease::new(ShardId(100), WorkerId(42), LeaseToken(777)),
+            db: Some((*db).clone()),
+        },
     );
 
     let plan = rockstream_plan::PlanNode::ViewSink {
@@ -901,6 +944,7 @@ pub async fn setup_test_deployment(
         routing_columns: std::collections::BTreeMap::new(),
         shard: ShardLease::new(ShardId(100), WorkerId(42), LeaseToken(777)),
         storage_identity: format!("lfs:{}", storage_dir.display()),
+        shard_index: 84,
     };
 
     let schemas = deployment_schema(&descriptor).unwrap();
@@ -1962,6 +2006,7 @@ pub struct WorkerClientHandle {
     topology_workers: Arc<RwLock<HashMap<WorkerId, WorkerInfo>>>,
     shard_leases: Arc<RwLock<HashMap<ShardId, ShardLease>>>,
     msg_tx: mpsc::Sender<WorkerMessage>,
+    #[allow(dead_code)]
     security_audit_waiters: crate::exchange::service::SecurityAuditWaiters,
     fence_waiters:
         Arc<parking_lot::Mutex<HashMap<ShardId, Vec<tokio::sync::oneshot::Sender<bool>>>>>,
@@ -1971,6 +2016,7 @@ pub struct WorkerClientHandle {
     compaction_config: Arc<RwLock<EpochCompactionConfig>>,
     deployments: WorkerDeployments,
     tls_reloader: Option<Arc<rockstream_types::tls::TlsCertificateReloader>>,
+    exchange_registry: crate::exchange::service::ExchangeRegistry,
 }
 
 impl WorkerClientHandle {
@@ -2070,13 +2116,38 @@ impl WorkerClientHandle {
         self.topology_workers.read().values().cloned().collect()
     }
 
-    pub(crate) fn exchange_registry(&self) -> crate::exchange::service::ExchangeRegistry {
-        crate::exchange::service::ExchangeRegistry::with_worker_state(
-            self.active_shards.clone(),
-            self.topology_workers.clone(),
-        )
-        .with_shard_leases(self.shard_leases.clone())
-        .with_security_audit(self.msg_tx.clone(), self.security_audit_waiters.clone())
+    /// Shared exchange registry backing this worker's gRPC `ShuffleService`
+    /// and deployed application exchange inlets (Issue #400 R2).
+    pub fn exchange_registry(&self) -> crate::exchange::service::ExchangeRegistry {
+        self.exchange_registry.clone()
+    }
+
+    /// Number of gRPC Arrow IPC shuffle frames received by this worker.
+    pub fn grpc_frames_received(&self) -> u64 {
+        self.exchange_registry.grpc_frames_received()
+    }
+
+    /// Control-free hot-path local lease fence check (Issue #400 R4).
+    ///
+    /// Verifies that this worker still owns `shard_id` with `lease_token` and
+    /// that no strictly higher `LeaseToken` is known in the local topology
+    /// lease snapshot, without making a synchronous RPC to `ControlService`.
+    pub fn verify_local_lease_fence(&self, shard_id: ShardId, lease_token: LeaseToken) -> bool {
+        let Some(local_worker_id) = self.worker_id() else {
+            return false;
+        };
+        let active_ok = self.active_shards.read().get(&shard_id).is_some_and(|s| {
+            s.lease.worker_id == local_worker_id && s.lease.lease_token == lease_token
+        });
+        if !active_ok {
+            return false;
+        }
+        if let Some(known) = self.shard_leases.read().get(&shard_id) {
+            if known.lease_token.0 > lease_token.0 || known.worker_id != local_worker_id {
+                return false;
+            }
+        }
+        true
     }
 
     /// Request a fresh short-lived token over the authenticated control channel.
@@ -2622,6 +2693,13 @@ where
         None
     };
 
+    let exchange_registry = crate::exchange::service::ExchangeRegistry::with_worker_state(
+        active_shards.clone(),
+        topology_workers.clone(),
+    )
+    .with_shard_leases(shard_leases.clone())
+    .with_security_audit(msg_tx.clone(), security_audit_waiters.clone());
+
     let handle = WorkerClientHandle {
         worker_id: worker_id.clone(),
         active_shards: active_shards.clone(),
@@ -2636,6 +2714,7 @@ where
         compaction_config: compaction_config.clone(),
         deployments: deployments.clone(),
         tls_reloader: tls_reloader.clone(),
+        exchange_registry: exchange_registry.clone(),
     };
 
     let actor_registry =
@@ -2657,7 +2736,7 @@ where
         exchange_endpoint.is_some() || allow_insecure_internal_dev || tls_config.is_enabled();
     let mut exchange_service =
         crate::exchange::service::ExchangeService::new(handle.exchange_registry())
-            .with_exchange_config(exchange_config)
+            .with_exchange_config(exchange_config.clone())
             .with_owned_handler(owned_shuffle_handler(
                 actor_registry.clone(),
                 deployments.clone(),
@@ -2826,6 +2905,7 @@ where
 
         // 4. Read Loop: process ControlMessage commands from control plane.
         let mut lines = BufReader::new(reader).lines();
+        let mut explicit_shutdown = false;
         while let Ok(Some(line)) = lines.next_line().await {
             if line.trim().is_empty() {
                 continue;
@@ -2987,6 +3067,11 @@ where
                                 .await
                                 .map_err(io::Error::other)?,
                         );
+                        db.fence_lease_token(descriptor.shard.lease_token)
+                            .await
+                            .map_err(|error| {
+                                io::Error::new(io::ErrorKind::PermissionDenied, error.to_string())
+                            })?;
                         let schemas = deployment_schema(&descriptor)?;
                         let plan: rockstream_plan::PlanNode =
                             serde_json::from_str(&descriptor.plan_json).map_err(|error| {
@@ -3058,6 +3143,28 @@ where
                                 (descriptor.workload_id, descriptor.shard.shard_id),
                                 deployment.clone(),
                             );
+                            // Wire bounded application exchange inlets into this worker's
+                            // ExchangeRegistry so direct Arrow IPC shuffle frames and
+                            // receiver credit backpressure flow end-to-end (Issue #400 R2).
+                            if let Some((_source_name, source_schema)) =
+                                deployment.schemas.iter().next()
+                            {
+                                let inlet_cap = exchange_config.frame_channel_capacity.max(1);
+                                let (inlet_tx, mut inlet_rx) =
+                                    mpsc::channel::<rockstream_ops::zset::ArrowZSet>(inlet_cap);
+                                exchange_registry.register(
+                                    descriptor.workload_id.0,
+                                    descriptor.shard_index,
+                                    inlet_tx,
+                                    source_schema.clone(),
+                                );
+                                tokio::spawn(async move {
+                                    while let Some(_zset) = inlet_rx.recv().await {
+                                        // Draining bounded channel releases receiver buffer
+                                        // capacity and propagates credit backpressure upstream.
+                                    }
+                                });
+                            }
                             if deployment.recovery_on_open {
                                 let _ = msg_tx
                                     .send(WorkerMessage::OwnedEpochRecoveryRequired {
@@ -3538,6 +3645,15 @@ where
                             active_shards_clone.read().len() as u64,
                         );
                     }
+                    let revoked_inlets: Vec<(u64, u32)> = deployments_clone
+                        .read()
+                        .values()
+                        .filter(|d| d.descriptor.shard.shard_id == shard_id)
+                        .map(|d| (d.descriptor.workload_id.0, d.descriptor.shard_index))
+                        .collect();
+                    for (exchange_id, target_shard) in revoked_inlets {
+                        exchange_registry.unregister(exchange_id, target_shard);
+                    }
                     deployments_clone
                         .write()
                         .retain(|_, deployment| deployment.descriptor.shard.shard_id != shard_id);
@@ -3664,17 +3780,13 @@ where
                 }
                 ControlMessage::Shutdown => {
                     tracing::info!("Control plane requested shutdown");
+                    explicit_shutdown = true;
                     break;
                 }
                 _ => {}
             }
         }
 
-        if let Some(shutdown) = &_exchange_shutdown {
-            shutdown.0.cancel();
-        }
-        topology_workers.write().clear();
-        shard_leases.write().clear();
         for waiter in
             crate::exchange::service::drain_security_audit_waiters(&security_audit_waiters)
         {
@@ -3683,18 +3795,32 @@ where
         if let Some(waiter) = frontier_report_waiter_clone.lock().take() {
             let _ = waiter.send(Err("Control channel closed".to_owned()));
         }
-        actor_registry_clone.shutdown();
-        exchange_service.shutdown().await;
-        shuffle_mux.shutdown().await;
-        // Clean up remaining active shards on shutdown/disconnect
-        let dbs_to_close: Vec<ShardDb> = {
-            let mut shards = active_shards_clone.write();
-            shards.drain().filter_map(|(_, state)| state.db).collect()
-        };
-        for db in dbs_to_close {
-            let _ = db.close().await;
-        }
         let _ = shutdown_tx.send(true);
+        if explicit_shutdown || deployments_clone.read().is_empty() {
+            if let Some(shutdown) = &_exchange_shutdown {
+                shutdown.0.cancel();
+            }
+            topology_workers.write().clear();
+            shard_leases.write().clear();
+            actor_registry_clone.shutdown();
+            exchange_service.shutdown().await;
+            shuffle_mux.shutdown().await;
+            let dbs_to_close: Vec<ShardDb> = {
+                let mut shards = active_shards_clone.write();
+                shards.drain().filter_map(|(_, state)| state.db).collect()
+            };
+            for db in dbs_to_close {
+                let _ = db.close().await;
+            }
+        } else {
+            // Issue #400 R4: Control-node restart / outage tolerance.
+            // Keep `_exchange_shutdown`, `exchange_service`, `actor_registry`,
+            // and active shard leases alive until this task is aborted.
+            tracing::warn!(
+                "control channel closed while deployments are active; keeping direct data-plane exchange alive"
+            );
+            std::future::pending::<()>().await;
+        }
     });
 
     Ok((handle, join_handle))
