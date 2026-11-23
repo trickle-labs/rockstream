@@ -300,6 +300,8 @@ pub struct CatalogSinkEntry {
     #[serde(default)]
     pub secret_name: Option<String>,
     #[serde(default)]
+    pub security_protocol: Option<String>,
+    #[serde(default)]
     pub secret_consumer: Option<rockstream_types::ids::PrincipalId>,
     #[serde(default)]
     pub secret_namespace: Option<String>,
@@ -311,6 +313,25 @@ pub struct CatalogSinkEntry {
     /// registrar (glue/hive/rest/ducklake) failed to register the latest
     /// snapshot without failing the sink's commit (DESIGN.md §13.6.5).
     pub state: String,
+}
+
+fn sink_storage_options(entry: &CatalogSinkEntry) -> HashMap<String, String> {
+    let mut options = HashMap::new();
+    if entry.format.eq_ignore_ascii_case("KAFKA") {
+        options.insert("view".to_string(), entry.view.clone());
+        options.insert("brokers".to_string(), entry.path.clone());
+        options.insert("topic".to_string(), entry.catalog.clone());
+        if let Some(max_bytes) = entry.parquet_row_group_bytes {
+            options.insert("max_envelope_bytes".to_string(), max_bytes.to_string());
+        }
+        if let Some(protocol) = &entry.security_protocol {
+            options.insert("security.protocol".to_string(), protocol.clone());
+        }
+    }
+    if let Some(reference) = &entry.secret_name {
+        options.insert("secret".to_string(), reference.clone());
+    }
+    options
 }
 
 /// A source entry registered via `CREATE SOURCE` through the pgwire layer.
@@ -893,20 +914,53 @@ impl CatalogStubs {
                     );
                 }
             }
+            let is_kafka = s.sink_type.eq_ignore_ascii_case("KAFKA");
             inner.sinks.insert(
                 s.name.clone(),
                 CatalogSinkEntry {
                     name: s.name.clone(),
-                    view: s.target.clone(),
-                    format: "parquet".to_string(),
-                    path: s.target,
+                    view: if is_kafka {
+                        s.options
+                            .get("view")
+                            .cloned()
+                            .unwrap_or_else(|| s.target.clone())
+                    } else {
+                        s.target.clone()
+                    },
+                    format: if is_kafka { "KAFKA" } else { "parquet" }.to_string(),
+                    path: if is_kafka {
+                        s.options
+                            .get("brokers")
+                            .cloned()
+                            .unwrap_or_else(|| s.target.clone())
+                    } else {
+                        s.target.clone()
+                    },
                     snapshot_interval_epochs: None,
                     snapshot_interval_ms: None,
-                    parquet_row_group_bytes: None,
+                    parquet_row_group_bytes: if is_kafka {
+                        s.options
+                            .get("max_envelope_bytes")
+                            .and_then(|value| value.parse().ok())
+                    } else {
+                        None
+                    },
                     format_version: None,
                     partition_by: vec![],
-                    catalog: "memory".to_string(),
+                    catalog: if is_kafka {
+                        s.options
+                            .get("topic")
+                            .cloned()
+                            .unwrap_or_else(|| "memory".to_string())
+                    } else {
+                        "memory".to_string()
+                    },
                     secret_name: secret_reference,
+                    security_protocol: if is_kafka {
+                        s.options.get("security.protocol").cloned()
+                    } else {
+                        None
+                    },
                     secret_consumer: s.secret_consumer,
                     secret_namespace: s.secret_namespace,
                     last_snapshot_epoch: None,
@@ -2008,11 +2062,7 @@ impl CatalogStubs {
             name: entry.name.clone(),
             sink_type: entry.format.clone(),
             target: entry.path.clone(),
-            options: entry
-                .secret_name
-                .as_ref()
-                .map(|reference| [("secret".to_string(), reference.clone())].into())
-                .unwrap_or_default(),
+            options: sink_storage_options(&entry),
             status: entry.state.clone(),
             secret_reference: entry.secret_name.clone(),
             secret_consumer: entry.secret_consumer,
@@ -2053,11 +2103,7 @@ impl CatalogStubs {
             name: persisted_entry.name.clone(),
             sink_type: persisted_entry.format.clone(),
             target: persisted_entry.path.clone(),
-            options: persisted_entry
-                .secret_name
-                .as_ref()
-                .map(|reference| [("secret".to_string(), reference.clone())].into())
-                .unwrap_or_default(),
+            options: sink_storage_options(&persisted_entry),
             status: persisted_entry.state.clone(),
             secret_reference: persisted_entry.secret_name.clone(),
             secret_consumer: persisted_entry.secret_consumer,

@@ -52,6 +52,77 @@ struct KafkaBroker {
     producer: BaseProducer,
     bootstrap: String,
     topic: String,
+    security_protocol: Option<String>,
+}
+
+fn validate_sasl_plain_credentials(
+    security_protocol: &str,
+    secret_name: &str,
+    username: &str,
+    password: &str,
+) -> Result<(), SinkError> {
+    if !matches!(security_protocol, "SASL_SSL" | "SASL_PLAINTEXT") {
+        return Err(SinkError::Io(
+            "Kafka secret sinks require security.protocol SASL_SSL or SASL_PLAINTEXT".to_string(),
+        ));
+    }
+    if secret_name.is_empty() || username.is_empty() || password.is_empty() {
+        return Err(SinkError::Io(
+            "Kafka SASL secret requires a name, username, and password".to_string(),
+        ));
+    }
+    std::ffi::CString::new(username)
+        .and_then(|_| std::ffi::CString::new(password))
+        .map_err(|_| SinkError::Io("Kafka SASL credentials contain an invalid NUL byte".into()))?;
+    Ok(())
+}
+
+fn create_broker(
+    connector_id: ConnectorId,
+    bootstrap: &str,
+    topic: &str,
+    sasl: Option<(&str, &str, &str)>,
+) -> Result<KafkaBroker, SinkError> {
+    let mut config = ClientConfig::new();
+    config
+        .set("bootstrap.servers", bootstrap)
+        .set(
+            "transactional.id",
+            format!("rockstream-{}-{topic}", connector_id.0),
+        )
+        .set("enable.idempotence", "true")
+        .set("acks", "all");
+    if let Some((security_protocol, username, password)) = sasl {
+        config
+            .set("security.protocol", security_protocol)
+            .set("sasl.mechanisms", "PLAIN")
+            .set("sasl.username", username)
+            .set("sasl.password", password);
+    }
+    let producer: BaseProducer = config.create().map_err(|error| {
+        if sasl.is_some() {
+            SinkError::Io(format!("Kafka SASL producer creation failed: {error}"))
+        } else {
+            SinkError::Io(format!("Kafka producer configuration failed: {error}"))
+        }
+    })?;
+    producer
+        .init_transactions(Duration::from_secs(15))
+        .map_err(|error| {
+            if sasl.is_some() {
+                SinkError::Io(format!(
+                    "Kafka SASL producer initialization failed: {error}"
+                ))
+            } else {
+                SinkError::Io(format!("Kafka transaction initialization failed: {error}"))
+            }
+        })?;
+    Ok(KafkaBroker {
+        producer,
+        bootstrap: bootstrap.to_owned(),
+        topic: topic.to_owned(),
+        security_protocol: sasl.map(|(protocol, _, _)| protocol.to_owned()),
+    })
 }
 
 #[derive(Serialize, Deserialize)]
@@ -82,6 +153,7 @@ pub struct KafkaSink {
     kafka_tx_timeout_probability: f64,
     broker: Option<KafkaBroker>,
     secret_name: Option<String>,
+    secret_version: u64,
     pending_secret_token: Option<SecretToken>,
     active_secret_token_id: Option<String>,
     secret_rotations_applied: u64,
@@ -183,23 +255,52 @@ impl KafkaSink {
         bootstrap: &str,
         topic: &str,
     ) -> Result<Self, SinkError> {
-        let producer: BaseProducer = ClientConfig::new()
-            .set("bootstrap.servers", bootstrap)
-            .set(
-                "transactional.id",
-                format!("rockstream-{}-{topic}", connector_id.0),
-            )
-            .set("enable.idempotence", "true")
-            .set("acks", "all")
-            .create()
-            .map_err(|error| {
-                SinkError::Io(format!("Kafka producer configuration failed: {error}"))
-            })?;
-        producer
-            .init_transactions(Duration::from_secs(15))
-            .map_err(|error| {
-                SinkError::Io(format!("Kafka transaction initialization failed: {error}"))
-            })?;
+        Self::connect_inner(connector_id, bootstrap, topic, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn connect_with_sasl_plain(
+        connector_id: ConnectorId,
+        bootstrap: &str,
+        topic: &str,
+        security_protocol: &str,
+        secret_name: &str,
+        secret_version: u64,
+        username: &str,
+        password: &str,
+    ) -> Result<Self, SinkError> {
+        validate_sasl_plain_credentials(security_protocol, secret_name, username, password)?;
+        if secret_version == 0 {
+            return Err(SinkError::Io(
+                "Kafka SASL secret version must be positive".to_string(),
+            ));
+        }
+        Self::connect_inner(
+            connector_id,
+            bootstrap,
+            topic,
+            Some((
+                security_protocol,
+                secret_name,
+                secret_version,
+                username,
+                password,
+            )),
+        )
+    }
+
+    fn connect_inner(
+        connector_id: ConnectorId,
+        bootstrap: &str,
+        topic: &str,
+        sasl: Option<(&str, &str, u64, &str, &str)>,
+    ) -> Result<Self, SinkError> {
+        let broker = create_broker(
+            connector_id,
+            bootstrap,
+            topic,
+            sasl.map(|(protocol, _, _, username, password)| (protocol, username, password)),
+        )?;
         Ok(Self {
             connector_id,
             delivered_epochs: BTreeSet::new(),
@@ -208,12 +309,9 @@ impl KafkaSink {
             staged_epochs_count: 0,
             cluster_committed: 0,
             kafka_tx_timeout_probability: 0.0,
-            broker: Some(KafkaBroker {
-                producer,
-                bootstrap: bootstrap.to_owned(),
-                topic: topic.to_owned(),
-            }),
-            secret_name: None,
+            broker: Some(broker),
+            secret_name: sasl.map(|(_, name, _, _, _)| name.to_owned()),
+            secret_version: sasl.map_or(0, |(_, _, version, _, _)| version),
             pending_secret_token: None,
             active_secret_token_id: None,
             secret_rotations_applied: 0,
@@ -232,6 +330,7 @@ impl KafkaSink {
             kafka_tx_timeout_probability: 0.0,
             broker: None,
             secret_name: None,
+            secret_version: 0,
             pending_secret_token: None,
             active_secret_token_id: None,
             secret_rotations_applied: 0,
@@ -240,6 +339,57 @@ impl KafkaSink {
 
     pub fn bind_secret(&mut self, secret_name: impl Into<String>) {
         self.secret_name = Some(secret_name.into());
+    }
+
+    pub fn secret_binding(&self) -> (Option<&str>, u64) {
+        (self.secret_name.as_deref(), self.secret_version)
+    }
+
+    /// Recreate the producer with replacement credentials between transactions.
+    pub fn rotate_sasl_plain_credentials(
+        &mut self,
+        secret_name: &str,
+        version: u64,
+        username: &str,
+        password: &str,
+    ) -> Result<bool, SinkError> {
+        if self.secret_name.as_deref() != Some(secret_name) {
+            return Err(SinkError::Io(
+                "rotated secret does not match the Kafka sink binding".to_string(),
+            ));
+        }
+        if version < self.secret_version {
+            return Err(SinkError::Io(
+                "Kafka sink secret version moved backwards".to_string(),
+            ));
+        }
+        if version == self.secret_version {
+            return Ok(false);
+        }
+        if self.staged_epochs_count != 0 {
+            return Err(SinkError::Io(
+                "Kafka sink secret rotation requires an epoch boundary".to_string(),
+            ));
+        }
+        let broker = self
+            .broker
+            .as_ref()
+            .ok_or_else(|| SinkError::Io("Kafka sink is not connected".to_string()))?;
+        let security_protocol = broker
+            .security_protocol
+            .as_deref()
+            .ok_or_else(|| SinkError::Io("Kafka sink has no SASL transport".to_string()))?;
+        validate_sasl_plain_credentials(security_protocol, secret_name, username, password)?;
+        let replacement = create_broker(
+            self.connector_id,
+            &broker.bootstrap,
+            &broker.topic,
+            Some((security_protocol, username, password)),
+        )?;
+        self.broker = Some(replacement);
+        self.secret_version = version;
+        self.secret_rotations_applied += 1;
+        Ok(true)
     }
 
     /// Queue one encrypted replacement token for the next epoch boundary.
@@ -676,6 +826,67 @@ mod tests {
     }
 
     #[test]
+    fn sasl_secret_sink_rejects_unsupported_transport_and_version() {
+        let error = match KafkaSink::connect_with_sasl_plain(
+            ConnectorId(1),
+            "127.0.0.1:9092",
+            "output",
+            "PLAINTEXT",
+            "kafka_auth",
+            1,
+            "user",
+            "password",
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("unsupported Kafka SASL transport was accepted"),
+        };
+        assert!(matches!(
+            error,
+            SinkError::Io(message)
+                if message == "Kafka secret sinks require security.protocol SASL_SSL or SASL_PLAINTEXT"
+        ));
+
+        let error = match KafkaSink::connect_with_sasl_plain(
+            ConnectorId(1),
+            "127.0.0.1:9092",
+            "output",
+            "SASL_PLAINTEXT",
+            "kafka_auth",
+            0,
+            "user",
+            "password",
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("zero Kafka SASL secret version was accepted"),
+        };
+        assert!(matches!(
+            error,
+            SinkError::Io(message) if message == "Kafka SASL secret version must be positive"
+        ));
+    }
+
+    #[test]
+    fn sasl_secret_rotation_requires_the_bound_secret_and_a_connected_sink() {
+        let mut sink = make_sink();
+        sink.bind_secret("kafka_auth");
+        let error = sink
+            .rotate_sasl_plain_credentials("another_secret", 2, "user", "password")
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SinkError::Io(message) if message == "rotated secret does not match the Kafka sink binding"
+        ));
+
+        let error = sink
+            .rotate_sasl_plain_credentials("kafka_auth", 2, "user", "password")
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SinkError::Io(message) if message == "Kafka sink is not connected"
+        ));
+    }
+
+    #[test]
     fn lookup_distinguishes_setup_poll_absence_and_presence() {
         use rdkafka::mocking::MockCluster;
         use rdkafka::types::{RDKafkaApiKey, RDKafkaRespErr};
@@ -864,6 +1075,7 @@ mod tests {
             kafka_tx_timeout_probability: 0.0,
             broker: None,
             secret_name: None,
+            secret_version: 0,
             pending_secret_token: None,
             active_secret_token_id: None,
             secret_rotations_applied: 0,

@@ -57,6 +57,21 @@ impl KafkaViewSink {
         }
     }
 
+    pub fn secret_binding(&self) -> (Option<&str>, u64) {
+        self.sink.secret_binding()
+    }
+
+    pub fn rotate_sasl_plain_credentials(
+        &mut self,
+        secret_name: &str,
+        version: u64,
+        username: &str,
+        password: &str,
+    ) -> Result<bool, SinkError> {
+        self.sink
+            .rotate_sasl_plain_credentials(secret_name, version, username, password)
+    }
+
     /// Override the per-transaction envelope byte ceiling (useful for tests
     /// and brokers with custom `message.max.bytes`).
     pub fn with_max_envelope_bytes(mut self, max_envelope_bytes: usize) -> Self {

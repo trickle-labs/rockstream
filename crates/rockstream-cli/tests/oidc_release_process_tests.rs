@@ -16,7 +16,9 @@ use parking_lot::RwLock;
 use rdkafka::{
     admin::{AdminClient, AdminOptions, NewTopic, TopicReplication},
     config::ClientConfig,
+    consumer::{BaseConsumer, Consumer},
     producer::{FutureProducer, FutureRecord},
+    Message,
 };
 use rockstream_control::audit::FileAuditLog;
 use rockstream_control::management_store::{
@@ -2662,6 +2664,79 @@ async fn kafka_source_rows(
     }
 }
 
+fn kafka_sink_records(bootstrap: &str, topic: &str, deadline: Instant) -> Vec<serde_json::Value> {
+    let mut config = kafka_sasl_client(bootstrap, "admin", "admin-pass");
+    config
+        .set("group.id", "rockstream-sink-release-proof")
+        .set("enable.auto.commit", "false")
+        .set("auto.offset.reset", "earliest")
+        .set("isolation.level", "read_committed");
+    let consumer: BaseConsumer = config.create().unwrap();
+    consumer.subscribe(&[topic]).unwrap();
+    let mut records = Vec::new();
+    let mut idle_since = Instant::now();
+    loop {
+        if let Some(message) = consumer.poll(Duration::from_millis(100)) {
+            let message = message.unwrap();
+            let payload = message.payload().expect("Kafka sink record has a payload");
+            records.push(serde_json::from_slice(payload).unwrap());
+            idle_since = Instant::now();
+        } else if !records.is_empty() && idle_since.elapsed() >= Duration::from_secs(1) {
+            return records;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Kafka sink consumer received no committed records before the deadline"
+        );
+    }
+}
+
+fn assert_kafka_sink_rows(records: &[serde_json::Value], expected_rows: &[Vec<Option<String>>]) {
+    assert!(!records.is_empty(), "Kafka sink produced no records");
+    assert_eq!(records[0]["kind"], "snapshot");
+    let epochs = records
+        .iter()
+        .map(|record| record["epoch"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(epochs, (0..records.len() as u64).collect::<Vec<_>>());
+
+    let mut observed = BTreeMap::<String, i64>::new();
+    for record in records {
+        if record["kind"] == "snapshot" {
+            observed.clear();
+        } else {
+            assert_eq!(record["kind"], "changes");
+        }
+        for row in record["rows"].as_array().unwrap() {
+            let key = serde_json::to_string(&row["values"]).unwrap();
+            let weight = row["weight"].as_i64().unwrap();
+            let next = observed.get(&key).copied().unwrap_or_default() + weight;
+            if next == 0 {
+                observed.remove(&key);
+            } else {
+                observed.insert(key, next);
+            }
+        }
+    }
+    let mut expected = BTreeMap::<String, i64>::new();
+    for row in expected_rows {
+        let values = row
+            .iter()
+            .map(|value| match value {
+                Some(value) => serde_json::json!({ "Int64": value.parse::<i64>().unwrap() }),
+                None => serde_json::json!("Null"),
+            })
+            .collect::<Vec<_>>();
+        *expected
+            .entry(serde_json::to_string(&values).unwrap())
+            .or_default() += 1;
+    }
+    assert_eq!(
+        observed, expected,
+        "Kafka sink must expose the exact final relation"
+    );
+}
+
 async fn kafka_source_group_checkpoints<I: Image>(
     broker: &ContainerAsync<I>,
     topic: &str,
@@ -5071,6 +5146,8 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
             "PLAINTEXT:SASL_PLAINTEXT,BROKER:PLAINTEXT,CONTROLLER:PLAINTEXT",
         )
         .with_env_var("KAFKA_SASL_ENABLED_MECHANISMS", "PLAIN")
+        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
+        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1")
         .with_env_var(
             "KAFKA_AUTHORIZER_CLASS_NAME",
             "org.apache.kafka.metadata.authorizer.StandardAuthorizer",
@@ -5104,6 +5181,7 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
             &[
                 NewTopic::new("rotating-orders", 3, TopicReplication::Fixed(1)),
                 NewTopic::new("steady-orders", 1, TopicReplication::Fixed(1)),
+                NewTopic::new("sink-rotating-orders", 1, TopicReplication::Fixed(1)),
             ],
             &AdminOptions::new(),
         )
@@ -5113,7 +5191,8 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
         created_topics,
         [
             Ok("rotating-orders".to_string()),
-            Ok("steady-orders".to_string())
+            Ok("steady-orders".to_string()),
+            Ok("sink-rotating-orders".to_string())
         ]
     );
     for (principal, topic, group) in [
@@ -5149,6 +5228,52 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
                 group,
                 "--resource-pattern-type",
                 "prefixed",
+            ],
+        )
+        .await;
+    }
+    for principal in ["User:rotating", "User:rotated"] {
+        kafka_acl(
+            &broker,
+            &[
+                "--add",
+                "--allow-principal",
+                principal,
+                "--operation",
+                "Write",
+                "--operation",
+                "Describe",
+                "--topic",
+                "sink-rotating-orders",
+            ],
+        )
+        .await;
+        kafka_acl(
+            &broker,
+            &[
+                "--add",
+                "--allow-principal",
+                principal,
+                "--operation",
+                "Write",
+                "--operation",
+                "Describe",
+                "--transactional-id",
+                "rockstream-",
+                "--resource-pattern-type",
+                "prefixed",
+            ],
+        )
+        .await;
+        kafka_acl(
+            &broker,
+            &[
+                "--add",
+                "--allow-principal",
+                principal,
+                "--operation",
+                "IdempotentWrite",
+                "--cluster",
             ],
         )
         .await;
@@ -5261,6 +5386,9 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
         "CREATE MATERIALIZED VIEW rotating_a AS SELECT id, amount FROM rotating_orders",
         "CREATE MATERIALIZED VIEW rotating_b AS SELECT id, amount FROM rotating_orders",
         "CREATE MATERIALIZED VIEW steady_rows AS SELECT id, amount FROM steady_orders",
+        &format!(
+            "CREATE SINK rotating_out FROM rotating_a INTO KAFKA (brokers = '{bootstrap}', topic = 'sink-rotating-orders', secret = 'kafka_auth', security.protocol = 'SASL_PLAINTEXT')"
+        ),
     ] {
         client.simple_query(sql).await.unwrap();
     }
@@ -5649,6 +5777,12 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
         "unaffected consumer checkpoint after gateway restart",
     )
     .await;
+    let sink_records = kafka_sink_records(
+        &bootstrap,
+        "sink-rotating-orders",
+        Instant::now() + Duration::from_secs(90),
+    );
+    assert_kafka_sink_rows(&sink_records, &expected_rotating);
     let audit = FileAuditLog::open(storage.join("audit.jsonl"))
         .unwrap()
         .read_all()

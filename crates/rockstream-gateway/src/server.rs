@@ -3175,6 +3175,171 @@ impl GatewayHandler {
             .map_err(|error| error.to_string())
     }
 
+    async fn authorize_sink_secret_use(
+        &self,
+        sink: &CatalogSinkEntry,
+        reference: &str,
+    ) -> Result<String, String> {
+        let secret_name = rockstream_types::secret::secret_name_from_reference(reference)
+            .ok_or_else(|| "sink has an unsupported secret reference".to_string())?;
+        let consumer_id = sink
+            .secret_consumer
+            .ok_or_else(|| "sink secret reference has no durable consumer identity".to_string())?;
+        let namespace = sink
+            .secret_namespace
+            .as_deref()
+            .ok_or_else(|| "sink secret reference has no durable namespace".to_string())?;
+        let store = self
+            .catalog
+            .get_durable_store()
+            .ok_or_else(|| "durable secret authorization state is unavailable".to_string())?;
+        use rockstream_storage::catalog::CatalogStore;
+        let consumers = store
+            .list_security_principals()
+            .await
+            .map_err(|_| "durable secret authorization state is unavailable".to_string())?;
+        let consumer = consumers
+            .into_iter()
+            .find(|principal| principal.id == consumer_id && principal.enabled)
+            .ok_or_else(|| "sink secret consumer is no longer enabled".to_string())?;
+        let scope = PolicyScope::Secret {
+            namespace: namespace.to_string(),
+            name: secret_name.to_string(),
+            consumer: Some(consumer_id),
+        };
+        if !rockstream_control::authorization::allows(&consumer, SecurityAction::SecretUse, &scope)
+        {
+            return Err("[RS-2401] sink secret consumer is no longer authorized".to_string());
+        }
+        Ok(secret_name.to_string())
+    }
+
+    async fn resolve_sink_secret(
+        &self,
+        sink: &CatalogSinkEntry,
+        reference: &str,
+    ) -> Result<rockstream_types::secret::Secret, String> {
+        let secret_name = self.authorize_sink_secret_use(sink, reference).await?;
+        let namespace = sink
+            .secret_namespace
+            .as_deref()
+            .ok_or_else(|| "sink secret reference has no durable namespace".to_string())?;
+        let namespace_id = self.secret_namespace_id(namespace).await?;
+        self.secret_store
+            .get_secret(namespace_id, &secret_name)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn kafka_sink_credentials(
+        &self,
+        sink: &CatalogSinkEntry,
+    ) -> Result<Option<(String, String, u64, String, String)>, String> {
+        let Some(reference) = sink.secret_name.as_deref() else {
+            if sink.security_protocol.is_some() {
+                return Err(
+                    "Kafka SASL security.protocol requires a bound sasl_plain secret".into(),
+                );
+            }
+            return Ok(None);
+        };
+        let protocol = match sink
+            .security_protocol
+            .as_deref()
+            .map(str::to_ascii_uppercase)
+            .as_deref()
+        {
+            Some("SASL_SSL") => "SASL_SSL",
+            Some("SASL_PLAINTEXT") => "SASL_PLAINTEXT",
+            _ => {
+                return Err(
+                    "Kafka secret sinks require security.protocol SASL_SSL or SASL_PLAINTEXT"
+                        .into(),
+                )
+            }
+        };
+        let secret = self.resolve_sink_secret(sink, reference).await?;
+        if secret.secret_type != rockstream_types::secret::SecretType::SaslPlain {
+            return Err("Kafka sink secret must use type sasl_plain".into());
+        }
+        let username = secret
+            .payload
+            .get("username")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "Kafka sink secret has no username".to_string())?
+            .clone();
+        let password = secret
+            .payload
+            .get("password")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "Kafka sink secret has no password".to_string())?
+            .clone();
+        Ok(Some((
+            protocol.to_string(),
+            secret.name,
+            secret.metadata.version,
+            username,
+            password,
+        )))
+    }
+
+    async fn refresh_kafka_sink_secret(
+        &self,
+        entry: &CatalogSinkEntry,
+        sink: &mut rockstream_ops::kafka_sink::KafkaViewSink,
+    ) -> Result<bool, String> {
+        let (bound_name, active_version) = sink.secret_binding();
+        let Some(bound_name) = bound_name.map(str::to_string) else {
+            if entry.secret_name.is_some() {
+                return Err("Kafka sink secret binding is unavailable".into());
+            }
+            if entry.security_protocol.is_some() {
+                return Err(
+                    "Kafka SASL security.protocol requires a bound sasl_plain secret".into(),
+                );
+            }
+            return Ok(false);
+        };
+        let reference = entry
+            .secret_name
+            .as_deref()
+            .ok_or_else(|| "Kafka sink secret reference is unavailable".to_string())?;
+        let secret_name = self.authorize_sink_secret_use(entry, reference).await?;
+        if secret_name != bound_name {
+            return Err("Kafka sink secret binding changed".into());
+        }
+        let namespace = entry
+            .secret_namespace
+            .as_deref()
+            .ok_or_else(|| "sink secret reference has no durable namespace".to_string())?;
+        let namespace_id = self.secret_namespace_id(namespace).await?;
+        let metadata = self
+            .secret_store
+            .get_secret_metadata(namespace_id, &secret_name)
+            .await
+            .map_err(|error| error.to_string())?;
+        if metadata.version < active_version {
+            return Err("Kafka sink secret version moved backwards".into());
+        }
+        if metadata.version == active_version {
+            return Ok(false);
+        }
+        let credentials = self
+            .kafka_sink_credentials(entry)
+            .await?
+            .ok_or_else(|| "Kafka sink secret credentials are unavailable".to_string())?;
+        if credentials.2 < metadata.version {
+            return Err("Kafka sink secret changed during credential resolution".into());
+        }
+        sink.rotate_sasl_plain_credentials(
+            &credentials.1,
+            credentials.2,
+            &credentials.3,
+            &credentials.4,
+        )
+        .map_err(|error| error.to_string())
+    }
+
     async fn refresh_kafka_secret_at_epoch(
         &self,
         runtime: &mut SourceRuntimeCoordinator<KafkaSource>,
@@ -3944,6 +4109,7 @@ impl GatewayHandler {
             return;
         }
         let matching_sinks: Vec<(
+            CatalogSinkEntry,
             String,
             Arc<tokio::sync::Mutex<rockstream_ops::kafka_sink::KafkaViewSink>>,
         )> = self
@@ -3956,11 +4122,19 @@ impl GatewayHandler {
             .filter_map(|entry| {
                 self.kafka_sinks
                     .get(&entry.name)
-                    .map(|sink| (entry.name, Arc::clone(sink.value())))
+                    .map(|sink| (entry.clone(), entry.name, Arc::clone(sink.value())))
             })
             .collect();
-        for (sink_name, sink_arc) in matching_sinks {
+        for (entry, sink_name, sink_arc) in matching_sinks {
             let mut sink = sink_arc.lock().await;
+            if let Err(error) = self.refresh_kafka_sink_secret(&entry, &mut sink).await {
+                tracing::warn!(
+                    sink = %sink_name,
+                    error = %error,
+                    "deliver_kafka_sinks_for_views: failed to refresh Kafka sink credentials"
+                );
+                continue;
+            }
             if let Err(err) = sink.drain_all().await {
                 tracing::warn!(
                     sink = %sink_name,
@@ -3996,12 +4170,29 @@ impl GatewayHandler {
             );
             let topic = &entry.catalog;
             let brokers = &entry.path;
-            let kafka_sink =
-                rockstream_connectors::KafkaSink::connect(connector_id, brokers, topic).map_err(
-                    |e| GatewayError::QueryTimeExecutionFailed {
-                        detail: format!("recover Kafka sink '{}': {e}", entry.name),
-                    },
-                )?;
+            let kafka_sink = match self
+                .kafka_sink_credentials(&entry)
+                .await
+                .map_err(|detail| GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("recover Kafka sink '{}': {detail}", entry.name),
+                })? {
+                Some((protocol, secret_name, version, username, password)) => {
+                    rockstream_connectors::KafkaSink::connect_with_sasl_plain(
+                        connector_id,
+                        brokers,
+                        topic,
+                        &protocol,
+                        &secret_name,
+                        version,
+                        &username,
+                        &password,
+                    )
+                }
+                None => rockstream_connectors::KafkaSink::connect(connector_id, brokers, topic),
+            }
+            .map_err(|error| GatewayError::QueryTimeExecutionFailed {
+                detail: format!("recover Kafka sink '{}': {error}", entry.name),
+            })?;
             let mut view_sink = rockstream_ops::kafka_sink::KafkaViewSink::new(
                 kafka_sink,
                 Arc::clone(shard_db),
@@ -11610,11 +11801,6 @@ impl GatewayHandler {
         }
 
         let is_kafka_sink = parsed.format.eq_ignore_ascii_case("KAFKA");
-        if is_kafka_sink && parsed.secret.is_some() {
-            return Ok(vec![create_sink_error_response(
-                "[RS-4007] sink.ddl_invalid: Kafka sink secret credentials are not supported. Next steps: omit the secret option until Kafka producer authentication and rotation are supported.".to_string(),
-            )]);
-        }
         if !is_kafka_sink
             && !matches!(
                 parsed.catalog.as_str(),
@@ -11704,6 +11890,7 @@ impl GatewayHandler {
             partition_by: parsed.partition_by,
             catalog: parsed.catalog,
             secret_name: secret_reference.clone(),
+            security_protocol: parsed.security_protocol,
             secret_consumer: secret_scope.as_ref().map(|(consumer, _)| *consumer),
             secret_namespace: secret_scope
                 .as_ref()
@@ -11721,16 +11908,40 @@ impl GatewayHandler {
                                 .format_version
                                 .unwrap_or_else(|| stable_name_id("kafka-sink", &parsed.name)),
                         );
-                        let kafka_sink = match rockstream_connectors::KafkaSink::connect(
-                            connector_id,
-                            &entry.path,
-                            &entry.catalog,
-                        ) {
-                            Ok(sink) => sink,
-                            Err(err) => {
+                        let credentials = match self.kafka_sink_credentials(&entry).await {
+                            Ok(credentials) => credentials,
+                            Err(error) => {
                                 return Ok(vec![create_sink_error_response(format!(
-                                    "[RS-4008] sink.kafka_connect_failed: failed to connect Kafka sink '{}' to '{}': {err}. Next steps: verify Kafka broker reachability and topic configuration.",
-                                    parsed.name, entry.path
+                                    "[RS-4008] sink.kafka_connect_failed: failed to resolve credentials for Kafka sink '{}': {error}. Next steps: verify the secret type, scope, and SASL transport.",
+                                    parsed.name,
+                                ))]);
+                            }
+                        };
+                        let kafka_sink_result = match credentials {
+                            Some((protocol, secret_name, version, username, password)) => {
+                                rockstream_connectors::KafkaSink::connect_with_sasl_plain(
+                                    connector_id,
+                                    &entry.path,
+                                    &entry.catalog,
+                                    &protocol,
+                                    &secret_name,
+                                    version,
+                                    &username,
+                                    &password,
+                                )
+                            }
+                            None => rockstream_connectors::KafkaSink::connect(
+                                connector_id,
+                                &entry.path,
+                                &entry.catalog,
+                            ),
+                        };
+                        let kafka_sink = match kafka_sink_result {
+                            Ok(sink) => sink,
+                            Err(error) => {
+                                return Ok(vec![create_sink_error_response(format!(
+                                    "[RS-4008] sink.kafka_connect_failed: failed to connect Kafka sink '{}' to '{}': {error}. Next steps: verify Kafka broker reachability, topic configuration, and secret credentials.",
+                                    parsed.name, entry.path,
                                 ))]);
                             }
                         };
@@ -21999,6 +22210,7 @@ struct ParsedCreateSink {
     partition_by: Vec<String>,
     catalog: String,
     secret: Option<String>,
+    security_protocol: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22070,7 +22282,7 @@ fn parse_create_sink_ddl(q: &str) -> Result<ParsedCreateSink, String> {
     let after_create_lower = after_create.to_lowercase();
 
     // SQL-wired Kafka sink syntax (issue #404 R4):
-    //   CREATE SINK [IF NOT EXISTS] <name> FROM <view> INTO KAFKA [WITH] (brokers = '...', topic = '...', ...)
+    //   CREATE SINK [IF NOT EXISTS] <name> FROM <view> INTO KAFKA [WITH] (brokers = '...', topic = '...', secret = '...', security.protocol = 'SASL_SSL')
     if let Some(from_pos) = after_create_lower.find(" from ") {
         if after_create_lower.contains(" into kafka") {
             let name = after_create[..from_pos]
@@ -22137,6 +22349,27 @@ fn parse_create_sink_ddl(q: &str) -> Result<ParsedCreateSink, String> {
                 }
                 None => None,
             };
+            let security_protocol = match option_map.get("security.protocol") {
+                Some(CreateSinkOptionValue::String(value)) => {
+                    Some(value.trim().to_ascii_uppercase())
+                }
+                Some(_) => {
+                    return Err("[RS-4007] CREATE SINK option security.protocol must be a string. Next steps: use SASL_SSL or SASL_PLAINTEXT with a SASL secret.".to_string());
+                }
+                None => None,
+            };
+            match (secret.is_some(), security_protocol.as_deref()) {
+                (true, None) => {
+                    return Err("[RS-4007] Kafka sink secret requires security.protocol. Next steps: provide security.protocol = 'SASL_SSL' or 'SASL_PLAINTEXT' with secret = '<name>'.".to_string());
+                }
+                (false, Some(_)) => {
+                    return Err("[RS-4007] Kafka sink security.protocol requires secret. Next steps: add secret = '<name>' or omit security.protocol.".to_string());
+                }
+                (true, Some(protocol)) if !matches!(protocol, "SASL_SSL" | "SASL_PLAINTEXT") => {
+                    return Err("[RS-4007] Kafka sink security.protocol must be SASL_SSL or SASL_PLAINTEXT. Next steps: choose a supported SASL transport.".to_string());
+                }
+                _ => {}
+            }
             let transactional_id = match option_map.get("transactional_id") {
                 Some(CreateSinkOptionValue::String(s)) if !s.trim().is_empty() => {
                     vec![s.trim().to_string()]
@@ -22156,10 +22389,11 @@ fn parse_create_sink_ddl(q: &str) -> Result<ParsedCreateSink, String> {
                         | "topic"
                         | "max_envelope_bytes"
                         | "secret"
+                        | "security.protocol"
                         | "transactional_id"
                 ) {
                     return Err(format!(
-                        "[RS-4007] CREATE SINK INTO KAFKA does not recognize option '{key}'. Next steps: use brokers, topic, optional max_envelope_bytes, transactional_id, or secret."
+                        "[RS-4007] CREATE SINK INTO KAFKA does not recognize option '{key}'. Next steps: use brokers, topic, optional max_envelope_bytes, transactional_id, secret, and security.protocol."
                     ));
                 }
             }
@@ -22175,6 +22409,7 @@ fn parse_create_sink_ddl(q: &str) -> Result<ParsedCreateSink, String> {
                 partition_by: transactional_id,
                 catalog: topic,
                 secret,
+                security_protocol,
             });
         }
     }
@@ -22282,6 +22517,7 @@ fn parse_create_sink_ddl(q: &str) -> Result<ParsedCreateSink, String> {
         partition_by,
         catalog,
         secret,
+        security_protocol: None,
     })
 }
 

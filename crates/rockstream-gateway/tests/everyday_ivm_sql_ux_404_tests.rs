@@ -855,7 +855,7 @@ async fn sql_create_sink_kafka_validation_and_error_contract() {
         "expected RS-4007 unknown view error, got: {msg}"
     );
 
-    // Secret references fail closed until the Kafka producer applies credentials.
+    // A secret binding must identify the producer's SASL transport.
     let err = client
         .simple_query(
             "CREATE SINK s4 FROM sales_mv INTO KAFKA (brokers = '127.0.0.1:9092', topic = 't', secret = 'kafka_auth')",
@@ -864,7 +864,7 @@ async fn sql_create_sink_kafka_validation_and_error_contract() {
         .unwrap_err();
     assert_eq!(
         err.as_db_error().unwrap().message(),
-        "[RS-4007] sink.ddl_invalid: Kafka sink secret credentials are not supported. Next steps: omit the secret option until Kafka producer authentication and rotation are supported."
+        "[RS-4007] Kafka sink secret requires security.protocol. Next steps: provide security.protocol = 'SASL_SSL' or 'SASL_PLAINTEXT' with secret = '<name>'."
     );
 
     // Ensure removed connectors still fail closed with RS-4017 (R6 scope guardrail).

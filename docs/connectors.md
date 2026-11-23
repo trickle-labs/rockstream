@@ -2,17 +2,17 @@
 
 ## Secret rotation
 
-Kafka and PostgreSQL CDC sources can bind to `secret = '<name>'`. The SQL
-Kafka sink rejects `secret =` until its producer can apply the referenced
-credentials. New source catalog entries store the binding as `secret://<name>`;
-resolved credential values are not copied into connector metadata. Attaching a
-secret requires an explicit `SecretUse` grant scoped to the secret and consumer
-principal; missing identity or durable policy fails closed. Source and sink
-metadata is committed before CREATE or DROP is acknowledged. The gateway
-rechecks a source consumer's current grant before resolving its credential.
-Older source entries without persisted consumer scope fail closed; an authorized
-migration route remains to be qualified. Kafka sink authentication and
-credential rotation remain unqualified.
+Kafka and PostgreSQL CDC sources, and SQL-wired Kafka sinks, can bind to
+`secret = '<name>'`. Kafka sinks also require
+`security.protocol = 'SASL_SSL'` or `'SASL_PLAINTEXT'`. New catalog entries store
+the binding as `secret://<name>`; resolved credential values are not copied
+into connector metadata. Attaching a secret requires an explicit `SecretUse`
+grant scoped to the secret and consumer principal; missing identity or durable
+policy fails closed. The gateway rechecks a source or sink consumer's current
+grant before resolving credentials. Older secret-bound sink entries without a
+persisted SASL protocol fail closed. The Docker-backed
+[`kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_consumers`](../crates/rockstream-cli/tests/oidc_release_process_tests.rs)
+release proof checks sink records across secret rotation and gateway restart.
 
 The gateway pgoutput source checks the durable secret version before a source
 transaction and after its committed epoch. If it changes during the transaction,
@@ -22,7 +22,9 @@ worker alive. A Kafka source uses an explicit SASL transport and PLAIN credentia
 at the next source epoch it replaces the consumer with the authorized credentials,
 seeking from the durable source checkpoint while keeping the worker alive. Kafka
 source rotation still needs release-process qualification across views and
-partitions.
+partitions. A Kafka sink checks its bound secret version before each committed
+view delivery and recreates its transactional producer at an epoch boundary
+when credentials rotate.
 
 RockStream supports exactly three external connector boundaries: PostgreSQL
 CDC, Kafka source, and Kafka sink. `object_store` is internal durable state,
@@ -250,6 +252,20 @@ contain signed changes for one nonempty view epoch each. The legacy
 `CREATE SINK` wires this adapter through pgwire, durable catalog persistence,
 commit-time delivery, and restart recovery.
 
+An authenticated sink uses a `sasl_plain` secret and an explicit transport:
+
+```sql
+CREATE SINK orders_out FROM orders_mv INTO KAFKA (
+    brokers = 'kafka:9092', topic = 'orders',
+    secret = 'kafka_auth', security.protocol = 'SASL_SSL'
+);
+```
+
+The gateway resolves credentials through the durable secret catalog. It checks
+for secret rotation before each committed view delivery and recreates the
+transactional producer at an epoch boundary. Failed authorization or credential
+refresh skips delivery.
+
 The canonical v1 payload is a JSON object with `version: 1`, `connector_id`,
 `view` (operator ID), `epoch` (sink transaction sequence starting at zero),
 `view_epoch` (last included view epoch, or null for an empty initial view),
@@ -273,8 +289,8 @@ checks durable topic delivery before republishing. An unresolved lookup returns
 Use one owner, a dedicated topic/connector ID, an append-only monotonically
 committed view log, and a fixed schema. Retain the log and Kafka delivery records
 until recovery no longer needs them. Envelopes above 900 KiB and view log reads
-above 64 MiB fail closed; chunked snapshots, automatic log compaction, SQL sink
-wiring, and full Core release qualification remain outside this adapter.
+above 64 MiB fail closed; chunked snapshots, automatic log compaction, and full
+Core release qualification remain outside this adapter.
 
 The [#122 acceptance contract](acceptance-contracts/122.md) is checked through a
 real consumer, including exact payloads, four crash windows, and wrong-value,
@@ -352,7 +368,8 @@ sink cells below exercise legacy marker transport and recovery only.
 
 ### Kafka sink
 
-Epoch/count marker transport checks only; row-delivery qualification is unsupported.
+The Docker-backed release proof named above exercises authenticated SQL sink
+row delivery, rotation, exact final relation recovery, and a gateway restart.
 
 | Cell | Test |
 | --- | --- |
