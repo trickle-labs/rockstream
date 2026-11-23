@@ -22290,9 +22290,10 @@ fn parse_create_sink_ddl(q: &str) -> Result<ParsedCreateSink, String> {
                 .trim_matches('"')
                 .to_lowercase();
             if name.is_empty() {
-                return Err(format!(
+                return Err(
                     "[RS-4007] CREATE SINK requires a sink name. Next steps: use CREATE SINK <name> FROM <view> INTO KAFKA (brokers = '...', topic = '...')."
-                ));
+                        .to_string(),
+                );
             }
             let after_from = after_create[from_pos + " from ".len()..].trim();
             let after_from_lower = after_from.to_lowercase();

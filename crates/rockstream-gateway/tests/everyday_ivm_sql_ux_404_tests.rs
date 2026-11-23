@@ -2,9 +2,9 @@
 //! - R1: Core ORDER BY and LIMIT (materialized Top-K views + SELECT ORDER BY/LIMIT)
 //! - R2: SQL-reachable HOP and SESSION windows with shared time-slice reuse
 //! - R3: Zero-downtime view evolution (`CREATE OR REPLACE MATERIALIZED VIEW`)
-//!       and backfill visibility (`SHOW BACKFILL STATUS`, `rockstream_catalog.backfill_status`)
+//!   and backfill visibility (`SHOW BACKFILL STATUS`, `rockstream_catalog.backfill_status`)
 //! - R4: Core SQL-wired Kafka sink (`CREATE SINK ... FROM <view> INTO KAFKA (...)`)
-//!       with chunked snapshots and durable catalog recovery
+//!   with chunked snapshots and durable catalog recovery
 //! - R5: Clear, actionable RS-* errors for unsupported SQL
 
 use std::collections::BTreeMap;
