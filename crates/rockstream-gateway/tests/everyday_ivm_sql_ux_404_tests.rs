@@ -855,10 +855,22 @@ async fn sql_create_sink_kafka_validation_and_error_contract() {
         "expected RS-4007 unknown view error, got: {msg}"
     );
 
+    // Secret references fail closed until the Kafka producer applies credentials.
+    let err = client
+        .simple_query(
+            "CREATE SINK s4 FROM sales_mv INTO KAFKA (brokers = '127.0.0.1:9092', topic = 't', secret = 'kafka_auth')",
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().unwrap().message(),
+        "[RS-4007] sink.ddl_invalid: Kafka sink secret credentials are not supported. Next steps: omit the secret option until Kafka producer authentication and rotation are supported."
+    );
+
     // Ensure removed connectors still fail closed with RS-4017 (R6 scope guardrail).
     let err = client
         .simple_query(
-            "CREATE SINK s4 FOR VIEW sales_mv TO PARQUET 's3://bucket/out' WITH (catalog = filesystem)",
+            "CREATE SINK s5 FOR VIEW sales_mv TO PARQUET 's3://bucket/out' WITH (catalog = filesystem)",
         )
         .await
         .unwrap_err();

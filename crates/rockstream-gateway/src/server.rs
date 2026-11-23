@@ -11610,6 +11610,11 @@ impl GatewayHandler {
         }
 
         let is_kafka_sink = parsed.format.eq_ignore_ascii_case("KAFKA");
+        if is_kafka_sink && parsed.secret.is_some() {
+            return Ok(vec![create_sink_error_response(
+                "[RS-4007] sink.ddl_invalid: Kafka sink secret credentials are not supported. Next steps: omit the secret option until Kafka producer authentication and rotation are supported.".to_string(),
+            )]);
+        }
         if !is_kafka_sink
             && !matches!(
                 parsed.catalog.as_str(),

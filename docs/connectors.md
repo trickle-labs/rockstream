@@ -2,17 +2,17 @@
 
 ## Secret rotation
 
-Kafka sources/sinks and PostgreSQL CDC sources can bind to `secret = '<name>'`.
-New source and sink catalog entries store the binding as `secret://<name>`;
+Kafka and PostgreSQL CDC sources can bind to `secret = '<name>'`. The SQL
+Kafka sink rejects `secret =` until its producer can apply the referenced
+credentials. New source catalog entries store the binding as `secret://<name>`;
 resolved credential values are not copied into connector metadata. Attaching a
 secret requires an explicit `SecretUse` grant scoped to the secret and consumer
 principal; missing identity or durable policy fails closed. Source and sink
 metadata is committed before CREATE or DROP is acknowledged. The gateway
 rechecks a source consumer's current grant before resolving its credential.
-Older entries without persisted consumer scope fail closed; an authorized
-migration route remains to be qualified. A Kafka sink stores and authorizes its
-secret reference for lifecycle checks, but its producer does not yet use those
-credentials; SASL authentication and credential rotation remain unqualified.
+Older source entries without persisted consumer scope fail closed; an authorized
+migration route remains to be qualified. Kafka sink authentication and
+credential rotation remain unqualified.
 
 The gateway pgoutput source checks the durable secret version before a source
 transaction and after its committed epoch. If it changes during the transaction,
