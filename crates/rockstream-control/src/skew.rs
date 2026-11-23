@@ -167,9 +167,17 @@ pub struct HotKeyDetector {
 }
 
 #[derive(Debug, Clone)]
+struct HotKeyWindow {
+    shard_id: ShardId,
+    key_prefix: Vec<u8>,
+    started_at_ms: u64,
+    last_observed_at_ms: u64,
+}
+
+#[derive(Debug, Clone)]
 pub struct AdaptiveSkewSplitter {
     config: SkewSplitConfig,
-    overload_started_at_ms: BTreeMap<OperatorId, (ShardId, Vec<u8>, u64, u64)>,
+    overload_started_at_ms: BTreeMap<OperatorId, HotKeyWindow>,
 }
 
 #[derive(Debug, Clone)]
@@ -675,15 +683,24 @@ impl AdaptiveSkewSplitter {
                 return Err(error);
             }
         };
+        let new_window = || HotKeyWindow {
+            shard_id: worst.shard_id,
+            key_prefix: hot_key.key_prefix.clone(),
+            started_at_ms: now_ms,
+            last_observed_at_ms: now_ms,
+        };
         let window = self
             .overload_started_at_ms
             .entry(operator_id)
-            .or_insert_with(|| (worst.shard_id, hot_key.key_prefix.clone(), now_ms, now_ms));
-        if window.0 != worst.shard_id || window.1 != hot_key.key_prefix || now_ms < window.3 {
-            *window = (worst.shard_id, hot_key.key_prefix.clone(), now_ms, now_ms);
+            .or_insert_with(new_window);
+        if window.shard_id != worst.shard_id
+            || window.key_prefix != hot_key.key_prefix
+            || now_ms < window.last_observed_at_ms
+        {
+            *window = new_window();
         }
-        window.3 = now_ms;
-        let overloaded_since = window.2;
+        window.last_observed_at_ms = now_ms;
+        let overloaded_since = window.started_at_ms;
         if now_ms.saturating_sub(overloaded_since) < SKEW_SPLIT_TRIGGER_WINDOW.as_millis() as u64 {
             return Ok(None);
         }
@@ -695,24 +712,29 @@ impl AdaptiveSkewSplitter {
         let bucket_count = 1u16 << (u16::BITS - 1 - requested_buckets.leading_zeros());
         let plan = plan_hot_key_mitigation(law, operator_id, bucket_count, spill_shard);
         if let Some(audit) = audit {
+            let action = match &plan {
+                HotKeyMitigationPlan::Split { .. } => "split",
+                HotKeyMitigationPlan::Spill { .. } => "single_owner_fallback",
+            };
             let event = rockstream_types::audit::AuditEvent::now(
                 "auto_tuner",
                 "skew_splitting.adjusted",
                 operator_id.to_string(),
             )
             .with_detail(format!(
-                "shard_id={}, hot_key={}, load_factor={load_factor:.3}, worst_score={}, median_score={}, hot_key_factor={}, bucket_count={}, sustained_ms={}",
+                "shard_id={}, hot_key={}, load_factor={load_factor:.3}, worst_score={}, median_score={}, hot_key_factor={}, bucket_count={}, sustained_ms={}, decision={action}, reassociation_admitted={}",
                 worst.shard_id,
                 hex_key(&hot_key.key_prefix),
                 worst_score,
                 median,
                 self.config.hot_key_factor,
                 bucket_count,
-                now_ms.saturating_sub(overloaded_since)
+                now_ms.saturating_sub(overloaded_since),
+                law.can_reassociate()
             ));
             let _ = audit.append(&event);
         }
-        window.2 = now_ms;
+        window.started_at_ms = now_ms;
         Ok(Some(SkewSplitDecision {
             operator_id,
             shard_id: worst.shard_id,

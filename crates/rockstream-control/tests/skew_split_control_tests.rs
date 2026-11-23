@@ -151,11 +151,10 @@ fn skew_control_loop_audits_non_composable_spill_decision() {
     let events = log.read_all().unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].action, "skew_splitting.adjusted");
-    assert!(events[0]
-        .detail
-        .as_deref()
-        .unwrap()
-        .contains("load_factor="));
+    let detail = events[0].detail.as_deref().unwrap();
+    assert!(detail.contains("load_factor="));
+    assert!(detail.contains("decision=single_owner_fallback"));
+    assert!(detail.contains("reassociation_admitted=false"));
 }
 
 #[test]

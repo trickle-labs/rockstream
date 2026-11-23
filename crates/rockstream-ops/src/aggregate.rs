@@ -1859,27 +1859,22 @@ impl BucketedAggregateOp {
             }
         }
 
-        for (&(group_key, _bucket), &(sum, count)) in local_partials.iter() {
-            if let Some((combined_sum, combined_count)) = local_combined.get_mut(&group_key) {
-                if *combined_count == 0 {
-                    *combined_sum = checked_add_i64(*combined_sum, sum)
-                        .map_err(|_| OpError::aggregate_overflow(group_key))?;
-                    *combined_count = checked_add_i64(*combined_count, count)
-                        .map_err(|_| OpError::aggregate_overflow(group_key))?;
-                    if *combined_count < 0 {
-                        return Err(OpError::invalid_multiplicity(group_key, *combined_count));
-                    }
-                }
-            } else {
-                let entry = local_combined.entry(group_key).or_insert((0, 0));
-                entry.0 = checked_add_i64(entry.0, sum)
-                    .map_err(|_| OpError::aggregate_overflow(group_key))?;
-                entry.1 = checked_add_i64(entry.1, count)
-                    .map_err(|_| OpError::aggregate_overflow(group_key))?;
-                if entry.1 < 0 {
-                    return Err(OpError::invalid_multiplicity(group_key, entry.1));
-                }
+        // Combined records are authoritative. Legacy partial-only records
+        // must reconstruct the sum of ALL buckets, independent of hash order.
+        let mut reconstructed: HashMap<i64, (i128, i128)> = HashMap::new();
+        for (&(group_key, _bucket), &(sum, count)) in &local_partials {
+            if !local_combined.contains_key(&group_key) {
+                let entry = reconstructed.entry(group_key).or_default();
+                entry.0 += i128::from(sum);
+                entry.1 += i128::from(count);
             }
+        }
+        for (group_key, (sum, count)) in reconstructed {
+            let sum = checked_i128_to_i64(sum)
+                .map_err(|_| OpError::aggregate_overflow(group_key))?;
+            let count = checked_i128_to_i64(count)
+                .map_err(|_| OpError::aggregate_overflow(group_key))?;
+            local_combined.insert(group_key, (sum, count));
         }
 
         let mut combined = self
@@ -2602,6 +2597,28 @@ mod tests {
         op2.restore(&entries).unwrap();
         assert_eq!(op2.live_groups(), 2);
         assert_eq!(op2.live_partials(), 1);
+    }
+
+    #[test]
+    fn bucketed_restore_reconstructs_every_legacy_partial() {
+        let op_id = OperatorId(10);
+        let entries = vec![
+            (
+                bytes::Bytes::from(bucketed_partial_key(op_id, 1, 0)),
+                encode_bucketed_value(10, 1),
+            ),
+            (
+                bytes::Bytes::from(bucketed_partial_key(op_id, 1, 1)),
+                encode_bucketed_value(30, 2),
+            ),
+        ];
+        let op = BucketedAggregateOp::new(op_id, 1, 4);
+        op.restore_from_entries(&entries).unwrap();
+        let output = op.process_delta(make_batch(&[(1, 5, 1)])).unwrap();
+        assert_eq!(
+            extract_rows(&output),
+            vec![(1, 40, 3, 40.0 / 3.0, -1), (1, 45, 4, 11.25, 1)]
+        );
     }
 
     #[test]
