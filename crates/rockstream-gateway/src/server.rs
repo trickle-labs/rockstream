@@ -26712,6 +26712,8 @@ mod source_batch_tests {
 }
 
 #[cfg(test)]
+// These subscription fixtures use unwrap for concise setup and assertions.
+#[allow(clippy::unwrap_used)]
 mod v073_subscription_policy_tests {
     use super::*;
 
