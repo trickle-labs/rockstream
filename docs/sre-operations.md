@@ -57,7 +57,7 @@ Actor- and scope-bound support artifacts can be generated through the authentica
 rockstream --management <addr> support artifact create [--node-id=<id>]
 rockstream --management <addr> support artifact download <opaque-id> --out=<path>
 ```
-The legacy local `support bundle` and `support diagnose` commands fail closed with `RS-2400` until they can enforce the same authenticated scope policy.
+The legacy local `rockstream support bundle` and `rockstream support diagnose` commands fail closed with `RS-2400` until they can enforce the same authenticated scope policy.
 
 Additionally, a support bundle is generated automatically every time a node runs `rockstream start`
 (`write_support_bundle()` in `crates/rockstream-cli/src/lib.rs`), written as a

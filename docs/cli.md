@@ -332,6 +332,8 @@ Generates shell completion scripts directly to stdout.
 | `RS-1731` | Control node is not the Raft leader. | Re-resolve control plane leadership and route the request to the active leader. |
 | `RS-2006` | Requested subscription epoch is prior to storage retention window. | Subscribe with `--snapshot` or specify a more recent epoch. |
 | `RS-2401` | Permission denied due to insufficient RBAC role. | Request elevated RBAC role (PipelineOwner / Admin) or authenticate under an authorized principal. |
+| `RS-3613` | Checkpoint export is already in progress. | Wait for the active export to finish, then retry through an authenticated management endpoint. |
+| `RS-3614` | Checkpoint export or restore failed validation or storage access. | Inspect checkpoint and object-store state before retrying through an authenticated management endpoint. |
 | `RS-4009` | Ingestion source not found. | Check source name with `rockstream source list`. |
 | `RS-4017` | Removed cold-tier storage configuration was passed. | Remove legacy cold-tier storage flags. |
 | `RS-5030` | In-flight shard migration conflict. | Wait for the active migration to complete before re-initiating shard migration. |
