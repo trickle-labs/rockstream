@@ -1,50 +1,23 @@
 # Disaster recovery
 
-Use a checkpoint export stored in a separate bucket, account, or region. Do
-not copy the live RockStream object-store prefix.
+## Current availability
 
-## Export schedule
+The v0.73 CLI does not currently expose authenticated checkpoint inspection,
+export, or restore operations. Its management protocol has no checkpoint RPC;
+the old local CLI path trusted a caller-selected `--identity-role`, which does
+not establish a durable principal or grant. The binary now fails closed with
+`RS-2400` and does not access checkpoint storage. Do not use the historical
+local command path from the v0.56.1 drill as a current recovery procedure.
+An authenticated management operation is required before this runbook can be used for v0.73.
 
-Run after each required recovery point:
+## Historical v0.56.1 drill
 
-```console
-rockstream --storage-dir "$ROCKSTREAM_STORAGE" --identity-role admin checkpoint export --destination "$DR_EXPORT_URL"
-```
-
-Retain exports according to the workload's recovery policy and verify the
-reported checkpoint, object count, byte count, and `SUCCESS` status.
-
-## Full-region-loss restore
-
-Provision an empty target bucket or directory, then run:
-
-```console
-rockstream --storage-dir "$ROCKSTREAM_AUDIT_DIR" --identity-role admin checkpoint restore --source "$DR_EXPORT_URL" --storage "$FRESH_STORAGE_URL" --yes
-```
-
-Start the single `rockstream` binary against `$FRESH_STORAGE_URL`. Verify every
-materialized view with complete sorted-row comparisons and confirm the restored
-checkpoint epoch, catalog, topology, leases, connector offsets, and source
-resume positions.
-
-Aggregate arrangements are restored from their dirty-key mutations. A crash
-before the epoch commit must leave no acknowledged partial epoch; retrying the
-same input must produce the same final multiset without duplicate deltas,
-stale values, or resurrected groups.
-
-Never reuse a target containing another active generation. `RS-3614` (previously `RS-5035`) means the
-export is incomplete, malformed, truncated, or inconsistent; leave the target
-offline, correct object-store access or replace the export, and retry into fresh
-storage. An already-running export returns `RS-3613` and can be retried after the active export finishes.
-
-## Measured drill
-
-The v0.56.1 local-filesystem drill exported checkpoint 56 and restored it using
-only the two commands above.
+The measured local-filesystem drill exported checkpoint 56 and restored it with
+the then-current local CLI.
 
 - Measured RPO: 0 committed checkpoints.
 - Measured RTO: 0.42 seconds from restore invocation to published bootstrap pointer.
 
-Repeat the drill at least quarterly and after object-store, credential, region,
-or topology changes. Record new measured values here; do not substitute
-predeclared targets.
+These historical measurements do not qualify the current authenticated CLI.
+Refresh this runbook after an authenticated checkpoint endpoint and its release-
+process recovery matrix are implemented.

@@ -594,7 +594,7 @@ fn main() -> ExitCode {
             }),
         },
         Command::Checkpoint { command } => {
-            let storage = StorageClient::with_identity(identity.clone());
+            let storage = RemoteStorageAdminClient::with_identity(identity.clone());
             let storage_path = cli
                 .storage_dir
                 .unwrap_or_else(|| std::path::PathBuf::from("."));

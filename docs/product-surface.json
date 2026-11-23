@@ -159,7 +159,7 @@
           },
           {
             "name": "checkpoint",
-            "about": "Checkpoint administration and manual triggering",
+            "about": "Checkpoint administration (currently unavailable: no authenticated management endpoint)",
             "subcommands": [
               {
                 "name": "export",
@@ -877,7 +877,7 @@
       },
       {
         "name": "checkpoint",
-        "about": "Checkpoint inspection commands",
+        "about": "Checkpoint commands (currently unavailable: no authenticated management endpoint)",
         "subcommands": [
           {
             "name": "export",

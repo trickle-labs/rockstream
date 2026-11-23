@@ -353,7 +353,7 @@ pub enum Command {
         #[command(subcommand)]
         command: ShardCommand,
     },
-    /// Checkpoint inspection commands.
+    /// Checkpoint commands (currently unavailable: no authenticated management endpoint).
     Checkpoint {
         #[command(subcommand)]
         command: CheckpointCommand,
@@ -958,7 +958,7 @@ pub enum AdminCommand {
         #[command(subcommand)]
         command: RaftAdminCommand,
     },
-    /// Checkpoint administration and manual triggering.
+    /// Checkpoint administration (currently unavailable: no authenticated management endpoint).
     Checkpoint {
         #[command(subcommand)]
         command: CheckpointCommand,

@@ -91,7 +91,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ### `rockstream admin checkpoint`
 
-Checkpoint administration and manual triggering
+Checkpoint administration (currently unavailable: no authenticated management endpoint)
 
 Exit codes
 
@@ -414,7 +414,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ## `rockstream checkpoint`
 
-Checkpoint inspection commands
+Checkpoint commands (currently unavailable: no authenticated management endpoint)
 
 Exit codes
 

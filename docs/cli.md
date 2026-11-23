@@ -186,15 +186,19 @@ Management mutations accept `--idempotency-key <UUID>`. For backup creation, set
 
 ### `rockstream checkpoint`
 
-Inspect, export, and restore durable cluster checkpoints.
+The checkpoint commands are currently unavailable: the management protocol does not expose authenticated
+checkpoint operations, and `--identity-role` is only a local compatibility
+label, not proof of authority. Both the top-level and `admin checkpoint`
+routes fail with `RS-2400` without reading or writing checkpoint storage.
 
 - `rockstream checkpoint list` — List all durable checkpoints, creation timestamps, and shard counts.
 - `rockstream checkpoint export --destination <file://...|s3://...>` — Export the latest M3-committed checkpoint and its immutable object inventory.
 - `rockstream checkpoint restore --source <file://...|s3://...> --storage <file://...|s3://...> --yes` — Verify a committed export and restore it into fresh storage. The target bootstrap pointer is published last.
 
-Both commands require the Admin role and emit `checkpoint.export` or
-`checkpoint.restore` audit events. Integrity, truncation, mixed-generation,
-and partial-restore failures return `RS-3614` with recovery steps; a concurrent export returns `RS-3613`.
+The legacy local implementation is not exposed by the CLI because a caller-
+selected Admin role cannot authorize checkpoint access. Use only a future
+authenticated management endpoint when one is available; the disaster-recovery
+runbook records the current limitation.
 
 ---
 
