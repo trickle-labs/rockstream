@@ -765,6 +765,23 @@ async fn interrupted_dispatch_blocks_distributed_reads_after_gateway_restart() {
                     let wire = serde_json::to_string(&response).unwrap() + "\n";
                     write.write_all(wire.as_bytes()).await.unwrap();
                 }
+                WorkerMessage::GetWorkloadTopology { workload_id } => {
+                    // This mock fixture has no live workers; returning an empty
+                    // shard list lets the gateway fall back to the interrupted
+                    // SubmitSourceDelta path under test.
+                    let response = ControlMessage::WorkloadTopology {
+                        snapshot: rockstream_types::data_plane::WorkloadTopologySnapshot {
+                            topology_epoch: 1,
+                            workload_id,
+                            routing_columns: BTreeMap::new(),
+                            schemas: Vec::new(),
+                            shards: Vec::new(),
+                            workers: Vec::new(),
+                        },
+                    };
+                    let wire = serde_json::to_string(&response).unwrap() + "\n";
+                    write.write_all(wire.as_bytes()).await.unwrap();
+                }
                 other => panic!("unexpected request: {other:?}"),
             }
         }

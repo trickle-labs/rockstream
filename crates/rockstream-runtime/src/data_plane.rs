@@ -427,13 +427,29 @@ impl DataPlaneClient {
                 },
             };
             // Check whether every shard owner advertises a reachable direct
-            // exchange address; if not (e.g. a mock unit-test worker without a
-            // shuffle listener), fall back to control-plane compatibility mode.
-            let all_direct_capable = !topology.shards.is_empty()
-                && topology
-                    .shards
-                    .iter()
-                    .all(|s| !s.worker_address.trim().is_empty());
+            // exchange address and is currently healthy in topology.
+            if topology.shards.is_empty() {
+                return self.submit_delta_via_control(request, None).await;
+            }
+            let active_worker_ids: std::collections::HashSet<_> = topology
+                .workers
+                .iter()
+                .filter(|w| w.healthy)
+                .map(|w| w.worker_id)
+                .collect();
+            if topology
+                .shards
+                .iter()
+                .any(|s| !active_worker_ids.contains(&s.worker_id))
+            {
+                return Err(io::Error::other(format!(
+                    "{RS_0001}: a routed shard owner has no active worker connection; Retry after the workload and workers are ready."
+                )));
+            }
+            let all_direct_capable = topology
+                .shards
+                .iter()
+                .all(|s| !s.worker_address.trim().is_empty());
             if !all_direct_capable {
                 return self.submit_delta_via_control(request, None).await;
             }
@@ -501,15 +517,32 @@ impl DataPlaneClient {
                             || err.contains("stale")
                             || err.contains("not deployed")
                             || err.contains("lease fence");
-                        if is_stale && attempt + 1 < MAX_STALE_TOPOLOGY_RETRIES {
+                        let is_connect_failure = err.contains("tcp connect error")
+                            || err.contains("transport error")
+                            || err.contains("Connection refused")
+                            || err.contains("connection closed");
+                        if (is_stale || is_connect_failure)
+                            && attempt + 1 < MAX_STALE_TOPOLOGY_RETRIES
+                        {
                             self.invalidate_topology(request.workload_id);
                             self.shuffle_pool.evict_worker(shard.worker_id);
-                            last_err = Some(io::Error::new(
-                                io::ErrorKind::PermissionDenied,
-                                format!("{RS_3004}: stale topology or lease ({err})"),
-                            ));
+                            last_err = Some(if is_connect_failure {
+                                io::Error::other(format!(
+                                    "{RS_0001}: a routed shard owner has no active worker connection; Retry after the workload and workers are ready."
+                                ))
+                            } else {
+                                io::Error::new(
+                                    io::ErrorKind::PermissionDenied,
+                                    format!("{RS_3004}: stale topology or lease ({err})"),
+                                )
+                            });
                             stale_detected = true;
                             break;
+                        }
+                        if is_connect_failure {
+                            return Err(io::Error::other(format!(
+                                "{RS_0001}: a routed shard owner has no active worker connection; Retry after the workload and workers are ready."
+                            )));
                         }
                         return Err(io::Error::new(
                             if is_stale {

@@ -890,7 +890,6 @@ pub async fn setup_test_deployment(
         deployments: deployments.clone(),
         tls_reloader: None,
         exchange_registry,
-        exchange_shutdown: Arc::new(RwLock::new(None)),
     };
 
     let store = rockstream_storage::build_runtime_object_store(storage_dir, "test_root").unwrap();
@@ -2018,10 +2017,6 @@ pub struct WorkerClientHandle {
     deployments: WorkerDeployments,
     tls_reloader: Option<Arc<rockstream_types::tls::TlsCertificateReloader>>,
     exchange_registry: crate::exchange::service::ExchangeRegistry,
-    /// Keeps the worker's gRPC `ExchangeService` alive across control-plane
-    /// disconnects/restarts until the worker handle itself is dropped (Issue #400 R4).
-    #[allow(dead_code)]
-    exchange_shutdown: Arc<RwLock<Option<Arc<CancelOnDrop>>>>,
 }
 
 impl WorkerClientHandle {
@@ -2720,7 +2715,6 @@ where
         deployments: deployments.clone(),
         tls_reloader: tls_reloader.clone(),
         exchange_registry: exchange_registry.clone(),
-        exchange_shutdown: Arc::new(RwLock::new(None)),
     };
 
     let actor_registry =
@@ -2798,11 +2792,8 @@ where
     let storage_context_clone = storage_context.clone();
     let compaction_config_clone = compaction_config.clone();
 
-    if let Some(shutdown) = exchange_shutdown {
-        *handle.exchange_shutdown.write() = Some(Arc::new(CancelOnDrop(shutdown)));
-    }
-    let exchange_shutdown_for_task = handle.exchange_shutdown.clone();
     let join_handle = tokio::spawn(async move {
+        let _exchange_shutdown = exchange_shutdown.map(CancelOnDrop);
         // 1. Send Registration message.
         let reg = WorkerRegistration::new(
             WorkerId(proposed_worker_id),
@@ -3806,7 +3797,7 @@ where
         }
         let _ = shutdown_tx.send(true);
         if explicit_shutdown || deployments_clone.read().is_empty() {
-            if let Some(shutdown) = exchange_shutdown_for_task.write().take() {
+            if let Some(shutdown) = &_exchange_shutdown {
                 shutdown.0.cancel();
             }
             topology_workers.write().clear();
@@ -3823,28 +3814,12 @@ where
             }
         } else {
             // Issue #400 R4: Control-node restart / outage tolerance.
-            // Keep the direct Arrow IPC ExchangeService, shard actors, and
-            // active shard leases alive until the worker handle is dropped.
+            // Keep `_exchange_shutdown`, `exchange_service`, `actor_registry`,
+            // and active shard leases alive until this task is aborted.
             tracing::warn!(
                 "control channel closed while deployments are active; keeping direct data-plane exchange alive"
             );
-            let cancel_token = exchange_shutdown_for_task
-                .read()
-                .as_ref()
-                .map(|c| c.0.clone());
-            if let Some(token) = cancel_token {
-                token.cancelled().await;
-            }
-            actor_registry_clone.shutdown();
-            exchange_service.shutdown().await;
-            shuffle_mux.shutdown().await;
-            let dbs_to_close: Vec<ShardDb> = {
-                let mut shards = active_shards_clone.write();
-                shards.drain().filter_map(|(_, state)| state.db).collect()
-            };
-            for db in dbs_to_close {
-                let _ = db.close().await;
-            }
+            std::future::pending::<()>().await;
         }
     });
 
