@@ -262,6 +262,42 @@ fn test_doctor_secret_redaction() {
     assert_eq!(redact_secrets(cert_key), "[REDACTED_PRIVATE_KEY_MATERIAL]");
 }
 
+#[test]
+fn test_doctor_output_contains_exact_redacted_storage_record() {
+    let opts = DoctorOptions {
+        storage: Some(
+            "s3://bucket/prefix?secret=known-secret&token=dXNlcjpwYXNz&password=known-password&region=us-west-2".to_string(),
+        ),
+        ..DoctorOptions::default()
+    };
+    let output = run_doctor(OutputFormat::Json, &opts).expect("doctor run failed");
+    let mut report: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+    let check = report["checks"]
+        .as_array_mut()
+        .expect("doctor checks array")
+        .iter_mut()
+        .find(|check| check["id"] == "storage.access")
+        .expect("storage.access check");
+    let mut actual = check.as_object().expect("check object").clone();
+    assert!(actual
+        .remove("duration_ms")
+        .expect("duration_ms field")
+        .is_u64());
+
+    assert_eq!(
+        serde_json::Value::Object(actual),
+        serde_json::json!({
+            "id": "storage.access",
+            "category": "storage",
+            "status": "pass",
+            "summary": "Storage access probe verified for object store (s3://bucket/prefix?secret=[REDACTED]&token=[REDACTED]&password=[REDACTED]&region=us-west-2)"
+        })
+    );
+    assert!(!output.contains("known-secret"));
+    assert!(!output.contains("known-password"));
+    assert!(!output.contains("dXNlcjpwYXNz"));
+}
+
 #[tokio::test]
 async fn test_doctor_output_formats() {
     let opts = DoctorOptions::default();
