@@ -37,7 +37,7 @@ The protocol version is `1`. Every request carries `protocol_version`. The serve
 
 The control service attaches drain and migration executors. It attaches the backup executor only when it can read the authoritative shard store. Embedded `--role all` supports one local worker. Multi-worker backups require every shard owner to use the same configured shared object store.
 
-The CLI sends `admin backup create` to `CreateBackup` only when you pass `--management`. Without that flag, it writes the legacy local manifest used by `admin backup inspect` and `admin backup verify`.
+The CLI sends `admin backup create` to `CreateBackup` only when you pass `--management`. Without that flag it fails closed with `RS-2400`; local backup creation no longer relies on `--identity-role`. `admin backup inspect` and `admin backup verify` remain local file checks. No authenticated backup-restore RPC is currently exposed, so `admin restore` also fails closed.
 
 ## CLI examples
 

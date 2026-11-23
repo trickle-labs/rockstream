@@ -16,7 +16,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ### `rockstream admin backup`
 
-Point-in-time durable backup operations (create, inspect, verify)
+Create backups through authenticated management; inspect or verify local backup files
 
 Exit codes
 
@@ -30,7 +30,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 #### `rockstream admin backup create`
 
-Create a full point-in-time backup
+Create a full point-in-time backup through authenticated management
 
 Options
 
@@ -91,7 +91,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ### `rockstream admin checkpoint`
 
-Checkpoint administration and manual triggering
+Checkpoint administration (currently unavailable: no authenticated management endpoint)
 
 Exit codes
 
@@ -323,7 +323,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ### `rockstream admin restore`
 
-Restore a database backup into a clean or authorized destination
+Unavailable until the CLI exposes an authenticated backup-restore endpoint
 
 Options
 
@@ -345,7 +345,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ## `rockstream audit`
 
-Audit log inspection commands
+Local audit-history commands are unavailable; use authenticated `SHOW SECURITY AUDIT`
 
 Exit codes
 
@@ -359,7 +359,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ### `rockstream audit query`
 
-Query audit log events matching a filter
+Unavailable for local logs; use authenticated `SHOW SECURITY AUDIT`
 
 Options
 
@@ -380,7 +380,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ### `rockstream audit tail`
 
-Tail recent audit log events
+Unavailable for local logs; use authenticated `SHOW SECURITY AUDIT`
 
 Options
 
@@ -414,7 +414,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ## `rockstream checkpoint`
 
-Checkpoint inspection commands
+Checkpoint commands (currently unavailable: no authenticated management endpoint)
 
 Exit codes
 
@@ -1788,7 +1788,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ## `rockstream support`
 
-Diagnostic support commands
+Generate actor-bound support artifacts through the authenticated management API
 
 Exit codes
 
@@ -1858,7 +1858,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ### `rockstream support bundle`
 
-Generate on-demand diagnostic support bundle
+Unavailable without authenticated support authorization; use `support artifact create`
 
 Options
 
@@ -1880,7 +1880,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ### `rockstream support diagnose`
 
-Look up one runtime diagnostic and write its support bundle
+Unavailable without authenticated diagnostic authorization; use `support artifact create`
 
 Options
 
