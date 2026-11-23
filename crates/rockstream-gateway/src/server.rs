@@ -25536,7 +25536,7 @@ mod v073_secret_policy_refresh_tests {
                             outcome: SecurityAuditOutcome::Success,
                             correlation: AuditCorrelation::Unknown,
                             operation_id: AuditField::Known("2".to_string()),
-                            policy_revision: AuditField::Known(1),
+                            policy_revision: AuditField::Known(2),
                             before_state: AuditField::Known(format!(
                                 "revision=1;policy={before_policy}"
                             )),
