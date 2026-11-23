@@ -4357,7 +4357,8 @@ mod tests {
         reset_all();
 
         set_support_artifact_storage_metrics(3, 4096, 2048, 100 * 1024 * 1024);
-        let lines: Vec<_> = generate_prometheus_metrics()
+        let prometheus = generate_prometheus_metrics();
+        let lines: Vec<_> = prometheus
             .lines()
             .filter(|line| {
                 line.starts_with("# HELP support_artifact_")
