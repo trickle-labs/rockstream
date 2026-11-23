@@ -221,18 +221,20 @@ impl ShardManager {
         self.force_acquire_with_heat_locked(&mut guard, shard_id, worker_id, heat_hint)
     }
 
-    /// Transfer a lease only if its complete fenced owner record is unchanged.
+    /// Transfer a lease only if its fenced ownership identity is unchanged.
     pub fn transfer_if_owner(
         &self,
         expected: &ShardLease,
         worker_id: WorkerId,
     ) -> Option<ShardLease> {
         let mut guard = self.inner.write();
-        if guard.leases.get(&expected.shard_id) != Some(expected) {
+        let current = guard.leases.get(&expected.shard_id)?;
+        if !current.same_owner(expected) {
             return None;
         }
+        let heat_hint = current.heat_hint.clone();
         let lease = ShardLease::new(expected.shard_id, worker_id, mint_token(&mut guard))
-            .with_heat_hint(expected.heat_hint.clone());
+            .with_heat_hint(heat_hint);
         guard.leases.insert(expected.shard_id, lease.clone());
         Some(lease)
     }
@@ -753,6 +755,24 @@ mod tests {
             m.is_valid_writer(ShardId(1), lease_b.lease_token),
             "Worker B must be the valid writer"
         );
+    }
+
+    #[test]
+    fn heat_updates_do_not_invalidate_a_fenced_handoff() {
+        let m = mgr();
+        let expected = m.acquire(ShardId(1), WorkerId(1)).unwrap();
+        let heat = LeaseHeatHint {
+            hot_key_prefixes: vec![b"new-hot-key".to_vec()],
+            expected_read_rate: 50,
+            ..LeaseHeatHint::default()
+        };
+        assert!(m.update_heat(expected.shard_id, heat.clone()));
+        let transferred = m.transfer_if_owner(&expected, WorkerId(2)).unwrap();
+        assert_eq!(transferred.heat_hint, heat);
+        assert_eq!(transferred.worker_id, WorkerId(2));
+        assert!(transferred.lease_token > expected.lease_token);
+        assert_eq!(m.transfer_if_owner(&expected, WorkerId(3)), None);
+        assert_eq!(m.get(expected.shard_id), Some(transferred));
     }
 
     #[test]
