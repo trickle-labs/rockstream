@@ -10,7 +10,9 @@ principal; missing identity or durable policy fails closed. Source and sink
 metadata is committed before CREATE or DROP is acknowledged. The gateway
 rechecks a source consumer's current grant before resolving its credential.
 Older entries without persisted consumer scope fail closed; an authorized
-migration route remains to be qualified.
+migration route remains to be qualified. A Kafka sink stores and authorizes its
+secret reference for lifecycle checks, but its producer does not yet use those
+credentials; SASL authentication and credential rotation remain unqualified.
 
 The gateway pgoutput source checks the durable secret version before a source
 transaction and after its committed epoch. If it changes during the transaction,
@@ -20,9 +22,7 @@ worker alive. A Kafka source uses an explicit SASL transport and PLAIN credentia
 at the next source epoch it replaces the consumer with the authorized credentials,
 seeking from the durable source checkpoint while keeping the worker alive. Kafka
 source rotation still needs release-process qualification across views and
-partitions. Kafka sink rotation remains
-unqualified; the experimental sink is not configured by SQL `CREATE SINK` and
-has no supported full-Core qualification route.
+partitions.
 
 RockStream supports exactly three external connector boundaries: PostgreSQL
 CDC, Kafka source, and Kafka sink. `object_store` is internal durable state,
@@ -246,8 +246,9 @@ delta log. Construct it with a connected `KafkaSink`, the view's `ShardDb`,
 operator ID, and column count, then call `deliver_next()` until it returns false.
 The first envelope contains the complete materialized snapshot; later envelopes
 contain signed changes for one nonempty view epoch each. The legacy
-`SinkConnector::pre_commit(epoch, row_count)` still emits count markers.
-SQL `CREATE SINK` does not configure this runtime adapter.
+`SinkConnector::pre_commit(epoch, row_count)` still emits count markers. SQL
+`CREATE SINK` wires this adapter through pgwire, durable catalog persistence,
+commit-time delivery, and restart recovery.
 
 The canonical v1 payload is a JSON object with `version: 1`, `connector_id`,
 `view` (operator ID), `epoch` (sink transaction sequence starting at zero),
