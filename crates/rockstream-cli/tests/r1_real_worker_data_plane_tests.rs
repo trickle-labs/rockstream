@@ -362,13 +362,6 @@ fn stable_name_id(namespace: &str, name: &str) -> u64 {
         })
 }
 
-fn stable_route(value: &str, shard_count: usize) -> usize {
-    value.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
-    }) as usize
-        % shard_count
-}
-
 async fn query_text_rows(client: &Client, sql: &str) -> Vec<Vec<String>> {
     tokio::time::timeout(Duration::from_secs(10), client.query(sql, &[]))
         .await
@@ -659,8 +652,16 @@ async fn run_cluster(worker_count: usize, kill_worker: bool) {
     }
 
     if kill_worker {
+        let worker1_shard = assigned_shards[&WorkerId(1)];
+        let worker2_shard = assigned_shards[&WorkerId(2)];
+        let worker2_rows = routed_by_shard.get(&worker2_shard).copied().unwrap_or(0);
         let dead_route = (0..16)
-            .find(|id| stable_route(&id.to_string(), worker_count) == 0)
+            .find(|id| {
+                let bucket =
+                    rockstream_types::rendezvous::fnv1a_64(id.to_string().as_bytes()) % 4096;
+                rockstream_types::rendezvous::rendezvous_hash(bucket, &shard_ids, 1)
+                    == Some(worker1_shard)
+            })
             .unwrap();
         processes.workers[0].kill().unwrap();
         processes.workers[0].wait().unwrap();
@@ -675,9 +676,9 @@ async fn run_cluster(worker_count: usize, kill_worker: bool) {
                 == vec![WorkerExecutionStatus {
                     worker_id: WorkerId(2),
                     process_id: processes.workers[1].id(),
-                    shard_ids: vec![ShardId(shard_base), ShardId(shard_base.wrapping_add(1))],
-                    input_rows: routed[1],
-                    output_rows: routed[1],
+                    shard_ids: shard_ids.clone(),
+                    input_rows: worker2_rows,
+                    output_rows: worker2_rows,
                     frontier: 2,
                     ready: true,
                 }]
