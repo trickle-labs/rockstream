@@ -1471,6 +1471,7 @@ pub(crate) fn compile_node(
             time_col,
             gap_ms,
             late_data_policy,
+            partition_by,
         } => {
             let (mut stages, in_schema) = compile_node(input, source_schema)?;
             let (packed_schema, utf8_packers) =
@@ -1480,11 +1481,12 @@ pub(crate) fn compile_node(
                     "SessionWindow over a non-Int64/Utf8 input schema (SessionWindowOp only supports Int64 columns, plus Utf8 passthrough)",
                 ));
             }
-            let op = Arc::new(SessionWindowOp::new(
+            let op = Arc::new(SessionWindowOp::new_with_partition_by(
                 packed_schema.clone(),
                 *time_col,
                 *gap_ms,
                 late_data_policy.clone(),
+                partition_by.clone(),
             ));
             stages.push(Stage::SessionWindow(op, next_stateful_op_id()));
             unpack_utf8_columns(&mut stages, 2, utf8_packers);
@@ -1539,20 +1541,25 @@ pub(crate) fn compile_node(
             k,
             rank_col,
             partition_by,
+            order_by,
         } => {
             let (mut stages, in_schema) = compile_node(input, source_schema)?;
-            if !schema_all_int64(&in_schema) {
+            let (packed_schema, utf8_packers) =
+                pack_utf8_columns(&mut stages, &in_schema, &HashMap::new());
+            if !schema_all_int64(&packed_schema) {
                 return Err(OpError::unsupported_plan_node(
-                    "TopK over a non-Int64-only input schema (TopKOp only supports Int64 columns)",
+                    "TopK over a non-Int64/Utf8 input schema (TopKOp only supports Int64 columns, plus Utf8 passthrough)",
                 ));
             }
-            let op = Arc::new(TopKOp::new(
-                in_schema.clone(),
+            let op = Arc::new(TopKOp::new_with_order(
+                packed_schema.clone(),
                 *k,
                 *rank_col,
                 partition_by.clone(),
+                order_by.clone(),
             ));
             stages.push(Stage::TopK(op, next_stateful_op_id()));
+            unpack_utf8_columns(&mut stages, 0, utf8_packers);
             Ok((stages, in_schema))
         }
 
@@ -1625,13 +1632,6 @@ pub(crate) fn compile_node(
                 // at the lowering layer (see comment above); `HopWindow`'s
                 // separate date_bin lowering path was not touched by that
                 // fix and remains rejected here.
-                if matches!(input.as_ref(), PlanNode::HopWindow { .. }) {
-                    return Err(OpError::unsupported_plan_node(
-                        "multi-aggregate composition (Slice 8) over a HopWindow input \
-                         is not yet supported (pre-existing date_bin/timestamp-precision \
-                         gap in that lowering path, unrelated to multi-aggregate composition)",
-                    ));
-                }
                 let (stages, in_schema) = compile_node(input, source_schema)?;
                 // A `Utf8` group-by column (e.g. Nexmark q16's `GROUP BY
                 // channel, date_bin(...)`) is packed into an `Int64`

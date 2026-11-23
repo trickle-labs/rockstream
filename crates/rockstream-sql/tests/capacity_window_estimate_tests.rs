@@ -68,6 +68,7 @@ fn session_timestamptz_report_is_exact() {
         time_col: 1,
         gap_ms: 30_000,
         late_data_policy: LateDataPolicy::Drop,
+        partition_by: None,
     };
     let ctx = CapacityEstimateContext {
         cardinality_hint: 1_000,

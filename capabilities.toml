@@ -27,10 +27,10 @@ evidence = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs
 
 [[contract.tier_decision]]
 capability = "sink.kafka"
-old_tier = "Core"
-new_tier = "Experimental"
-reason = "Bounded runtime view delivery is implemented, but full Core release proof levels remain unqualified (#122)."
-evidence = "crates/rockstream-connectors/tests/connector_surface_contract_tests.rs::kafka_sink_row_delivery_has_consumer_proofs_and_remains_experimental"
+old_tier = "Experimental"
+new_tier = "Core"
+reason = "SQL CREATE SINK ... FROM <view> INTO KAFKA (...) wiring, chunked snapshot delivery, and durable checkpoint-coupled recovery promote sink.kafka to Core (#404)."
+evidence = "crates/rockstream-ops/tests/kafka_view_delivery_tests.rs::view_snapshot_changes_and_recovery_match_exact_consumer_stream"
 
 [[dispatch]]
 id = "query_async_entry"
@@ -451,10 +451,10 @@ id = "language.hop-session-windows"
 kind = "language"
 name = "HOP and SESSION windows"
 tier = "Experimental"
-reachability = "Not SQL-reachable"
-dispatch = []
-proof = ""
-documentation = "docs/language-features.md#documented-planned-surface"
+reachability = "SQL over pgwire"
+dispatch = ["query_async_entry", "sql_lowering", "plan_compilation"]
+proof = "crates/rockstream-gateway/tests/everyday_ivm_sql_ux_404_tests.rs::hop_and_session_windows_e2e_and_restart_recovery"
+documentation = "docs/language-features.md#implemented-today"
 
 [[capability]]
 id = "language.custom-algebra"
@@ -501,20 +501,20 @@ id = "language.view-replacement"
 kind = "language"
 name = "View replacement workflow"
 tier = "Experimental"
-reachability = "Not SQL-reachable"
-dispatch = []
-proof = ""
-documentation = "docs/language-features.md#documented-planned-surface"
+reachability = "SQL over pgwire"
+dispatch = ["query_async_entry", "view_dispatch", "plan_compilation"]
+proof = "crates/rockstream-gateway/tests/everyday_ivm_sql_ux_404_tests.rs::zero_downtime_view_replacement_and_backfill_visibility"
+documentation = "docs/language-features.md#implemented-today"
 
 [[capability]]
 id = "language.lifecycle-visibility"
 kind = "language"
 name = "View and backfill lifecycle visibility"
 tier = "Experimental"
-reachability = "Not SQL-reachable"
-dispatch = []
-proof = ""
-documentation = "docs/language-features.md#documented-planned-surface"
+reachability = "SQL over pgwire"
+dispatch = ["query_async_entry", "catalog_query", "response_encoding"]
+proof = "crates/rockstream-gateway/tests/everyday_ivm_sql_ux_404_tests.rs::zero_downtime_view_replacement_and_backfill_visibility"
+documentation = "docs/language-features.md#implemented-today"
 
 [[capability]]
 id = "language.source-lifecycle"
@@ -630,11 +630,20 @@ documentation = "docs/language-features.md#documented-planned-surface"
 id = "language.limit-order-by"
 kind = "language"
 name = "LIMIT and ORDER BY"
-tier = "Experimental"
-reachability = "Frontend rejects the construct"
-dispatch = []
-proof = ""
-documentation = "docs/language-features.md#current-frontend-gaps"
+tier = "Core"
+reachability = "SQL over pgwire"
+dispatch = ["query_async_entry", "sql_lowering", "plan_compilation", "response_encoding"]
+proof = "crates/rockstream-gateway/tests/everyday_ivm_sql_ux_404_tests.rs::core_limit_order_by_incremental"
+proof_levels_achieved = ["L0", "L1", "L2", "L3", "L5"]
+min_proof_level = ["L0", "L1", "L2", "L3", "L5"]
+documentation = "docs/language-features.md#implemented-today"
+behavior = [
+  { behavior = "incremental", statement = "Top-K ORDER BY ... LIMIT views incrementally apply inserts, updates, deletes, ties, and NULL ordering to match the exact ordered batch oracle.", proof = "crates/rockstream-gateway/tests/everyday_ivm_sql_ux_404_tests.rs::core_limit_order_by_incremental" },
+  { behavior = "backfill", statement = "Top-K view creation backfills the exact ordered top-N rows from the committed table snapshot before subsequent deltas.", proof = "crates/rockstream-gateway/tests/everyday_ivm_sql_ux_404_tests.rs::core_limit_order_by_backfill" },
+  { behavior = "checkpoint_recovery", statement = "Reopening the durable shard restores Top-K state and refill candidates across restart.", proof = "crates/rockstream-gateway/tests/everyday_ivm_sql_ux_404_tests.rs::core_limit_order_by_checkpoint_recovery" },
+  { behavior = "state_growth", statement = "Top-K state is bounded by TOPK_BUFFER_LIMIT with spill support and exposes its fill level.", proof = "crates/rockstream-gateway/tests/everyday_ivm_sql_ux_404_tests.rs::core_limit_order_by_state_growth", bound = "configured Top-K buffer limit", metric = "topk_buffer_fill_level", on_bound = "the operator spills to shard storage or rejects overflow with its RS-coded resource error" },
+  { behavior = "failure", statement = "Unbounded ORDER BY without LIMIT or unsupported OFFSET in materialized views fails closed with an actionable RS-coded error.", proof = "crates/rockstream-gateway/tests/everyday_ivm_sql_ux_404_tests.rs::core_limit_order_by_failure" },
+]
 
 [[capability]]
 id = "language.explain-index"
@@ -698,11 +707,11 @@ behavior = [
 id = "sink.kafka"
 kind = "sink"
 name = "Kafka sink"
-tier = "Experimental"
-reachability = "Connector runtime"
-dispatch = ["kafka_sink_runtime", "kafka_view_sink_runtime"]
-proof = ""
-proof_levels_achieved = []
+tier = "Core"
+reachability = "SQL over pgwire + connector runtime"
+dispatch = ["query_async_entry", "kafka_sink_runtime", "kafka_view_sink_runtime"]
+proof = "crates/rockstream-ops/tests/kafka_view_delivery_tests.rs::view_snapshot_changes_and_recovery_match_exact_consumer_stream"
+proof_levels_achieved = ["L0", "L1", "L3", "L4", "L5"]
 min_proof_level = ["L0", "L1", "L3", "L4", "L5"]
 documentation = "docs/connectors.md#kafka-sink"
 behavior = [

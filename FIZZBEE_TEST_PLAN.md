@@ -790,6 +790,18 @@ authorization rule. `security_audit_metrics_tests.rs::durable_audit_metrics_foll
 and `security_audit_health_tests.rs::audit_storage_degradation_is_visible_without_failing_ready_health`
 check the metric and health surfaces.
 
+Issue #304 wires `sasl_plain` references into SQL Kafka sinks. Resolution checks
+the durable consumer grant and secret version; a replacement transactional
+producer is initialized only between sink transactions, before the next view
+delivery. This reuses M3's fencing and durable checkpoint rules without adding
+a sink-state transition. The Docker release test
+`kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_consumers`
+checks pending rows across live rotation, old-credential revocation, exact sink
+results, transaction sequence, and restart recovery. M3 abstracts secret
+authorization and version lookup, so this release test is the concrete evidence
+for that boundary; the remaining #304 policy and bounded-resource criteria stay
+open.
+
 The worker audit append handoff bounds pending acknowledgements by the worker
 message-channel capacity, matches replies to registered request IDs, and clears
 waiters after acknowledgement, enqueue failure, timeout, cancellation, or
