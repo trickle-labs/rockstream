@@ -436,6 +436,8 @@ struct MetricRegistry {
     security_audit_retained_bytes: u64,
     security_audit_capacity_bytes: u64,
     security_audit_degraded: bool,
+    security_audit_transport_pending: u64,
+    security_audit_transport_capacity: u64,
 
     // SRE Observability metrics
     compaction_bytes_reclaimed: HashMap<u16, Counter>,
@@ -592,6 +594,8 @@ impl MetricRegistry {
             security_audit_retained_bytes: 0,
             security_audit_capacity_bytes: 0,
             security_audit_degraded: false,
+            security_audit_transport_pending: 0,
+            security_audit_transport_capacity: 0,
             compaction_bytes_reclaimed: HashMap::new(),
             duplicate_dropped_total: HashMap::new(),
             tombstone_bytes: HashMap::new(),
@@ -1334,6 +1338,8 @@ pub fn reset_all() {
         reg.security_audit_retained_bytes = 0;
         reg.security_audit_capacity_bytes = 0;
         reg.security_audit_degraded = false;
+        reg.security_audit_transport_pending = 0;
+        reg.security_audit_transport_capacity = 0;
         reg.compaction_bytes_reclaimed.clear();
         reg.duplicate_dropped_total.clear();
         reg.tombstone_bytes.clear();
@@ -2638,6 +2644,13 @@ pub fn set_security_audit_degraded(degraded: bool) {
     with_registry(|reg| reg.security_audit_degraded = degraded);
 }
 
+pub fn set_security_audit_transport_metrics(pending: u64, capacity: u64) {
+    with_registry(|reg| {
+        reg.security_audit_transport_pending = pending;
+        reg.security_audit_transport_capacity = capacity;
+    });
+}
+
 pub fn is_security_audit_degraded() -> bool {
     with_registry(|reg| reg.security_audit_degraded)
 }
@@ -2686,6 +2699,18 @@ pub fn generate_prometheus_metrics() -> String {
         out.push_str(&format!(
             "security_audit_degraded {}\n\n",
             u8::from(reg.security_audit_degraded)
+        ));
+        out.push_str("# HELP security_audit_transport_capacity Maximum in-flight worker security audit acknowledgements.\n");
+        out.push_str("# TYPE security_audit_transport_capacity gauge\n");
+        out.push_str(&format!(
+            "security_audit_transport_capacity {}\n",
+            reg.security_audit_transport_capacity
+        ));
+        out.push_str("# HELP security_audit_transport_pending Worker security audit requests awaiting durable acknowledgement.\n");
+        out.push_str("# TYPE security_audit_transport_pending gauge\n");
+        out.push_str(&format!(
+            "security_audit_transport_pending {}\n\n",
+            reg.security_audit_transport_pending
         ));
 
         // 1. merge_law_applied_total
@@ -4236,6 +4261,7 @@ mod tests {
 
         set_security_audit_storage_metrics(7, 2048, 4096);
         set_security_audit_degraded(true);
+        set_security_audit_transport_metrics(2, 32);
         let prometheus = generate_prometheus_metrics();
         let lines: Vec<_> = prometheus
             .lines()
@@ -4261,6 +4287,12 @@ mod tests {
                 "# HELP security_audit_degraded Whether required security audit writes are failing.",
                 "# TYPE security_audit_degraded gauge",
                 "security_audit_degraded 1",
+                "# HELP security_audit_transport_capacity Maximum in-flight worker security audit acknowledgements.",
+                "# TYPE security_audit_transport_capacity gauge",
+                "security_audit_transport_capacity 32",
+                "# HELP security_audit_transport_pending Worker security audit requests awaiting durable acknowledgement.",
+                "# TYPE security_audit_transport_pending gauge",
+                "security_audit_transport_pending 2",
             ]
         );
         assert!(is_security_audit_degraded());

@@ -269,6 +269,12 @@ retention fill. `security_audit_degraded` is 1 while required writes are
 failing; health reports audit storage degradation without marking a ready
 process unhealthy.
 
+The worker audit transport allows at most 32 unacknowledged records per worker
+process and waits up to 30 seconds for durable acknowledgement. A full,
+unavailable, or timed-out transport rejects the related request. Prometheus
+exports `security_audit_transport_pending` and
+`security_audit_transport_capacity` to show the current waiter fill and limit.
+
 Authenticated PGWire clients with the current `security.audit.read` permission
 can read retained security records with `SHOW SECURITY AUDIT [FROM
 <timestamp_ms>] [TO <timestamp_ms>] [AFTER <cursor>] [LIMIT <rows>]`. Time bounds

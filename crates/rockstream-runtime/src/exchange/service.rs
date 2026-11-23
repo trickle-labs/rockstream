@@ -29,6 +29,43 @@ use rockstream_types::topology::WorkerMessage;
 
 pub type SecurityAuditWaiters = Arc<parking_lot::Mutex<HashMap<String, oneshot::Sender<bool>>>>;
 
+pub(crate) fn remove_security_audit_waiter(
+    waiters: &SecurityAuditWaiters,
+    request_id: &str,
+    capacity: usize,
+) -> Option<oneshot::Sender<bool>> {
+    let mut pending = waiters.lock();
+    let waiter = pending.remove(request_id);
+    if waiter.is_some() {
+        rockstream_types::metrics::set_security_audit_transport_metrics(
+            pending.len() as u64,
+            capacity as u64,
+        );
+    }
+    waiter
+}
+
+pub(crate) fn drain_security_audit_waiters(
+    waiters: &SecurityAuditWaiters,
+) -> Vec<oneshot::Sender<bool>> {
+    let mut pending = waiters.lock();
+    let drained = std::mem::take(&mut *pending);
+    rockstream_types::metrics::set_security_audit_transport_metrics(0, 0);
+    drained.into_values().collect()
+}
+
+struct SecurityAuditWaiterGuard {
+    waiters: SecurityAuditWaiters,
+    request_id: String,
+    capacity: usize,
+}
+
+impl Drop for SecurityAuditWaiterGuard {
+    fn drop(&mut self) {
+        remove_security_audit_waiter(&self.waiters, &self.request_id, self.capacity);
+    }
+}
+
 pub(crate) type OwnedShuffleHandler = Arc<
     dyn Fn(ShuffleFrame, bytes::Bytes) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
         + Send
@@ -123,6 +160,11 @@ impl ExchangeRegistry {
         worker_messages: mpsc::Sender<WorkerMessage>,
         waiters: SecurityAuditWaiters,
     ) -> Self {
+        let capacity = worker_messages.max_capacity();
+        rockstream_types::metrics::set_security_audit_transport_metrics(
+            waiters.lock().len() as u64,
+            capacity as u64,
+        );
         self.worker_messages = Some(worker_messages);
         self.security_audit_waiters = Some(waiters);
         self
@@ -142,17 +184,26 @@ impl ExchangeRegistry {
             )))
         })?;
         let request_id = record.event_id.clone();
+        let capacity = worker_messages.max_capacity();
         let (ack_tx, ack_rx) = oneshot::channel();
         {
             let mut waiters = waiters.lock();
-            if waiters.len() >= worker_messages.max_capacity() || waiters.contains_key(&request_id)
-            {
+            if waiters.len() >= capacity || waiters.contains_key(&request_id) {
                 return Err(Box::new(Status::unavailable(format!(
                     "{RS_0003}: required security audit capacity is unavailable"
                 ))));
             }
             waiters.insert(request_id.clone(), ack_tx);
+            rockstream_types::metrics::set_security_audit_transport_metrics(
+                waiters.len() as u64,
+                capacity as u64,
+            );
         }
+        let _waiter_guard = SecurityAuditWaiterGuard {
+            waiters: waiters.clone(),
+            request_id: request_id.clone(),
+            capacity,
+        };
         if worker_messages
             .try_send(WorkerMessage::ReportSecurityAudit {
                 request_id: request_id.clone(),
@@ -160,19 +211,15 @@ impl ExchangeRegistry {
             })
             .is_err()
         {
-            waiters.lock().remove(&request_id);
             return Err(Box::new(Status::unavailable(format!(
                 "{RS_0003}: required security audit transport is unavailable"
             ))));
         }
         match tokio::time::timeout(Duration::from_secs(30), ack_rx).await {
             Ok(Ok(true)) => Ok(()),
-            _ => {
-                waiters.lock().remove(&request_id);
-                Err(Box::new(Status::unavailable(format!(
-                    "{RS_0003}: required security audit append failed"
-                ))))
-            }
+            _ => Err(Box::new(Status::unavailable(format!(
+                "{RS_0003}: required security audit append failed"
+            )))),
         }
     }
 
@@ -1094,6 +1141,98 @@ mod tests {
     /// `rockstream_types::metrics::tests`.
     static SHM_TEST_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
     static FLOW_CONTROL_TEST_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
+
+    // Keep global metric resets and snapshots isolated across async waits.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn security_audit_transport_metrics_track_pending_and_recovery() {
+        let _flow_guard = FLOW_CONTROL_TEST_LOCK.lock().await;
+        let _metrics_guard = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
+        rockstream_types::metrics::reset_all();
+
+        let (sender, mut receiver) = mpsc::channel::<WorkerMessage>(1);
+        let waiters = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let registry = ExchangeRegistry::new().with_security_audit(sender, waiters.clone());
+        let append = tokio::spawn({
+            let registry = registry.clone();
+            async move {
+                registry
+                    .append_security_audit(ExchangeRegistry::node_identity_rejection(
+                        AuditIdentity::Unknown,
+                        AuditField::Unknown,
+                    ))
+                    .await
+            }
+        });
+
+        let Some(WorkerMessage::ReportSecurityAudit { .. }) = receiver.recv().await else {
+            panic!("security audit transport did not receive the request");
+        };
+        let metric_lines = || {
+            rockstream_types::metrics::generate_prometheus_metrics()
+                .lines()
+                .filter(|line| {
+                    line.starts_with("# HELP security_audit_transport_")
+                        || line.starts_with("# TYPE security_audit_transport_")
+                        || line.starts_with("security_audit_transport_")
+                })
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let expected_lines = |pending| {
+            vec![
+                "# HELP security_audit_transport_capacity Maximum in-flight worker security audit acknowledgements.".to_owned(),
+                "# TYPE security_audit_transport_capacity gauge".to_owned(),
+                "security_audit_transport_capacity 1".to_owned(),
+                "# HELP security_audit_transport_pending Worker security audit requests awaiting durable acknowledgement.".to_owned(),
+                "# TYPE security_audit_transport_pending gauge".to_owned(),
+                format!("security_audit_transport_pending {pending}"),
+            ]
+        };
+        assert_eq!(metric_lines(), expected_lines(1));
+
+        let full_error = registry
+            .append_security_audit(ExchangeRegistry::node_identity_rejection(
+                AuditIdentity::Unknown,
+                AuditField::Unknown,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(full_error.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            full_error.message(),
+            "RS-0003: required security audit capacity is unavailable"
+        );
+
+        append.abort();
+        assert!(append.await.unwrap_err().is_cancelled());
+        assert_eq!(metric_lines(), expected_lines(0));
+
+        let append = tokio::spawn({
+            let registry = registry.clone();
+            async move {
+                registry
+                    .append_security_audit(ExchangeRegistry::node_identity_rejection(
+                        AuditIdentity::Unknown,
+                        AuditField::Unknown,
+                    ))
+                    .await
+            }
+        });
+        let Some(WorkerMessage::ReportSecurityAudit { request_id, .. }) = receiver.recv().await
+        else {
+            panic!("recovered security audit transport did not receive the request");
+        };
+        assert_eq!(metric_lines(), expected_lines(1));
+        let waiter = remove_security_audit_waiter(&waiters, &request_id, 1)
+            .expect("request must be waiting for its durable acknowledgement");
+        waiter
+            .send(true)
+            .expect("append task must still be waiting");
+        assert!(append.await.unwrap().is_ok());
+        assert_eq!(metric_lines(), expected_lines(0));
+        rockstream_types::metrics::reset_all();
+    }
 
     fn worker_info(worker_id: u64, address: String, host_id: &str, az: &str) -> WorkerInfo {
         worker_info_with_codecs(worker_id, address, host_id, az, true, true)

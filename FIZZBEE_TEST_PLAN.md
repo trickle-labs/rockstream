@@ -790,6 +790,16 @@ authorization rule. `security_audit_metrics_tests.rs::durable_audit_metrics_foll
 and `security_audit_health_tests.rs::audit_storage_degradation_is_visible_without_failing_ready_health`
 check the metric and health surfaces.
 
+The worker audit append handoff bounds pending acknowledgements by the worker
+message-channel capacity, matches replies to registered request IDs, and clears
+waiters after acknowledgement, enqueue failure, timeout, cancellation, or
+transport shutdown. Only a successful durable acknowledgement lets the append
+return success; capacity exhaustion and other failed outcomes fail closed. The
+runtime tests check the pending/capacity metrics, saturation, and capacity
+recovery after cancellation and acknowledgement. M1–M7 do not model this waiter
+map or channel state, so this is implementation evidence rather than formal
+proof of the append transport or the durable audit store.
+
 `runtime/src/exchange` now provides a worker mTLS listener and client pool.
 `shuffle_mtls_tests.rs` covers invalid peer credentials, worker identity and
 source-shard authorization, audited denial without inlet delivery, and active
