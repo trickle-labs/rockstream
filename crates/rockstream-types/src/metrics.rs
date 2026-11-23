@@ -438,6 +438,10 @@ struct MetricRegistry {
     security_audit_degraded: bool,
     security_audit_transport_pending: u64,
     security_audit_transport_capacity: u64,
+    support_artifact_retained_count: u64,
+    support_artifact_retained_bytes: u64,
+    support_artifact_capacity_count: u64,
+    support_artifact_capacity_bytes: u64,
 
     // SRE Observability metrics
     compaction_bytes_reclaimed: HashMap<u16, Counter>,
@@ -596,6 +600,10 @@ impl MetricRegistry {
             security_audit_degraded: false,
             security_audit_transport_pending: 0,
             security_audit_transport_capacity: 0,
+            support_artifact_retained_count: 0,
+            support_artifact_retained_bytes: 0,
+            support_artifact_capacity_count: 0,
+            support_artifact_capacity_bytes: 0,
             compaction_bytes_reclaimed: HashMap::new(),
             duplicate_dropped_total: HashMap::new(),
             tombstone_bytes: HashMap::new(),
@@ -1340,6 +1348,10 @@ pub fn reset_all() {
         reg.security_audit_degraded = false;
         reg.security_audit_transport_pending = 0;
         reg.security_audit_transport_capacity = 0;
+        reg.support_artifact_retained_count = 0;
+        reg.support_artifact_retained_bytes = 0;
+        reg.support_artifact_capacity_count = 0;
+        reg.support_artifact_capacity_bytes = 0;
         reg.compaction_bytes_reclaimed.clear();
         reg.duplicate_dropped_total.clear();
         reg.tombstone_bytes.clear();
@@ -2640,6 +2652,20 @@ pub fn set_security_audit_storage_metrics(
     });
 }
 
+pub fn set_support_artifact_storage_metrics(
+    retained_count: u64,
+    retained_bytes: u64,
+    capacity_count: u64,
+    capacity_bytes: u64,
+) {
+    with_registry(|reg| {
+        reg.support_artifact_retained_count = retained_count;
+        reg.support_artifact_retained_bytes = retained_bytes;
+        reg.support_artifact_capacity_count = capacity_count;
+        reg.support_artifact_capacity_bytes = capacity_bytes;
+    });
+}
+
 pub fn set_security_audit_degraded(degraded: bool) {
     with_registry(|reg| reg.security_audit_degraded = degraded);
 }
@@ -2711,6 +2737,31 @@ pub fn generate_prometheus_metrics() -> String {
         out.push_str(&format!(
             "security_audit_transport_pending {}\n\n",
             reg.security_audit_transport_pending
+        ));
+
+        out.push_str("# HELP support_artifact_retained_count Number of artifacts retained in the observed support-artifact ledger.\n");
+        out.push_str("# TYPE support_artifact_retained_count gauge\n");
+        out.push_str(&format!(
+            "support_artifact_retained_count {}\n",
+            reg.support_artifact_retained_count
+        ));
+        out.push_str("# HELP support_artifact_retained_bytes Payload bytes retained in the observed support-artifact ledger.\n");
+        out.push_str("# TYPE support_artifact_retained_bytes gauge\n");
+        out.push_str(&format!(
+            "support_artifact_retained_bytes {}\n",
+            reg.support_artifact_retained_bytes
+        ));
+        out.push_str("# HELP support_artifact_capacity_count Maximum retained support artifacts per deployment.\n");
+        out.push_str("# TYPE support_artifact_capacity_count gauge\n");
+        out.push_str(&format!(
+            "support_artifact_capacity_count {}\n",
+            reg.support_artifact_capacity_count
+        ));
+        out.push_str("# HELP support_artifact_capacity_bytes Maximum retained support-artifact payload bytes per deployment.\n");
+        out.push_str("# TYPE support_artifact_capacity_bytes gauge\n");
+        out.push_str(&format!(
+            "support_artifact_capacity_bytes {}\n\n",
+            reg.support_artifact_capacity_bytes
         ));
 
         // 1. merge_law_applied_total
@@ -4296,6 +4347,42 @@ mod tests {
             ]
         );
         assert!(is_security_audit_degraded());
+
+        reset_all();
+    }
+
+    #[test]
+    fn support_artifact_storage_metrics_are_exported_exactly() {
+        let _g = TEST_LOCK.lock().unwrap();
+        reset_all();
+
+        set_support_artifact_storage_metrics(3, 4096, 2048, 100 * 1024 * 1024);
+        let lines: Vec<_> = generate_prometheus_metrics()
+            .lines()
+            .filter(|line| {
+                line.starts_with("# HELP support_artifact_")
+                    || line.starts_with("# TYPE support_artifact_")
+                    || line.starts_with("support_artifact_")
+            })
+            .collect();
+
+        assert_eq!(
+            lines,
+            vec![
+                "# HELP support_artifact_retained_count Number of artifacts retained in the observed support-artifact ledger.",
+                "# TYPE support_artifact_retained_count gauge",
+                "support_artifact_retained_count 3",
+                "# HELP support_artifact_retained_bytes Payload bytes retained in the observed support-artifact ledger.",
+                "# TYPE support_artifact_retained_bytes gauge",
+                "support_artifact_retained_bytes 4096",
+                "# HELP support_artifact_capacity_count Maximum retained support artifacts per deployment.",
+                "# TYPE support_artifact_capacity_count gauge",
+                "support_artifact_capacity_count 2048",
+                "# HELP support_artifact_capacity_bytes Maximum retained support-artifact payload bytes per deployment.",
+                "# TYPE support_artifact_capacity_bytes gauge",
+                "support_artifact_capacity_bytes 104857600",
+            ]
+        );
 
         reset_all();
     }
