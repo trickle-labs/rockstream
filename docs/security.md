@@ -128,10 +128,10 @@ enabled SCRAM login; startup rejects an unavailable or empty store. MD5 is not
 a release authentication mode. Enabling these startup paths does not satisfy
 the v0.73 ten-case release qualification gate by itself.
 
-Active `SUBSCRIBE` streams recheck the caller's current read authorization every
-second before delivering rows, including rows already buffered from a snapshot.
-A revoked grant produces the normal durable authorization-denial audit and
-closes that stream; if the denial cannot be audited, the session is invalidated.
+Active `SUBSCRIBE` streams recheck the caller's current read authorization at
+one-second intervals before delivering pending or live rows. In durable
+security mode, a revoked grant produces a durable denial audit and closes that
+stream; if the required audit cannot be persisted, the session is invalidated.
 Other principals' subscriptions continue independently.
 
 Starting in **v0.55**, RockStream enforces mutual TLS (mTLS) with cryptographically verified node identity across all internal network transport boundaries:
