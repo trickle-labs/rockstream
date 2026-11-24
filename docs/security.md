@@ -97,7 +97,8 @@ the secret and consumer principal, and missing identity or durable policy
 fails closed. Gateway source resolution reads the consumer's current durable
 policy before decrypting the value. Legacy source records without a persisted
 consumer identity are denied at resolution; an authorized migration route
-remains to be qualified.
+remains to be qualified. The gateway refreshes this policy view at one-second
+intervals, and a failed refresh rejects source credential resolution.
 
 This document describes the security model, mutual TLS (mTLS) transport encryption, identity verification, and dynamic certificate rotation in RockStream.
 
@@ -127,6 +128,12 @@ boundary. SCRAM-SHA-256 requires a recovered durable principal store with an
 enabled SCRAM login; startup rejects an unavailable or empty store. MD5 is not
 a release authentication mode. Enabling these startup paths does not satisfy
 the v0.73 ten-case release qualification gate by itself.
+
+Active `SUBSCRIBE` streams recheck the caller's current read authorization at
+one-second intervals before delivering pending or live rows. In durable
+security mode, a revoked grant produces a durable denial audit and closes that
+stream; if the required audit cannot be persisted, the session is invalidated.
+Other principals' subscriptions continue independently.
 
 Starting in **v0.55**, RockStream enforces mutual TLS (mTLS) with cryptographically verified node identity across all internal network transport boundaries:
 
@@ -169,7 +176,7 @@ Worker shuffle and native management APIs are separate transport boundaries. A c
 
 The native management API requires mTLS and a durable security catalog. Only certificates with a parsed `Cli` node identity are eligible for principal mapping; worker and control-node certificates are rejected and audited even when their fingerprints are listed as login methods. A verified CLI certificate is mapped by SHA-256 fingerprint to an enabled principal; the node role, CLI role flag, and headers do not grant application authority. Each RPC evaluates the principal's current persisted grants for the requested action and scope. A failed handshake, wrong-role certificate, or unmapped certificate establishes no management session. An authorization denial is audited and rejects that operation while preserving the authenticated session. Startup fails when the security catalog is unavailable or has no enabled administrator and mTLS principal. This implementation and its component tests do not constitute the assembled v0.73 qualification sign-off; missing release evidence remains blocking.
 
-Management support artifacts require current `SupportGenerate` authority on the requested cluster or node scope. Downloads use an opaque UUID, require both artifact-download authority and current authority on the original scope, and are bound to the creating principal. Artifacts contain sanitized operational metadata only. Each is limited to 10 MiB and remains available for at most 10 minutes. The shared object store retains at most 2,048 artifacts and 100 MiB of payload per deployment; at either limit it rejects new generation and never evicts an unexpired artifact. Each management-service instance admits one artifact generation at a time. A pre-admission busy response does not create an operation record; an admitted quota failure records a failed operation and audit. Both use gRPC `ResourceExhausted`. Backends without atomic conditional writes keep the management API available but disable support-artifact generation and download. Durable cleanup also requires object-store prefix listing; if startup recovery cannot list artifacts, management initialization fails closed before listeners open. Expired and orphaned data is cleaned within 60 seconds and before listeners open during startup recovery.
+Management support artifacts require current `SupportGenerate` authority on the requested cluster or node scope. Downloads use an opaque UUID, require both artifact-download authority and current authority on the original scope, and are bound to the creating principal. Artifacts contain sanitized operational metadata only. Each is limited to 10 MiB and remains available for at most 10 minutes. The shared object store retains at most 2,048 artifacts and 100 MiB of payload per deployment; at either limit it rejects new generation and never evicts an unexpired artifact. The `support_artifact_retained_count`, `support_artifact_retained_bytes`, `support_artifact_capacity_count`, and `support_artifact_capacity_bytes` gauges report ledger-accounted fill and its configured limits. Each management-service instance admits one artifact generation at a time. A pre-admission busy response does not create an operation record; an admitted quota failure records a failed operation and audit. Both use gRPC `ResourceExhausted`. Backends without atomic conditional writes keep the management API available but disable support-artifact generation and download. Durable cleanup also requires object-store prefix listing; if startup recovery cannot list artifacts, management initialization fails closed before listeners open. Expired and orphaned data is cleaned within 60 seconds and before listeners open during startup recovery.
 
 The local CLI `support bundle`, `support diagnose`, `audit tail`, and `audit query` routes fail closed with `RS-2400` because they do not enforce the durable principal and scope policy. Use authenticated management support artifacts and authenticated pgwire `SHOW SECURITY AUDIT` for those protected reads.
 

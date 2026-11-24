@@ -985,6 +985,10 @@ Retries use a fresh generation path, so expiry and orphan cleanup delete only
 the generation they observed and cannot remove a concurrent retry's object;
 restart cleanup removes unreferenced late writes. M1–M7 do not model this
 management workflow; these tests are implementation evidence, not formal proof.
+Support-artifact fill metrics publish the ledger's retained artifact count and
+recorded bytes alongside their configured limits; `support_artifact_usage_reports_exact_ledger_fill`
+asserts the exact `(2, 18)` count/byte result. This observability adds no
+artifact transition or M1–M7 invariant.
 
 PR #388 (issue #302) hardens the durable catalog audit-append retry
 boundary against concurrent writers. The secret-store rotation audit writer

@@ -4052,7 +4052,7 @@ async fn oidc_startup_rejects_unavailable_jwks_before_listening() {
 }
 
 #[tokio::test]
-async fn release_process_rejects_scram_with_empty_durable_credentials_before_listening() {
+async fn release_process_bootstraps_scram_after_empty_store_rejection() {
     let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
     let temp = tempfile::tempdir().unwrap();
     let storage = temp.path().join("empty-scram-storage");
@@ -4127,6 +4127,144 @@ async fn release_process_rejects_scram_with_empty_durable_credentials_before_lis
         "[RS-0002] config.invalid: Configuration error (detail=gateway startup rejected: SCRAM requires an available durable catalog with an enabled SCRAM login) (correlation_id=<correlation_id> context=detail=gateway startup rejected: SCRAM requires an available durable catalog with an enabled SCRAM login) next_steps: Check configuration file and CLI flags.\n  next steps: Provision an enabled SCRAM login in the recovered durable catalog before starting the gateway."
     );
     assert!(tokio::net::TcpStream::connect(address).await.is_err());
+
+    let principal = scram_principal();
+    let principal_file = temp.path().join("administrator.json");
+    std::fs::write(&principal_file, serde_json::to_vec(&principal).unwrap()).unwrap();
+    let bootstrap = Command::new(env!("CARGO_BIN_EXE_rockstream"))
+        .arg("--json")
+        .arg("security")
+        .arg("preprovision-admin")
+        .arg("--storage")
+        .arg(&storage)
+        .arg("--layout")
+        .arg("gateway")
+        .arg("--principal-file")
+        .arg(&principal_file)
+        .arg("--operation-id")
+        .arg("1")
+        .arg("--yes")
+        .output()
+        .unwrap();
+    assert!(
+        bootstrap.status.success(),
+        "{}",
+        String::from_utf8_lossy(&bootstrap.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(bootstrap.stdout).unwrap(),
+        "{\n  \"principal_id\": 1,\n  \"catalog_revision\": 1\n}\n"
+    );
+
+    let shard_dir = storage.join("gateway-shard");
+    let store =
+        rockstream_storage::build_runtime_object_store(&shard_dir, "gateway-shard").unwrap();
+    let durable = DurableCatalogStore::recover(store, "gateway")
+        .await
+        .unwrap();
+    assert_eq!(
+        durable.list_security_principals().await.unwrap(),
+        vec![principal.clone()]
+    );
+    let audit_records = durable.list_security_audit_records().await.unwrap();
+    assert_eq!(audit_records.len(), 1);
+    assert_eq!(
+        audit_records,
+        vec![expected_bootstrap_audit(
+            &principal,
+            1,
+            audit_records[0].timestamp_ms,
+        )]
+    );
+    drop(durable);
+
+    let mut authenticated_process = start_gateway_process(
+        temp.path(),
+        &storage,
+        address,
+        &cert_path,
+        &key_path,
+        "scram",
+        None,
+        "",
+        "",
+        "",
+    );
+    wait_for_gateway(&mut authenticated_process.0, address).await;
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=alice password=pencil dbname=test sslmode=disable",
+            address.port()
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("the preprovisioned SCRAM administrator should authenticate");
+    let connection_task = tokio::spawn(connection);
+    let rows = client.query("SELECT 1 AS value", &[]).await.unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.get::<_, i64>(0))
+            .collect::<Vec<_>>(),
+        vec![1i64]
+    );
+    drop(client);
+    connection_task.abort();
+    authenticated_process.0.kill().unwrap();
+    authenticated_process.0.wait().unwrap();
+
+    let store =
+        rockstream_storage::build_runtime_object_store(&shard_dir, "gateway-shard").unwrap();
+    let recovered = DurableCatalogStore::recover(store, "gateway")
+        .await
+        .unwrap();
+    assert_eq!(
+        recovered.list_security_principals().await.unwrap(),
+        vec![principal.clone()]
+    );
+    let audit_records = recovered.list_security_audit_records().await.unwrap();
+    assert_eq!(audit_records.len(), 2);
+    assert_eq!(
+        audit_records[0],
+        expected_bootstrap_audit(&principal, 1, audit_records[0].timestamp_ms)
+    );
+
+    let mut authentication = audit_records[1].clone();
+    let event_id = std::mem::replace(&mut authentication.event_id, "<event_id>".to_string());
+    let timestamp_ms = std::mem::replace(&mut authentication.timestamp_ms, 0);
+    let correlation = std::mem::replace(&mut authentication.correlation, AuditCorrelation::Unknown);
+    assert!(event_id.starts_with("gateway-authn-"));
+    assert_eq!(event_id.len(), "gateway-authn-".len() + 32);
+    assert!(event_id["gateway-authn-".len()..]
+        .chars()
+        .all(|character| character.is_ascii_hexdigit()));
+    assert!(timestamp_ms >= audit_records[0].timestamp_ms);
+    assert!(matches!(
+        correlation,
+        AuditCorrelation::Observed(ref id)
+            if id.len() == 32 && id.chars().all(|character| character.is_ascii_hexdigit())
+    ));
+    assert_eq!(
+        authentication,
+        SecurityAuditRecord {
+            format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: "<event_id>".to_string(),
+            timestamp_ms: 0,
+            actor: AuditIdentity::Verified("scram:alice".to_string()),
+            target: AuditField::Known("principal:1".to_string()),
+            scope: AuditField::NotApplicable,
+            action: SecurityAuditClass::AuthenticationSuccess,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::Known(1),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
+    );
+    assert!(!serde_json::to_string(&audit_records)
+        .unwrap()
+        .contains("pencil"));
 }
 
 #[tokio::test]
