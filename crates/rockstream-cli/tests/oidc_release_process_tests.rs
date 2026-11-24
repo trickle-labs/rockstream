@@ -7178,7 +7178,7 @@ async fn support_artifact_download_is_bound_to_authenticated_principal() {
 }
 
 #[tokio::test]
-async fn operator_with_explicit_backup_scope_can_create_backup_over_release_management_api() {
+async fn operator_scoped_backup_grant_keeps_support_artifact_sanitized() {
     let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     assert!(rockstream_test_support::docker_available());
@@ -7223,6 +7223,26 @@ async fn operator_with_explicit_backup_scope_can_create_backup_over_release_mana
     )
     .await
     .unwrap();
+
+    let artifact_id = uuid::Uuid::new_v4().to_string();
+    let artifact = client
+        .generate_support_artifact(GenerateSupportArtifactRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            node_id: String::new(),
+            idempotency_key: artifact_id.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(artifact.opaque_id, artifact_id);
+    let generated_at_ms = artifact.expires_at_ms - 600_000;
+    let expected_content = format!(
+        "{{\"format_version\":1,\"generated_at_ms\":{generated_at_ms},\"scope\":\"cluster\",\"source_version\":\"rockstream:{}\",\"topology_revision\":1,\"active_operations\":1,\"retained_operations\":1,\"node\":null}}",
+        env!("CARGO_PKG_VERSION")
+    );
+    let (content, expires_at_ms) = download_support_artifact(&mut client, &artifact_id).await;
+    assert_eq!(String::from_utf8(content).unwrap(), expected_content);
+    assert_eq!(expires_at_ms, artifact.expires_at_ms);
 
     let idempotency_key = uuid::Uuid::new_v4().to_string();
     let accepted = client
