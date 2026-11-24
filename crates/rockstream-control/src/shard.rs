@@ -557,6 +557,10 @@ pub struct ShardPersistentStore {
 }
 
 impl ShardPersistentStore {
+    pub(crate) fn object_store(&self) -> Arc<dyn ObjectStore> {
+        self.store.clone()
+    }
+
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
         Self {
             store,

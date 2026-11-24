@@ -62,7 +62,7 @@ use crate::migration::{
 };
 use crate::placement::PlacementAlgorithm;
 use crate::raft::{RaftHandle, RaftRole};
-use crate::scheduler::ShardScheduler;
+use crate::scheduler::{ElasticRebalanceConfig, ElasticRebalancePolicy, ShardScheduler};
 use crate::secret_store::{SecretStore, SecretStoreError};
 use crate::shard::{ShardManager, ShardPersistentStore};
 use crate::topology::{TopologyCatalog, TopologyPersistentStore};
@@ -177,6 +177,7 @@ struct DataPlaneState {
     /// At most one latest receipt per deployed workload; redeployment clears it.
     direct_completed: HashMap<WorkloadId, SourceEpochMetadata>,
     direct_grant_waiters: HashMap<uuid::Uuid, mpsc::Sender<(WorkerId, bool)>>,
+    shard_loads: HashMap<ShardId, (LeaseToken, u64, u64)>,
     deployments: HashMap<WorkloadId, DeploymentState>,
     source_waiters: HashMap<String, SourceWaiter>,
     operator_stats_waiters: HashMap<String, OperatorStatsWaiter>,
@@ -244,6 +245,8 @@ struct SourceWaiter {
     source: String,
     expected: HashSet<ShardId>,
     received: HashSet<ShardId>,
+    /// Exact fences from successful durable shard commits for this epoch.
+    committed_leases: BTreeMap<ShardId, LeaseToken>,
     dispatchers: HashMap<ShardId, WorkerId>,
     owned_intent: Option<rockstream_types::data_plane::OwnedEpochIntent>,
     prepare_reply: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
@@ -277,6 +280,8 @@ impl SourceWaiter {
         {
             return false;
         }
+        self.committed_leases
+            .insert(output.shard_id, output.lease_token);
         self.received == self.expected
     }
 }
@@ -803,6 +808,7 @@ async fn persist_shard_state(shard_manager: &ShardManager, shard_store: &ShardPe
 
 /// Handle to the running control service.
 pub struct ControlServiceHandle {
+    automatic_elasticity_enabled: bool,
     /// Bound address.
     pub addr: SocketAddr,
     /// Shutdown sender; drop or send to stop the service.
@@ -817,6 +823,9 @@ pub struct ControlServiceHandle {
 }
 
 impl ControlServiceHandle {
+    pub fn automatic_elasticity_enabled(&self) -> bool {
+        self.automatic_elasticity_enabled
+    }
     /// Total row payloads received via legacy control-mediated `SubmitSourceDelta`.
     /// Must remain `0` when all ingestion flows over the direct Arrow IPC path.
     pub fn row_payloads_received(&self) -> u64 {
@@ -905,9 +914,14 @@ pub struct ControlService {
     security_catalog: Option<Arc<dyn CatalogStore>>,
     actor_assertion_verifier: Option<Arc<crate::delegation::ActorAssertionVerifier>>,
     backup_source: Option<BackupSource>,
+    elasticity: rockstream_types::config::ElasticityConfig,
 }
 
 impl ControlService {
+    pub fn with_elasticity(mut self, config: rockstream_types::config::ElasticityConfig) -> Self {
+        self.elasticity = config;
+        self
+    }
     /// Create a new `ControlService` backed by the given catalog.
     pub fn new(catalog: TopologyCatalog) -> Self {
         Self {
@@ -934,6 +948,7 @@ impl ControlService {
             security_catalog: None,
             actor_assertion_verifier: None,
             backup_source: None,
+            elasticity: rockstream_types::config::ElasticityConfig::default(),
         }
     }
 
@@ -1025,6 +1040,7 @@ impl ControlService {
         operation_store: Arc<dyn object_store::ObjectStore>,
         config: rockstream_types::config::NodeConfig,
     ) -> Self {
+        self.elasticity = config.control.elasticity.clone();
         self.management = Some((bind_addr.into(), operation_store, config));
         self
     }
@@ -1183,19 +1199,52 @@ impl ControlService {
         let addr = listener.local_addr()?;
         tracing::info!(addr = %addr, "control service listening");
 
-        let operation_store = self
+        let durable_operation_backend = self
             .management
             .as_ref()
-            .map(|(_, store, _)| ManagementOperationStore::new(store.clone()));
+            .map(|(_, store, _)| store.clone())
+            .or_else(|| self.shard_store.as_ref().map(|store| store.object_store()));
+        let operation_store = durable_operation_backend
+            .as_ref()
+            .map(|store| ManagementOperationStore::new(store.clone()));
         let migration_waiters = Arc::new(AsyncMutex::new(HashMap::new()));
         let backup_waiters = Arc::new(AsyncMutex::new(HashMap::new()));
-        let management = if let Some((management_addr, management_store, config)) = &self.management
+        let migration_runtime =
+            operation_store
+                .as_ref()
+                .map(|operations| ManagementMigrationRuntime {
+                    catalog: self.catalog.clone(),
+                    shard_manager: self.shard_manager.clone(),
+                    data_plane: self.data_plane.clone(),
+                    shard_store: self.shard_store.clone(),
+                    worker_senders: self.worker_senders.clone(),
+                    waiters: migration_waiters.clone(),
+                    operations: operations.clone(),
+                    gc_pins: crate::checkpoint_store::GcPinStore::new(
+                        durable_operation_backend.clone().unwrap(),
+                    ),
+                    started: Arc::new(AsyncMutex::new(HashSet::new())),
+                    raft: self.raft.clone(),
+                });
+        let automatic_rebalance =
+            migration_runtime
+                .as_ref()
+                .map(|runtime| AutomaticRebalanceRuntime {
+                    migration: runtime.clone(),
+                    config: self.elasticity.clone(),
+                    audit: self.audit.clone(),
+                    policies: Arc::new(AsyncMutex::new(BTreeMap::new())),
+                    topology_store: self.topology_store.clone(),
+                });
+        let management = if let Some((management_addr, _management_store, config)) =
+            &self.management
         {
             let operations = operation_store
                 .as_ref()
                 .expect("management config has an operation store")
                 .clone();
             let drain_runtime = ManagementDrainRuntime {
+                automatic_rebalance: automatic_rebalance.clone(),
                 catalog: self.catalog.clone(),
                 shard_manager: self.shard_manager.clone(),
                 data_plane: self.data_plane.clone(),
@@ -1206,17 +1255,6 @@ impl ControlService {
                 worker_senders: self.worker_senders.clone(),
                 migration_waiters: migration_waiters.clone(),
                 operations: operations.clone(),
-                started: Arc::new(AsyncMutex::new(HashSet::new())),
-            };
-            let migration_runtime = ManagementMigrationRuntime {
-                catalog: self.catalog.clone(),
-                shard_manager: self.shard_manager.clone(),
-                data_plane: self.data_plane.clone(),
-                shard_store: self.shard_store.clone(),
-                worker_senders: self.worker_senders.clone(),
-                waiters: migration_waiters.clone(),
-                operations: operations.clone(),
-                gc_pins: crate::checkpoint_store::GcPinStore::new(management_store.clone()),
                 started: Arc::new(AsyncMutex::new(HashSet::new())),
             };
             let backup_source = self.backup_source.clone().or_else(|| {
@@ -1239,7 +1277,7 @@ impl ControlService {
                 )
             })?)
             .with_drain_runtime(drain_runtime)
-            .with_migration_runtime(migration_runtime);
+            .with_migration_runtime(migration_runtime.clone().unwrap());
             let management = if let Some((source, shared_store_id, local_worker_id)) = backup_source
             {
                 management.with_backup_runtime(ManagementBackupRuntime {
@@ -1278,6 +1316,50 @@ impl ControlService {
 
         let (shutdown_tx, _) = broadcast::channel(1);
         let shutdown_tx2 = shutdown_tx.clone();
+        let automatic_elasticity_enabled = automatic_rebalance
+            .as_ref()
+            .is_some_and(|runtime| runtime.config.enabled);
+        if let Some(runtime) = automatic_rebalance.clone() {
+            let mut shutdown = shutdown_tx.subscribe();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(1));
+                loop {
+                    tokio::select! { _ = shutdown.recv() => break, _ = interval.tick() => runtime.finish_drains().await }
+                }
+            });
+        }
+        if management.is_none() {
+            if let Some(runtime) = migration_runtime {
+                // Internal reconciliation is independent of exposing an admin
+                // listener. Only automatic operations belong to this loop.
+                let mut shutdown = shutdown_tx.subscribe();
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(1));
+                    loop {
+                        tokio::select! {
+                            _ = shutdown.recv() => break,
+                            _ = interval.tick() => {
+                                if runtime.raft.as_ref().is_some_and(|raft| !raft.is_leader()) { continue; }
+                                let Ok(records) = runtime.operations.nonterminal().await else { continue; };
+                                for mut record in records {
+                                    let Some(request) = record.request().cloned().filter(|request| request.get("automatic").and_then(serde_json::Value::as_bool) == Some(true)) else { continue; };
+                                    if runtime.started.lock().await.contains(record.operation_id()) { continue; }
+                                    if record.status() == OperationStatus::Running {
+                                        let recovered = runtime.operations.transition_if(record.operation_id(), OperationStatus::Running, record.phase(), OperationUpdate {
+                                            status: OperationStatus::Waiting, updated_at_ms: chrono::Utc::now().timestamp_millis(), progress: record.progress(), phase: record.phase().map(str::to_owned), error_code: None, next_steps: Vec::new(),
+                                        }).await;
+                                        let Ok(recovered) = recovered else { continue; }; record = recovered;
+                                    }
+                                    if let (Some(shard), Some(target)) = (request.get("shard_id").and_then(serde_json::Value::as_u64), request.get("target_node_id").and_then(serde_json::Value::as_u64)) {
+                                        runtime.schedule(ShardId(shard), WorkerId(target), record.operation_id().to_owned()).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        }
 
         // Shared across every connection this service ever accepts: which
         // leader-epoch this node has already synced its `ShardManager`
@@ -1301,6 +1383,7 @@ impl ControlService {
             migration_waiters,
             backup_waiters,
             data_plane: self.data_plane.clone(),
+            automatic_rebalance,
         };
 
         let reloader_for_handle = reloader.clone();
@@ -1355,6 +1438,7 @@ impl ControlService {
 
         let row_payloads_received = self.data_plane.lock().await.row_payloads_received.clone();
         Ok(ControlServiceHandle {
+            automatic_elasticity_enabled,
             addr,
             shutdown_tx,
             management,
@@ -1400,10 +1484,535 @@ struct ConnectionContext {
     migration_waiters: Arc<AsyncMutex<HashMap<String, oneshot::Sender<WorkerMessage>>>>,
     backup_waiters: Arc<AsyncMutex<HashMap<String, oneshot::Sender<WorkerMessage>>>>,
     data_plane: Arc<AsyncMutex<DataPlaneState>>,
+    automatic_rebalance: Option<AutomaticRebalanceRuntime>,
+}
+
+/// Dispatches only complete, fenced source epochs through the same durable
+/// operation store and executor as the management API. Worker maxima and
+/// uncommitted load reports are deliberately not scheduling clocks.
+#[derive(Clone)]
+struct AutomaticRebalanceRuntime {
+    topology_store: Option<Arc<TopologyPersistentStore>>,
+    migration: ManagementMigrationRuntime,
+    config: rockstream_types::config::ElasticityConfig,
+    audit: Option<Arc<FileAuditLog>>,
+    policies: Arc<AsyncMutex<BTreeMap<WorkloadId, ElasticRebalancePolicy>>>,
+}
+
+impl AutomaticRebalanceRuntime {
+    async fn begin_drain(
+        &self,
+        worker_id: WorkerId,
+        existing_operation: Option<&str>,
+    ) -> Result<WorkerLifecycleState, String> {
+        if self
+            .migration
+            .raft
+            .as_ref()
+            .is_some_and(|raft| !raft.is_leader())
+        {
+            return Err("control is not leader".into());
+        }
+        let worker = self
+            .migration
+            .catalog
+            .get(worker_id)
+            .ok_or("worker is unavailable")?;
+        if !worker.healthy
+            || worker.capabilities.shared_shard_store_id.is_none()
+            || !self
+                .migration
+                .catalog
+                .healthy_workers()
+                .iter()
+                .any(|candidate| {
+                    candidate.worker_id != worker_id
+                        && candidate.lifecycle.is_active()
+                        && candidate.capabilities.shared_shard_store_id
+                            == worker.capabilities.shared_shard_store_id
+                })
+        {
+            return Err("drain requires a healthy recipient sharing the same object store".into());
+        }
+        let leases: Vec<_> = self
+            .migration
+            .shard_manager
+            .leases()
+            .into_iter()
+            .filter(|lease| lease.worker_id == worker_id)
+            .collect();
+        let operation_id = existing_operation.map(str::to_owned).unwrap_or_else(|| {
+            format!(
+                "auto-drain-{}-{}",
+                worker_id.0,
+                leases
+                    .iter()
+                    .map(|lease| lease.lease_token.0)
+                    .max()
+                    .unwrap_or(0)
+            )
+        });
+        if existing_operation.is_none() {
+            self.migration
+                .operations
+                .accept_idempotent(
+                    &operation_id,
+                    1,
+                    &serde_json::json!({"worker_id": worker_id.0, "automatic": true}),
+                    operation_id.clone(),
+                    crate::management_store::OperationKind::DrainWorker,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        let lifecycle = if matches!(worker.lifecycle, WorkerLifecycleState::Draining { .. }) {
+            worker.lifecycle
+        } else {
+            WorkerLifecycleState::draining(leases.len() as u32, now_ms())
+        };
+        self.migration
+            .operations
+            .transition(
+                &operation_id,
+                OperationUpdate {
+                    status: OperationStatus::Running,
+                    updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                    progress: Some(10),
+                    phase: Some("draining_at_committed_frontiers".into()),
+                    error_code: None,
+                    next_steps: Vec::new(),
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Some(worker) = self
+            .migration
+            .catalog
+            .set_lifecycle(worker_id, lifecycle.clone())
+        {
+            persist_worker_if_needed(self.topology_store.as_ref(), &worker).await;
+        }
+        Ok(lifecycle)
+    }
+
+    async fn finish_drains(&self) {
+        if self
+            .migration
+            .raft
+            .as_ref()
+            .is_some_and(|raft| !raft.is_leader())
+        {
+            return;
+        }
+        let Ok(records) = self.migration.operations.load_all().await else {
+            return;
+        };
+        for record in records.iter().filter(|record| {
+            record.kind() == crate::management_store::OperationKind::DrainWorker
+                && record.phase() == Some("draining_at_committed_frontiers")
+                && !record.status().is_terminal()
+        }) {
+            let Some(worker_id) = record
+                .request()
+                .and_then(|request| request.get("worker_id"))
+                .and_then(serde_json::Value::as_u64)
+                .map(WorkerId)
+            else {
+                continue;
+            };
+            if self
+                .migration
+                .shard_manager
+                .leases()
+                .iter()
+                .any(|lease| lease.worker_id == worker_id)
+            {
+                if self
+                    .schedule_idle_drain_shard(worker_id, record.operation_id())
+                    .await
+                {
+                    return;
+                }
+                continue;
+            }
+            if let Some(worker) = self.migration.catalog.set_lifecycle(
+                worker_id,
+                WorkerLifecycleState::Decommissioned {
+                    completed_at_ms: now_ms(),
+                },
+            ) {
+                persist_worker_if_needed(self.topology_store.as_ref(), &worker).await;
+            }
+            let _ = self
+                .migration
+                .operations
+                .transition(
+                    record.operation_id(),
+                    OperationUpdate {
+                        status: OperationStatus::Succeeded,
+                        updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                        progress: Some(100),
+                        phase: Some("completed".into()),
+                        error_code: None,
+                        next_steps: Vec::new(),
+                    },
+                )
+                .await;
+            if let Some(sender) = self
+                .migration
+                .worker_senders
+                .lock()
+                .await
+                .get(&worker_id)
+                .cloned()
+            {
+                send_message(
+                    &sender,
+                    &ControlMessage::BeginDrain(DrainRequest {
+                        worker_id,
+                        deadline_ms: now_ms().saturating_add(DEFAULT_DRAIN_DEADLINE_MS),
+                    }),
+                )
+                .await;
+            }
+        }
+    }
+
+    /// Explicit drains also make progress when there are no new workload
+    /// epochs. This proposes an idle-boundary operation; the executor freezes
+    /// admission and obtains durable anchor proof before touching the donor.
+    async fn schedule_idle_drain_shard(
+        &self,
+        worker_id: WorkerId,
+        drain_operation_id: &str,
+    ) -> bool {
+        // Serialize automatic proposals with committed-frontier decisions.
+        let _policies = self.policies.lock().await;
+        let Ok(records) = self.migration.operations.load_all().await else {
+            return false;
+        };
+        if records.iter().any(|record| {
+            record.kind() == crate::management_store::OperationKind::MigrateShard
+                && !record.status().is_terminal()
+        }) {
+            return false;
+        }
+        let Some(donor) = self.migration.catalog.get(worker_id) else {
+            return false;
+        };
+        if !donor.healthy
+            || !matches!(donor.lifecycle, WorkerLifecycleState::Draining { .. })
+            || donor.capabilities.shared_shard_store_id.is_none()
+        {
+            return false;
+        }
+        let mut leases = self.migration.shard_manager.leases();
+        leases.sort_by_key(|lease| lease.shard_id);
+        let lease = {
+            let state = self.migration.data_plane.lock().await;
+            leases
+                .iter()
+                .filter(|lease| lease.worker_id == worker_id)
+                .find(|lease| {
+                    idle_handoff_anchors(&state, &self.migration.shard_manager, lease.shard_id)
+                        .is_ok()
+                })
+                .cloned()
+        };
+        let Some(lease) = lease else {
+            return false;
+        };
+        let mut targets: Vec<_> = self
+            .migration
+            .catalog
+            .healthy_workers()
+            .into_iter()
+            .filter(|target| {
+                target.worker_id != worker_id
+                    && target.lifecycle.is_active()
+                    && target.capabilities.shared_shard_store_id
+                        == donor.capabilities.shared_shard_store_id
+                    && target.protocol_range.contains(donor.protocol_range.max)
+                    && target
+                        .storage_format_range
+                        .contains(donor.storage_format_range.max)
+                    && target.capacity_headroom.fraction().is_finite()
+                    && target.capacity_headroom.fraction() > 0.0
+            })
+            .collect();
+        targets.sort_by(|a, b| {
+            let count = |id| leases.iter().filter(|lease| lease.worker_id == id).count();
+            count(a.worker_id)
+                .cmp(&count(b.worker_id))
+                .then_with(|| {
+                    b.capacity_headroom
+                        .fraction()
+                        .total_cmp(&a.capacity_headroom.fraction())
+                })
+                .then_with(|| a.worker_id.cmp(&b.worker_id))
+        });
+        let Some(target) = targets.first() else {
+            return false;
+        };
+        let attempts = records
+            .iter()
+            .filter(|record| {
+                record.request().is_some_and(|request| {
+                    request
+                        .get("drain_operation_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(drain_operation_id)
+                        && request.get("shard_id").and_then(serde_json::Value::as_u64)
+                            == Some(lease.shard_id.0)
+                        && request
+                            .get("expected_donor_lease_token")
+                            .and_then(serde_json::Value::as_u64)
+                            == Some(lease.lease_token.0)
+                })
+            })
+            .count();
+        let operation_id = format!(
+            "auto-idle-drain-{}-{}-{}-{attempts}",
+            worker_id.0, lease.shard_id.0, lease.lease_token.0
+        );
+        let request = serde_json::json!({
+            "shard_id": lease.shard_id.0,
+            "target_node_id": target.worker_id.0,
+            "expected_donor_lease_token": lease.lease_token.0,
+            "drain_operation_id": drain_operation_id,
+            "draining": true,
+            "idle_drain": true,
+            "automatic": true,
+        });
+        if let Some(audit) = &self.audit {
+            let event = AuditEvent::now("control", "shard.idle_drain", lease.shard_id.to_string())
+                .with_detail(request.to_string());
+            if audit.append(&event).is_err() {
+                return false;
+            }
+        }
+        match self
+            .migration
+            .operations
+            .accept_idempotent(
+                &operation_id,
+                1,
+                &request,
+                operation_id.clone(),
+                crate::management_store::OperationKind::MigrateShard,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+        {
+            Ok(record) => {
+                self.migration
+                    .schedule(
+                        lease.shard_id,
+                        target.worker_id,
+                        record.operation_id().to_owned(),
+                    )
+                    .await;
+                true
+            }
+            Err(error) => {
+                tracing::warn!(%operation_id, %error, "idle drain migration was not durably accepted");
+                false
+            }
+        }
+    }
+
+    async fn committed(
+        &self,
+        workload_id: WorkloadId,
+        epoch: u64,
+        committed_leases: &BTreeMap<ShardId, LeaseToken>,
+    ) {
+        if !self.config.enabled
+            || committed_leases.is_empty()
+            || self
+                .migration
+                .raft
+                .as_ref()
+                .is_some_and(|raft| !raft.is_leader())
+        {
+            return;
+        }
+        let Some(frontier) = epoch.checked_add(1) else {
+            return;
+        };
+        // A source epoch is admitted against exactly this membership. Any
+        // intervening lease transfer makes its evidence ineligible for a new move.
+        let leases = {
+            let state = self.migration.data_plane.lock().await;
+            let Some(deployment) = state.deployments.get(&workload_id) else {
+                return;
+            };
+            if deployment.recovery_required
+                || deployment.descriptors.len() != committed_leases.len()
+                || state
+                    .source_waiters
+                    .values()
+                    .any(|pending| pending.workload_id == workload_id)
+                || committed_leases
+                    .keys()
+                    .any(|id| state.handoff_shards.contains(id))
+            {
+                return;
+            }
+            let mut leases = Vec::with_capacity(committed_leases.len());
+            for (id, token) in committed_leases {
+                let Some(descriptor) = deployment.descriptors.get(id) else {
+                    return;
+                };
+                let Some(lease) = self.migration.shard_manager.get(*id) else {
+                    return;
+                };
+                if lease.lease_token != *token || !lease.same_owner(&descriptor.shard) {
+                    return;
+                }
+                leases.push(lease);
+            }
+            leases
+        };
+        // Lease tokens are a durable, globally increasing incarnation namespace.
+        // Every change of this fixed virtual-shard membership mints a newer token.
+        let generation = rockstream_types::frontier::FrontierGeneration(
+            leases
+                .iter()
+                .map(|lease| lease.lease_token.0)
+                .max()
+                .unwrap_or(0),
+        );
+        let mut policies = self.policies.lock().await;
+        let active: HashSet<_> = self
+            .migration
+            .data_plane
+            .lock()
+            .await
+            .deployments
+            .keys()
+            .copied()
+            .collect();
+        policies.retain(|workload, _| active.contains(workload));
+        // One move at a time, including manually requested migration/drain. The
+        // durable record survives restart; an ambiguous read cannot authorize a move.
+        let Ok(operations) = self.migration.operations.load_all().await else {
+            return;
+        };
+        if operations.iter().any(|record| {
+            !record.status().is_terminal()
+                && (record.kind() == crate::management_store::OperationKind::MigrateShard
+                    || (record.kind() == crate::management_store::OperationKind::DrainWorker
+                        && record.phase() != Some("draining_at_committed_frontiers")))
+        }) {
+            return;
+        }
+        let policy = policies.entry(workload_id).or_insert_with(|| {
+            ElasticRebalancePolicy::new(ElasticRebalanceConfig {
+                hysteresis_frontiers: self.config.hysteresis_frontiers,
+                minimum_residency_ms: self.config.minimum_residency_ms,
+                minimum_headroom_gap: f64::from(self.config.minimum_headroom_gap_bps) / 10_000.0,
+            })
+        });
+        let cpu_nanos = {
+            let mut state = self.migration.data_plane.lock().await;
+            state.shard_loads.retain(|id, (token, _, observed)| {
+                now_ms().saturating_sub(*observed) <= 60_000
+                    && self
+                        .migration
+                        .shard_manager
+                        .get(*id)
+                        .is_some_and(|lease| lease.lease_token == *token)
+            });
+            state
+                .shard_loads
+                .iter()
+                .map(|(id, (_, cpu, _))| (*id, *cpu))
+                .collect()
+        };
+        let Some(decision) = policy.observe_with_load(
+            generation,
+            frontier,
+            now_ms(),
+            &self.migration.catalog.all_workers(),
+            &leases,
+            &cpu_nanos,
+        ) else {
+            return;
+        };
+        let operation_id = format!("{}-{}-{}", decision.operation_id(), generation.0, frontier);
+        if operations
+            .iter()
+            .any(|record| record.operation_id() == operation_id)
+        {
+            return;
+        }
+        let request = serde_json::json!({
+            "shard_id": decision.shard_id.0,
+            "target_node_id": decision.recipient.0,
+            "expected_donor_lease_token": decision.donor_lease_token.0,
+            "workload_id": workload_id.0,
+            "membership_generation": generation.0,
+            "committed_frontier": frontier,
+            "donor_shards": decision.donor_shards,
+            "recipient_shards": decision.recipient_shards,
+            "headroom_gap": decision.headroom_gap,
+            "cpu_nanos_gap": decision.cpu_nanos_gap,
+            "draining": decision.draining,
+            "automatic": true,
+        });
+        if let Some(audit) = &self.audit {
+            let event = AuditEvent::now(
+                "control",
+                "shard.auto_rebalance",
+                decision.shard_id.to_string(),
+            )
+            .with_detail(request.to_string());
+            if audit.append(&event).is_err() {
+                return;
+            }
+        }
+        if self
+            .migration
+            .raft
+            .as_ref()
+            .is_some_and(|raft| !raft.is_leader())
+        {
+            return;
+        }
+        match self
+            .migration
+            .operations
+            .accept_idempotent(
+                &operation_id,
+                1,
+                &request,
+                operation_id.clone(),
+                crate::management_store::OperationKind::MigrateShard,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+        {
+            Ok(record) => {
+                self.migration
+                    .schedule(
+                        decision.shard_id,
+                        decision.recipient,
+                        record.operation_id().to_owned(),
+                    )
+                    .await
+            }
+            Err(error) => {
+                tracing::warn!(%operation_id, %error, "automatic rebalance was not durably accepted")
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
 pub(crate) struct ManagementDrainRuntime {
+    automatic_rebalance: Option<AutomaticRebalanceRuntime>,
     catalog: TopologyCatalog,
     shard_manager: ShardManager,
     data_plane: Arc<AsyncMutex<DataPlaneState>>,
@@ -1430,6 +2039,18 @@ impl ManagementDrainRuntime {
     }
 
     async fn execute(&self, worker_id: WorkerId, operation_id: &str) {
+        if let Some(runtime) = &self.automatic_rebalance {
+            if let Err(error) = runtime.begin_drain(worker_id, Some(operation_id)).await {
+                self.fail(
+                    operation_id,
+                    "RS-3610",
+                    &error,
+                    "Recover a compatible shared-store recipient and retry.",
+                )
+                .await;
+            }
+            return;
+        }
         let previous = match self.operations.get(operation_id).await {
             Ok(Some(record)) => record,
             Ok(None) | Err(_) => return,
@@ -1627,6 +2248,7 @@ pub(crate) struct ManagementMigrationRuntime {
     operations: ManagementOperationStore,
     gc_pins: crate::checkpoint_store::GcPinStore,
     started: Arc<AsyncMutex<HashSet<String>>>,
+    raft: Option<RaftHandle>,
 }
 
 impl ManagementMigrationRuntime {
@@ -1663,6 +2285,9 @@ impl ManagementMigrationRuntime {
     }
 
     async fn execute(&self, shard_id: ShardId, target: WorkerId, operation_id: &str) {
+        if self.raft.as_ref().is_some_and(|raft| !raft.is_leader()) {
+            return;
+        }
         let previous = match self.operations.get(operation_id).await {
             Ok(Some(record)) => record,
             Ok(None) | Err(_) => return,
@@ -1734,6 +2359,7 @@ impl ManagementMigrationRuntime {
                             self.wait(operation_id, &error).await;
                             return;
                         }
+                        end_shard_handoff(&self.data_plane, shard_id).await;
                         self.release_migration_pin(operation_id).await;
                         let _ = self
                             .operations
@@ -1835,6 +2461,20 @@ impl ManagementMigrationRuntime {
             return;
         };
         let donor = lease.worker_id;
+        if previous
+            .request()
+            .and_then(|request| request.get("expected_donor_lease_token"))
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|token| token != lease.lease_token.0)
+        {
+            self.fail(
+                operation_id,
+                "RS-3604",
+                "automatic migration donor fence changed",
+            )
+            .await;
+            return;
+        }
         let Some(donor_info) = self.catalog.get(donor) else {
             self.fail(
                 operation_id,
@@ -1844,7 +2484,10 @@ impl ManagementMigrationRuntime {
             .await;
             return;
         };
-        if !donor_info.healthy || !donor_info.lifecycle.is_active() {
+        if !donor_info.healthy
+            || !(donor_info.lifecycle.is_active()
+                || matches!(donor_info.lifecycle, WorkerLifecycleState::Draining { .. }))
+        {
             self.fail(
                 operation_id,
                 "RS-3610",
@@ -1917,7 +2560,50 @@ impl ManagementMigrationRuntime {
             return;
         }
         self.acquire_migration_pin(operation_id).await;
-        begin_shard_handoff(&self.data_plane, shard_id).await;
+        let anchors = {
+            let mut state = self.data_plane.lock().await;
+            match idle_handoff_anchors(&state, &self.shard_manager, shard_id) {
+                Ok(anchors) => {
+                    state.handoff_shards.insert(shard_id);
+                    Ok(anchors)
+                }
+                Err(error) => Err(error),
+            }
+        };
+        let anchors = match anchors {
+            Ok(anchors) => anchors,
+            Err(error) => {
+                self.wait(operation_id, error).await;
+                self.release_migration_pin(operation_id).await;
+                return;
+            }
+        };
+        for (workload_id, anchor) in anchors {
+            let result = match senders.get(&anchor.worker_id) {
+                Some(sender) => {
+                    self.send_and_wait(
+                        sender,
+                        ControlMessage::VerifyWorkloadIdle {
+                            operation_id: operation_id.to_owned(),
+                            workload_id,
+                            anchor: anchor.clone(),
+                        },
+                        operation_id,
+                        &format!("idle:{}", workload_id.0),
+                        anchor.worker_id,
+                        &anchor,
+                    )
+                    .await
+                }
+                None => Err("workload anchor must reconnect before handoff".to_owned()),
+            };
+            if let Err(error) = result {
+                self.wait(operation_id, &error).await;
+                end_shard_handoff(&self.data_plane, shard_id).await;
+                self.release_migration_pin(operation_id).await;
+                return;
+            }
+        }
         if let Err(error) = self
             .send_and_wait(
                 donor_sender,
@@ -2005,6 +2691,14 @@ impl ManagementMigrationRuntime {
             .is_err()
         {
             self.reopen_donor(operation_id, &lease).await;
+            end_shard_handoff(&self.data_plane, shard_id).await;
+            self.release_migration_pin(operation_id).await;
+            return;
+        }
+        if self.raft.as_ref().is_some_and(|raft| !raft.is_leader()) {
+            self.reopen_donor(operation_id, &lease).await;
+            self.wait(operation_id, "leadership changed before lease transfer")
+                .await;
             end_shard_handoff(&self.data_plane, shard_id).await;
             self.release_migration_pin(operation_id).await;
             return;
@@ -2161,7 +2855,11 @@ impl ManagementMigrationRuntime {
         original: &rockstream_types::lease::ShardLease,
         transferred: &rockstream_types::lease::ShardLease,
     ) {
-        if self.shard_manager.get(original.shard_id) != Some(transferred.clone()) {
+        if !self
+            .shard_manager
+            .get(original.shard_id)
+            .is_some_and(|lease| lease.same_owner(transferred))
+        {
             return;
         }
         let Some(lease) = self
@@ -2818,6 +3516,7 @@ struct WorkloadDeploymentContext<'a> {
     shard_manager: &'a ShardManager,
     worker_senders: &'a Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
     data_plane: &'a Arc<AsyncMutex<DataPlaneState>>,
+    automatic_rebalance: Option<&'a AutomaticRebalanceRuntime>,
 }
 async fn deploy_workload(
     request: DeploymentRequest,
@@ -2832,6 +3531,7 @@ async fn deploy_workload(
         shard_manager,
         worker_senders,
         data_plane,
+        automatic_rebalance,
     } = context;
     let secret_names = match secret_catalog {
         Some(catalog) => match secret_names_for_deployment(Some(catalog), &request.schemas).await {
@@ -2852,7 +3552,16 @@ async fn deploy_workload(
         None => Vec::new(),
     };
     let healthy = catalog.healthy_workers();
-    let shard_count = requested_shard_count.unwrap_or(healthy.len()).max(1);
+    let default_shards = automatic_rebalance
+        .filter(|runtime| runtime.config.enabled)
+        .filter(|_| {
+            healthy
+                .iter()
+                .all(|worker| worker.capabilities.shared_shard_store_id.is_some())
+        })
+        .map(|runtime| runtime.config.initial_virtual_shards.clamp(1, 4096))
+        .unwrap_or(healthy.len());
+    let shard_count = requested_shard_count.unwrap_or(default_shards).max(1);
     let workers = PlacementAlgorithm::assign_shards(&healthy, shard_count);
     if workers.is_empty() {
         send_message(sender, &data_plane_failure("no healthy workers available")).await;
@@ -3089,6 +3798,7 @@ async fn finish_owned_source(
     anchor_worker: WorkerId,
     intent: rockstream_types::data_plane::OwnedEpochIntent,
     reply: tokio::sync::oneshot::Receiver<Result<(), String>>,
+    automatic_rebalance: Option<AutomaticRebalanceRuntime>,
 ) {
     let sender = worker_senders.lock().await.get(&anchor_worker).cloned();
     let permit = match &sender {
@@ -3137,6 +3847,11 @@ async fn finish_owned_source(
                 }
             };
             if let Some(waiter) = waiter {
+                if let Some(runtime) = &automatic_rebalance {
+                    runtime
+                        .committed(waiter.workload_id, waiter.epoch, &waiter.committed_leases)
+                        .await;
+                }
                 send_message(
                     &waiter.sender,
                     &ControlMessage::SourceDeltaCommitted {
@@ -3166,6 +3881,70 @@ async fn finish_owned_source(
             .await;
         }
     }
+}
+
+/// The caller keeps the data-plane mutex until it inserts the handoff marker.
+/// That marker freezes admission for every workload sharing the moving shard.
+fn idle_handoff_anchors(
+    state: &DataPlaneState,
+    manager: &ShardManager,
+    shard_id: ShardId,
+) -> Result<Vec<(WorkloadId, rockstream_types::lease::ShardLease)>, &'static str> {
+    if state.handoff_shards.contains(&shard_id) {
+        return Err("shard already has an ownership handoff");
+    }
+    let mut anchors = Vec::new();
+    for (workload_id, deployment) in &state.deployments {
+        if !deployment.descriptors.contains_key(&shard_id) {
+            continue;
+        }
+        if deployment.recovery_required
+            || deployment.ready_waiter.is_some()
+            || (state.direct_epochs.contains_key(workload_id)
+                && state
+                    .direct_epoch_deadlines
+                    .get(workload_id)
+                    .is_none_or(|deadline| *deadline > now_ms()))
+            || state
+                .source_waiters
+                .values()
+                .any(|waiter| waiter.workload_id == *workload_id)
+            || state
+                .workload_read_waiters
+                .values()
+                .any(|waiter| waiter.workload_id == *workload_id)
+            || deployment.descriptors.iter().any(|(id, descriptor)| {
+                state.handoff_shards.contains(id)
+                    || !deployment.ready_shards.contains(id)
+                    || !manager
+                        .get(*id)
+                        .is_some_and(|lease| lease.same_owner(&descriptor.shard))
+            })
+        {
+            return Err("workload has an active epoch, read, recovery, or ownership handoff");
+        }
+        let anchor = deployment
+            .descriptors
+            .values()
+            .min_by_key(|descriptor| (descriptor.shard_index, descriptor.shard.shard_id))
+            .ok_or("workload has no routing anchor")?;
+        anchors.push((*workload_id, anchor.shard.clone()));
+        // Legacy owned epochs select the lowest shard ID. At an integer wrap
+        // that can differ from the routing journal's lowest virtual index.
+        if let Some(owned_anchor) = deployment
+            .descriptors
+            .values()
+            .min_by_key(|descriptor| descriptor.shard.shard_id)
+            .filter(|owned| owned.shard.shard_id != anchor.shard.shard_id)
+        {
+            anchors.push((*workload_id, owned_anchor.shard.clone()));
+        }
+        if anchors.len() > 64 {
+            return Err("shard has too many active workloads for a bounded idle barrier");
+        }
+    }
+    anchors.sort_by_key(|(workload_id, lease)| (*workload_id, lease.shard_id));
+    Ok(anchors)
 }
 
 async fn begin_shard_handoff(data_plane: &Arc<AsyncMutex<DataPlaneState>>, shard_id: ShardId) {
@@ -3287,6 +4066,10 @@ async fn redeploy_shard_workloads(
                     status.shard_ids.sort();
                     status.shard_ids.dedup();
                 }
+                state.topology_epoch = state
+                    .topology_epoch
+                    .checked_add(1)
+                    .ok_or_else(|| "topology epoch exhausted during shard movement".to_owned())?;
             }
             Ok(Err(_)) => {
                 return Err(format!(
@@ -3567,6 +4350,7 @@ async fn submit_source_delta(
                     source: request.source.clone(),
                     expected: routed.iter().map(|(_, frame)| frame.shard_id).collect(),
                     received: HashSet::new(),
+                    committed_leases: BTreeMap::new(),
                     dispatchers,
                     owned_intent,
                     prepare_reply,
@@ -5262,7 +6046,10 @@ async fn request_workload_snapshot(
                 return unavailable();
             };
             if !worker.healthy
-                || !worker.lifecycle.is_active()
+                || matches!(
+                    worker.lifecycle,
+                    WorkerLifecycleState::Decommissioned { .. }
+                )
                 || !worker
                     .protocol_range
                     .contains(rockstream_types::compatibility::ProtocolVersion::V4)
@@ -5297,7 +6084,20 @@ async fn request_workload_snapshot(
     let (report_tx, mut report_rx) = mpsc::channel(expected_shards.len());
     {
         let mut state = data_plane.lock().await;
-        if state.workload_read_waiters.contains_key(&request_id) {
+        if state.workload_read_waiters.contains_key(&request_id)
+            || state
+                .source_waiters
+                .values()
+                .any(|waiter| waiter.workload_id == workload_id)
+            || expected_shards.values().any(|shards| {
+                shards.iter().any(|(id, token)| {
+                    state.handoff_shards.contains(id)
+                        || shard_manager
+                            .get(*id)
+                            .is_none_or(|lease| lease.lease_token != *token)
+                })
+            })
+        {
             return unavailable();
         }
         state.workload_read_waiters.insert(
@@ -5423,6 +6223,7 @@ async fn handle_connection_stream<R, W>(
         migration_waiters,
         backup_waiters,
         data_plane,
+        automatic_rebalance,
     } = ctx;
     let (sender, mut outbound) = mpsc::channel::<ControlMessage>(32);
     let writer_task = tokio::spawn(async move {
@@ -5880,6 +6681,7 @@ async fn handle_connection_stream<R, W>(
                         shard_manager: &shard_manager,
                         worker_senders: &worker_senders,
                         data_plane: &data_plane,
+                        automatic_rebalance: automatic_rebalance.as_ref(),
                     },
                 )
                 .await;
@@ -5902,6 +6704,7 @@ async fn handle_connection_stream<R, W>(
                         shard_manager: &shard_manager,
                         worker_senders: &worker_senders,
                         data_plane: &data_plane,
+                        automatic_rebalance: automatic_rebalance.as_ref(),
                     },
                 )
                 .await;
@@ -6240,6 +7043,15 @@ async fn handle_connection_stream<R, W>(
                 };
                 match completion {
                     Some(SourceCompletion::Immediate(waiter, request_id)) => {
+                        if let Some(runtime) = &automatic_rebalance {
+                            runtime
+                                .committed(
+                                    waiter.workload_id,
+                                    waiter.epoch,
+                                    &waiter.committed_leases,
+                                )
+                                .await;
+                        }
                         send_message(
                             &waiter.sender,
                             &ControlMessage::SourceDeltaCommitted {
@@ -6256,6 +7068,7 @@ async fn handle_connection_stream<R, W>(
                             anchor,
                             intent,
                             reply,
+                            automatic_rebalance.clone(),
                         ));
                     }
                     Some(SourceCompletion::MissingAnchor(request_id, workload_id)) => {
@@ -6436,6 +7249,19 @@ async fn handle_connection_stream<R, W>(
                 let reply = {
                     let state = data_plane.lock().await;
                     match state.deployments.get(&workload_id) {
+                        Some(deployment)
+                            if deployment.recovery_required
+                                || deployment.ready_waiter.is_some()
+                                || deployment.descriptors.iter().any(|(id, descriptor)| {
+                                    state.handoff_shards.contains(id)
+                                        || !deployment.ready_shards.contains(id)
+                                        || !shard_manager.get(*id).is_some_and(|lease| {
+                                            lease.same_owner(&descriptor.shard)
+                                        })
+                                }) =>
+                        {
+                            data_plane_failure("RS-3004: workload ownership is changing")
+                        }
                         Some(deployment) => {
                             let workers = catalog.all_workers();
                             let worker_addrs: HashMap<WorkerId, String> = workers
@@ -6446,9 +7272,7 @@ async fn handle_connection_stream<R, W>(
                                 .descriptors
                                 .values()
                                 .map(|descriptor| {
-                                    let active_lease = shard_manager
-                                        .get(descriptor.shard.shard_id)
-                                        .unwrap_or_else(|| descriptor.shard.clone());
+                                    let active_lease = descriptor.shard.clone();
                                     let worker_address = worker_addrs
                                         .get(&active_lease.worker_id)
                                         .cloned()
@@ -7028,9 +7852,26 @@ async fn handle_connection_stream<R, W>(
                         let mut state = data_plane.lock().await;
                         release_completed_direct_reservation(&mut state, &metadata);
                     }
+                    if let Some(runtime) = &automatic_rebalance {
+                        runtime.committed(workload_id, epoch, &members).await;
+                    }
                 }
             }
             WorkerMessage::ShardLoadReport { worker_id, samples } => {
+                if connected_worker_id == Some(worker_id) && samples.len() <= 4096 {
+                    let mut state = data_plane.lock().await;
+                    for sample in &samples {
+                        if let Some(lease) = shard_manager
+                            .get(sample.shard_id)
+                            .filter(|lease| lease.worker_id == worker_id)
+                        {
+                            state.shard_loads.insert(
+                                sample.shard_id,
+                                (lease.lease_token, sample.cpu_nanos, now_ms()),
+                            );
+                        }
+                    }
+                }
                 tracing::debug!(
                     %worker_id,
                     sample_count = samples.len(),
@@ -7410,6 +8251,24 @@ async fn handle_connection_stream<R, W>(
                 }
             }
             WorkerMessage::RequestDrain { worker_id } => {
+                if let Some(runtime) = &automatic_rebalance {
+                    match runtime.begin_drain(worker_id, None).await {
+                        Ok(state) => {
+                            send_message(
+                                &sender,
+                                &ControlMessage::DrainStatus {
+                                    worker_id,
+                                    state,
+                                    queue_fill: 0,
+                                    queue_capacity: MAX_DRAIN_QUEUE as u32,
+                                },
+                            )
+                            .await
+                        }
+                        Err(error) => send_message(&sender, &data_plane_failure(error)).await,
+                    }
+                    continue;
+                }
                 let worker_sender = if connected_worker_id == Some(worker_id) {
                     Some(sender.clone())
                 } else {
@@ -7632,7 +8491,19 @@ fn topology_changed_message(
     shard_manager: &ShardManager,
 ) -> ControlMessage {
     ControlMessage::TopologyChanged {
-        workers: catalog.healthy_workers(),
+        // Draining donors still execute their remaining shards between
+        // committed-frontier handoffs and remain authenticated exchange peers.
+        workers: catalog
+            .all_workers()
+            .into_iter()
+            .filter(|worker| {
+                worker.healthy
+                    && !matches!(
+                        worker.lifecycle,
+                        WorkerLifecycleState::Decommissioned { .. }
+                    )
+            })
+            .collect(),
         shard_leases: shard_manager.leases(),
     }
 }
@@ -8016,6 +8887,37 @@ mod tests {
     }
 
     #[test]
+    fn topology_retains_draining_exchange_peers_until_decommission() {
+        let catalog = TopologyCatalog::new();
+        for id in 1..=3 {
+            catalog.register(&WorkerRegistration::new(
+                WorkerId(id),
+                NodeRole::Worker,
+                format!("127.0.0.1:{}", 9000 + id),
+                CapacityHeadroom::new(0.8),
+            ));
+        }
+        catalog.set_lifecycle(WorkerId(2), WorkerLifecycleState::draining(1, 0));
+        catalog.set_lifecycle(
+            WorkerId(3),
+            WorkerLifecycleState::Decommissioned { completed_at_ms: 1 },
+        );
+        let ControlMessage::TopologyChanged {
+            workers,
+            shard_leases,
+        } = topology_changed_message(&catalog, &ShardManager::new())
+        else {
+            unreachable!()
+        };
+        let mut ids: Vec<_> = workers.into_iter().map(|worker| worker.worker_id).collect();
+        ids.sort();
+        assert_eq!(
+            (ids, shard_leases),
+            (vec![WorkerId(1), WorkerId(2)], Vec::new())
+        );
+    }
+
+    #[test]
     fn complete_routing_snapshots_reject_concurrent_mixed_and_missing_epoch_reports() {
         let shard = |id, epoch, routing| ShardOutput {
             shard_id: ShardId(id),
@@ -8096,6 +8998,7 @@ mod tests {
             source: "input".to_owned(),
             expected: HashSet::from([ShardId(1), ShardId(2)]),
             received: HashSet::new(),
+            committed_leases: BTreeMap::new(),
             dispatchers: HashMap::new(),
             owned_intent: None,
             prepare_reply: None,
@@ -8135,6 +9038,461 @@ mod tests {
             vec![false, false, false, false, false, true, false]
         );
         assert_eq!(waiter.received, HashSet::from([ShardId(1), ShardId(2)]));
+        assert_eq!(
+            waiter.committed_leases,
+            BTreeMap::from([(ShardId(1), LeaseToken(4)), (ShardId(2), LeaseToken(4))])
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_rebalance_requires_complete_current_membership_and_distinct_commits() {
+        use rockstream_types::ids::OperatorId;
+        let catalog = TopologyCatalog::new();
+        for id in [1, 2] {
+            let mut registration = WorkerRegistration::new(
+                WorkerId(id),
+                NodeRole::Worker,
+                format!("127.0.0.1:{}", 9000 + id),
+                CapacityHeadroom::new(0.8),
+            );
+            registration.capabilities.shared_shard_store_id = Some([7; 32]);
+            catalog.register(&registration);
+        }
+        let manager = ShardManager::new();
+        let request = DeploymentRequest {
+            version: rockstream_types::data_plane::DEPLOYMENT_DESCRIPTOR_VERSION,
+            workload_id: WorkloadId(1),
+            namespace: "public".into(),
+            workload_name: "test".into(),
+            plan_json: "{}".into(),
+            join_strategy: rockstream_types::config::JoinStrategy::Auto,
+            schemas: Vec::new(),
+            frontier: 0,
+            storage_root: "test".into(),
+            sink_operator_id: OperatorId(1),
+            output_columns: Vec::new(),
+            primary_key: vec![0],
+            merge_key_columns: vec![0],
+            routing_columns: BTreeMap::new(),
+        };
+        let mut descriptors = HashMap::new();
+        let mut members = BTreeMap::new();
+        for id in 1..=4 {
+            let lease = manager.acquire(ShardId(id), WorkerId(1)).unwrap();
+            members.insert(lease.shard_id, lease.lease_token);
+            descriptors.insert(
+                lease.shard_id,
+                DeploymentDescriptor::with_shard_index(
+                    request.clone(),
+                    lease,
+                    format!("test/{id}"),
+                    (id - 1) as u32,
+                ),
+            );
+        }
+        let before = manager.leases();
+        let data_plane = Arc::new(AsyncMutex::new(DataPlaneState::default()));
+        data_plane.lock().await.deployments.insert(
+            WorkloadId(1),
+            DeploymentState {
+                request,
+                actor: None,
+                secret_names: Vec::new(),
+                descriptors,
+                workers: HashMap::new(),
+                ready_shards: members.keys().copied().collect(),
+                ready_waiter: None,
+                recovery_required: false,
+            },
+        );
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let operations = ManagementOperationStore::new(store.clone());
+        let runtime = AutomaticRebalanceRuntime {
+            topology_store: None,
+            migration: ManagementMigrationRuntime {
+                catalog,
+                shard_manager: manager.clone(),
+                data_plane,
+                shard_store: None,
+                worker_senders: Arc::new(AsyncMutex::new(HashMap::new())),
+                waiters: Arc::new(AsyncMutex::new(HashMap::new())),
+                operations: operations.clone(),
+                gc_pins: crate::checkpoint_store::GcPinStore::new(store),
+                started: Arc::new(AsyncMutex::new(HashSet::new())),
+                raft: None,
+            },
+            config: rockstream_types::config::ElasticityConfig {
+                minimum_residency_ms: 0,
+                ..Default::default()
+            },
+            audit: None,
+            policies: Arc::new(AsyncMutex::new(BTreeMap::new())),
+        };
+        let mut disabled = runtime.clone();
+        disabled.config.enabled = false;
+        for epoch in 1..=4 {
+            disabled.committed(WorkloadId(1), epoch, &members).await;
+        }
+        assert!(operations.load_all().await.unwrap().is_empty());
+        let mut missing = members.clone();
+        missing.remove(&ShardId(4));
+        for epoch in 1..=4 {
+            runtime.committed(WorkloadId(1), epoch, &missing).await;
+        }
+        assert!(operations.load_all().await.unwrap().is_empty());
+        let mut stale = members.clone();
+        stale.insert(ShardId(4), LeaseToken(0));
+        for epoch in 1..=4 {
+            runtime.committed(WorkloadId(1), epoch, &stale).await;
+        }
+        assert!(operations.load_all().await.unwrap().is_empty());
+        runtime.committed(WorkloadId(1), 5, &members).await;
+        runtime.committed(WorkloadId(1), 5, &members).await;
+        runtime.committed(WorkloadId(1), 4, &members).await;
+        runtime.committed(WorkloadId(1), 6, &members).await;
+        assert!(operations.load_all().await.unwrap().is_empty());
+        runtime.committed(WorkloadId(1), 7, &members).await;
+        let records = operations.load_all().await.unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.request().unwrap().clone())
+                .collect::<Vec<_>>(),
+            vec![serde_json::json!({
+                "shard_id": 1, "target_node_id": 2, "expected_donor_lease_token": members[&ShardId(1)].0,
+                "workload_id": 1, "membership_generation": members.values().map(|token| token.0).max().unwrap(),
+                "committed_frontier": 8, "donor_shards": 4, "recipient_shards": 0,
+                "headroom_gap": 0.0, "cpu_nanos_gap": 0, "draining": false, "automatic": true,
+            })]
+        );
+        runtime.committed(WorkloadId(1), 8, &members).await;
+        runtime.committed(WorkloadId(1), 9, &members).await;
+        assert_eq!(
+            operations
+                .load_all()
+                .await
+                .unwrap()
+                .iter()
+                .map(|record| record.operation_id().to_owned())
+                .collect::<Vec<_>>(),
+            records
+                .iter()
+                .map(|record| record.operation_id().to_owned())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(manager.leases(), before);
+        // A transient failed handoff can be retried at a later committed
+        // frontier under the same donor fence; the original record stays immutable.
+        operations
+            .transition(
+                records[0].operation_id(),
+                OperationUpdate {
+                    status: OperationStatus::Failed,
+                    updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                    progress: None,
+                    phase: Some("failed".into()),
+                    error_code: Some("RS-3610".into()),
+                    next_steps: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        for epoch in 10..=12 {
+            runtime.committed(WorkloadId(1), epoch, &members).await;
+        }
+        let mut actual: Vec<_> = operations
+            .load_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|record| record.operation_id().to_owned())
+            .collect();
+        actual.sort();
+        let mut expected = vec![
+            records[0].operation_id().to_owned(),
+            format!(
+                "auto-rebalance-1-{}-2-{}-13",
+                members[&ShardId(1)].0,
+                members.values().map(|token| token.0).max().unwrap()
+            ),
+        ];
+        expected.sort();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn automatic_elasticity_starts_without_a_public_management_listener() {
+        let service = ControlService::new(TopologyCatalog::new())
+            .with_shard_store(Arc::new(ShardPersistentStore::new(Arc::new(
+                object_store::memory::InMemory::new(),
+            ))))
+            .with_insecure_dev_mode()
+            .start("127.0.0.1:0")
+            .await
+            .unwrap();
+        assert!(service.automatic_elasticity_enabled());
+        assert!(service.management.is_none());
+        service.shutdown();
+    }
+
+    #[tokio::test]
+    async fn disabled_auto_policy_keeps_canonical_explicit_drain_available() {
+        let catalog = TopologyCatalog::new();
+        let manager = ShardManager::new();
+        let lease = manager.acquire(ShardId(9), WorkerId(1)).unwrap();
+        let donor = registration_with_location(1, 0.8, "one", "local");
+        catalog.register(&registration_with_location(2, 0.8, "two", "local"));
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let operations = ManagementOperationStore::new(store.clone());
+        let service = ControlService::new(catalog.clone())
+            .with_shard_manager(manager)
+            .with_shard_store(Arc::new(ShardPersistentStore::new(store)))
+            .with_elasticity(rockstream_types::config::ElasticityConfig {
+                enabled: false,
+                ..Default::default()
+            })
+            .with_insecure_dev_mode()
+            .start("127.0.0.1:0")
+            .await
+            .unwrap();
+        assert!(!service.automatic_elasticity_enabled());
+        let mut stream = TcpStream::connect(service.addr).await.unwrap();
+        let _ = send_and_recv(&mut stream, &WorkerMessage::Register(donor)).await;
+        let response = send_and_recv(
+            &mut stream,
+            &WorkerMessage::RequestDrain {
+                worker_id: WorkerId(1),
+            },
+        )
+        .await;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response).unwrap(),
+            serde_json::to_value(ControlMessage::DrainStatus {
+                worker_id: WorkerId(1),
+                state: catalog.get(WorkerId(1)).unwrap().lifecycle,
+                queue_fill: 0,
+                queue_capacity: MAX_DRAIN_QUEUE as u32,
+            })
+            .unwrap()
+        );
+        let record = operations
+            .get(&format!("auto-drain-1-{}", lease.lease_token.0))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (record.status(), record.phase(), record.request()),
+            (
+                OperationStatus::Running,
+                Some("draining_at_committed_frontiers"),
+                Some(&serde_json::json!({"worker_id": 1, "automatic": true})),
+            )
+        );
+        service.shutdown();
+    }
+
+    #[tokio::test]
+    async fn explicit_drain_proposes_unused_leases_and_retries_failed_idle_moves() {
+        let catalog = TopologyCatalog::new();
+        for id in [1, 2] {
+            let mut worker = WorkerRegistration::new(
+                WorkerId(id),
+                NodeRole::Worker,
+                format!("127.0.0.1:{}", 9000 + id),
+                CapacityHeadroom::new(0.8),
+            );
+            worker.capabilities.shared_shard_store_id = Some([7; 32]);
+            catalog.register(&worker);
+        }
+        let manager = ShardManager::new();
+        let lease = manager.acquire(ShardId(9), WorkerId(1)).unwrap();
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let operations = ManagementOperationStore::new(store.clone());
+        let runtime = AutomaticRebalanceRuntime {
+            topology_store: None,
+            migration: ManagementMigrationRuntime {
+                catalog,
+                shard_manager: manager.clone(),
+                data_plane: Arc::new(AsyncMutex::new(DataPlaneState::default())),
+                shard_store: None,
+                worker_senders: Arc::new(AsyncMutex::new(HashMap::new())),
+                waiters: Arc::new(AsyncMutex::new(HashMap::new())),
+                operations: operations.clone(),
+                gc_pins: crate::checkpoint_store::GcPinStore::new(store),
+                started: Arc::new(AsyncMutex::new(HashSet::new())),
+                raft: None,
+            },
+            config: Default::default(),
+            audit: None,
+            policies: Arc::new(AsyncMutex::new(BTreeMap::new())),
+        };
+        runtime.begin_drain(WorkerId(1), None).await.unwrap();
+        let parent = format!("auto-drain-1-{}", lease.lease_token.0);
+        for attempt in 0..2 {
+            runtime.finish_drains().await;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !runtime.migration.started.lock().await.is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let operation_id = format!("auto-idle-drain-1-9-{}-{attempt}", lease.lease_token.0);
+            let record = operations.get(&operation_id).await.unwrap().unwrap();
+            assert_eq!(
+                record.request(),
+                Some(&serde_json::json!({
+                    "shard_id": 9,
+                    "target_node_id": 2,
+                    "expected_donor_lease_token": lease.lease_token.0,
+                    "drain_operation_id": parent,
+                    "draining": true,
+                    "idle_drain": true,
+                    "automatic": true,
+                }))
+            );
+            assert_eq!(record.status(), OperationStatus::Waiting);
+            assert_eq!(manager.get(ShardId(9)), Some(lease.clone()));
+            operations
+                .transition(
+                    &operation_id,
+                    OperationUpdate {
+                        status: OperationStatus::Failed,
+                        updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                        progress: None,
+                        phase: Some("failed".into()),
+                        error_code: Some("RS-3610".into()),
+                        next_steps: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let mut actual: Vec<_> = operations
+            .load_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|record| (record.operation_id().to_owned(), record.status()))
+            .collect();
+        actual.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            actual,
+            vec![
+                (parent, OperationStatus::Running),
+                (
+                    format!("auto-idle-drain-1-9-{}-0", lease.lease_token.0),
+                    OperationStatus::Failed
+                ),
+                (
+                    format!("auto-idle-drain-1-9-{}-1", lease.lease_token.0),
+                    OperationStatus::Failed
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn idle_handoff_excludes_live_admissions_but_requires_anchor_proof_after_expiry() {
+        let manager = ShardManager::new();
+        let lease = manager.acquire(ShardId(9), WorkerId(1)).unwrap();
+        let workload_id = WorkloadId(1);
+        let request = DeploymentRequest {
+            version: rockstream_types::data_plane::DEPLOYMENT_DESCRIPTOR_VERSION,
+            workload_id,
+            namespace: "public".into(),
+            workload_name: "idle".into(),
+            plan_json: "{}".into(),
+            join_strategy: Default::default(),
+            schemas: Vec::new(),
+            frontier: 0,
+            storage_root: "test".into(),
+            sink_operator_id: rockstream_types::ids::OperatorId(1),
+            output_columns: Vec::new(),
+            primary_key: vec![0],
+            merge_key_columns: vec![0],
+            routing_columns: BTreeMap::new(),
+        };
+        let descriptor = DeploymentDescriptor::with_shard_index(
+            request.clone(),
+            lease.clone(),
+            "test/9".into(),
+            0,
+        );
+        let mut state = DataPlaneState::default();
+        state.deployments.insert(
+            workload_id,
+            DeploymentState {
+                request,
+                actor: None,
+                secret_names: Vec::new(),
+                descriptors: HashMap::from([(lease.shard_id, descriptor)]),
+                workers: HashMap::new(),
+                ready_shards: HashSet::from([lease.shard_id]),
+                ready_waiter: None,
+                recovery_required: false,
+            },
+        );
+        let anchors = vec![(workload_id, lease.clone())];
+        assert_eq!(
+            idle_handoff_anchors(&state, &manager, lease.shard_id),
+            Ok(anchors.clone())
+        );
+        state.direct_epochs.insert(
+            workload_id,
+            rockstream_types::direct_epoch::SourceEpochMetadata {
+                version: rockstream_types::data_plane::DEPLOYMENT_DESCRIPTOR_VERSION,
+                workload_id,
+                request_id: "pending".into(),
+                source: "items".into(),
+                epoch: 1,
+                input_digest: [9; 32],
+            },
+        );
+        let blocked = Err("workload has an active epoch, read, recovery, or ownership handoff");
+        assert_eq!(
+            idle_handoff_anchors(&state, &manager, lease.shard_id),
+            blocked
+        );
+        state.direct_epoch_deadlines.insert(workload_id, u64::MAX);
+        assert_eq!(
+            idle_handoff_anchors(&state, &manager, lease.shard_id),
+            blocked
+        );
+        state.direct_epoch_deadlines.insert(workload_id, 0);
+        assert_eq!(
+            idle_handoff_anchors(&state, &manager, lease.shard_id),
+            Ok(anchors)
+        );
+        let (sender, _) = mpsc::channel(1);
+        state.workload_read_waiters.insert(
+            "read".into(),
+            WorkloadReadWaiter {
+                workload_id,
+                expected_shards: HashMap::new(),
+                received_workers: HashSet::new(),
+                sender,
+            },
+        );
+        assert_eq!(
+            idle_handoff_anchors(&state, &manager, lease.shard_id),
+            blocked
+        );
+        state.workload_read_waiters.clear();
+        state.handoff_shards.insert(lease.shard_id);
+        assert_eq!(
+            idle_handoff_anchors(&state, &manager, lease.shard_id),
+            Err("shard already has an ownership handoff")
+        );
+        state.handoff_shards.clear();
+        manager.transfer_if_owner(&lease, WorkerId(2)).unwrap();
+        assert_eq!(
+            idle_handoff_anchors(&state, &manager, lease.shard_id),
+            blocked
+        );
     }
 
     #[test]
@@ -8186,6 +9544,7 @@ mod tests {
                 object_store::memory::InMemory::new(),
             )),
             started: Arc::new(AsyncMutex::new(HashSet::new())),
+            raft: None,
         };
         let worker_id = WorkerId(7);
         let lease = rockstream_types::lease::ShardLease::new(ShardId(3), worker_id, LeaseToken(1));

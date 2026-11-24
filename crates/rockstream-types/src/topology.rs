@@ -371,6 +371,13 @@ pub enum ControlMessage {
         operation_id: String,
         lease: ShardLease,
     },
+    /// Verify a workload's durable anchor has no unfinished epoch after
+    /// control has frozen new admissions for an ownership handoff.
+    VerifyWorkloadIdle {
+        operation_id: String,
+        workload_id: crate::ids::WorkloadId,
+        anchor: ShardLease,
+    },
     /// Create a durable SlateDB checkpoint for an idle shard.
     CreateShardCheckpoint {
         request_id: String,

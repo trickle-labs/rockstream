@@ -951,7 +951,7 @@ impl ManagementOperationStore {
             .map(|(record, _)| record))
     }
 
-    async fn load_all(&self) -> Result<Vec<OperationRecord>, OperationStoreError> {
+    pub(crate) async fn load_all(&self) -> Result<Vec<OperationRecord>, OperationStoreError> {
         let mut listing = self.store.list(Some(&self.prefix));
         let mut records = Vec::new();
         while let Some(entry) = listing.next().await {

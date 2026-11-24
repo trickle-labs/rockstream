@@ -64,6 +64,16 @@ pub struct DeploymentDescriptor {
 }
 
 impl DeploymentDescriptor {
+    /// Stable shared-store namespace, independent of the current lease holder.
+    pub fn object_store_prefix(&self) -> String {
+        format!(
+            "{}/workload-{}/shard-{}",
+            self.storage_root.trim_end_matches('/'),
+            self.workload_id.0,
+            self.shard.shard_id.0
+        )
+    }
+
     pub fn new(request: DeploymentRequest, shard: ShardLease, storage_identity: String) -> Self {
         Self::with_shard_index(request, shard, storage_identity, 0)
     }

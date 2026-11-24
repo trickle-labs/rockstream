@@ -103,6 +103,8 @@ pub struct ElasticRebalanceDecision {
     pub donor_shards: usize,
     pub recipient_shards: usize,
     pub headroom_gap: f64,
+    pub cpu_nanos_gap: u64,
+    pub draining: bool,
 }
 
 impl ElasticRebalanceDecision {
@@ -148,6 +150,26 @@ impl ElasticRebalancePolicy {
         workers: &[WorkerInfo],
         leases: &[ShardLease],
     ) -> Option<ElasticRebalanceDecision> {
+        self.observe_with_load(
+            generation,
+            frontier,
+            now_ms,
+            workers,
+            leases,
+            &BTreeMap::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn observe_with_load(
+        &mut self,
+        generation: FrontierGeneration,
+        frontier: u64,
+        now_ms: u64,
+        workers: &[WorkerInfo],
+        leases: &[ShardLease],
+        cpu_nanos: &BTreeMap<ShardId, u64>,
+    ) -> Option<ElasticRebalanceDecision> {
         if let Some((old_generation, old_frontier)) = self.last_frontier {
             if generation < old_generation
                 || (generation == old_generation && frontier <= old_frontier)
@@ -159,7 +181,9 @@ impl ElasticRebalancePolicy {
             }
         }
         self.last_frontier = Some((generation, frontier));
-        let Some(decision) = self.candidate(generation, frontier, now_ms, workers, leases) else {
+        let Some(decision) =
+            self.candidate(generation, frontier, now_ms, workers, leases, cpu_nanos)
+        else {
             self.pending = None;
             return None;
         };
@@ -180,6 +204,7 @@ impl ElasticRebalancePolicy {
         Some(decision)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn candidate(
         &self,
         generation: FrontierGeneration,
@@ -187,20 +212,33 @@ impl ElasticRebalancePolicy {
         now_ms: u64,
         workers: &[WorkerInfo],
         leases: &[ShardLease],
+        cpu_nanos: &BTreeMap<ShardId, u64>,
     ) -> Option<ElasticRebalanceDecision> {
         let eligible: BTreeMap<_, _> = workers
             .iter()
             .filter(|worker| {
                 worker.healthy
-                    && worker.lifecycle.is_active()
+                    && (worker.lifecycle.is_active()
+                        || matches!(
+                            worker.lifecycle,
+                            rockstream_types::topology::WorkerLifecycleState::Draining { .. }
+                        ))
                     && worker.capabilities.shared_shard_store_id.is_some()
                     && worker.capacity_headroom.fraction().is_finite()
             })
             .map(|worker| (worker.worker_id, worker))
             .collect();
         let mut owned = BTreeMap::<WorkerId, usize>::new();
+        let complete_load = leases
+            .iter()
+            .all(|lease| cpu_nanos.contains_key(&lease.shard_id));
+        let mut worker_cpu = BTreeMap::<WorkerId, u64>::new();
         for lease in leases {
             *owned.entry(lease.worker_id).or_default() += 1;
+            if complete_load {
+                let cpu = worker_cpu.entry(lease.worker_id).or_default();
+                *cpu = cpu.saturating_add(cpu_nanos[&lease.shard_id]);
+            }
         }
 
         let mut best: Option<ElasticRebalanceDecision> = None;
@@ -214,8 +252,13 @@ impl ElasticRebalancePolicy {
                 continue;
             }
             let donor_shards = owned[&lease.worker_id];
+            let draining = matches!(
+                donor.lifecycle,
+                rockstream_types::topology::WorkerLifecycleState::Draining { .. }
+            );
             for (&recipient, target) in &eligible {
                 if recipient == lease.worker_id
+                    || !target.lifecycle.is_active()
                     || target.capabilities.shared_shard_store_id
                         != donor.capabilities.shared_shard_store_id
                     || !target.protocol_range.contains(donor.protocol_range.max)
@@ -230,13 +273,34 @@ impl ElasticRebalancePolicy {
                 let gap = donor_shards.saturating_sub(recipient_shards);
                 let headroom_gap =
                     target.capacity_headroom.fraction() - donor.capacity_headroom.fraction();
+                let donor_cpu = worker_cpu.get(&lease.worker_id).copied().unwrap_or(0);
+                let target_cpu = worker_cpu.get(&recipient).copied().unwrap_or(0);
+                let moved_cpu = cpu_nanos.get(&lease.shard_id).copied().unwrap_or(0);
+                let cpu_nanos_gap = donor_cpu.saturating_sub(target_cpu);
+                let cpu_improves = complete_load
+                    && moved_cpu > 0
+                    && cpu_nanos_gap > moved_cpu.saturating_mul(2)
+                    && donor_cpu > target_cpu.saturating_add(target_cpu / 5);
+                if complete_load
+                    && !draining
+                    && donor_cpu
+                        .saturating_sub(moved_cpu)
+                        .abs_diff(target_cpu.saturating_add(moved_cpu))
+                        > donor_cpu.abs_diff(target_cpu)
+                {
+                    continue;
+                }
                 // Count balancing must improve the distribution. A sustained
                 // memory-pressure signal may also move one shard between
                 // nearly balanced workers, but never into a more-loaded target.
                 let pressure = self.config.minimum_headroom_gap.is_finite()
                     && self.config.minimum_headroom_gap > 0.0
                     && headroom_gap >= self.config.minimum_headroom_gap;
-                if gap < 2 && !(donor_shards >= recipient_shards && pressure) {
+                if !(draining
+                    || cpu_improves
+                    || gap >= 2
+                    || donor_shards >= recipient_shards && pressure)
+                {
                     continue;
                 }
                 let decision = ElasticRebalanceDecision {
@@ -249,17 +313,24 @@ impl ElasticRebalancePolicy {
                     donor_shards,
                     recipient_shards,
                     headroom_gap,
+                    cpu_nanos_gap,
+                    draining,
                 };
                 let better = best.as_ref().is_none_or(|current| {
-                    gap.cmp(
-                        &current
-                            .donor_shards
-                            .saturating_sub(current.recipient_shards),
-                    )
-                    .then_with(|| headroom_gap.total_cmp(&current.headroom_gap))
-                    .then_with(|| current.shard_id.cmp(&decision.shard_id))
-                    .then_with(|| current.recipient.cmp(&decision.recipient))
-                    .is_gt()
+                    draining
+                        .cmp(&current.draining)
+                        .then_with(|| cpu_nanos_gap.cmp(&current.cpu_nanos_gap))
+                        .then_with(|| {
+                            gap.cmp(
+                                &current
+                                    .donor_shards
+                                    .saturating_sub(current.recipient_shards),
+                            )
+                        })
+                        .then_with(|| headroom_gap.total_cmp(&current.headroom_gap))
+                        .then_with(|| current.shard_id.cmp(&decision.shard_id))
+                        .then_with(|| current.recipient.cmp(&decision.recipient))
+                        .is_gt()
                 });
                 if better {
                     best = Some(decision);
@@ -558,6 +629,94 @@ mod tests {
     }
 
     #[test]
+    fn sustained_cpu_pressure_moves_a_partition_even_with_balanced_counts() {
+        let mut policy = ElasticRebalancePolicy::new(ElasticRebalanceConfig {
+            minimum_residency_ms: 0,
+            hysteresis_frontiers: 2,
+            ..Default::default()
+        });
+        let workers = [rebalance_worker(1, 0.8, 1), rebalance_worker(2, 0.8, 1)];
+        let leases = [
+            rebalance_lease(1, 1, 0),
+            rebalance_lease(2, 1, 0),
+            rebalance_lease(3, 2, 0),
+            rebalance_lease(4, 2, 0),
+        ];
+        let load = BTreeMap::from([
+            (ShardId(1), 10),
+            (ShardId(2), 90),
+            (ShardId(3), 5),
+            (ShardId(4), 5),
+        ]);
+        assert_eq!(
+            policy.observe_with_load(FrontierGeneration(4), 1, 100, &workers, &leases, &load),
+            None
+        );
+        let decision = policy
+            .observe_with_load(FrontierGeneration(4), 2, 100, &workers, &leases, &load)
+            .unwrap();
+        assert_eq!(
+            decision,
+            ElasticRebalanceDecision {
+                generation: FrontierGeneration(4),
+                frontier: 2,
+                shard_id: ShardId(1),
+                donor: WorkerId(1),
+                donor_lease_token: LeaseToken(1),
+                recipient: WorkerId(2),
+                donor_shards: 2,
+                recipient_shards: 2,
+                headroom_gap: 0.0,
+                cpu_nanos_gap: 90,
+                draining: false
+            }
+        );
+    }
+
+    #[test]
+    fn draining_donor_moves_to_active_recipient_after_residency_and_hysteresis() {
+        let mut policy = ElasticRebalancePolicy::new(ElasticRebalanceConfig {
+            minimum_residency_ms: 60,
+            hysteresis_frontiers: 2,
+            ..Default::default()
+        });
+        let mut workers = [rebalance_worker(1, 0.8, 1), rebalance_worker(2, 0.8, 1)];
+        workers[0].lifecycle = rockstream_types::topology::WorkerLifecycleState::draining(1, 0);
+        let leases = [
+            rebalance_lease(1, 1, 0),
+            rebalance_lease(2, 2, 0),
+            rebalance_lease(3, 2, 0),
+        ];
+        assert_eq!(
+            policy.observe(FrontierGeneration(3), 1, 59, &workers, &leases),
+            None
+        );
+        assert_eq!(
+            policy.observe(FrontierGeneration(3), 2, 60, &workers, &leases),
+            None
+        );
+        let decision = policy
+            .observe(FrontierGeneration(3), 3, 61, &workers, &leases)
+            .unwrap();
+        assert_eq!(
+            decision,
+            ElasticRebalanceDecision {
+                generation: FrontierGeneration(3),
+                frontier: 3,
+                shard_id: ShardId(1),
+                donor: WorkerId(1),
+                donor_lease_token: LeaseToken(1),
+                recipient: WorkerId(2),
+                donor_shards: 1,
+                recipient_shards: 2,
+                headroom_gap: 0.0,
+                cpu_nanos_gap: 0,
+                draining: true
+            }
+        );
+    }
+
+    #[test]
     fn elastic_scale_out_proposes_one_move_after_distinct_committed_frontiers() {
         let mut policy = ElasticRebalancePolicy::new(ElasticRebalanceConfig::default());
         let workers = [
@@ -596,6 +755,8 @@ mod tests {
                 donor_shards: 2,
                 recipient_shards: 0,
                 headroom_gap: 0.9 - 0.4,
+                cpu_nanos_gap: 0,
+                draining: false,
             }
         );
         assert_eq!(decision.operation_id(), "auto-rebalance-1-1-3");
