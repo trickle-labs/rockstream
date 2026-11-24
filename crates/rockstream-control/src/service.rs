@@ -1631,6 +1631,45 @@ impl AutomaticRebalanceRuntime {
         let Ok(records) = self.migration.operations.load_all().await else {
             return;
         };
+        if let Some(record) = records.iter().find(|record| {
+            record.kind() == crate::management_store::OperationKind::MigrateShard
+                && matches!(
+                    record.status(),
+                    OperationStatus::Pending | OperationStatus::Waiting
+                )
+                && record
+                    .request()
+                    .and_then(|request| request.get("idle_drain"))
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+        }) {
+            if records.iter().any(|other| {
+                other.kind() == crate::management_store::OperationKind::MigrateShard
+                    && !other.status().is_terminal()
+                    && other.operation_id() != record.operation_id()
+            }) {
+                return;
+            }
+            let Some(request) = record.request() else {
+                return;
+            };
+            let (Some(shard_id), Some(target)) = (
+                request.get("shard_id").and_then(serde_json::Value::as_u64),
+                request
+                    .get("target_node_id")
+                    .and_then(serde_json::Value::as_u64),
+            ) else {
+                return;
+            };
+            self.migration
+                .schedule(
+                    ShardId(shard_id),
+                    WorkerId(target),
+                    record.operation_id().to_owned(),
+                )
+                .await;
+            return;
+        }
         for record in records.iter().filter(|record| {
             record.kind() == crate::management_store::OperationKind::DrainWorker
                 && record.phase() == Some("draining_at_committed_frontiers")
@@ -9542,6 +9581,23 @@ mod tests {
             );
             assert_eq!(record.status(), OperationStatus::Waiting);
             assert_eq!(manager.get(ShardId(9)), Some(lease.clone()));
+            if attempt == 1 {
+                let previous_update = record.updated_at_ms();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        runtime.finish_drains().await;
+                        let retried = operations.get(&operation_id).await.unwrap().unwrap();
+                        if retried.status() == OperationStatus::Waiting
+                            && retried.updated_at_ms() > previous_update
+                        {
+                            break retried;
+                        }
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
             operations
                 .transition(
                     &operation_id,
@@ -9750,13 +9806,11 @@ mod tests {
             .unwrap();
         assert!(matches!(message, ControlMessage::WarmShardCache { .. }));
         // The cache round trip must not open a window for new epoch admission.
-        assert!(
-            data_plane
-                .lock()
-                .await
-                .handoff_shards
-                .contains(&lease.shard_id)
-        );
+        assert!(data_plane
+            .lock()
+            .await
+            .handoff_shards
+            .contains(&lease.shard_id));
         assert_eq!(manager.get(lease.shard_id), Some(lease.clone()));
         waiters
             .lock()
@@ -9804,7 +9858,12 @@ mod tests {
         assert!(data_plane.lock().await.handoff_shards.is_empty());
         assert_eq!(manager.get(lease.shard_id), Some(lease));
         assert_eq!(
-            operations.get(operation_id).await.unwrap().unwrap().status(),
+            operations
+                .get(operation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status(),
             OperationStatus::Failed
         );
     }
