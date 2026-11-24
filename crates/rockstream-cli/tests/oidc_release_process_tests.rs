@@ -2333,9 +2333,36 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
     recovered_operation.updated_at = "<timestamp>".to_owned();
     assert_eq!(recovered_operation, scoped_operation);
     recovered.refresh().await.unwrap();
+    let recovered_records = recovered.list_security_audit_records().await.unwrap();
+    assert_eq!(recovered_records.len(), records.len() + 1);
+    assert_eq!(&recovered_records[..records.len()], records.as_slice());
+    let recovery_auth = &recovered_records[records.len()];
+    let event_id = recovery_auth
+        .event_id
+        .strip_prefix("management-authn-")
+        .expect("recovery lookup authentication audit event");
+    assert!(uuid::Uuid::parse_str(event_id).is_ok());
+    assert!(recovery_auth.timestamp_ms > 0);
+    let mut normalized_auth = recovery_auth.clone();
+    normalized_auth.event_id = "<event_id>".to_owned();
+    normalized_auth.timestamp_ms = 0;
     assert_eq!(
-        recovered.list_security_audit_records().await.unwrap(),
-        records
+        normalized_auth,
+        SecurityAuditRecord {
+            format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: "<event_id>".to_owned(),
+            timestamp_ms: 0,
+            actor: AuditIdentity::Verified("principal:1".to_owned()),
+            target: AuditField::Known("management-api".to_owned()),
+            scope: AuditField::NotApplicable,
+            action: SecurityAuditClass::AuthenticationSuccess,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::Known(1),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
     );
     recovered_control_process.0.kill().unwrap();
     recovered_control_process.0.wait().unwrap();
