@@ -3858,6 +3858,17 @@ async fn oidc_password_auth_runs_in_release_process_and_audits_after_restart() {
         error.as_db_error().unwrap().message(),
         "[RS-2400] auth.unauthenticated: malformed JWT: expected 3 parts. next_steps: Provide valid credentials (Bearer token or mTLS certificate)"
     );
+    let exact_limit_token = "x".repeat(16 * 1024);
+    let exact_limit_error =
+        oidc_authentication_error(address.port(), &exact_limit_token, &client_tls).await;
+    assert_eq!(
+        exact_limit_error.as_db_error().unwrap().code().code(),
+        "28000"
+    );
+    assert_eq!(
+        exact_limit_error.as_db_error().unwrap().message(),
+        "[RS-2400] auth.unauthenticated: malformed JWT: expected 3 parts. next_steps: Provide valid credentials (Bearer token or mTLS certificate)"
+    );
     let oversized_token = "x".repeat(16 * 1024 + 1);
     let oversized_error =
         oidc_authentication_error(address.port(), &oversized_token, &client_tls).await;
@@ -3937,7 +3948,7 @@ async fn oidc_password_auth_runs_in_release_process_and_audits_after_restart() {
         .await
         .unwrap();
     let records = recovered.list_security_audit_records().await.unwrap();
-    assert_eq!(records.len(), 10);
+    assert_eq!(records.len(), 11);
     assert_eq!(records[0].action, SecurityAuditClass::GrantChange);
     assert_eq!(records[0].outcome, SecurityAuditOutcome::Success);
     assert_eq!(records[1].action, SecurityAuditClass::GrantChange);
@@ -3975,7 +3986,7 @@ async fn oidc_password_auth_runs_in_release_process_and_audits_after_restart() {
         assert_eq!(record.actor, AuditIdentity::Unknown);
         assert_eq!(record.target, AuditField::Unknown);
     }
-    let oversized_record = &records[7];
+    let oversized_record = &records[8];
     let event_id = oversized_record
         .event_id
         .strip_prefix("gateway-authn-")
@@ -4013,6 +4024,9 @@ async fn oidc_password_auth_runs_in_release_process_and_audits_after_restart() {
     assert!(!serde_json::to_string(&records)
         .unwrap()
         .contains("bad-token"));
+    assert!(!serde_json::to_string(&records)
+        .unwrap()
+        .contains(&exact_limit_token));
     assert!(!serde_json::to_string(&records)
         .unwrap()
         .contains(&oversized_token));
