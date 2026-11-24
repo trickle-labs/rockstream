@@ -65,7 +65,10 @@ impl WorkerDeployment {
 fn unique_shard_databases(databases: Vec<ShardDb>) -> Vec<ShardDb> {
     let mut unique: Vec<ShardDb> = Vec::with_capacity(databases.len());
     for db in databases {
-        if !unique.iter().any(|existing| existing.same_open_instance(&db)) {
+        if !unique
+            .iter()
+            .any(|existing| existing.same_open_instance(&db))
+        {
             unique.push(db);
         }
     }
