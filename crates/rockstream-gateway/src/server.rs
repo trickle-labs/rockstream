@@ -2706,6 +2706,23 @@ impl GatewayHandler {
         }
     }
 
+    async fn refresh_security_policy_if_stale(
+        &self,
+        store: &rockstream_storage::catalog::DurableCatalogStore,
+    ) -> Result<(), String> {
+        use rockstream_storage::catalog::CatalogStore;
+
+        let mut refreshed_at = self.security_policy_refreshed_at.lock().await;
+        if refreshed_at
+            .as_ref()
+            .is_none_or(|last| last.elapsed() >= SECURITY_POLICY_REFRESH_INTERVAL)
+        {
+            store.refresh().await.map_err(|error| error.to_string())?;
+            *refreshed_at = Some(std::time::Instant::now());
+        }
+        Ok(())
+    }
+
     async fn security_principal_for_login(
         &self,
         authenticated: &Principal,
@@ -2716,15 +2733,7 @@ impl GatewayHandler {
             .catalog
             .get_durable_store()
             .ok_or_else(|| "durable security catalog is unavailable".to_string())?;
-        let mut refreshed_at = self.security_policy_refreshed_at.lock().await;
-        if refreshed_at
-            .as_ref()
-            .is_none_or(|last| last.elapsed() >= SECURITY_POLICY_REFRESH_INTERVAL)
-        {
-            store.refresh().await.map_err(|error| error.to_string())?;
-            *refreshed_at = Some(std::time::Instant::now());
-        }
-        drop(refreshed_at);
+        self.refresh_security_policy_if_stale(&store).await?;
         let principals = store
             .list_security_principals()
             .await
@@ -3140,6 +3149,9 @@ impl GatewayHandler {
             .get_durable_store()
             .ok_or_else(|| "durable secret authorization state is unavailable".to_string())?;
         use rockstream_storage::catalog::CatalogStore;
+        self.refresh_security_policy_if_stale(&store)
+            .await
+            .map_err(|_| "durable secret authorization state is unavailable".to_string())?;
         let consumers = store
             .list_security_principals()
             .await
@@ -27156,5 +27168,167 @@ mod v072_datafusion_fallback_limits {
         .is_err());
         assert!(account_fallback_query_batch(usize::MAX, 0, &batch).is_err());
         assert!(account_fallback_query_batch(0, usize::MAX, &batch).is_err());
+    }
+}
+
+#[cfg(test)]
+mod v073_secret_policy_refresh_tests {
+    use super::*;
+
+    struct NoopViewReader;
+
+    #[async_trait::async_trait]
+    impl ViewReader for NoopViewReader {
+        async fn read_view(
+            &self,
+            _view_name: &str,
+            _limit: Option<usize>,
+            _strategy: ViewReadStrategy,
+        ) -> Result<Vec<Vec<u8>>, GatewayError> {
+            Ok(Vec::new())
+        }
+
+        fn published_frontier(&self) -> Option<u64> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn source_secret_use_refreshes_durable_policy_before_resolution() {
+        use rockstream_storage::catalog::{
+            CatalogMutation, CatalogStore, CatalogTxn, DurableCatalogStore,
+        };
+        use rockstream_types::authorization::{
+            PermissionPreset, ScopedActionGrant, ScopedPresetGrant,
+            SECURITY_PRINCIPAL_FORMAT_VERSION,
+        };
+
+        let object_store = Arc::new(object_store::memory::InMemory::new());
+        let writer = Arc::new(DurableCatalogStore::new(
+            object_store.clone(),
+            "secret-policy-refresh",
+        ));
+        let salt = vec![1; 16];
+        let (_, stored_key, server_key) =
+            crate::role_catalog::gen_scram_verifiers("admin-password", &salt, 4096);
+        let administrator = SecurityPrincipal {
+            format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+            id: PrincipalId(1),
+            display_name: "Secret policy administrator".to_string(),
+            enabled: true,
+            revision: 1,
+            login_methods: vec![LoginMethod::ScramSha256 {
+                username: "secret-policy-admin".to_string(),
+                salt,
+                iterations: 4096,
+                stored_key: stored_key.to_vec(),
+                server_key: server_key.to_vec(),
+            }],
+            preset_grants: vec![ScopedPresetGrant {
+                preset: PermissionPreset::Administrator,
+                scope: PolicyScope::Cluster,
+            }],
+            scoped_grants: vec![ScopedActionGrant {
+                action: SecurityAction::SecretUse,
+                scope: PolicyScope::Secret {
+                    namespace: "public".to_string(),
+                    name: "kafka".to_string(),
+                    consumer: Some(PrincipalId(1)),
+                },
+            }],
+        };
+        writer
+            .preprovision_first_administrator(administrator.clone(), 1)
+            .await
+            .unwrap_or_else(|error| panic!("failed to provision test administrator: {error}"));
+
+        let stale_store = Arc::new(DurableCatalogStore::new(
+            object_store,
+            "secret-policy-refresh",
+        ));
+        stale_store
+            .refresh()
+            .await
+            .unwrap_or_else(|error| panic!("failed to refresh test catalog: {error}"));
+        let mut revoked = administrator.clone();
+        revoked.revision = 2;
+        revoked.scoped_grants.clear();
+        let before_policy = serde_json::to_string(&(
+            administrator.enabled,
+            &administrator.preset_grants,
+            &administrator.scoped_grants,
+        ))
+        .unwrap_or_else(|error| panic!("failed to serialize test policy: {error}"));
+        let after_policy = serde_json::to_string(&(
+            revoked.enabled,
+            &revoked.preset_grants,
+            &revoked.scoped_grants,
+        ))
+        .unwrap_or_else(|error| panic!("failed to serialize revoked test policy: {error}"));
+        writer
+            .commit_txn(
+                CatalogTxn::new(
+                    2,
+                    2,
+                    vec![CatalogMutation::PutSecurityPrincipal {
+                        principal: revoked,
+                        expected_revision: Some(1),
+                        grantor_revision: Some((PrincipalId(1), 1)),
+                        audit: SecurityAuditRecord {
+                            format_version:
+                                rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+                            event_id: "secret-use-revocation".to_string(),
+                            timestamp_ms: current_time_ms(),
+                            actor: AuditIdentity::Verified("principal:1".to_string()),
+                            target: AuditField::Known("principal:1".to_string()),
+                            scope: AuditField::Known("cluster".to_string()),
+                            action: SecurityAuditClass::GrantChange,
+                            outcome: SecurityAuditOutcome::Success,
+                            correlation: AuditCorrelation::Unknown,
+                            operation_id: AuditField::Known("2".to_string()),
+                            policy_revision: AuditField::Known(2),
+                            before_state: AuditField::Known(format!(
+                                "revision=1;policy={before_policy}"
+                            )),
+                            after_state: AuditField::Known(format!(
+                                "revision=2;policy={after_policy}"
+                            )),
+                        },
+                    }],
+                )
+                .unwrap_or_else(|error| panic!("invalid test catalog transaction: {error}")),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("failed to revoke test policy: {error}"));
+        assert_eq!(
+            stale_store
+                .list_security_principals()
+                .await
+                .unwrap_or_else(|error| panic!("failed to read stale test policy: {error}")),
+            vec![administrator]
+        );
+
+        let catalog = Arc::new(CatalogStubs::new());
+        catalog.set_durable_store(stale_store);
+        let handler = GatewayHandler::new(catalog, Arc::new(NoopViewReader));
+        let source = CatalogSourceEntry {
+            name: "kafka_source".to_string(),
+            table_name: Some("orders".to_string()),
+            source_type: "kafka".to_string(),
+            format: "json".to_string(),
+            options: HashMap::from([("secret".to_string(), "secret://kafka".to_string())]),
+            status: "RUNNING".to_string(),
+            live_offset: "0".to_string(),
+            live_lag: 0,
+            secret_consumer: Some(PrincipalId(1)),
+            secret_namespace: Some("public".to_string()),
+        };
+        assert_eq!(
+            handler
+                .authorize_source_secret_use(&source, "secret://kafka")
+                .await
+                .map_err(|error| error.to_string()),
+            Err("[RS-2401] source secret consumer is no longer authorized".to_string())
+        );
     }
 }

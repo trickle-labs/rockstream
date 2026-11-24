@@ -97,7 +97,8 @@ the secret and consumer principal, and missing identity or durable policy
 fails closed. Gateway source resolution reads the consumer's current durable
 policy before decrypting the value. Legacy source records without a persisted
 consumer identity are denied at resolution; an authorized migration route
-remains to be qualified.
+remains to be qualified. The gateway refreshes this policy view at one-second
+intervals, and a failed refresh rejects source credential resolution.
 
 This document describes the security model, mutual TLS (mTLS) transport encryption, identity verification, and dynamic certificate rotation in RockStream.
 
