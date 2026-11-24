@@ -1,10 +1,10 @@
 //! Memory-only worker secret-token resolution.
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use rockstream_types::{
     ids::WorkloadId,
-    secret::{SecretToken, SecretType},
+    secret::{SecretToken, SecretType, MAX_WORKER_SECRET_TOKEN_PAYLOAD_BYTES},
 };
 use serde_json;
 use std::collections::{HashMap, HashSet};
@@ -13,6 +13,9 @@ use thiserror::Error;
 
 /// Bound for tokens retained by one worker process.
 pub const MAX_WORKER_SECRET_TOKENS: usize = 1024;
+/// Bound for serialized credential payloads retained by one worker process.
+pub const MAX_WORKER_SECRET_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const AES_256_GCM_TAG_BYTES: usize = 16;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum SecretManagerError {
@@ -36,15 +39,19 @@ pub struct ResolvedSecret {
 /// Bounded, memory-only cache of worker secret credentials.
 pub struct WorkerSecretManager {
     worker_identity: String,
+    resolve_lock: Mutex<()>,
     cache: RwLock<WorkerSecretCache>,
     refresh_targets: RwLock<HashSet<(WorkloadId, String)>>,
     fill_level: AtomicUsize,
+    fill_bytes: AtomicUsize,
 }
 
 #[derive(Default)]
 struct WorkerSecretCache {
     entries: HashMap<(WorkloadId, String), ResolvedSecret>,
     pending: HashMap<(WorkloadId, String), ResolvedSecret>,
+    entry_bytes: HashMap<(WorkloadId, String), usize>,
+    pending_bytes: HashMap<(WorkloadId, String), usize>,
     workload_epochs: HashMap<WorkloadId, u64>,
 }
 
@@ -57,15 +64,31 @@ impl WorkerSecretCache {
                 .filter(|key| !self.entries.contains_key(*key))
                 .count()
     }
+
+    fn bytes_used(&self) -> usize {
+        self.entry_bytes
+            .values()
+            .chain(self.pending_bytes.values())
+            .copied()
+            .fold(0usize, usize::saturating_add)
+    }
+
+    fn bytes_after_insert(&self, key: &(WorkloadId, String), bytes: usize) -> usize {
+        self.bytes_used()
+            .saturating_sub(self.pending_bytes.get(key).copied().unwrap_or_default())
+            .saturating_add(bytes)
+    }
 }
 
 impl WorkerSecretManager {
     pub fn new(worker_identity: impl Into<String>) -> Self {
         Self {
             worker_identity: worker_identity.into(),
+            resolve_lock: Mutex::new(()),
             cache: RwLock::new(WorkerSecretCache::default()),
             refresh_targets: RwLock::new(HashSet::new()),
             fill_level: AtomicUsize::new(0),
+            fill_bytes: AtomicUsize::new(0),
         }
     }
 
@@ -114,7 +137,10 @@ impl WorkerSecretManager {
         let key = (workload_id, secret_name.to_owned());
         cache.entries.remove(&key);
         cache.pending.remove(&key);
+        cache.entry_bytes.remove(&key);
+        cache.pending_bytes.remove(&key);
         self.fill_level.store(cache.len(), Ordering::Relaxed);
+        self.fill_bytes.store(cache.bytes_used(), Ordering::Relaxed);
         drop(cache);
         if !retry {
             self.refresh_targets.write().remove(&key);
@@ -146,10 +172,14 @@ impl WorkerSecretManager {
             .collect();
         for key in &keys {
             if let Some(secret) = cache.pending.remove(key) {
+                cache.entry_bytes.remove(key);
+                let bytes = cache.pending_bytes.remove(key).unwrap_or_default();
                 cache.entries.insert(key.clone(), secret);
+                cache.entry_bytes.insert(key.clone(), bytes);
             }
         }
         self.fill_level.store(cache.len(), Ordering::Relaxed);
+        self.fill_bytes.store(cache.bytes_used(), Ordering::Relaxed);
         keys.len()
     }
 
@@ -159,6 +189,7 @@ impl WorkerSecretManager {
         token: &SecretToken,
         now_secs: u64,
     ) -> Result<ResolvedSecret, SecretManagerError> {
+        let _resolve_guard = self.resolve_lock.lock();
         if token.format_version != SecretToken::FORMAT_VERSION {
             return Err(SecretManagerError::Invalid {
                 message: "token format version is unsupported".to_string(),
@@ -184,6 +215,17 @@ impl WorkerSecretManager {
                 message: "token nonce is invalid".to_string(),
             });
         }
+        if token.encrypted_payload.len()
+            > MAX_WORKER_SECRET_TOKEN_PAYLOAD_BYTES + AES_256_GCM_TAG_BYTES
+        {
+            return Err(SecretManagerError::Invalid {
+                message: "token payload exceeds the maximum supported size".to_string(),
+            });
+        }
+        let payload_bytes = token
+            .encrypted_payload
+            .len()
+            .saturating_sub(AES_256_GCM_TAG_BYTES);
 
         let key = UnboundKey::new(
             &AES_256_GCM,
@@ -221,15 +263,20 @@ impl WorkerSecretManager {
         let mut cache = self.cache.write();
         let active = cache.entries.contains_key(&cache_key);
         let pending = cache.pending.contains_key(&cache_key);
-        if !active && !pending && cache.len() >= MAX_WORKER_SECRET_TOKENS {
+        if (!active && !pending && cache.len() >= MAX_WORKER_SECRET_TOKENS)
+            || cache.bytes_after_insert(&cache_key, payload_bytes) > MAX_WORKER_SECRET_CACHE_BYTES
+        {
             return Err(SecretManagerError::Capacity);
         }
         if active || pending {
-            cache.pending.insert(cache_key, resolved.clone());
+            cache.pending.insert(cache_key.clone(), resolved.clone());
+            cache.pending_bytes.insert(cache_key, payload_bytes);
         } else {
-            cache.entries.insert(cache_key, resolved.clone());
+            cache.entries.insert(cache_key.clone(), resolved.clone());
+            cache.entry_bytes.insert(cache_key, payload_bytes);
         }
         self.fill_level.store(cache.len(), Ordering::Relaxed);
+        self.fill_bytes.store(cache.bytes_used(), Ordering::Relaxed);
         Ok(resolved)
     }
 
@@ -247,7 +294,17 @@ impl WorkerSecretManager {
         cache
             .pending
             .retain(|_, value| value.expires_at != 0 && now_secs < value.expires_at);
+        let WorkerSecretCache {
+            entries,
+            entry_bytes,
+            pending,
+            pending_bytes,
+            ..
+        } = &mut *cache;
+        entry_bytes.retain(|key, _| entries.contains_key(key));
+        pending_bytes.retain(|key, _| pending.contains_key(key));
         self.fill_level.store(cache.len(), Ordering::Relaxed);
+        self.fill_bytes.store(cache.bytes_used(), Ordering::Relaxed);
         cache
             .entries
             .get(&(workload_id, secret_name.to_owned()))
@@ -256,5 +313,46 @@ impl WorkerSecretManager {
 
     pub fn fill_level(&self) -> usize {
         self.fill_level.load(Ordering::Relaxed)
+    }
+
+    /// Return the serialized credential payload bytes retained by this worker.
+    pub fn fill_bytes(&self) -> usize {
+        self.fill_bytes.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_byte_admission_counts_active_and_pending_generations() {
+        let active = (WorkloadId(1), "active".to_owned());
+        let other = (WorkloadId(2), "other".to_owned());
+        let mut cache = WorkerSecretCache::default();
+        cache
+            .entry_bytes
+            .insert(active.clone(), MAX_WORKER_SECRET_CACHE_BYTES - 10);
+
+        assert_eq!(cache.bytes_used(), MAX_WORKER_SECRET_CACHE_BYTES - 10);
+        assert_eq!(
+            cache.bytes_after_insert(&other, 10),
+            MAX_WORKER_SECRET_CACHE_BYTES
+        );
+        assert_eq!(
+            cache.bytes_after_insert(&other, 11),
+            MAX_WORKER_SECRET_CACHE_BYTES + 1
+        );
+
+        cache.pending_bytes.insert(active.clone(), 5);
+        assert_eq!(cache.bytes_used(), MAX_WORKER_SECRET_CACHE_BYTES - 5);
+        assert_eq!(
+            cache.bytes_after_insert(&active, 5),
+            MAX_WORKER_SECRET_CACHE_BYTES - 5
+        );
+        assert_eq!(
+            cache.bytes_after_insert(&active, 11),
+            MAX_WORKER_SECRET_CACHE_BYTES + 1
+        );
     }
 }

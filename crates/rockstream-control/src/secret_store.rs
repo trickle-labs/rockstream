@@ -20,6 +20,7 @@ use rockstream_types::error_code::{
 };
 use rockstream_types::secret::{
     EncryptedSecret, Secret, SecretMetadata, SecretRotation, SecretToken, SecretType,
+    MAX_WORKER_SECRET_TOKEN_PAYLOAD_BYTES,
 };
 use slatedb::{Db, WriteBatch};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -212,6 +213,28 @@ impl From<KekError> for SecretStoreError {
             KekError::InvalidKey { message, .. } => Self::encryption_failed(message),
         }
     }
+}
+
+fn serialize_worker_secret_payload(
+    payload: &HashMap<String, String>,
+) -> Result<Vec<u8>, SecretStoreError> {
+    let unescaped_bytes = payload.iter().fold(0usize, |total, (key, value)| {
+        total.saturating_add(key.len()).saturating_add(value.len())
+    });
+    if unescaped_bytes > MAX_WORKER_SECRET_TOKEN_PAYLOAD_BYTES {
+        return Err(SecretStoreError::capacity_exceeded(format!(
+            "secret payload exceeds {MAX_WORKER_SECRET_TOKEN_PAYLOAD_BYTES} serialized bytes"
+        )));
+    }
+
+    let serialized = serde_json::to_vec(payload)
+        .map_err(|_| SecretStoreError::encryption_failed("serialize failed"))?;
+    if serialized.len() > MAX_WORKER_SECRET_TOKEN_PAYLOAD_BYTES {
+        return Err(SecretStoreError::capacity_exceeded(format!(
+            "secret payload exceeds {MAX_WORKER_SECRET_TOKEN_PAYLOAD_BYTES} serialized bytes"
+        )));
+    }
+    Ok(serialized)
 }
 
 /// Metadata item returned when listing secrets (never contains secret values).
@@ -781,6 +804,7 @@ impl SecretStore {
         if trimmed_name.is_empty() {
             return Err(SecretStoreError::ddl_invalid("secret name cannot be empty"));
         }
+        drop(serialize_worker_secret_payload(&payload)?);
 
         if self
             .get_encrypted_raw(namespace_id, trimmed_name)
@@ -1063,6 +1087,7 @@ impl SecretStore {
                 ));
             }
         }
+        drop(serialize_worker_secret_payload(&payload)?);
         let rotation = self.rotation_lock.clone().read_owned().await;
         let trimmed_name = name.trim();
         let existing = match self.get_encrypted_raw(namespace_id, trimmed_name).await? {
@@ -1421,8 +1446,7 @@ impl SecretStore {
 
         let node_key = SecretToken::workload_key(worker_identity, workload_id);
 
-        let serialized_payload = serde_json::to_vec(&secret.payload)
-            .map_err(|e| SecretStoreError::encryption_failed(format!("serialize failed: {e}")))?;
+        let serialized_payload = serialize_worker_secret_payload(&secret.payload)?;
 
         let (encrypted_payload, nonce) =
             crate::kek::encrypt_aes_256_gcm(&node_key, &serialized_payload)?;
