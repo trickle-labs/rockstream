@@ -776,7 +776,10 @@ pub fn detect_hot_key(
                 .then_with(|| right.key_prefix.cmp(&left.key_prefix))
                 .then_with(|| left.cpu_nanos.cmp(&right.cpu_nanos))
                 .then_with(|| left.bytes_per_epoch.cmp(&right.bytes_per_epoch))
-                .then_with(|| left.state_writes_per_epoch.cmp(&right.state_writes_per_epoch))
+                .then_with(|| {
+                    left.state_writes_per_epoch
+                        .cmp(&right.state_writes_per_epoch)
+                })
         })
         .expect("key_loads checked non-empty");
     let key_score = load_score(hottest);

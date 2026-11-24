@@ -1870,10 +1870,10 @@ impl BucketedAggregateOp {
             }
         }
         for (group_key, (sum, count)) in reconstructed {
-            let sum = checked_i128_to_i64(sum)
-                .map_err(|_| OpError::aggregate_overflow(group_key))?;
-            let count = checked_i128_to_i64(count)
-                .map_err(|_| OpError::aggregate_overflow(group_key))?;
+            let sum =
+                checked_i128_to_i64(sum).map_err(|_| OpError::aggregate_overflow(group_key))?;
+            let count =
+                checked_i128_to_i64(count).map_err(|_| OpError::aggregate_overflow(group_key))?;
             local_combined.insert(group_key, (sum, count));
         }
 

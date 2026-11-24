@@ -219,7 +219,9 @@ impl ElasticRebalancePolicy {
                     || target.capabilities.shared_shard_store_id
                         != donor.capabilities.shared_shard_store_id
                     || !target.protocol_range.contains(donor.protocol_range.max)
-                    || !target.storage_format_range.contains(donor.storage_format_range.max)
+                    || !target
+                        .storage_format_range
+                        .contains(donor.storage_format_range.max)
                     || target.capacity_headroom.fraction() <= 0.0
                 {
                     continue;
@@ -249,11 +251,15 @@ impl ElasticRebalancePolicy {
                     headroom_gap,
                 };
                 let better = best.as_ref().is_none_or(|current| {
-                    gap.cmp(&current.donor_shards.saturating_sub(current.recipient_shards))
-                        .then_with(|| headroom_gap.total_cmp(&current.headroom_gap))
-                        .then_with(|| current.shard_id.cmp(&decision.shard_id))
-                        .then_with(|| current.recipient.cmp(&decision.recipient))
-                        .is_gt()
+                    gap.cmp(
+                        &current
+                            .donor_shards
+                            .saturating_sub(current.recipient_shards),
+                    )
+                    .then_with(|| headroom_gap.total_cmp(&current.headroom_gap))
+                    .then_with(|| current.shard_id.cmp(&decision.shard_id))
+                    .then_with(|| current.recipient.cmp(&decision.recipient))
+                    .is_gt()
                 });
                 if better {
                     best = Some(decision);
