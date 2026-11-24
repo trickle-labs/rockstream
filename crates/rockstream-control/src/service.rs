@@ -9688,13 +9688,11 @@ mod tests {
             .unwrap();
         assert!(matches!(message, ControlMessage::WarmShardCache { .. }));
         // The cache round trip must not open a window for new epoch admission.
-        assert!(
-            data_plane
-                .lock()
-                .await
-                .handoff_shards
-                .contains(&lease.shard_id)
-        );
+        assert!(data_plane
+            .lock()
+            .await
+            .handoff_shards
+            .contains(&lease.shard_id));
         assert_eq!(manager.get(lease.shard_id), Some(lease.clone()));
         waiters
             .lock()
@@ -9742,7 +9740,12 @@ mod tests {
         assert!(data_plane.lock().await.handoff_shards.is_empty());
         assert_eq!(manager.get(lease.shard_id), Some(lease));
         assert_eq!(
-            operations.get(operation_id).await.unwrap().unwrap().status(),
+            operations
+                .get(operation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status(),
             OperationStatus::Failed
         );
     }
