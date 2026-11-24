@@ -3858,6 +3858,17 @@ async fn oidc_password_auth_runs_in_release_process_and_audits_after_restart() {
         error.as_db_error().unwrap().message(),
         "[RS-2400] auth.unauthenticated: malformed JWT: expected 3 parts. next_steps: Provide valid credentials (Bearer token or mTLS certificate)"
     );
+    let oversized_token = "x".repeat(16 * 1024 + 1);
+    let oversized_error =
+        oidc_authentication_error(address.port(), &oversized_token, &client_tls).await;
+    assert_eq!(
+        oversized_error.as_db_error().unwrap().code().code(),
+        "28000"
+    );
+    assert_eq!(
+        oversized_error.as_db_error().unwrap().message(),
+        "[RS-2400] auth.unauthenticated: OIDC token exceeds the 16 KiB limit. next_steps: Provide valid credentials (Bearer token or mTLS certificate)"
+    );
     drop(client);
     connection_task.abort();
     process.0.kill().unwrap();
@@ -3926,7 +3937,7 @@ async fn oidc_password_auth_runs_in_release_process_and_audits_after_restart() {
         .await
         .unwrap();
     let records = recovered.list_security_audit_records().await.unwrap();
-    assert_eq!(records.len(), 9);
+    assert_eq!(records.len(), 10);
     assert_eq!(records[0].action, SecurityAuditClass::GrantChange);
     assert_eq!(records[0].outcome, SecurityAuditOutcome::Success);
     assert_eq!(records[1].action, SecurityAuditClass::GrantChange);
@@ -3964,9 +3975,47 @@ async fn oidc_password_auth_runs_in_release_process_and_audits_after_restart() {
         assert_eq!(record.actor, AuditIdentity::Unknown);
         assert_eq!(record.target, AuditField::Unknown);
     }
+    let oversized_record = &records[7];
+    let event_id = oversized_record
+        .event_id
+        .strip_prefix("gateway-authn-")
+        .expect("oversized-token authentication audit ID");
+    assert_eq!(event_id.len(), 32);
+    assert!(u128::from_str_radix(event_id, 16).is_ok());
+    assert!(oversized_record.timestamp_ms > 0);
+    assert!(matches!(
+        &oversized_record.correlation,
+        AuditCorrelation::Observed(value)
+            if value.len() == 32 && u128::from_str_radix(value, 16).is_ok()
+    ));
+    let mut normalized_oversized_record = oversized_record.clone();
+    normalized_oversized_record.event_id = "gateway-authn:<32 hex>".to_owned();
+    normalized_oversized_record.timestamp_ms = 0;
+    normalized_oversized_record.correlation = AuditCorrelation::Observed("<32 hex>".to_owned());
+    assert_eq!(
+        normalized_oversized_record,
+        SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: "gateway-authn:<32 hex>".to_owned(),
+            timestamp_ms: 0,
+            actor: AuditIdentity::Unknown,
+            target: AuditField::Unknown,
+            scope: AuditField::NotApplicable,
+            action: SecurityAuditClass::AuthenticationFailure,
+            outcome: SecurityAuditOutcome::Failure,
+            correlation: AuditCorrelation::Observed("<32 hex>".to_owned()),
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::Unknown,
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
+    );
     assert!(!serde_json::to_string(&records)
         .unwrap()
         .contains("bad-token"));
+    assert!(!serde_json::to_string(&records)
+        .unwrap()
+        .contains(&oversized_token));
 }
 
 #[tokio::test]
