@@ -18,6 +18,7 @@ pub mod compactor;
 pub mod concurrency_governor;
 pub mod error;
 pub mod format_migration;
+pub mod heat_cache;
 pub mod keys;
 pub mod merge_registry;
 pub mod metered_store;

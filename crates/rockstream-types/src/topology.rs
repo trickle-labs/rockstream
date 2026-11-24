@@ -378,6 +378,14 @@ pub enum ControlMessage {
         workload_id: crate::ids::WorkloadId,
         anchor: ShardLease,
     },
+    /// Read immutable shared-store ranges into the target cache without opening
+    /// a database writer or acquiring the donor's lease.
+    WarmShardCache {
+        operation_id: String,
+        lease: ShardLease,
+        /// (isolated cache identity/local path, shared object-store prefix).
+        storage_scopes: Vec<(String, String)>,
+    },
     /// Create a durable SlateDB checkpoint for an idle shard.
     CreateShardCheckpoint {
         request_id: String,
@@ -1071,6 +1079,12 @@ pub enum WorkerMessage {
         input_digest: [u8; 32],
         decision: serde_json::Value,
         shard_leases: Vec<(ShardId, crate::ids::LeaseToken)>,
+    },
+    ShardHeatReport {
+        worker_id: WorkerId,
+        shard_id: ShardId,
+        lease_token: crate::ids::LeaseToken,
+        heat: crate::lease::LeaseHeatHint,
     },
     /// Query this control node's current Raft leadership status (v0.45.2
     /// M7 S4). Any connected client (worker, ops tooling, or a test) may

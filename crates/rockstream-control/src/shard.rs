@@ -788,6 +788,7 @@ mod tests {
             hot_sst_ids: vec!["sst-7".to_string()],
             hot_block_ranges: vec![(10, 20)],
             expected_read_rate: 100,
+            blocks: Vec::new(),
         };
         assert!(m.update_heat(ShardId(1), heat));
         assert!(m.decay_heat(ShardId(1), 1, 1));

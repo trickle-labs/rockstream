@@ -5461,6 +5461,7 @@ dependencies = [
  "libc",
  "moka",
  "object_store 0.14.2",
+ "parking_lot",
  "reqwest 0.12.28",
  "rockstream-sim",
  "rockstream-test-support",

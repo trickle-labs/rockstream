@@ -141,6 +141,7 @@ pub struct NvmeCacheConfig {
 
 /// Worker-wide shared storage context managing unified block & index caches.
 pub struct WorkerStorageContext {
+    heat_cache: Arc<crate::heat_cache::HeatCache>,
     budget_bytes: usize,
     cache_budget: WorkerCacheBudget,
     blocks: Mutex<LruStore>,
@@ -187,7 +188,10 @@ impl WorkerStorageContext {
     /// Create a worker storage context with explicitly separated RAM decoded block/meta
     /// caches vs. worker-wide raw object-store disk cache budget.
     pub fn from_cache_budget(worker_id: &str, cache_budget: WorkerCacheBudget) -> Self {
-        let block_budget = cache_budget.decoded_block_cache_bytes;
+        let heat_budget = (cache_budget.decoded_block_cache_bytes / 8).min(4 * 1024 * 1024);
+        let block_budget = cache_budget
+            .decoded_block_cache_bytes
+            .saturating_sub(heat_budget);
         let index_budget = cache_budget.metadata_index_cache_bytes;
         let budget_bytes = cache_budget.total_ram_bytes();
 
@@ -212,6 +216,7 @@ impl WorkerStorageContext {
 
         Self {
             budget_bytes,
+            heat_cache: Arc::new(crate::heat_cache::HeatCache::new(heat_budget)),
             cache_budget,
             blocks: Mutex::new(LruStore::new(block_budget)),
             indexes: Mutex::new(LruStore::new(index_budget)),
@@ -317,6 +322,10 @@ impl WorkerStorageContext {
         self.db_cache.clone()
     }
 
+    pub fn heat_cache(&self) -> Arc<crate::heat_cache::HeatCache> {
+        self.heat_cache.clone()
+    }
+
     /// Retrieve the total configured budget in bytes.
     pub fn budget_bytes(&self) -> usize {
         self.budget_bytes
@@ -370,18 +379,30 @@ impl WorkerStorageContext {
         let indexes_bytes = self.indexes.lock().unwrap().current_bytes;
 
         StorageCacheStats {
-            hits: self.hits.load(Ordering::Relaxed),
-            misses: self.misses.load(Ordering::Relaxed),
+            hits: self
+                .hits
+                .load(Ordering::Relaxed)
+                .saturating_add(self.heat_cache.hits()),
+            misses: self
+                .misses
+                .load(Ordering::Relaxed)
+                .saturating_add(self.heat_cache.misses()),
             evictions: self.evictions.load(Ordering::Relaxed),
-            current_bytes: blocks_bytes + indexes_bytes,
+            current_bytes: blocks_bytes + indexes_bytes + self.heat_cache.resident_bytes(),
             capacity_bytes: self.budget_bytes,
         }
     }
 
     /// Hit ratio helper (0.0 .. 1.0).
     pub fn hit_ratio(&self) -> f64 {
-        let h = self.hits.load(Ordering::Relaxed);
-        let m = self.misses.load(Ordering::Relaxed);
+        let h = self
+            .hits
+            .load(Ordering::Relaxed)
+            .saturating_add(self.heat_cache.hits());
+        let m = self
+            .misses
+            .load(Ordering::Relaxed)
+            .saturating_add(self.heat_cache.misses());
         let total = h + m;
         if total == 0 {
             0.0
@@ -392,6 +413,7 @@ impl WorkerStorageContext {
 
     /// Clear all cached blocks and indexes.
     pub fn clear(&self) {
+        self.heat_cache.clear();
         self.blocks.lock().unwrap().clear();
         self.indexes.lock().unwrap().clear();
     }
