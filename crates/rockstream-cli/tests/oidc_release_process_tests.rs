@@ -2190,20 +2190,94 @@ async fn delegated_gateway_sql_rechecks_control_policy_and_recovers_lost_grant_r
     let audit_after_scoped_grant = control_catalog.list_security_audit_records().await.unwrap();
     assert_eq!(
         audit_after_scoped_grant.len(),
-        audit_before_scoped_grant.len() + 3
+        audit_before_scoped_grant.len() + 4
     );
     assert_eq!(
         &audit_after_scoped_grant[..audit_before_scoped_grant.len()],
         audit_before_scoped_grant.as_slice()
     );
-    let scoped_grant_record = &audit_after_scoped_grant[audit_before_scoped_grant.len() + 1];
-    assert_eq!(scoped_grant_record.action, SecurityAuditClass::GrantChange);
-    assert_eq!(scoped_grant_record.outcome, SecurityAuditOutcome::Success);
+    let authentication = &audit_after_scoped_grant[audit_before_scoped_grant.len()];
+    let authentication_id = authentication
+        .event_id
+        .strip_prefix("management-authn-")
+        .expect("lost-response client authentication audit event");
+    assert!(uuid::Uuid::parse_str(authentication_id).is_ok());
+    assert!(authentication.timestamp_ms > 0);
     assert_eq!(
-        scoped_grant_record.correlation,
-        AuditCorrelation::Observed(scoped_operation_id.clone())
+        authentication,
+        &SecurityAuditRecord {
+            format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: authentication.event_id.clone(),
+            timestamp_ms: authentication.timestamp_ms,
+            actor: AuditIdentity::Verified("principal:1".to_owned()),
+            target: AuditField::Known("management-api".to_owned()),
+            scope: AuditField::NotApplicable,
+            action: SecurityAuditClass::AuthenticationSuccess,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::Known(1),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
     );
-    assert_eq!(scoped_grant_record.policy_revision, AuditField::Known(3));
+    let start = &audit_after_scoped_grant[audit_before_scoped_grant.len() + 1];
+    assert!(start.timestamp_ms > 0);
+    assert_eq!(
+        start,
+        &SecurityAuditRecord {
+            format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: format!("management-security-grants-start:{scoped_operation_id}"),
+            timestamp_ms: start.timestamp_ms,
+            actor: AuditIdentity::Verified("principal:1".to_owned()),
+            target: AuditField::Known("principal:2".to_owned()),
+            scope: AuditField::Known("cluster".to_owned()),
+            action: SecurityAuditClass::AdminOperationStart,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::Observed(scoped_operation_id.clone()),
+            operation_id: AuditField::Known(scoped_operation_id.clone()),
+            policy_revision: AuditField::Known(1),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
+    );
+    let before_policy = serde_json::to_string(&(
+        operator_only_actor.enabled,
+        &operator_only_actor.preset_grants,
+        &operator_only_actor.scoped_grants,
+    ))
+    .unwrap();
+    let after_policy = serde_json::to_string(&(
+        scoped_actor.enabled,
+        &scoped_actor.preset_grants,
+        &scoped_actor.scoped_grants,
+    ))
+    .unwrap();
+    let scoped_grant_record = &audit_after_scoped_grant[audit_before_scoped_grant.len() + 2];
+    assert!(scoped_grant_record.timestamp_ms > 0);
+    let expected_scoped_grant = SecurityAuditRecord {
+        format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: format!("management-security-grants:{scoped_operation_id}"),
+        timestamp_ms: scoped_grant_record.timestamp_ms,
+        actor: AuditIdentity::Verified("principal:1".to_owned()),
+        target: AuditField::Known("principal:2".to_owned()),
+        scope: AuditField::Known("cluster".to_owned()),
+        action: SecurityAuditClass::GrantChange,
+        outcome: SecurityAuditOutcome::Success,
+        correlation: AuditCorrelation::Observed(scoped_operation_id.clone()),
+        operation_id: AuditField::Known(scoped_operation_id.clone()),
+        policy_revision: AuditField::Known(3),
+        before_state: AuditField::Known(format!("revision=2;policy={before_policy}")),
+        after_state: AuditField::Known(format!("revision=3;policy={after_policy}")),
+    };
+    assert_eq!(scoped_grant_record, &expected_scoped_grant);
+    let completion = &audit_after_scoped_grant[audit_before_scoped_grant.len() + 3];
+    assert_eq!(completion.timestamp_ms, scoped_grant_record.timestamp_ms);
+    let mut expected_completion = expected_scoped_grant;
+    expected_completion.event_id =
+        format!("management-security-grants-completion:{scoped_operation_id}");
+    expected_completion.action = SecurityAuditClass::AdminOperationCompletion;
+    assert_eq!(completion, &expected_completion);
 
     tokio::time::sleep(Duration::from_secs(2)).await;
     let backup_response = operator_management
