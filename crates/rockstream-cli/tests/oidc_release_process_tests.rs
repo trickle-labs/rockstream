@@ -1698,12 +1698,6 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
             Err(error) => panic!("management endpoint did not start: {error}"),
         }
     };
-    control_catalog.refresh().await.unwrap();
-    let mut expected_audit = control_catalog.list_security_audit_records().await.unwrap();
-    expected_audit.sort_by(|left, right| {
-        (left.timestamp_ms, left.event_id.as_str())
-            .cmp(&(right.timestamp_ms, right.event_id.as_str()))
-    });
     let audit_history = management
         .list_security_audit_records(ListSecurityAuditRecordsRequest {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
@@ -1715,6 +1709,12 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
         .await
         .expect("authenticated management administrator can read the durable audit history")
         .into_inner();
+    control_catalog.refresh().await.unwrap();
+    let mut expected_audit = control_catalog.list_security_audit_records().await.unwrap();
+    expected_audit.sort_by(|left, right| {
+        (left.timestamp_ms, left.event_id.as_str())
+            .cmp(&(right.timestamp_ms, right.event_id.as_str()))
+    });
     assert_eq!(
         audit_history.protocol_version,
         rockstream_management_proto::PROTOCOL_VERSION
@@ -1975,6 +1975,21 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
         rockstream_management_proto::v1::management_service_client::ManagementServiceClient::new(
             operator_channel,
         );
+    let audit_read_error = operator_management
+        .list_security_audit_records(ListSecurityAuditRecordsRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            from_timestamp_ms: None,
+            to_timestamp_ms: None,
+            page_size: 100,
+            page_token: String::new(),
+        })
+        .await
+        .expect_err("the operator preset must not authorize security audit reads");
+    assert_eq!(audit_read_error.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        audit_read_error.message(),
+        "management action is not authorized"
+    );
     let self_grant_error = operator_management
         .set_security_principal_grants(SetSecurityPrincipalGrantsRequest {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
@@ -2021,6 +2036,37 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
     principals_after_operator_denials.sort_by_key(|principal| principal.id);
     assert_eq!(principals_after_operator_denials, principals_after_grant);
     let audit_before_scoped_grant = control_catalog.list_security_audit_records().await.unwrap();
+    let audit_read_denial_record = &audit_before_scoped_grant[audit_before_scoped_grant.len() - 3];
+    let audit_read_denial_id = audit_read_denial_record
+        .event_id
+        .strip_prefix("management-denial-")
+        .expect("operator audit-read denial audit event");
+    assert!(uuid::Uuid::parse_str(audit_read_denial_id).is_ok());
+    assert!(audit_read_denial_record.timestamp_ms > 0);
+    assert_eq!(
+        audit_read_denial_record,
+        &SecurityAuditRecord {
+            format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: audit_read_denial_record.event_id.clone(),
+            timestamp_ms: audit_read_denial_record.timestamp_ms,
+            actor: AuditIdentity::Verified("principal:2".to_owned()),
+            target: AuditField::Known("SecurityAuditRead".to_owned()),
+            scope: AuditField::Known(
+                serde_json::to_string(&PolicyScope::AuditRange {
+                    from_ms: None,
+                    to_ms: None,
+                })
+                .unwrap(),
+            ),
+            action: SecurityAuditClass::AuthorizationDenial,
+            outcome: SecurityAuditOutcome::Denied,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::Known(2),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
+    );
     let self_grant_denial_record = &audit_before_scoped_grant[audit_before_scoped_grant.len() - 2];
     assert!(self_grant_denial_record
         .event_id
