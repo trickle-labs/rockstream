@@ -1421,6 +1421,21 @@ and `online_drain_worker_moves_active_workload_to_healthy_recipient` in
 `crates/rockstream-control/tests/online_migration_backup_streaming_tests.rs`
 exercise the concrete live-worker handoffs.
 
+PR #429 (issue #403) adds `ElasticRebalancePolicy` as a deterministic,
+read-only proposal: it considers healthy active workers with finite headroom,
+compatible protocol and storage formats, and the same shared shard store; it
+requires minimum donor residency and either shard-count imbalance or sustained
+headroom pressure. It proposes one move only after distinct increasing
+frontiers within one membership generation, with a stable operation ID. The
+existing migration executor still revalidates ownership and performs the
+handoff. `transfer_if_owner` compares shard, worker, and lease token while
+preserving the latest mutable heat hint and minting a new fencing token, so
+telemetry updates do not stale a valid handoff and stale owners remain fenced.
+`elastic_scale_out_proposes_one_move_after_distinct_committed_frontiers`,
+`elastic_policy_resets_on_membership_change_and_respects_residency`, and
+`heat_updates_do_not_invalidate_a_fenced_handoff` cover these implementation
+boundaries; the proposal adds no M4/M6 ownership action or invariant.
+
 `CreateBackup` now pins each active shard's durable checkpoint snapshot and
 optional workload-specific object prefix without stopping concurrent writes.
 Its export excludes control manifests newer than the selected checkpoint,
