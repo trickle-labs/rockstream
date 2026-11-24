@@ -29,9 +29,9 @@ use rockstream_management_proto::v1::{
     management_service_client::ManagementServiceClient, CancelOperationRequest,
     CreateBackupRequest, DownloadSupportArtifactChunk, DownloadSupportArtifactRequest,
     GenerateSupportArtifactRequest, GenerateSupportArtifactResponse, GetClusterStatusRequest,
-    GetOperationRequest, ListOperationsRequest, ListSecurityPrincipalsRequest,
-    Operation as ManagementWireOperation, SecurityActionGrant, SecurityPresetGrant,
-    SetSecurityPrincipalGrantsRequest,
+    GetOperationRequest, ListOperationsRequest, ListSecurityAuditRecordsRequest,
+    ListSecurityPrincipalsRequest, Operation as ManagementWireOperation, SecurityActionGrant,
+    SecurityPresetGrant, SetSecurityPrincipalGrantsRequest,
 };
 use rockstream_runtime::exchange::pool::ShuffleClientPool;
 use rockstream_runtime::exchange::proto::ShuffleFrame;
@@ -1698,6 +1698,41 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
             Err(error) => panic!("management endpoint did not start: {error}"),
         }
     };
+    control_catalog.refresh().await.unwrap();
+    let mut expected_audit = control_catalog.list_security_audit_records().await.unwrap();
+    expected_audit.sort_by(|left, right| {
+        (left.timestamp_ms, left.event_id.as_str())
+            .cmp(&(right.timestamp_ms, right.event_id.as_str()))
+    });
+    let audit_history = management
+        .list_security_audit_records(ListSecurityAuditRecordsRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            from_timestamp_ms: None,
+            to_timestamp_ms: None,
+            page_size: 100,
+            page_token: String::new(),
+        })
+        .await
+        .expect("authenticated management administrator can read the durable audit history")
+        .into_inner();
+    assert_eq!(
+        audit_history.protocol_version,
+        rockstream_management_proto::PROTOCOL_VERSION
+    );
+    assert_eq!(
+        audit_history.source_version,
+        format!("security-audit-records:v{SECURITY_AUDIT_FORMAT_VERSION}")
+    );
+    assert!(chrono::DateTime::parse_from_rfc3339(&audit_history.observed_at).is_ok());
+    assert_eq!(
+        audit_history.records_json,
+        expected_audit
+            .iter()
+            .map(|record| serde_json::to_string(record).unwrap())
+            .collect::<Vec<_>>()
+    );
+    assert!(audit_history.next_page_token.is_empty());
+
     let operation_id = uuid::Uuid::new_v4().to_string();
     let response = management
         .set_security_principal_grants(SetSecurityPrincipalGrantsRequest {
