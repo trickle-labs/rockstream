@@ -51,6 +51,25 @@ struct ArtifactLedger {
     object_generations: BTreeMap<String, String>,
 }
 
+fn support_artifact_usage(ledger: &ArtifactLedger) -> (u64, u64) {
+    (
+        ledger.artifacts.len() as u64,
+        ledger.artifacts.values().fold(0u64, |total, artifact| {
+            total.saturating_add(artifact.size as u64)
+        }),
+    )
+}
+
+fn publish_support_artifact_metrics(ledger: &ArtifactLedger) {
+    let (count, bytes) = support_artifact_usage(ledger);
+    rockstream_types::metrics::set_support_artifact_storage_metrics(
+        count,
+        bytes,
+        MAX_ARTIFACTS_PER_DEPLOYMENT as u64,
+        MAX_ARTIFACT_STORAGE_BYTES as u64,
+    );
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
 struct LedgerArtifact {
     owner: PrincipalId,
@@ -496,16 +515,18 @@ impl SupportArtifactStore {
                     LEDGER_FORMAT_VERSION => {}
                     _ => return Err(ArtifactStoreError::StorageUnavailable),
                 }
+                publish_support_artifact_metrics(&ledger);
                 Ok((ledger, Some(version)))
             }
-            Err(ObjectStoreError::NotFound { .. }) => Ok((
-                ArtifactLedger {
+            Err(ObjectStoreError::NotFound { .. }) => {
+                let ledger = ArtifactLedger {
                     format_version: LEDGER_FORMAT_VERSION,
                     artifacts: BTreeMap::new(),
                     object_generations: BTreeMap::new(),
-                },
-                None,
-            )),
+                };
+                publish_support_artifact_metrics(&ledger);
+                Ok((ledger, None))
+            }
             Err(_) => Err(ArtifactStoreError::StorageUnavailable),
         }
     }
@@ -535,7 +556,10 @@ impl SupportArtifactStore {
                 )
                 .await
             {
-                Ok(_) => return Ok(true),
+                Ok(_) => {
+                    publish_support_artifact_metrics(&ledger);
+                    return Ok(true);
+                }
                 Err(ObjectStoreError::AlreadyExists { .. })
                 | Err(ObjectStoreError::Precondition { .. })
                 | Err(ObjectStoreError::NotFound { .. }) => continue,
@@ -574,6 +598,38 @@ mod tests {
     use object_store::local::LocalFileSystem;
     use object_store::memory::InMemory;
     use tokio::sync::Notify;
+
+    #[test]
+    fn support_artifact_usage_reports_exact_ledger_fill() {
+        let ledger = ArtifactLedger {
+            format_version: LEDGER_FORMAT_VERSION,
+            artifacts: [
+                (
+                    "first".to_owned(),
+                    LedgerArtifact {
+                        owner: PrincipalId(1),
+                        scope: PolicyScope::Cluster,
+                        size: 7,
+                        expires_at_ms: 1_000,
+                    },
+                ),
+                (
+                    "second".to_owned(),
+                    LedgerArtifact {
+                        owner: PrincipalId(2),
+                        scope: PolicyScope::Cluster,
+                        size: 11,
+                        expires_at_ms: 2_000,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            object_generations: BTreeMap::new(),
+        };
+
+        assert_eq!(support_artifact_usage(&ledger), (2, 18));
+    }
 
     #[derive(Debug)]
     struct FailingListStore {
