@@ -59,6 +59,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
 };
+use tonic::codegen::Service as _;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
 static RELEASE_PROCESS_PORT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -1221,6 +1222,16 @@ async fn management_client_with_identity(
     cert_path: &Path,
     key_path: &Path,
 ) -> Result<ManagementServiceClient<tonic::transport::Channel>, String> {
+    let channel = management_channel_with_identity(address, pki, cert_path, key_path).await?;
+    Ok(ManagementServiceClient::new(channel))
+}
+
+async fn management_channel_with_identity(
+    address: std::net::SocketAddr,
+    pki: &rockstream_test_support::pki::TestPki,
+    cert_path: &Path,
+    key_path: &Path,
+) -> Result<tonic::transport::Channel, String> {
     let tls = ClientTlsConfig::new()
         .ca_certificate(Certificate::from_pem(
             std::fs::read(&pki.ca_cert_path).unwrap(),
@@ -1229,14 +1240,66 @@ async fn management_client_with_identity(
             std::fs::read(cert_path).unwrap(),
             std::fs::read(key_path).unwrap(),
         ));
-    let channel = Endpoint::from_shared(format!("https://{address}"))
+    Endpoint::from_shared(format!("https://{address}"))
         .map_err(|error| error.to_string())?
         .tls_config(tls)
         .map_err(|error| error.to_string())?
         .connect()
         .await
-        .map_err(|error| error.to_string())?;
-    Ok(ManagementServiceClient::new(channel))
+        .map_err(|error| error.to_string())
+}
+
+#[derive(Clone)]
+struct DropFirstGrantResponse<S> {
+    inner: S,
+    dropped: Arc<AtomicBool>,
+}
+
+impl<S> tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::BoxBody>>
+    for DropFirstGrantResponse<S>
+where
+    S: tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::BoxBody>>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+    S::Error: std::error::Error + Send + Sync + 'static,
+    S::Response: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = std::io::Error;
+    type Future = tonic::codegen::BoxFuture<Self::Response, Self::Error>;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(
+        &mut self,
+        request: tonic::codegen::http::Request<tonic::body::BoxBody>,
+    ) -> Self::Future {
+        let is_grant_mutation = request.uri().path()
+            == "/rockstream.management.v1.ManagementService/SetSecurityPrincipalGrants";
+        let dropped = Arc::clone(&self.dropped);
+        let mut inner = self.inner.clone();
+        Box::pin(async move {
+            futures::future::poll_fn(|cx| inner.poll_ready(cx))
+                .await
+                .map_err(std::io::Error::other)?;
+            let response = inner.call(request).await.map_err(std::io::Error::other)?;
+            if is_grant_mutation && !dropped.swap(true, Ordering::SeqCst) {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "injected lost grant-operation response",
+                ))
+            } else {
+                Ok(response)
+            }
+        })
+    }
 }
 
 async fn wait_for_management_client(
@@ -1523,7 +1586,8 @@ async fn delegated_actor_policy_is_rechecked_by_release_control_process() {
 }
 
 #[tokio::test]
-async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
+async fn delegated_gateway_sql_rechecks_control_policy_and_recovers_lost_grant_response_in_release_process(
+) {
     let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let temp = tempfile::tempdir().unwrap();
@@ -2036,7 +2100,20 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
     );
 
     let scoped_operation_id = uuid::Uuid::new_v4().to_string();
-    let scoped_response = management
+    let response_dropped = Arc::new(AtomicBool::new(false));
+    let channel = management_channel_with_identity(
+        management_address,
+        &pki,
+        &pki.cli_cert_path,
+        &pki.cli_key_path,
+    )
+    .await
+    .unwrap();
+    let mut response_loss_client = ManagementServiceClient::new(DropFirstGrantResponse {
+        inner: channel,
+        dropped: Arc::clone(&response_dropped),
+    });
+    let response_loss = response_loss_client
         .set_security_principal_grants(SetSecurityPrincipalGrantsRequest {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
             principal_id: 2,
@@ -2052,22 +2129,16 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
                 scope_json: serde_json::to_string(&backup_scope).unwrap(),
             }],
         })
-        .await
-        .expect("the administrator should add a scoped backup-create grant")
-        .into_inner();
-    assert_eq!(
-        scoped_response.protocol_version,
-        rockstream_management_proto::PROTOCOL_VERSION
+        .await;
+    assert!(
+        response_loss.is_err(),
+        "the successful grant response is lost"
     );
-    let mut scoped_operation = scoped_response.operation.expect("scoped grant operation");
-    assert_eq!(scoped_operation.operation_id, scoped_operation_id);
-    assert!(chrono::DateTime::parse_from_rfc3339(&scoped_operation.started_at).is_ok());
-    assert!(chrono::DateTime::parse_from_rfc3339(&scoped_operation.updated_at).is_ok());
-    scoped_operation.started_at = "<timestamp>".to_owned();
-    scoped_operation.updated_at = "<timestamp>".to_owned();
-    assert_eq!(
-        scoped_operation,
-        ManagementWireOperation {
+    assert!(
+        response_dropped.load(Ordering::SeqCst),
+        "the response is dropped only after the server returns success"
+    );
+    let expected_scoped_operation = ManagementWireOperation {
             operation_id: scoped_operation_id.clone(),
             kind: "security_principal_grants".to_owned(),
             state: "succeeded".to_owned(),
@@ -2099,8 +2170,7 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
                 ]
             })
             .to_string(),
-        }
-    );
+        };
 
     let mut scoped_actor = operator_only_actor.clone();
     scoped_actor.revision = 3;
@@ -2317,21 +2387,26 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
     .await;
     wait_for_gateway(&mut recovered_control_process.0, control_address).await;
     let mut recovered_management = wait_for_management_client(management_address, &pki).await;
-    let mut recovered_operation = recovered_management
+    let recovered_response = recovered_management
         .get_operation(GetOperationRequest {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
             operation_id: scoped_operation_id,
         })
         .await
         .unwrap()
-        .into_inner()
+        .into_inner();
+    assert_eq!(
+        recovered_response.protocol_version,
+        rockstream_management_proto::PROTOCOL_VERSION
+    );
+    let mut recovered_operation = recovered_response
         .operation
         .expect("the committed grant operation remains queryable after restart");
     assert!(chrono::DateTime::parse_from_rfc3339(&recovered_operation.started_at).is_ok());
     assert!(chrono::DateTime::parse_from_rfc3339(&recovered_operation.updated_at).is_ok());
     recovered_operation.started_at = "<timestamp>".to_owned();
     recovered_operation.updated_at = "<timestamp>".to_owned();
-    assert_eq!(recovered_operation, scoped_operation);
+    assert_eq!(recovered_operation, expected_scoped_operation);
     recovered.refresh().await.unwrap();
     let recovered_records = recovered.list_security_audit_records().await.unwrap();
     assert_eq!(recovered_records.len(), records.len() + 1);
