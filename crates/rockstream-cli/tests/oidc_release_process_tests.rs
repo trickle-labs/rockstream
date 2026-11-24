@@ -6169,6 +6169,16 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
             "durable source {source_name} must retain a canonical secret reference"
         );
     }
+    let sinks = durable_catalog.list_sinks().await.unwrap();
+    let sink = sinks
+        .iter()
+        .find(|sink| sink.name == "rotating_out")
+        .expect("the rotated Kafka sink must remain durable");
+    assert_eq!(
+        sink.options.get("secret").map(String::as_str),
+        Some("secret://kafka_auth"),
+        "durable sink must retain a canonical secret reference"
+    );
     let rotation_audits = durable_catalog
         .list_security_audit_records()
         .await
