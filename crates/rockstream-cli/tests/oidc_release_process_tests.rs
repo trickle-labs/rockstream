@@ -2300,6 +2300,45 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
             after_state: AuditField::NotApplicable,
         }
     );
+
+    drop(management);
+    let mut recovered_control_process = start_control_process_with_operator(
+        &control_working_dir,
+        &control_storage,
+        control_address,
+        management_address,
+        &pki,
+        None,
+        false,
+        None,
+        false,
+        false,
+    )
+    .await;
+    wait_for_gateway(&mut recovered_control_process.0, control_address).await;
+    let mut recovered_management = wait_for_management_client(management_address, &pki).await;
+    let mut recovered_operation = recovered_management
+        .get_operation(GetOperationRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            operation_id: scoped_operation_id,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .operation
+        .expect("the committed grant operation remains queryable after restart");
+    assert!(chrono::DateTime::parse_from_rfc3339(&recovered_operation.started_at).is_ok());
+    assert!(chrono::DateTime::parse_from_rfc3339(&recovered_operation.updated_at).is_ok());
+    recovered_operation.started_at = "<timestamp>".to_owned();
+    recovered_operation.updated_at = "<timestamp>".to_owned();
+    assert_eq!(recovered_operation, scoped_operation);
+    recovered.refresh().await.unwrap();
+    assert_eq!(
+        recovered.list_security_audit_records().await.unwrap(),
+        records
+    );
+    recovered_control_process.0.kill().unwrap();
+    recovered_control_process.0.wait().unwrap();
 }
 
 #[tokio::test]
