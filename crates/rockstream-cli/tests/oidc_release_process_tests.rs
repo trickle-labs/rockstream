@@ -799,8 +799,7 @@ async fn start_delegated_control_process(
     start_delegated_control_process_with_management_address(
         working_dir,
         storage,
-        address,
-        management_address,
+        (address, management_address),
         pki,
         additional_principal,
         seed_worker_secret,
@@ -812,8 +811,7 @@ async fn start_delegated_control_process(
 async fn start_delegated_control_process_with_management_address(
     working_dir: &Path,
     storage: &Path,
-    address: std::net::SocketAddr,
-    management_address: std::net::SocketAddr,
+    (address, management_address): (std::net::SocketAddr, std::net::SocketAddr),
     pki: &rockstream_test_support::pki::TestPki,
     additional_principal: Option<SecurityPrincipal>,
     seed_worker_secret: bool,
@@ -2374,8 +2372,7 @@ async fn delegated_worker_secret_rechecks_actor_scope_in_release_control_process
     let mut process = start_delegated_control_process_with_management_address(
         temp.path(),
         &storage,
-        address,
-        management_address,
+        (address, management_address),
         &pki,
         Some(actor.clone()),
         true,
