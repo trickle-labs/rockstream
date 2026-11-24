@@ -129,6 +129,12 @@ enabled SCRAM login; startup rejects an unavailable or empty store. MD5 is not
 a release authentication mode. Enabling these startup paths does not satisfy
 the v0.73 ten-case release qualification gate by itself.
 
+OIDC accepts RS256 tokens up to 16 KiB. The JWKS response is limited to 1 MiB
+and 100 keys; cache entries expire within 60 seconds and honor a shorter issuer
+cache lifetime. Fetches time out after 5 seconds and make at most one retry
+after 250 milliseconds for transient transport, 429, or server errors. An
+expired key is never used after a failed refresh.
+
 Active `SUBSCRIBE` streams recheck the caller's current read authorization at
 one-second intervals before delivering pending or live rows. In durable
 security mode, a revoked grant produces a durable denial audit and closes that
