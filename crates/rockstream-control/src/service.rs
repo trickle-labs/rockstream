@@ -2588,18 +2588,6 @@ impl ManagementMigrationRuntime {
             return;
         }
         self.acquire_migration_pin(operation_id).await;
-        prepare_recipient_cache(
-            &self.data_plane,
-            &self.waiters,
-            target_sender,
-            target,
-            &self
-                .shard_manager
-                .get(shard_id)
-                .unwrap_or_else(|| lease.clone()),
-            operation_id,
-        )
-        .await;
         let anchors = {
             let mut state = self.data_plane.lock().await;
             match idle_handoff_anchors(&state, &self.shard_manager, shard_id) {
@@ -2644,6 +2632,21 @@ impl ManagementMigrationRuntime {
                 return;
             }
         }
+        // Freeze admission and prove durable idleness before awaiting cache I/O.
+        // Otherwise continuous ingestion can consume every idle window while the
+        // advisory prefetch runs, starving an otherwise eligible migration.
+        prepare_recipient_cache(
+            &self.data_plane,
+            &self.waiters,
+            target_sender,
+            target,
+            &self
+                .shard_manager
+                .get(shard_id)
+                .unwrap_or_else(|| lease.clone()),
+            operation_id,
+        )
+        .await;
         if let Err(error) = self
             .send_and_wait(
                 donor_sender,
@@ -2977,6 +2980,7 @@ impl ManagementMigrationRuntime {
     }
 
     async fn fail(&self, operation_id: &str, code: &str, message: &str) {
+        tracing::warn!(%operation_id, %code, %message, "shard migration failed");
         if let Err(error) = self
             .operations
             .transition(
@@ -3005,6 +3009,7 @@ impl ManagementMigrationRuntime {
             .flatten()
             .and_then(|record| record.phase().map(str::to_owned))
             .unwrap_or_else(|| "waiting_for_worker_connection".to_owned());
+        tracing::info!(%operation_id, %phase, %message, "shard migration waiting");
         if let Err(error) = self
             .operations
             .transition(
@@ -9673,6 +9678,134 @@ mod tests {
         assert_eq!(
             idle_handoff_anchors(&state, &manager, lease.shard_id),
             blocked
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_reserves_idle_handoff_before_awaiting_cache_preparation() {
+        let catalog = TopologyCatalog::new();
+        for id in [1, 2] {
+            let mut worker = WorkerRegistration::new(
+                WorkerId(id),
+                NodeRole::Worker,
+                format!("127.0.0.1:{}", 9000 + id),
+                CapacityHeadroom::new(0.8),
+            );
+            worker.capabilities.shared_shard_store_id = Some([7; 32]);
+            catalog.register(&worker);
+        }
+        let manager = ShardManager::new();
+        let mut lease = manager.acquire(ShardId(9), WorkerId(1)).unwrap();
+        lease
+            .heat_hint
+            .blocks
+            .push(rockstream_types::lease::SstBlockHeat {
+                storage_scope: "shards/9".into(),
+                object_path: "db/compacted/hot.sst".into(),
+                start: 0,
+                end: 4,
+                observed_at_ms: now_ms(),
+            });
+        manager.update_heat(lease.shard_id, lease.heat_hint.clone());
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let operations = ManagementOperationStore::new(store.clone());
+        let operation_id = "warm-migration-9";
+        operations
+            .accept_idempotent(
+                operation_id,
+                1,
+                &serde_json::json!({"shard_id": 9, "target_node_id": 2}),
+                operation_id.to_owned(),
+                crate::management_store::OperationKind::MigrateShard,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .unwrap();
+        let data_plane = Arc::new(AsyncMutex::new(DataPlaneState::default()));
+        let waiters = Arc::new(AsyncMutex::new(HashMap::new()));
+        let (donor_sender, mut donor_receiver) = mpsc::channel(4);
+        let (target_sender, mut target_receiver) = mpsc::channel(4);
+        let runtime = ManagementMigrationRuntime {
+            catalog,
+            shard_manager: manager.clone(),
+            data_plane: data_plane.clone(),
+            shard_store: None,
+            worker_senders: Arc::new(AsyncMutex::new(HashMap::from([
+                (WorkerId(1), donor_sender),
+                (WorkerId(2), target_sender),
+            ]))),
+            waiters: waiters.clone(),
+            operations: operations.clone(),
+            gc_pins: crate::checkpoint_store::GcPinStore::new(store),
+            started: Arc::new(AsyncMutex::new(HashSet::new())),
+            raft: None,
+        };
+        let migration = tokio::spawn(async move {
+            runtime.execute(ShardId(9), WorkerId(2), operation_id).await;
+        });
+        let message = tokio::time::timeout(Duration::from_secs(2), target_receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(message, ControlMessage::WarmShardCache { .. }));
+        // The cache round trip must not open a window for new epoch admission.
+        assert!(
+            data_plane
+                .lock()
+                .await
+                .handoff_shards
+                .contains(&lease.shard_id)
+        );
+        assert_eq!(manager.get(lease.shard_id), Some(lease.clone()));
+        waiters
+            .lock()
+            .await
+            .remove(&format!("{operation_id}:prefetch"))
+            .unwrap()
+            .send(WorkerMessage::ShardTransferAck {
+                operation_id: operation_id.to_owned(),
+                stage: "prefetch".into(),
+                worker_id: WorkerId(2),
+                shard_id: lease.shard_id,
+                lease_token: lease.lease_token,
+                success: true,
+                error: None,
+            })
+            .unwrap();
+        let message = tokio::time::timeout(Duration::from_secs(2), donor_receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            message,
+            ControlMessage::PrepareShardTransfer { .. }
+        ));
+        // A donor refusal must release admission without changing ownership.
+        waiters
+            .lock()
+            .await
+            .remove(&format!("{operation_id}:donor"))
+            .unwrap()
+            .send(WorkerMessage::ShardTransferAck {
+                operation_id: operation_id.to_owned(),
+                stage: "donor".into(),
+                worker_id: WorkerId(1),
+                shard_id: lease.shard_id,
+                lease_token: lease.lease_token,
+                success: false,
+                error: Some("test donor refusal".into()),
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), migration)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(data_plane.lock().await.handoff_shards.is_empty());
+        assert_eq!(manager.get(lease.shard_id), Some(lease));
+        assert_eq!(
+            operations.get(operation_id).await.unwrap().unwrap().status(),
+            OperationStatus::Failed
         );
     }
 
