@@ -214,6 +214,16 @@ authenticated management API instead.
 - `rockstream --management <addr> support artifact create [--node-id <id>] [--idempotency-key <uuid>]` — Create a sanitized cluster- or node-scoped artifact through the authenticated management API. The client prints its idempotency UUID before sending the request; reuse that UUID to retry or reconcile.
 - `rockstream --management <addr> support artifact download <opaque-id> --out <path>` — Download the artifact to a local file while it remains available.
 
+Creation requires current `SupportGenerate` authority on the requested scope.
+Downloads require the creating principal, artifact-download authority, and
+current authority on the artifact's original scope. Opaque IDs expire after 10
+minutes; each artifact is limited to 10 MiB, and each deployment rejects new
+generation at 2,048 artifacts or 100 MiB rather than evicting unexpired data.
+Expired and orphaned data is cleaned within 60 seconds. Artifact operations are
+disabled when the object store lacks atomic conditional writes, and startup
+fails closed before listeners open if it cannot list artifacts for recovery.
+See the [security guide](security.md) for audit and storage recovery details.
+
 ---
 
 ### `rockstream resource`
