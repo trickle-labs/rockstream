@@ -176,6 +176,7 @@ struct DataPlaneState {
     direct_completing: HashMap<WorkloadId, SourceEpochMetadata>,
     /// At most one latest receipt per deployed workload; redeployment clears it.
     direct_completed: HashMap<WorkloadId, SourceEpochMetadata>,
+    adaptive_events: HashMap<WorkloadId, std::collections::VecDeque<serde_json::Value>>,
     direct_grant_waiters: HashMap<uuid::Uuid, mpsc::Sender<(WorkerId, bool)>>,
     shard_loads: HashMap<ShardId, (LeaseToken, u64, u64)>,
     deployments: HashMap<WorkloadId, DeploymentState>,
@@ -329,6 +330,28 @@ struct WorkloadReadWaiter {
     expected_shards: HashMap<WorkerId, HashMap<ShardId, LeaseToken>>,
     received_workers: HashSet<WorkerId>,
     sender: mpsc::Sender<(WorkerId, bool, Vec<ShardOutput>)>,
+}
+
+fn remember_adaptive_event(
+    state: &mut DataPlaneState,
+    workload: WorkloadId,
+    mut event: serde_json::Value,
+) {
+    const MAX_EVENT_BYTES: usize = 256 * 1024;
+    if serde_json::to_vec(&event).is_ok_and(|bytes| bytes.len() > MAX_EVENT_BYTES) {
+        event = serde_json::json!({"action":event.get("action"),"epoch":event.get("epoch"),"generation":event.get("generation"),"details_in_durable_audit":true});
+    }
+    let events = state.adaptive_events.entry(workload).or_default();
+    events.push_back(event);
+    while events.len() > 32
+        || events
+            .iter()
+            .map(|event| serde_json::to_vec(event).map_or(MAX_EVENT_BYTES, |bytes| bytes.len()))
+            .sum::<usize>()
+            > MAX_EVENT_BYTES
+    {
+        events.pop_front();
+    }
 }
 
 fn workload_topology_snapshot(
@@ -1962,6 +1985,11 @@ impl AutomaticRebalanceRuntime {
             "draining": decision.draining,
             "automatic": true,
         });
+        remember_adaptive_event(
+            &mut *self.migration.data_plane.lock().await,
+            workload_id,
+            serde_json::json!({"action":"shard.auto_rebalance", "decision":request.clone()}),
+        );
         if let Some(audit) = &self.audit {
             let event = AuditEvent::now(
                 "control",
@@ -5169,6 +5197,7 @@ fn is_gateway_data_plane_message(message: &WorkerMessage) -> bool {
             | WorkerMessage::DeployWorkloadSharded { .. }
             | WorkerMessage::SubmitSourceDelta(_)
             | WorkerMessage::AuthorizeSourceEpoch { .. }
+            | WorkerMessage::ReadAdaptiveDiagnostics { .. }
             | WorkerMessage::ReadOperatorStats { .. }
             | WorkerMessage::ReadWorkload { .. }
             | WorkerMessage::GetWorkloadTopology { .. }
@@ -5238,6 +5267,7 @@ async fn gateway_data_plane_scope(
             ))
         }
         WorkerMessage::ReadWorkload { workload_id, .. }
+        | WorkerMessage::ReadAdaptiveDiagnostics { workload_id }
         | WorkerMessage::ReadOperatorStats { workload_id, .. }
         | WorkerMessage::GetWorkloadTopology { workload_id } => {
             let state = data_plane.lock().await;
@@ -7324,6 +7354,23 @@ async fn handle_connection_stream<R, W>(
                 .await;
                 send_message(&sender, &reply).await;
             }
+            WorkerMessage::ReadAdaptiveDiagnostics { workload_id } => {
+                let events = data_plane
+                    .lock()
+                    .await
+                    .adaptive_events
+                    .get(&workload_id)
+                    .map(|events| events.iter().cloned().collect())
+                    .unwrap_or_default();
+                send_message(
+                    &sender,
+                    &ControlMessage::AdaptiveDiagnostics {
+                        workload_id,
+                        events,
+                    },
+                )
+                .await;
+            }
             WorkerMessage::DirectEpochGrantInstalled {
                 worker_id,
                 grant_id,
@@ -7900,10 +7947,11 @@ async fn handle_connection_stream<R, W>(
                 anchor_shard_id,
                 anchor_lease_token,
                 epoch,
+                generation,
                 request_id,
                 input_digest,
+                decision,
                 shard_leases,
-                ..
             } => {
                 if connected_worker_id != Some(worker_id) || shard_leases.len() > 4096 {
                     continue;
@@ -7943,6 +7991,20 @@ async fn handle_connection_stream<R, W>(
                         revoke_direct_grants(&metadata, None, &targets, &worker_senders).await;
                         let mut state = data_plane.lock().await;
                         release_completed_direct_reservation(&mut state, &metadata);
+                    }
+                    let event = serde_json::json!({"action":"routing.committed","generation":generation,"epoch":epoch,"decision":decision});
+                    if serde_json::to_vec(&event).is_ok_and(|bytes| bytes.len() <= 1024 * 1024) {
+                        if let Some(audit) = &audit {
+                            let _ = audit.append(
+                                &AuditEvent::now(
+                                    "control",
+                                    "routing.committed",
+                                    workload_id.to_string(),
+                                )
+                                .with_detail(event.to_string()),
+                            );
+                        }
+                        remember_adaptive_event(&mut *data_plane.lock().await, workload_id, event);
                     }
                     if let Some(runtime) = &automatic_rebalance {
                         runtime.committed(workload_id, epoch, &members).await;

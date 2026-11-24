@@ -366,6 +366,8 @@
     "rockstream-sql::test/lfs_catalog::register_workload_survives_restart_minio_tc": "Ignored placeholder (empty body), not a MinIO proof; must implement real assertions before treating as mandatory.",
     "rockstream-sql::test/lfs_catalog::index_point_lookup_minio_tc": "Ignored placeholder (empty body), not a MinIO proof; must implement real assertions before treating as mandatory.",
     "rockstream-sql::test/lfs_catalog::index_backfill_minio_tc": "Ignored placeholder (empty body), not a MinIO proof; must implement real assertions before treating as mandatory.",
-    "rockstream-storage::test/enospc_recovery_tests::dm_log_writes_replays_the_exact_post_ack_epoch": "Requires Linux root and dm-log-writes device-mapper support; the dedicated post-ack-block-crash workflow runs this ignored case and captures source-bound recovery evidence, so the ordinary package shard does not execute it."
+    "rockstream-storage::test/enospc_recovery_tests::dm_log_writes_replays_the_exact_post_ack_epoch": "Requires Linux root and dm-log-writes device-mapper support; the dedicated post-ack-block-crash workflow runs this ignored case and captures source-bound recovery evidence, so the ordinary package shard does not execute it.",
+    "rockstream-cli::test/automatic_skew_process_tests::four_process_skew_p99_is_within_twice_uniform": "Requires a release build and 100 measured epochs per profile. The dedicated automatic-skew-qualification workflow executes this ignored case with exact oracle and source-bound measured evidence; ordinary package execution is not a performance pass.",
+    "rockstream-cli::test/automatic_skew_process_tests::shared_store_two_to_four_to_two_workers_preserves_exact_output": "Requires real Docker/MinIO and separate worker processes. The dedicated automatic-skew-qualification workflow executes this ignored case; ordinary package execution does not count as shared-store movement qualification."
   }
 }

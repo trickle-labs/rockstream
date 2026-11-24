@@ -702,6 +702,28 @@ impl DataPlaneClient {
         .await
     }
 
+    /// Bounded runtime decisions visible through the same delegated view-read
+    /// policy as EXPLAIN ANALYZE. Raw source values are never returned here.
+    pub async fn adaptive_diagnostics(
+        &self,
+        workload_id: WorkloadId,
+        actor_assertion: Option<&str>,
+    ) -> io::Result<Vec<serde_json::Value>> {
+        match self
+            .request_with_assertion(
+                WorkerMessage::ReadAdaptiveDiagnostics { workload_id },
+                actor_assertion,
+            )
+            .await?
+        {
+            ControlMessage::AdaptiveDiagnostics {
+                workload_id: actual,
+                events,
+            } if actual == workload_id => Ok(events),
+            response => Err(Self::unexpected(response)),
+        }
+    }
+
     async fn routing_command<T: serde::Serialize, R: serde::de::DeserializeOwned>(
         &self,
         topology: &WorkloadTopologySnapshot,

@@ -4998,6 +4998,7 @@ dependencies = [
  "rockstream-gateway",
  "rockstream-management-proto",
  "rockstream-ops",
+ "rockstream-oracle",
  "rockstream-plan",
  "rockstream-runtime",
  "rockstream-sim",
