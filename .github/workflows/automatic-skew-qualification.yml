@@ -29,7 +29,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_RELEASE_DEBUG: "0"
       ROCKSTREAM_REQUIRE_DOCKER: "1"
-      ROCKSTREAM_SKEW_EVIDENCE_PATH: target/automatic-skew/latency.json
+      ROCKSTREAM_SKEW_EVIDENCE_PATH: ${{ github.workspace }}/target/automatic-skew/latency.json
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -49,6 +49,8 @@ jobs:
           cargo test --locked -p rockstream-storage --lib heat_cache
       - name: Qualify real worker processes, crash replay, p99, and 2 to 4 to 2 movement
         run: cargo test --locked --release -p rockstream-cli --test automatic_skew_process_tests -- --include-ignored --test-threads=1
+      - name: Require measured latency evidence
+        run: test -s "$ROCKSTREAM_SKEW_EVIDENCE_PATH"
       - name: Record source revision for measured evidence
         if: always()
         run: |

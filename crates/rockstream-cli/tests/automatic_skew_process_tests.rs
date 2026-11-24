@@ -168,7 +168,10 @@ impl ProcessCluster {
     }
 
     fn logs(&self) -> String {
-        let mut files = vec![self.root.path().join("control.log")];
+        let mut files = vec![
+            self.root.path().join("control.log"),
+            self.root.path().join("control").join("audit.jsonl"),
+        ];
         files.extend(
             (1..=self.workers.len()).map(|id| self.root.path().join(format!("worker-{id}.log"))),
         );
@@ -677,22 +680,26 @@ async fn shared_store_two_to_four_to_two_workers_preserves_exact_output() {
             }
             input.extend(rows.iter().map(|(key, value, _)| (*key, *value)));
             loop {
-                if let Ok(snapshot) = client.read_workload(workload).await {
-                    let expected =
-                        rockstream_oracle::aggregate_oracle::run_datafusion_aggregate(&input)
-                            .await
-                            .unwrap()
-                            .into_iter()
-                            .map(|(key, sum, _, _)| (format!("{key}\t{sum}"), 1))
-                            .collect::<BTreeMap<_, _>>();
-                    assert_eq!(materialized_rows(&snapshot), expected);
-                    break;
+                match client.read_workload(workload).await {
+                    Ok(snapshot) => {
+                        let expected =
+                            rockstream_oracle::aggregate_oracle::run_datafusion_aggregate(&input)
+                                .await
+                                .unwrap()
+                                .into_iter()
+                                .map(|(key, sum, _, _)| (format!("{key}\t{sum}"), 1))
+                                .collect::<BTreeMap<_, _>>();
+                        assert_eq!(materialized_rows(&snapshot), expected);
+                        break;
+                    }
+                    Err(error) => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "handoff withheld snapshots indefinitely at epoch {epoch}: {error}; {}",
+                            cluster.logs()
+                        );
+                    }
                 }
-                assert!(
-                    Instant::now() < deadline,
-                    "handoff withheld snapshots indefinitely: {}",
-                    cluster.logs()
-                );
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
             if let Ok(topology) = client.get_workload_topology(workload).await {
