@@ -668,6 +668,32 @@ mod tests {
     }
 
     #[test]
+    fn service_principal_can_retain_consumer_scoped_grants_without_interactive_login() {
+        let principal = SecurityPrincipal {
+            format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+            id: PrincipalId(10),
+            display_name: "warehouse connector".to_owned(),
+            enabled: true,
+            revision: 1,
+            login_methods: vec![LoginMethod::Service {
+                service_id: "connector/warehouse".to_owned(),
+            }],
+            preset_grants: vec![],
+            scoped_grants: vec![ScopedActionGrant {
+                action: SecurityAction::SecretUse,
+                scope: PolicyScope::Secret {
+                    namespace: "sales".to_owned(),
+                    name: "warehouse_password".to_owned(),
+                    consumer: Some(PrincipalId(10)),
+                },
+            }],
+        };
+
+        assert!(!principal.has_interactive_login());
+        assert_eq!(principal.validate(), Ok(()));
+    }
+
+    #[test]
     fn oidc_login_identity_is_the_issuer_and_subject_pair() {
         let principal = SecurityPrincipal {
             format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
