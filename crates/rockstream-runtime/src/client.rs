@@ -60,6 +60,18 @@ impl WorkerDeployment {
     }
 }
 
+/// Active-shard state and workload deployments can hold clones of one writer.
+/// A close affects every clone, so a handoff or drain must visit it only once.
+fn unique_shard_databases(databases: Vec<ShardDb>) -> Vec<ShardDb> {
+    let mut unique: Vec<ShardDb> = Vec::with_capacity(databases.len());
+    for db in databases {
+        if !unique.iter().any(|existing| existing.same_open_instance(&db)) {
+            unique.push(db);
+        }
+    }
+    unique
+}
+
 /// The caller holds the deployment's execution gate. Journal presence is
 /// authoritative even when control has restarted and lost its in-flight map.
 async fn validate_idle_journals(deployment: &WorkerDeployment) -> Result<(), String> {
@@ -1338,6 +1350,31 @@ mod data_plane_tests {
 
     use super::*;
     use rockstream_types::ids::OperatorId;
+
+    #[tokio::test]
+    async fn handoff_flushes_and_closes_each_open_writer_once() {
+        // The active-shard map keeps a clone of the deployment's writer.
+        // An independent database can use the same path on another store.
+        let first = ShardDb::builder("db", Arc::new(object_store::memory::InMemory::new()))
+            .build()
+            .await
+            .unwrap();
+        let second = ShardDb::builder("db", Arc::new(object_store::memory::InMemory::new()))
+            .build()
+            .await
+            .unwrap();
+        let active = first.clone();
+        assert!(first.same_open_instance(&active));
+        assert!(!first.same_open_instance(&second));
+        let databases = unique_shard_databases(vec![first, active, second]);
+        assert_eq!(databases.len(), 2);
+        for db in &databases {
+            db.flush().await.unwrap();
+        }
+        for db in databases {
+            db.close().await.unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn direct_grant_installation_checks_durable_pending_after_draining_execution() {
@@ -3847,7 +3884,7 @@ where
                         }
                     }
                     let mut flushed = true;
-                    for db in databases {
+                    for db in unique_shard_databases(databases) {
                         if let Err(error) = db.flush().await {
                             tracing::error!(code = %rockstream_types::error_code::RS_0001, worker = %id, %error, "worker drain stopped because shard flush failed");
                             flushed = false;
@@ -4117,8 +4154,8 @@ where
                     };
                     let (available, shards) = match result {
                         Ok(shards) => (true, shards),
-                        Err(_) => {
-                            tracing::warn!(%workload_id, "worker workload read unavailable");
+                        Err(error) => {
+                            tracing::warn!(%workload_id, %error, "worker workload read unavailable");
                             (false, Vec::new())
                         }
                     };
@@ -4474,12 +4511,6 @@ where
                                 validate_idle_journals(deployment).await?;
                                 gates.push(gate);
                             }
-                            // A direct request that already captured an Arc must fail
-                            // after waking, even after these gates are released.
-                            for gate in &mut gates {
-                                **gate = true;
-                            }
-                            actor_registry_clone.revoke(lease.shard_id);
                             let mut databases: Vec<_> = deployed
                                 .iter()
                                 .map(|deployment| deployment.db.as_ref().clone())
@@ -4491,10 +4522,21 @@ where
                             {
                                 databases.push(db);
                             }
-                            for db in databases {
+                            let databases = unique_shard_databases(databases);
+                            // Flush all distinct writers before changing readiness. A flush
+                            // failure must not leave an otherwise live donor revoked.
+                            for db in &databases {
                                 db.flush()
                                     .await
                                     .map_err(|error| format!("shard flush failed: {error}"))?;
+                            }
+                            // A direct request that already captured an Arc must fail
+                            // after waking, even after these gates are released.
+                            for gate in &mut gates {
+                                **gate = true;
+                            }
+                            actor_registry_clone.revoke(lease.shard_id);
+                            for db in databases {
                                 db.close()
                                     .await
                                     .map_err(|error| format!("shard close failed: {error}"))?;
@@ -4511,6 +4553,14 @@ where
                         }
                         .await
                     };
+                    if let Err(error) = &result {
+                        tracing::warn!(
+                            %operation_id,
+                            shard_id = ?lease.shard_id,
+                            %error,
+                            "worker shard transfer preparation refused"
+                        );
+                    }
                     let _ = msg_tx
                         .send(WorkerMessage::ShardTransferAck {
                             operation_id,

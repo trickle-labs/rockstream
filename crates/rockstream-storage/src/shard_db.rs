@@ -578,6 +578,14 @@ impl Drop for ShardDb {
 }
 
 impl ShardDb {
+    /// Whether two handles refer to the same open database instance.
+    ///
+    /// Cloning a ShardDb shares its writer and epoch state; separately opened
+    /// databases may have the same path and must not be treated as aliases.
+    pub fn same_open_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.last_epoch, &other.last_epoch)
+    }
+
     /// Return the shared storage context if configured for this shard.
     pub fn storage_context(&self) -> Option<&Arc<crate::storage_context::WorkerStorageContext>> {
         self.storage_context.as_ref()
