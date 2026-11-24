@@ -728,7 +728,7 @@ async fn management_rejects_stale_grantor_revision_without_changing_grants() {
     let server = auth.start_management(service).await;
     let mut client = auth.client(server.addr).await;
 
-    let mut concurrent_catalog =
+    let concurrent_catalog =
         DurableCatalogStore::recover(auth.store.clone(), "management-security")
             .await
             .unwrap();
