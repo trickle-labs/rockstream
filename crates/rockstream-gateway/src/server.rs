@@ -10888,7 +10888,7 @@ impl GatewayHandler {
                             .map(|session| session.current_namespace.clone())
                     })
                     .unwrap_or_else(|| "public".to_owned());
-                let request = DeploymentRequest {
+                let mut request = DeploymentRequest {
                     version: DEPLOYMENT_DESCRIPTOR_VERSION,
                     workload_id: WorkloadId(stable_name_id("workload", &view_name)),
                     namespace: namespace.clone(),
@@ -10932,6 +10932,7 @@ impl GatewayHandler {
                     merge_key_columns,
                     routing_columns,
                 };
+                configure_join_result_merge(&mut request);
                 let worker_request =
                     rockstream_types::topology::WorkerMessage::DeployWorkload(request.clone());
                 let assertion = self
@@ -20138,6 +20139,26 @@ fn deployment_routing(
         .or_else(|| join_routing_columns(plan).map(|routing| (routing, Vec::new())))
 }
 
+/// Salted join-key SUM/COUNT groups have one partial result per owning shard.
+/// The runtime's executable eligibility check supplies their actual projected
+/// output group columns; plain joins retain weighted-bag concatenation.
+fn configure_join_result_merge(request: &mut DeploymentRequest) {
+    let topology = rockstream_types::data_plane::WorkloadTopologySnapshot {
+        topology_epoch: 0,
+        workload_id: request.workload_id,
+        plan_json: request.plan_json.clone(),
+        routing_columns: request.routing_columns.clone(),
+        schemas: request.schemas.clone(),
+        shards: Vec::new(),
+        workers: Vec::new(),
+    };
+    if let Some(columns) =
+        rockstream_runtime::skew_join::join_merge_key_columns(&request.plan_json, &topology)
+    {
+        request.merge_key_columns = columns;
+    }
+}
+
 fn runtime_rows_for_table(table: &str, ops: &[DmlOp]) -> Vec<RuntimeRow> {
     let mut rows = Vec::new();
     for op in ops {
@@ -20554,6 +20575,140 @@ mod distributed_workload_snapshot_tests {
                 Some((BTreeMap::from([("items".to_owned(), 1)]), vec![0]))
             );
         }
+        Ok(())
+    }
+
+    async fn sql_join_snapshot(
+        sql: &str,
+        output_columns: &[&str],
+        rows_by_shard: &[&[(&str, i64)]],
+    ) -> Result<WorkloadSnapshot, Box<dyn std::error::Error>> {
+        let frontend = SqlFrontend::new();
+        // Unused source columns force the real optimizer to project each
+        // input, so deployment must resolve the raw key column through it.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("unused", DataType::Int64, false),
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        for relation in ["a", "b"] {
+            frontend.register_table(relation, Arc::clone(&schema))?;
+        }
+        let plan = rockstream_plan::PlanNode::ViewSink {
+            view_name: "view".to_owned(),
+            pk: (0..output_columns.len()).collect(),
+            child: Box::new(frontend.sql_to_plan_node(sql).await?),
+        };
+        let (routing_columns, merge_key_columns) = deployment_routing(&plan)
+            .ok_or_else(|| std::io::Error::other(format!("unroutable SQL plan: {plan:?}")))?;
+        let mut snapshot = snapshot(true);
+        snapshot.deployment.plan_json = serde_json::to_string(&plan)?;
+        snapshot.deployment.routing_columns = routing_columns;
+        snapshot.deployment.merge_key_columns = merge_key_columns;
+        snapshot.deployment.output_columns = output_columns.iter().map(|s| (*s).into()).collect();
+        snapshot.deployment.primary_key = (0..output_columns.len()).collect();
+        snapshot.deployment.schemas = ["a", "b"]
+            .into_iter()
+            .map(|relation| DeploymentSchema {
+                relation: relation.into(),
+                columns: ["unused", "k", "v"]
+                    .into_iter()
+                    .map(|name| DeploymentColumn {
+                        name: name.into(),
+                        data_type: "bigint".into(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        configure_join_result_merge(&mut snapshot.deployment);
+        snapshot.shards = rows_by_shard
+            .iter()
+            .enumerate()
+            .map(|(index, rows)| ShardOutput {
+                committed_epoch: None,
+                routing_epoch: None,
+                shard_id: ShardId(index as u64 + 1),
+                lease_token: Some(LeaseToken(1)),
+                deltas: Vec::new(),
+                rows: rows
+                    .iter()
+                    .map(|(values_tsv, weight)| RuntimeRow {
+                        values_tsv: (*values_tsv).into(),
+                        weight: *weight,
+                    })
+                    .collect(),
+            })
+            .collect();
+        Ok(snapshot)
+    }
+
+    #[tokio::test]
+    async fn sql_join_sum_partials_merge_by_the_projected_group(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot = sql_join_snapshot(
+            "SELECT a.k, SUM(a.v) FROM a JOIN b ON a.k = b.k GROUP BY a.k",
+            &["k", "sum"],
+            &[&[("7\t10", 1), ("8\t-5", 1)], &[("7\t20", 1), ("8\t2", 1)]],
+        )
+        .await?;
+        assert_eq!(
+            snapshot.deployment.routing_columns,
+            BTreeMap::from([("a".to_owned(), 1), ("b".to_owned(), 1)])
+        );
+        assert_eq!(
+            snapshot.deployment.merge_key_columns,
+            vec![0],
+            "plan: {}",
+            snapshot.deployment.plan_json
+        );
+        assert_eq!(
+            merge_workload_snapshot(&snapshot)?,
+            vec![b"7\t30".to_vec(), b"8\t-3".to_vec()]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_join_count_partials_merge_after_output_reordering(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot = sql_join_snapshot(
+            "SELECT COUNT(*), a.k FROM a JOIN b ON a.k = b.k GROUP BY a.k",
+            &["count", "k"],
+            &[&[("3\t7", 1), ("2\t8", 1)], &[("4\t7", 1)]],
+        )
+        .await?;
+        assert_eq!(
+            snapshot.deployment.merge_key_columns,
+            vec![1],
+            "plan: {}",
+            snapshot.deployment.plan_json
+        );
+        assert_eq!(
+            merge_workload_snapshot(&snapshot)?,
+            vec![b"7\t7".to_vec(), b"2\t8".to_vec()]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_plain_join_keeps_exact_bag_multiplicity() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let snapshot = sql_join_snapshot(
+            "SELECT a.k, a.v, b.v FROM a JOIN b ON a.k = b.k",
+            &["k", "left_value", "right_value"],
+            &[&[("7\t3\t4", 2)], &[("7\t3\t4", 1), ("8\t5\t6", 1)]],
+        )
+        .await?;
+        assert_eq!(snapshot.deployment.merge_key_columns, Vec::<usize>::new());
+        assert_eq!(
+            merge_workload_snapshot(&snapshot)?,
+            vec![
+                b"7\t3\t4".to_vec(),
+                b"7\t3\t4".to_vec(),
+                b"7\t3\t4".to_vec(),
+                b"8\t5\t6".to_vec(),
+            ]
+        );
         Ok(())
     }
 }

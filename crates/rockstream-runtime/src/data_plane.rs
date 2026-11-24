@@ -595,6 +595,7 @@ impl DataPlaneClient {
                 let payload = crate::exchange::serialization::serialize_zset(&zset)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 let owner_context = RuntimeExchangeMessage {
+                    join_bootstrap: None,
                     attempt_id: None,
                     version: request.version,
                     request_id: request.request_id.clone(),
@@ -756,6 +757,8 @@ impl DataPlaneClient {
         request: &SourceDeltaRequest,
     ) -> io::Result<bool> {
         use crate::skew_routing::{RoutingEpochRecord, RoutingOperation, RoutingSnapshot};
+        let join_eligible =
+            crate::skew_join::join_merge_key_columns(&topology.plan_json, topology).is_some();
         if topology.shards.is_empty() {
             return Ok(false);
         }
@@ -770,6 +773,18 @@ impl DataPlaneClient {
                 &serde_json::Value::Null,
             )
             .await?;
+        // An existing join cannot start a low-side snapshot halfway through
+        // its history. Only a journal initialized before the first durable
+        // input can safely promote without scanning the old arrangements.
+        let legacy_join = join_eligible
+            && (snapshot
+                .state
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("join_tracking_disabled")
+                || (snapshot.state.is_null()
+                    && snapshot.pending.is_none()
+                    && snapshot.anchor_frontier > 0));
         if let Some(completed) = &snapshot.completed {
             if crate::skew_routing::matches_request(completed, request).map_err(io::Error::other)? {
                 // Authorization may have installed a new control reservation
@@ -789,18 +804,70 @@ impl DataPlaneClient {
             }
             pending
         } else {
-            let planned = crate::skew_aggregate::prepare_aggregate_epoch(
-                Some(&snapshot.state),
-                request,
-                topology,
-            )
-            .map_err(io::Error::other)?;
-            let (plan, next_state) = match planned {
-                Some(planned) => (planned.plan, planned.next_state),
-                None => (
-                    serde_json::json!({"kind":"passthrough","reason":"operands_not_admitted"}),
-                    serde_json::Value::Null,
-                ),
+            let (plan, next_state, point_mutations) = if legacy_join {
+                (
+                    serde_json::json!({"kind":"passthrough","reason":"join_history_predates_routing_journal"}),
+                    serde_json::json!({"kind":"join_tracking_disabled","reason":"incomplete_historical_low_snapshot"}),
+                    BTreeMap::new(),
+                )
+            } else if join_eligible {
+                let keys =
+                    crate::skew_join::join_state_keys(request, topology, &topology.plan_json)
+                        .map_err(io::Error::other)?;
+                let mut points: BTreeMap<String, serde_json::Value> = self
+                    .routing_command(
+                        topology,
+                        anchor,
+                        request.epoch,
+                        RoutingOperation::GetMany,
+                        &keys,
+                    )
+                    .await?;
+                let scans = crate::skew_join::join_fallback_scans(
+                    &points,
+                    request,
+                    topology,
+                    &topology.plan_json,
+                )
+                .map_err(io::Error::other)?;
+                if !scans.is_empty() {
+                    let proofs: BTreeMap<String, serde_json::Value> = self
+                        .routing_command(
+                            topology,
+                            anchor,
+                            request.epoch,
+                            RoutingOperation::JoinRowStats,
+                            &scans,
+                        )
+                        .await?;
+                    points.extend(proofs);
+                }
+                let previous = (!snapshot.state.is_null()).then_some(&snapshot.state);
+                let planned = crate::skew_join::prepare_join_epoch(
+                    previous,
+                    &points,
+                    request,
+                    topology,
+                    &topology.plan_json,
+                )
+                .map_err(io::Error::other)?
+                .ok_or_else(|| io::Error::other("eligible join lost its routing specification"))?;
+                (planned.plan, planned.next_state, planned.point_mutations)
+            } else {
+                let planned = crate::skew_aggregate::prepare_aggregate_epoch(
+                    Some(&snapshot.state),
+                    request,
+                    topology,
+                )
+                .map_err(io::Error::other)?;
+                match planned {
+                    Some(planned) => (planned.plan, planned.next_state, BTreeMap::new()),
+                    None => (
+                        serde_json::json!({"kind":"passthrough","reason":"operands_not_admitted"}),
+                        serde_json::Value::Null,
+                        BTreeMap::new(),
+                    ),
+                }
             };
             let record = RoutingEpochRecord {
                 version: crate::skew_routing::ROUTING_VERSION,
@@ -817,7 +884,7 @@ impl DataPlaneClient {
                 shard_ids: shards.clone(),
                 plan,
                 next_state,
-                point_mutations: BTreeMap::new(),
+                point_mutations,
             };
             let prepared: RoutingSnapshot = self
                 .routing_command(
@@ -876,12 +943,34 @@ impl DataPlaneClient {
                 )
                 .map_err(io::Error::other)?;
             }
-            raw
+            raw.into_iter()
+                .map(|(shard, rows)| {
+                    (
+                        shard,
+                        crate::skew_join::JoinShardBatch {
+                            rows,
+                            bootstrap: None,
+                        },
+                    )
+                })
+                .collect()
+        } else if record.plan.get("kind").and_then(serde_json::Value::as_str)
+            == Some("heavy_light_join/v1")
+        {
+            crate::skew_join::route_join_epoch(&record.plan, request).map_err(io::Error::other)?
         } else if record.plan.get("kind").and_then(serde_json::Value::as_str) == Some("passthrough")
         {
             Self::partition_request(topology, request)?
                 .into_iter()
-                .map(|(shard, rows)| (shard.shard_id, rows))
+                .map(|(shard, rows)| {
+                    (
+                        shard.shard_id,
+                        crate::skew_join::JoinShardBatch {
+                            rows,
+                            bootstrap: None,
+                        },
+                    )
+                })
                 .collect()
         } else {
             return Err(io::Error::other(
@@ -892,18 +981,23 @@ impl DataPlaneClient {
         // no rows. The completion certificate therefore describes a complete
         // membership frontier, not the maximum progress of one worker.
         for shard in &shards {
-            routed.entry(*shard).or_default();
+            routed
+                .entry(*shard)
+                .or_insert_with(|| crate::skew_join::JoinShardBatch {
+                    rows: Vec::new(),
+                    bootstrap: None,
+                });
         }
         let schemas = crate::client::deployment_schemas_from_slice(&topology.schemas)?;
         let schema = schemas
             .get(&request.source)
             .cloned()
-            .ok_or_else(|| io::Error::other("unknown aggregate source"))?;
+            .ok_or_else(|| io::Error::other("unknown routed source"))?;
         let results = futures::stream::iter(routed)
-            .map(|(shard, rows)| {
+            .map(|(shard, batch)| {
                 let schema = schema.clone();
                 async move {
-                    self.send_skew_final(topology, request, shard, rows, schema)
+                    self.send_skew_final(topology, request, shard, batch, schema)
                         .await
                 }
             })
@@ -961,7 +1055,7 @@ impl DataPlaneClient {
         topology: &WorkloadTopologySnapshot,
         request: &SourceDeltaRequest,
         shard_id: ShardId,
-        rows: Vec<RuntimeRow>,
+        batch: crate::skew_join::JoinShardBatch,
         schema: arrow::datatypes::SchemaRef,
     ) -> io::Result<()> {
         let shard = topology
@@ -969,10 +1063,10 @@ impl DataPlaneClient {
             .iter()
             .find(|shard| shard.shard_id == shard_id)
             .ok_or_else(|| io::Error::other("RS-3004: final shard absent"))?;
-        let input = crate::client::rows_to_zset(&rows, schema)?;
+        let input = crate::client::rows_to_zset(&batch.rows, schema)?;
         let payload =
             crate::exchange::serialization::serialize_zset(&input).map_err(io::Error::other)?;
-        let owner = RuntimeExchangeMessage {
+        let mut owner = RuntimeExchangeMessage {
             attempt_id: None,
             version: request.version,
             request_id: request.request_id.clone(),
@@ -983,8 +1077,26 @@ impl DataPlaneClient {
             lease_token: shard.lease_token,
             source: request.source.clone(),
             rows: Vec::new(),
+            join_bootstrap: batch.bootstrap,
         };
+        if owner.join_bootstrap.is_some() {
+            // Large low-side snapshots belong in the flow-controlled payload,
+            // not in HTTP/2 metadata. The worker still uses execute_frame's
+            // single arrangement/output/frontier/replay transaction.
+            owner.rows = batch.rows;
+            let _: serde_json::Value = self
+                .routing_command(
+                    topology,
+                    shard_id,
+                    request.epoch,
+                    crate::skew_routing::RoutingOperation::JoinExecute,
+                    &owner,
+                )
+                .await?;
+            return Ok(());
+        }
         let context = self.owned_context(&owner)?;
+
         let row_count = u32::try_from(input.num_rows()).map_err(io::Error::other)?;
         let frame = crate::exchange::proto::ShuffleFrame {
             exchange_id: request.workload_id.0,

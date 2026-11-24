@@ -26,6 +26,7 @@ pub use epoch_compaction::{
 };
 pub mod secrets;
 pub mod shard_actor;
+pub mod skew_join;
 pub mod tls;
 pub use client::{
     execute_frame, setup_test_deployment, start_worker_client,

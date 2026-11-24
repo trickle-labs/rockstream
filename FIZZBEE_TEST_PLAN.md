@@ -1440,6 +1440,32 @@ telemetry updates do not stale a valid handoff and stale owners remain fenced.
 `heat_updates_do_not_invalidate_a_fenced_handoff` cover these implementation
 boundaries; the proposal adds no M4/M6 ownership action or invariant.
 
+Issue #403 heavy/light join routing records a prepared source epoch before
+fanout and applies its per-key and salted-row point mutations only after every
+target acknowledges the durable epoch. Promotion retains historical high-side
+rows on their original shard and installs the bounded low-side snapshot in the
+same worker commit as the first salted delta. Replay includes that snapshot in
+the execution identity; a changed replay cannot seed it twice. A key's high
+side and shard identities remain fixed while live; the bounded bootstrap
+snapshot is discarded after promotion and later low deltas stream normally.
+Source-row ledger storage uses point records, so its total cardinality is
+independent of the per-epoch memory budget. Arithmetic admission proves
+absolute weighted join contribution bounds before SUM/COUNT regrouping. If an
+epoch loses that admission, exact per-key sufficient summaries retract the
+previous partial outputs and install a canonical output at the original
+owner. The fallback checks each joined row's multiplication against paged
+opposite-arrangement extrema; wide cancellation cannot hide scalar overflow.
+The canonical mode remains durable even through an empty key so old local
+arrangements are never executed again without an explicit cleanup generation.
+`skew_join::tests` checks exact factorized output through promotion, historical
+and salted retractions, both choices of high side, and changed-input replay.
+The same tests check cancellation into canonical fallback, subsequent
+retractions, journal restoration, and rejection of scalar overflow.
+`weighted_join_restore_preserves_exact_retractions` also checks multiplicity
+across eager and lazy classic-arrangement restoration. These concrete routing,
+payload-budget, and arithmetic boundaries are not invariants proved by M1–M7;
+the existing models only cover their fencing and commit coordination boundary.
+
 `CreateBackup` now pins each active shard's durable checkpoint snapshot and
 optional workload-specific object prefix without stopping concurrent writes.
 Its export excludes control manifests newer than the selected checkpoint,

@@ -791,6 +791,7 @@ async fn test_control_plane_retains_zero_row_payloads_or_output_history() {
     assert_eq!(
         execute,
         RuntimeExchangeMessage {
+            join_bootstrap: None,
             attempt_id: None,
             version: 1,
             request_id: "delta-1".to_string(),

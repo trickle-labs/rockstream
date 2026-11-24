@@ -3045,6 +3045,7 @@ fn route_source_delta(
             (
                 descriptor.shard.worker_id,
                 RuntimeExchangeMessage {
+                    join_bootstrap: None,
                     attempt_id: None,
                     version: request.version,
                     request_id: request.request_id.clone(),

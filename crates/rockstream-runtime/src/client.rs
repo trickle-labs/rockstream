@@ -381,7 +381,7 @@ fn execution_record(frame: &RuntimeExchangeMessage) -> io::Result<(Vec<u8>, [u8;
     // shortcut: retain execution records until a durable replay-retention watermark is available.
     let mut key = rockstream_storage::keys::ShardKeyEncoder::meta_key(b"owned-execution/");
     key.extend_from_slice(&frame.epoch.to_be_bytes());
-    let input = serde_json::to_vec(&(
+    let mut input = serde_json::to_vec(&(
         frame.version,
         &frame.request_id,
         frame.workload_id,
@@ -392,7 +392,58 @@ fn execution_record(frame: &RuntimeExchangeMessage) -> io::Result<(Vec<u8>, [u8;
         &frame.rows,
     ))
     .map_err(io::Error::other)?;
+    // Preserve pre-skew replay identities for ordinary frames. A bootstrap is
+    // part of the same durable input and cannot be changed on a retry.
+    if let Some(bootstrap) = &frame.join_bootstrap {
+        input.extend_from_slice(b"\0join-bootstrap/v1\0");
+        input.extend_from_slice(&serde_json::to_vec(bootstrap).map_err(io::Error::other)?);
+    }
     Ok((key, *blake3::hash(&input).as_bytes()))
+}
+
+fn validate_join_bootstrap(
+    deployment: &WorkerDeployment,
+    frame: &RuntimeExchangeMessage,
+) -> io::Result<()> {
+    let Some(bootstrap) = &frame.join_bootstrap else {
+        return Ok(());
+    };
+    let join = deployment.compiled.join.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "join bootstrap requires an inner join",
+        )
+    })?;
+    if !matches!(
+        join.pipeline.join(),
+        rockstream_ops::live_exec::JoinKind::Inner(_)
+            | rockstream_ops::live_exec::JoinKind::Factorized(_)
+    ) || bootstrap.source == frame.source
+        || !((frame.source == join.left_source && bootstrap.source == join.right_source)
+            || (frame.source == join.right_source && bootstrap.source == join.left_source))
+        || bootstrap.rows.iter().any(|row| row.weight <= 0)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "join bootstrap must contain positive rows from the opposite input",
+        ));
+    }
+    crate::skew_join::validate_join_final_rows(&deployment.descriptor, &bootstrap.final_rows)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let bytes = bootstrap
+        .rows
+        .iter()
+        .chain(&bootstrap.final_rows)
+        .try_fold(0usize, |bytes, row| {
+            bytes.checked_add(row.values_tsv.len() + std::mem::size_of::<i64>())
+        });
+    if bytes.is_none_or(|bytes| bytes > crate::skew_join::MAX_JOIN_BOOTSTRAP_BYTES) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "join bootstrap exceeds the bounded replication budget",
+        ));
+    }
+    Ok(())
 }
 
 fn cancellation_reporter(sender: mpsc::Sender<WorkerMessage>) -> CancellationReporter {
@@ -479,6 +530,7 @@ pub async fn execute_frame(
         .get(&frame.source)
         .cloned()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unknown source relation"))?;
+    validate_join_bootstrap(&deployment, &frame)?;
     client
         .secret_manager
         .advance_workload_epoch(frame.workload_id, frame.epoch);
@@ -555,7 +607,12 @@ pub async fn execute_frame(
         .record_encoded_exchange(worker_id, strategy)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let compacted_input_rows = deployment.compactor.compact_slice(&frame.rows);
-    if compacted_input_rows.is_empty() {
+    if compacted_input_rows.is_empty()
+        && frame
+            .join_bootstrap
+            .as_ref()
+            .is_none_or(|bootstrap| bootstrap.rows.is_empty() && bootstrap.final_rows.is_empty())
+    {
         if !client.verify_local_lease_fence(frame.shard_id, frame.lease_token) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -609,17 +666,21 @@ pub async fn execute_frame(
         },
         || -> io::Result<_> {
             if let Some(join) = &deployment.compiled.join {
-                let empty = |schema: SchemaRef| rows_to_zset(&[], schema);
+                let other_input = |source: &str| {
+                    let rows = frame
+                        .join_bootstrap
+                        .as_ref()
+                        .filter(|bootstrap| bootstrap.source == source)
+                        .map_or(&[][..], |bootstrap| bootstrap.rows.as_slice());
+                    rows_to_zset(rows, deployment.schemas[source].clone())
+                };
                 if frame.source == join.left_source {
                     join.pipeline
-                        .process(
-                            input,
-                            empty(deployment.schemas[&join.right_source].clone())?,
-                        )
+                        .process(input, other_input(&join.right_source)?)
                         .map_err(io::Error::other)
                 } else if frame.source == join.right_source {
                     join.pipeline
-                        .process(empty(deployment.schemas[&join.left_source].clone())?, input)
+                        .process(other_input(&join.left_source)?, input)
                         .map_err(io::Error::other)
                 } else {
                     Err(io::Error::new(
@@ -647,9 +708,14 @@ pub async fn execute_frame(
         .verify_lease_token(frame.lease_token)
         .await
         .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error.to_string()))?;
-    let raw_output_rows = zset_to_rows(&output)?;
+    let mut raw_output_rows = zset_to_rows(&output)?;
+    if let Some(bootstrap) = &frame.join_bootstrap {
+        raw_output_rows.extend(bootstrap.final_rows.clone());
+    }
     let output_rows = deployment.compactor.compact_slice(&raw_output_rows);
-    let output_for_sink = if output_rows.len() != raw_output_rows.len() {
+    let output_for_sink = if output_rows.len() != raw_output_rows.len()
+        || raw_output_rows.len() != output.num_rows()
+    {
         rows_to_zset(&output_rows, output.data.schema())?
     } else {
         output
@@ -678,6 +744,11 @@ pub async fn execute_frame(
         .commit_epoch(frame.epoch, writes)
         .await
         .map_err(io::Error::other)?;
+    if let Some(join) = &deployment.compiled.join {
+        join.pipeline.ack_persisted_state();
+    } else {
+        deployment.compiled.pipeline.ack_persisted_state();
+    }
     *needs_recovery = false;
     rockstream_types::metrics::add_r1_worker_rows(
         worker_id,
@@ -1374,6 +1445,7 @@ mod data_plane_tests {
             operator_id: OperatorId(10),
             lease_token: LeaseToken(777),
             source: "items".into(),
+            join_bootstrap: None,
             rows: vec![RuntimeRow {
                 values_tsv: "1\tfirst".into(),
                 weight: 1,
@@ -1454,6 +1526,166 @@ mod data_plane_tests {
         );
     }
 
+    #[tokio::test]
+    async fn join_bootstrap_commits_both_inputs_once_and_rejects_changed_replay() {
+        use rockstream_plan::{AggregateExpr, AggregateFunc, Expr, JoinSemantics, PlanNode};
+        use rockstream_types::data_plane::JoinBootstrap;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (client, deployments, db, _, mut progress) =
+            setup_test_deployment(temp_dir.path(), EpochCompactionConfig::default()).await;
+        {
+            let mut deployments = deployments.write();
+            let deployment =
+                Arc::get_mut(deployments.get_mut(&(WorkloadId(1), ShardId(100))).unwrap()).unwrap();
+            let mut left = deployment.descriptor.schemas[0].clone();
+            left.relation = "left".into();
+            left.columns[1].data_type = "i64".into();
+            let mut right = left.clone();
+            right.relation = "right".into();
+            deployment.descriptor.schemas = vec![left, right];
+            deployment.descriptor.join_strategy =
+                rockstream_types::config::JoinStrategy::Factorized;
+            let plan = PlanNode::ViewSink {
+                view_name: "joined".into(),
+                pk: vec![0],
+                child: Box::new(PlanNode::Aggregate {
+                    input: Box::new(PlanNode::InnerJoin {
+                        left: Box::new(PlanNode::Source {
+                            name: "left".into(),
+                        }),
+                        right: Box::new(PlanNode::Source {
+                            name: "right".into(),
+                        }),
+                        left_keys: vec![0],
+                        right_keys: vec![0],
+                        left_arr_id: OperatorId(40),
+                        right_arr_id: OperatorId(41),
+                        semantics: JoinSemantics::default(),
+                    }),
+                    group_by: vec![Expr::Column(0)],
+                    aggregates: vec![AggregateExpr {
+                        func: AggregateFunc::Sum,
+                        input: Expr::Column(1),
+                        distinct: false,
+                    }],
+                }),
+            };
+            deployment.descriptor.plan_json = serde_json::to_string(&plan).unwrap();
+            deployment.schemas = deployment_schema(&deployment.descriptor).unwrap();
+            deployment.compiled = rockstream_ops::compile_plan_with_sink_id_and_strategy(
+                &plan,
+                db.clone(),
+                &deployment.schemas,
+                OperatorId(10),
+                deployment.descriptor.join_strategy,
+            )
+            .unwrap();
+            assert_eq!(deployment.compiled.strategy(), "factorized");
+        }
+        let frame = RuntimeExchangeMessage {
+            attempt_id: None,
+            version: DEPLOYMENT_DESCRIPTOR_VERSION,
+            request_id: "promote-1".into(),
+            workload_id: WorkloadId(1),
+            shard_id: ShardId(100),
+            operator_id: OperatorId(10),
+            lease_token: LeaseToken(777),
+            epoch: 1,
+            source: "left".into(),
+            rows: vec![RuntimeRow {
+                values_tsv: "1\t7".into(),
+                weight: 3,
+            }],
+            join_bootstrap: Some(JoinBootstrap {
+                source: "right".into(),
+                rows: vec![RuntimeRow {
+                    values_tsv: "1\t10".into(),
+                    weight: 2,
+                }],
+                final_rows: Vec::new(),
+            }),
+        };
+        execute_frame(&client, &deployments, frame.clone())
+            .await
+            .unwrap();
+        progress.recv().await.unwrap();
+        execute_frame(&client, &deployments, frame.clone())
+            .await
+            .unwrap();
+        progress.recv().await.unwrap();
+        let mut wrong = frame.clone();
+        wrong.join_bootstrap.as_mut().unwrap().rows[0].weight = 3;
+        assert_eq!(
+            execute_frame(&client, &deployments, wrong)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "committed execution does not match replay"
+        );
+        let read = read_workload_shards(
+            &deployments,
+            &client.active_shards,
+            WorkloadId(1),
+            &[ShardId(100)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read[0].rows,
+            vec![RuntimeRow {
+                values_tsv: "1\t42".into(),
+                weight: 1
+            }]
+        );
+        let next = RuntimeExchangeMessage {
+            epoch: 2,
+            request_id: "promote-2".into(),
+            join_bootstrap: None,
+            rows: vec![RuntimeRow {
+                values_tsv: "1\t7".into(),
+                weight: -1,
+            }],
+            ..frame
+        };
+        execute_frame(&client, &deployments, next).await.unwrap();
+        progress.recv().await.unwrap();
+        let read = read_workload_shards(
+            &deployments,
+            &client.active_shards,
+            WorkloadId(1),
+            &[ShardId(100)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read[0].rows,
+            vec![RuntimeRow {
+                values_tsv: "1\t28".into(),
+                weight: 1
+            }]
+        );
+        let deployment = deployments
+            .read()
+            .get(&(WorkloadId(1), ShardId(100)))
+            .cloned()
+            .unwrap();
+        let mut pending = WriteBatch::new();
+        deployment
+            .compiled
+            .join
+            .as_ref()
+            .unwrap()
+            .pipeline
+            .append_state(&db, &mut pending)
+            .await
+            .unwrap();
+        assert!(
+            pending.is_empty(),
+            "successful commit must acknowledge all factorized dirty rows"
+        );
+        db.as_ref().clone().close().await.unwrap();
+    }
+
     #[test]
     fn linux_memory_headroom_uses_available_memory() {
         let meminfo = "MemTotal: 1000 kB\nMemFree: 100 kB\nMemAvailable: 250 kB\n";
@@ -1503,6 +1735,7 @@ mod data_plane_tests {
         let (client, deployments, db, _, mut progress_rx) =
             setup_test_deployment(temp_dir.path(), EpochCompactionConfig::default()).await;
         let frame = RuntimeExchangeMessage {
+            join_bootstrap: None,
             attempt_id: None,
             version: DEPLOYMENT_DESCRIPTOR_VERSION,
             request_id: "rejected-request".to_owned(),
@@ -1588,6 +1821,7 @@ mod data_plane_tests {
             deployment.schemas = schemas;
         }
         let owner = RuntimeExchangeMessage {
+            join_bootstrap: None,
             attempt_id: None,
             version: DEPLOYMENT_DESCRIPTOR_VERSION,
             request_id: "owned-shuffle".to_owned(),
@@ -1860,6 +2094,7 @@ mod data_plane_tests {
         // Frame with offsetting updates (+1 and -1) on key "10\talice"
         // and a non-zero row (+1) on key "20\tbob"
         let frame = RuntimeExchangeMessage {
+            join_bootstrap: None,
             attempt_id: None,
             version: DEPLOYMENT_DESCRIPTOR_VERSION,
             request_id: "req-1".to_string(),
@@ -1946,6 +2181,7 @@ mod data_plane_tests {
 
         // Frame where all rows offset to net-zero (+1 and -1 on same key)
         let frame = RuntimeExchangeMessage {
+            join_bootstrap: None,
             attempt_id: None,
             version: DEPLOYMENT_DESCRIPTOR_VERSION,
             request_id: "req-net-zero".to_string(),
@@ -2027,6 +2263,7 @@ mod data_plane_tests {
             setup_test_deployment(temp_dir.path(), EpochCompactionConfig::default()).await;
         db.set_fail_writes(true);
         let frame = RuntimeExchangeMessage {
+            join_bootstrap: None,
             attempt_id: None,
             version: DEPLOYMENT_DESCRIPTOR_VERSION,
             request_id: "empty-failed".to_owned(),
@@ -2073,6 +2310,7 @@ mod data_plane_tests {
         let (client, deployments, db, _, mut progress_rx) =
             setup_test_deployment(temp_dir.path(), EpochCompactionConfig::default()).await;
         let frame = RuntimeExchangeMessage {
+            join_bootstrap: None,
             attempt_id: None,
             version: DEPLOYMENT_DESCRIPTOR_VERSION,
             request_id: "replay".to_owned(),
@@ -2174,6 +2412,7 @@ mod data_plane_tests {
         let (client, deployments, _, compactor, mut progress_rx) =
             setup_test_deployment(temp_dir.path(), EpochCompactionConfig::default()).await;
         let frame = RuntimeExchangeMessage {
+            join_bootstrap: None,
             attempt_id: None,
             version: DEPLOYMENT_DESCRIPTOR_VERSION,
             request_id: "concurrent-replay".to_owned(),
@@ -2233,6 +2472,7 @@ mod data_plane_tests {
         let (client, deployments, db, compactor, mut progress_rx) =
             setup_test_deployment(temp_dir.path(), EpochCompactionConfig::default()).await;
         let frame = RuntimeExchangeMessage {
+            join_bootstrap: None,
             attempt_id: None,
             version: DEPLOYMENT_DESCRIPTOR_VERSION,
             request_id: "failed-commit".to_owned(),
@@ -2322,6 +2562,7 @@ mod data_plane_tests {
 
         // Multiple updates on key 42: +3 and -1 -> net weight +2
         let frame = RuntimeExchangeMessage {
+            join_bootstrap: None,
             attempt_id: None,
             version: DEPLOYMENT_DESCRIPTOR_VERSION,
             request_id: "req-collapse".to_string(),
