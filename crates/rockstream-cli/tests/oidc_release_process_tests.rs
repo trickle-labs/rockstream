@@ -59,7 +59,6 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
 };
-use tonic::codegen::Service as _;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
 static RELEASE_PROCESS_PORT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
