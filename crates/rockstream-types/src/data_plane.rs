@@ -114,6 +114,9 @@ pub struct WorkloadShardPlacement {
 pub struct WorkloadTopologySnapshot {
     pub topology_epoch: u64,
     pub workload_id: WorkloadId,
+    /// The deployed logical plan, used for executable skew admission.
+    #[serde(default)]
+    pub plan_json: String,
     pub routing_columns: BTreeMap<String, usize>,
     pub schemas: Vec<DeploymentSchema>,
     pub shards: Vec<WorkloadShardPlacement>,
@@ -234,6 +237,12 @@ pub struct ShardOutput {
     pub shard_id: ShardId,
     #[serde(default)]
     pub lease_token: Option<LeaseToken>,
+    /// Durable application frontier captured under the shard execution gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committed_epoch: Option<Epoch>,
+    /// Completed global routing epoch; present only on the workload anchor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_epoch: Option<Epoch>,
     #[serde(default)]
     pub deltas: Vec<RuntimeOutputDelta>,
     #[serde(default)]
@@ -313,6 +322,8 @@ mod tests {
             shards: vec![ShardOutput {
                 shard_id: ShardId(2),
                 lease_token: Some(LeaseToken(13)),
+                committed_epoch: None,
+                routing_epoch: None,
                 deltas: vec![output.clone()],
                 rows: vec![],
             }],
@@ -407,6 +418,8 @@ mod tests {
             shards: vec![ShardOutput {
                 shard_id: ShardId(2),
                 lease_token: Some(LeaseToken(13)),
+                committed_epoch: None,
+                routing_epoch: None,
                 deltas: vec![output.clone()],
                 rows: vec![],
             }],
@@ -483,6 +496,8 @@ mod tests {
                 shards: vec![ShardOutput {
                     shard_id: ShardId(2),
                     lease_token: Some(LeaseToken(13)),
+                    committed_epoch: None,
+                    routing_epoch: None,
                     deltas: vec![],
                     rows: vec![RuntimeRow {
                         values_tsv: "42".into(),

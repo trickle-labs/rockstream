@@ -28,6 +28,8 @@ message ShuffleAck {
   uint64 epoch = 4;
   uint64 seq = 5;
   uint32 credit_grant = 6; // Additional credit granted to the sender
+  // Bounded response to authenticated owned commands (routing journal / partials).
+  bytes owned_result = 7;
 }
 
 message ExchangeFrame {

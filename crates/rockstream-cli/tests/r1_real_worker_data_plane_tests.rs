@@ -773,6 +773,7 @@ async fn interrupted_dispatch_blocks_distributed_reads_after_gateway_restart() {
                         snapshot: rockstream_types::data_plane::WorkloadTopologySnapshot {
                             topology_epoch: 1,
                             workload_id,
+                            plan_json: String::new(),
                             routing_columns: BTreeMap::new(),
                             schemas: Vec::new(),
                             shards: Vec::new(),

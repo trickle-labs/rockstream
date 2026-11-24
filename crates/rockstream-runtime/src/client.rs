@@ -49,7 +49,7 @@ pub struct WorkerDeployment {
     pub compiled: rockstream_ops::compile::CompiledView,
     pub commit_group: Arc<PhysicalCommitGroup>,
     pub compactor: Arc<EpochCompactor>,
-    execution_requires_recovery: tokio::sync::Mutex<bool>,
+    pub(crate) execution_requires_recovery: tokio::sync::Mutex<bool>,
     owned_epoch: crate::owned_epoch::OwnedEpochJournal,
     recovery_on_open: bool,
 }
@@ -106,6 +106,64 @@ async fn read_workload_shards(
     let mut outputs = Vec::with_capacity(targets.len());
     for deployment in targets {
         let descriptor = &deployment.descriptor;
+        // Read state and its durable frontier under the same gate as writes,
+        // routing prepare, and routing finish. The coordinator then compares
+        // these per-shard cuts rather than accepting a mixed-epoch snapshot.
+        let recovering = deployment.execution_requires_recovery.lock().await;
+        if *recovering {
+            return Err(io::Error::other("workload shard requires recovery"));
+        }
+        if !active_shards
+            .read()
+            .get(&descriptor.shard.shard_id)
+            .is_some_and(|state| state.lease.same_owner(&descriptor.shard) && state.db.is_some())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "shard lease changed during read",
+            ));
+        }
+        deployment
+            .db
+            .verify_lease_token(descriptor.shard.lease_token)
+            .await
+            .map_err(io::Error::other)?;
+        let routing = crate::skew_routing::load_snapshot(&deployment.db, workload_id)
+            .await
+            .map_err(io::Error::other)?;
+        if routing.pending.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "skew routing epoch is not fully committed",
+            ));
+        }
+        let committed_epoch = match deployment
+            .db
+            .get(&rockstream_storage::ShardKeyEncoder::frontier_key())
+            .await
+            .map_err(io::Error::other)?
+        {
+            Some(bytes) => u64::from_be_bytes(
+                bytes
+                    .as_ref()
+                    .try_into()
+                    .map_err(|_| io::Error::other("invalid committed read frontier"))?,
+            ),
+            None => 0,
+        };
+        let routing_epoch = if let Some(completed) = routing.completed {
+            if completed.shard_ids.first() != Some(&descriptor.shard.shard_id) {
+                return Err(io::Error::other("routing journal is on a non-anchor shard"));
+            }
+            Some(completed.epoch)
+        } else if descriptor.shard_index == 0 {
+            // Before the first journal, the anchor's durable frontier is its
+            // certificate. Uneven legacy participants fail closed until a
+            // complete direct epoch advances every shard.
+            Some(committed_epoch)
+        } else {
+            None
+        };
         let stored = rockstream_ops::read_view_output(
             &deployment.db,
             descriptor.sink_operator_id,
@@ -123,9 +181,16 @@ async fn read_workload_shards(
                 Ok(RuntimeRow { values_tsv, weight })
             })
             .collect::<io::Result<Vec<_>>>()?;
+        deployment
+            .db
+            .verify_lease_token(descriptor.shard.lease_token)
+            .await
+            .map_err(io::Error::other)?;
         outputs.push(ShardOutput {
             shard_id: descriptor.shard.shard_id,
             lease_token: Some(descriptor.shard.lease_token),
+            committed_epoch: Some(committed_epoch),
+            routing_epoch,
             deltas: Vec::new(),
             rows,
         });
@@ -671,11 +736,57 @@ pub(crate) fn owned_shuffle_handler(
     deployments: WorkerDeployments,
     client: WorkerClientHandle,
 ) -> crate::exchange::service::OwnedShuffleHandler {
-    Arc::new(move |frame, context| {
+    Arc::new(move |frame, context, require_actor_grant| {
         let actors = actors.clone();
         let deployments = deployments.clone();
         let client = client.clone();
         Box::pin(async move {
+            let admission = match client
+                .direct_grants
+                .command_guard(&context, crate::direct_grants::now_ms())
+                .await
+            {
+                Ok(admission) => admission,
+                Err(error) => {
+                    client
+                        .exchange_registry
+                        .audit_direct_epoch_denial(&frame)
+                        .await
+                        .map_err(|audit| audit.to_string())?;
+                    return Err(error);
+                }
+            };
+            let context = match client.direct_grants.unwrap_context(
+                context,
+                &frame,
+                require_actor_grant,
+                crate::direct_grants::now_ms(),
+            ) {
+                Ok(context) => context,
+                Err(error) => {
+                    drop(admission);
+                    client
+                        .exchange_registry
+                        .audit_direct_epoch_denial(&frame)
+                        .await
+                        .map_err(|audit| audit.to_string())?;
+                    return Err(error);
+                }
+            };
+            // Keep admission through the execution receipt, including time in
+            // the actor queue. Replacement grants first drain this guard.
+            let _admission = admission;
+            let envelope: serde_json::Value = serde_json::from_slice(&context)
+                .map_err(|_| "invalid owned shuffle context".to_owned())?;
+            if envelope.get("operation").is_some() {
+                // A malformed routing envelope must never fall through to
+                // source execution with the read-only authorization decision.
+                let command =
+                    serde_json::from_value::<crate::skew_routing::RoutingCommand>(envelope)
+                        .map_err(|_| "invalid owned routing context".to_owned())?;
+                return crate::skew_routing::handle_command(&deployments, &client, frame, command)
+                    .await;
+            }
             let mut owner: RuntimeExchangeMessage = serde_json::from_slice(&context)
                 .map_err(|error| format!("invalid shuffle execution context: {error}"))?;
             let output = failure_identity(&owner);
@@ -733,8 +844,81 @@ pub(crate) fn owned_shuffle_handler(
             receipt
                 .await
                 .map_err(|_| "worker execution receipt was lost".to_owned())?
+                .map(|()| bytes::Bytes::new())
         })
     })
+}
+
+async fn install_direct_epoch_grant(
+    client: &WorkerClientHandle,
+    deployments: &WorkerDeployments,
+    grant: rockstream_types::direct_epoch::DirectEpochGrant,
+) -> Result<(), String> {
+    if !grant.metadata.is_valid() || grant.members.is_empty() || grant.members.len() > 4096 {
+        return Err("invalid direct epoch grant".into());
+    }
+    let _admission = client
+        .direct_grants
+        .installation_guard(grant.metadata.workload_id)
+        .await?;
+    let mut targets: Vec<_> = deployments
+        .read()
+        .values()
+        .filter(|deployment| deployment.descriptor.workload_id == grant.metadata.workload_id)
+        .cloned()
+        .collect();
+    targets.sort_by_key(|deployment| deployment.descriptor.shard.shard_id);
+    if targets.is_empty() || targets.len() > grant.members.len() {
+        return Err("direct epoch grant has no complete local membership".into());
+    }
+    let mut execution_guards = Vec::with_capacity(targets.len());
+    for deployment in &targets {
+        let guard = deployment.execution_requires_recovery.lock().await;
+        if *guard {
+            return Err("direct epoch deployment requires recovery".into());
+        }
+        execution_guards.push(guard);
+    }
+    for deployment in &targets {
+        let shard = &deployment.descriptor.shard;
+        if client.worker_id() != Some(shard.worker_id)
+            || grant.members.get(&shard.shard_id) != Some(&shard.lease_token)
+            || !client.verify_local_lease_fence(shard.shard_id, shard.lease_token)
+            || !deployment.schemas.contains_key(&grant.metadata.source)
+        {
+            return Err("direct epoch grant does not match local deployment".into());
+        }
+        deployment
+            .db
+            .verify_lease_token(shard.lease_token)
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Some(intent) = deployment.owned_epoch.load().await? {
+            if intent.workload_id != grant.metadata.workload_id
+                || intent.source != grant.metadata.source
+                || intent.request_id != grant.metadata.request_id
+                || intent.epoch != grant.metadata.epoch
+            {
+                return Err("another owned source epoch requires reconciliation".into());
+            }
+        }
+        let routing =
+            crate::skew_routing::load_snapshot(&deployment.db, grant.metadata.workload_id).await?;
+        if let Some(pending) = routing.pending {
+            if !crate::direct_grants::metadata_matches_record(&grant.metadata, &pending)
+                || pending.shard_ids != grant.members.keys().copied().collect::<Vec<_>>()
+            {
+                return Err("another routing epoch requires reconciliation".into());
+            }
+        }
+    }
+    if !client
+        .direct_grants
+        .install(grant, crate::direct_grants::now_ms())
+    {
+        return Err("direct epoch grant is expired, conflicting, or exceeds capacity".into());
+    }
+    Ok(())
 }
 
 fn owned_shuffle_shard(workload_id: WorkloadId, shard_id: ShardId) -> Result<u32, String> {
@@ -876,6 +1060,7 @@ pub async fn setup_test_deployment(
     .with_security_audit(msg_tx.clone(), security_audit_waiters.clone());
 
     let client = WorkerClientHandle {
+        direct_grants: crate::direct_grants::DirectGrantRegistry::default(),
         worker_id,
         active_shards: active_shards.clone(),
         topology_workers,
@@ -944,7 +1129,9 @@ pub async fn setup_test_deployment(
         routing_columns: std::collections::BTreeMap::new(),
         shard: ShardLease::new(ShardId(100), WorkerId(42), LeaseToken(777)),
         storage_identity: format!("lfs:{}", storage_dir.display()),
-        shard_index: 84,
+        // A one-shard deployment uses placement index zero. The legacy
+        // workload-relative shuffle alias (84) is validated separately.
+        shard_index: 0,
     };
 
     let schemas = deployment_schema(&descriptor).unwrap();
@@ -1021,6 +1208,230 @@ mod data_plane_tests {
 
     use super::*;
     use rockstream_types::ids::OperatorId;
+
+    #[tokio::test]
+    async fn direct_grant_installation_checks_durable_pending_after_draining_execution() {
+        use rockstream_types::direct_epoch::{
+            DirectEpochGrant, SourceEpochMetadata, DIRECT_EPOCH_GRANT_TTL_MS,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (client, deployments, db, _, _) =
+            setup_test_deployment(dir.path(), EpochCompactionConfig::default()).await;
+        let deployment = deployments.read()[&(WorkloadId(1), ShardId(100))].clone();
+        let mut grant = DirectEpochGrant {
+            grant_id: uuid::Uuid::from_u128(11),
+            metadata: SourceEpochMetadata {
+                version: DEPLOYMENT_DESCRIPTOR_VERSION,
+                workload_id: WorkloadId(1),
+                source: "items".into(),
+                request_id: "replacement".into(),
+                epoch: 1,
+                input_digest: [3; 32],
+            },
+            expires_at_ms: crate::direct_grants::now_ms() + DIRECT_EPOCH_GRANT_TTL_MS,
+            members: std::collections::BTreeMap::from([(ShardId(100), LeaseToken(777))]),
+        };
+        let pending = crate::skew_routing::RoutingEpochRecord {
+            version: crate::skew_routing::ROUTING_VERSION,
+            workload_id: WorkloadId(1),
+            source: "items".into(),
+            request_id: "pending".into(),
+            epoch: 1,
+            input_digest: [9; 32],
+            generation: 1,
+            shard_ids: vec![ShardId(100)],
+            plan: serde_json::json!({"kind":"passthrough"}),
+            next_state: serde_json::Value::Null,
+            point_mutations: std::collections::BTreeMap::new(),
+        };
+        let execution = deployment.execution_requires_recovery.lock().await;
+        let mut installing = Box::pin(install_direct_epoch_grant(
+            &client,
+            &deployments,
+            grant.clone(),
+        ));
+        assert!(futures::poll!(installing.as_mut()).is_pending());
+        crate::skew_routing::prepare_record(&db, pending.clone())
+            .await
+            .unwrap();
+        drop(execution);
+        assert_eq!(
+            installing.await,
+            Err("another routing epoch requires reconciliation".into())
+        );
+        grant.metadata.request_id = pending.request_id.clone();
+        // Matching labels alone cannot replay a different original input.
+        assert_eq!(
+            install_direct_epoch_grant(&client, &deployments, grant.clone()).await,
+            Err("another routing epoch requires reconciliation".into())
+        );
+        grant.metadata.input_digest = pending.input_digest;
+        assert_eq!(
+            install_direct_epoch_grant(&client, &deployments, grant.clone()).await,
+            Ok(())
+        );
+        assert_eq!(
+            crate::skew_routing::load_snapshot(&db, WorkloadId(1))
+                .await
+                .unwrap(),
+            crate::skew_routing::RoutingSnapshot {
+                pending: Some(pending),
+                ..Default::default()
+            }
+        );
+        *deployment.execution_requires_recovery.lock().await = true;
+        assert_eq!(
+            install_direct_epoch_grant(&client, &deployments, grant.clone()).await,
+            Err("direct epoch deployment requires recovery".into())
+        );
+        *deployment.execution_requires_recovery.lock().await = false;
+        let mut owned = rockstream_types::data_plane::OwnedEpochIntent {
+            attempt_id: uuid::Uuid::from_u128(17),
+            version: DEPLOYMENT_DESCRIPTOR_VERSION,
+            request_id: "other-owned-request".into(),
+            workload_id: WorkloadId(1),
+            epoch: 1,
+            source: "items".into(),
+            anchor_shard: ShardId(100),
+            target_shards: vec![ShardId(100)],
+        };
+        deployment.owned_epoch.prepare(&owned).await.unwrap();
+        assert_eq!(
+            install_direct_epoch_grant(&client, &deployments, grant.clone()).await,
+            Err("another owned source epoch requires reconciliation".into())
+        );
+        deployment.owned_epoch.finish(&owned).await.unwrap();
+        owned.request_id = grant.metadata.request_id.clone();
+        deployment.owned_epoch.prepare(&owned).await.unwrap();
+        assert_eq!(
+            install_direct_epoch_grant(&client, &deployments, grant).await,
+            Ok(())
+        );
+        assert_eq!(deployment.owned_epoch.load().await.unwrap(), Some(owned));
+    }
+
+    #[tokio::test]
+    async fn workload_read_waits_for_execution_gate_and_rejects_recovery_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, deployments, _, _, _) =
+            setup_test_deployment(dir.path(), EpochCompactionConfig::default()).await;
+        let deployment = deployments
+            .read()
+            .get(&(WorkloadId(1), ShardId(100)))
+            .unwrap()
+            .clone();
+        let mut write_guard = deployment.execution_requires_recovery.lock().await;
+        let shard_ids = [ShardId(100)];
+        let read = read_workload_shards(
+            &deployments,
+            &client.active_shards,
+            WorkloadId(1),
+            &shard_ids,
+        );
+        tokio::pin!(read);
+        assert!(matches!(
+            futures::poll!(read.as_mut()),
+            std::task::Poll::Pending
+        ));
+        *write_guard = true;
+        drop(write_guard);
+        let error = read.await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "workload shard requires recovery");
+        *deployment.execution_requires_recovery.lock().await = false;
+        assert_eq!(
+            read_workload_shards(
+                &deployments,
+                &client.active_shards,
+                WorkloadId(1),
+                &[ShardId(100)]
+            )
+            .await
+            .unwrap(),
+            vec![ShardOutput {
+                shard_id: ShardId(100),
+                lease_token: Some(LeaseToken(777)),
+                committed_epoch: Some(0),
+                routing_epoch: Some(0),
+                deltas: Vec::new(),
+                rows: Vec::new(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn workload_read_pairs_rows_with_durable_epoch_and_pending_journal_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, deployments, db, _, _) =
+            setup_test_deployment(dir.path(), EpochCompactionConfig::default()).await;
+        let frame = RuntimeExchangeMessage {
+            attempt_id: None,
+            version: DEPLOYMENT_DESCRIPTOR_VERSION,
+            request_id: "read-epoch-1".into(),
+            workload_id: WorkloadId(1),
+            shard_id: ShardId(100),
+            epoch: 1,
+            operator_id: OperatorId(10),
+            lease_token: LeaseToken(777),
+            source: "items".into(),
+            rows: vec![RuntimeRow {
+                values_tsv: "1\tfirst".into(),
+                weight: 1,
+            }],
+        };
+        execute_frame(&client, &deployments, frame).await.unwrap();
+        let before = read_workload_shards(
+            &deployments,
+            &client.active_shards,
+            WorkloadId(1),
+            &[ShardId(100)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            before,
+            vec![ShardOutput {
+                shard_id: ShardId(100),
+                lease_token: Some(LeaseToken(777)),
+                committed_epoch: Some(1),
+                routing_epoch: Some(1),
+                deltas: Vec::new(),
+                rows: vec![RuntimeRow {
+                    values_tsv: "1\tfirst".into(),
+                    weight: 1
+                }]
+            }]
+        );
+        let record = crate::skew_routing::RoutingEpochRecord {
+            version: 1,
+            workload_id: WorkloadId(1),
+            source: "items".into(),
+            request_id: "read-epoch-2".into(),
+            epoch: 2,
+            input_digest: [0; 32],
+            generation: 1,
+            shard_ids: vec![ShardId(100)],
+            plan: serde_json::json!({"kind":"passthrough"}),
+            next_state: serde_json::Value::Null,
+            point_mutations: Default::default(),
+        };
+        crate::skew_routing::prepare_record(&db, record)
+            .await
+            .unwrap();
+        let error = read_workload_shards(
+            &deployments,
+            &client.active_shards,
+            WorkloadId(1),
+            &[ShardId(100)],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            error.to_string(),
+            "skew routing epoch is not fully committed"
+        );
+    }
 
     #[tokio::test]
     async fn worker_tls_reload_rejects_missing_credentials_and_disabled_mtls() {
@@ -1198,12 +1609,22 @@ mod data_plane_tests {
                 weight: 1,
             },
         ];
-        let schema = deployments.read()[&(WorkloadId(1), ShardId(100))].schemas["items"].clone();
+        let (placement_index, schema) = {
+            let deployed = deployments.read();
+            let deployment = &deployed[&(owner.workload_id, owner.shard_id)];
+            (
+                deployment.descriptor.shard_index,
+                deployment.schemas["items"].clone(),
+            )
+        };
+        let legacy_index = owned_shuffle_shard(owner.workload_id, owner.shard_id).unwrap();
         let input = rows_to_zset(&rows, schema.clone()).unwrap();
         let frame = crate::exchange::proto::ShuffleFrame {
             exchange_id: 1,
-            src_shard: 0,
-            target_shard: 84,
+            src_shard: placement_index,
+            // Explicit compatibility frames use the legacy alias; ordinary
+            // dispatch below must use the descriptor's actual placement.
+            target_shard: legacy_index,
             epoch: 1,
             seq: 0,
             payload: crate::exchange::serialization::serialize_zset(&input)
@@ -1240,7 +1661,7 @@ mod data_plane_tests {
         let addr = listener.local_addr().unwrap();
         let registry = crate::exchange::service::ExchangeRegistry::new();
         let (inlet_tx, inlet_rx) = mpsc::channel(1);
-        registry.register(1, 84, inlet_tx, schema.clone());
+        registry.register(1, placement_index, inlet_tx, schema.clone());
         drop(inlet_rx);
         let service = crate::exchange::service::ExchangeService::new(registry.clone())
             .with_owned_handler(handle)
@@ -1305,7 +1726,7 @@ mod data_plane_tests {
             None
         );
         let (inlet_tx, mut reopened_inlet) = mpsc::channel(1);
-        registry.register(1, 84, inlet_tx, schema);
+        registry.register(1, placement_index, inlet_tx, schema);
         actors_for_test.register_owned(owner.shard_id, owner.lease_token, execute);
         let sending = {
             let mux = mux.clone();
@@ -1322,7 +1743,7 @@ mod data_plane_tests {
             .await
             .unwrap();
         assert!(!sending.is_finished());
-        assert_eq!(flow.rows_in_flight(1, 84, 84), 2);
+        assert_eq!(flow.rows_in_flight(1, placement_index, placement_index), 2);
         assert_eq!(
             db.get(&rockstream_storage::keys::ShardKeyEncoder::frontier_key())
                 .await
@@ -1418,10 +1839,12 @@ mod data_plane_tests {
         );
         assert_eq!(
             (
-                flow.rows_in_flight(1, 84, 84),
-                flow.batches_in_flight(1, 84, 84)
+                flow.rows_in_flight(1, placement_index, placement_index),
+                flow.batches_in_flight(1, placement_index, placement_index),
+                flow.rows_in_flight(1, placement_index, legacy_index),
+                flow.batches_in_flight(1, placement_index, legacy_index)
             ),
-            (0, 0)
+            (0, 0, 0, 0)
         );
         mux.shutdown().await;
         service.shutdown().await;
@@ -2001,11 +2424,12 @@ pub struct ShardState {
 /// A client handle to interact with the running worker daemon.
 #[derive(Clone)]
 pub struct WorkerClientHandle {
+    pub(crate) direct_grants: crate::direct_grants::DirectGrantRegistry,
     worker_id: Arc<RwLock<Option<WorkerId>>>,
     active_shards: Arc<RwLock<HashMap<ShardId, ShardState>>>,
     topology_workers: Arc<RwLock<HashMap<WorkerId, WorkerInfo>>>,
     shard_leases: Arc<RwLock<HashMap<ShardId, ShardLease>>>,
-    msg_tx: mpsc::Sender<WorkerMessage>,
+    pub(crate) msg_tx: mpsc::Sender<WorkerMessage>,
     #[allow(dead_code)]
     security_audit_waiters: crate::exchange::service::SecurityAuditWaiters,
     fence_waiters:
@@ -2701,6 +3125,7 @@ where
     .with_security_audit(msg_tx.clone(), security_audit_waiters.clone());
 
     let handle = WorkerClientHandle {
+        direct_grants: crate::direct_grants::DirectGrantRegistry::default(),
         worker_id: worker_id.clone(),
         active_shards: active_shards.clone(),
         topology_workers: topology_workers.clone(),
@@ -2924,6 +3349,25 @@ where
             };
 
             match msg {
+                ControlMessage::InstallDirectEpochGrant { grant } => {
+                    let grant_id = grant.grant_id;
+                    let installed =
+                        install_direct_epoch_grant(&epoch_client, &deployments_clone, grant).await;
+                    if let Err(error) = &installed {
+                        tracing::warn!(%grant_id, %error, "direct epoch grant installation rejected");
+                    }
+                    let accepted = installed.is_ok();
+                    let _ = msg_tx
+                        .send(WorkerMessage::DirectEpochGrantInstalled {
+                            worker_id: WorkerId(proposed_worker_id),
+                            grant_id,
+                            accepted,
+                        })
+                        .await;
+                }
+                ControlMessage::RevokeDirectEpochGrants { metadata, grant_id } => {
+                    epoch_client.direct_grants.revoke(&metadata, grant_id);
+                }
                 ControlMessage::SecurityAuditRecorded {
                     request_id,
                     persisted,

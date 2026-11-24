@@ -723,6 +723,8 @@ async fn test_control_plane_retains_zero_row_payloads_or_output_history() {
             shards: vec![rockstream_types::data_plane::ShardOutput {
                 shard_id: assigned_shard_id,
                 lease_token: Some(assigned_lease_token),
+                committed_epoch: None,
+                routing_epoch: None,
                 deltas: vec![],
                 rows: vec![RuntimeRow {
                     values_tsv: "\\N".to_owned(),

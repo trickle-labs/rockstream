@@ -41,6 +41,7 @@ use rockstream_types::data_plane::{
     DeploymentDescriptor, DeploymentRequest, RuntimeExchangeMessage, RuntimeRow, ShardOutput,
     SourceDeltaRequest, WorkerExecutionStatus, WorkloadSnapshot,
 };
+use rockstream_types::direct_epoch::{DirectEpochGrant, SourceEpochMetadata};
 use rockstream_types::error_code::{
     ErrorCode, RS_0001, RS_0003, RS_2400, RS_2401, RS_2410, RS_2411, RS_2412, RS_3604, RS_3610,
     RS_3611, RS_3612, RS_8004,
@@ -167,6 +168,15 @@ struct DrainState {
 
 #[derive(Default)]
 struct DataPlaneState {
+    direct_epochs: HashMap<WorkloadId, rockstream_types::direct_epoch::SourceEpochMetadata>,
+    direct_epoch_deadlines: HashMap<WorkloadId, u64>,
+    /// One installation owner per workload; deadlines are not unique attempt IDs.
+    direct_installing: HashMap<WorkloadId, uuid::Uuid>,
+    /// Revocation must finish before another capability can be installed.
+    direct_completing: HashMap<WorkloadId, SourceEpochMetadata>,
+    /// At most one latest receipt per deployed workload; redeployment clears it.
+    direct_completed: HashMap<WorkloadId, SourceEpochMetadata>,
+    direct_grant_waiters: HashMap<uuid::Uuid, mpsc::Sender<(WorkerId, bool)>>,
     deployments: HashMap<WorkloadId, DeploymentState>,
     source_waiters: HashMap<String, SourceWaiter>,
     operator_stats_waiters: HashMap<String, OperatorStatsWaiter>,
@@ -243,7 +253,7 @@ struct SourceWaiter {
 }
 
 enum SourceCompletion {
-    Immediate(mpsc::Sender<ControlMessage>, String, u64),
+    Immediate(Box<SourceWaiter>, String),
     Owned(
         WorkerId,
         rockstream_types::data_plane::OwnedEpochIntent,
@@ -314,6 +324,429 @@ struct WorkloadReadWaiter {
     expected_shards: HashMap<WorkerId, HashMap<ShardId, LeaseToken>>,
     received_workers: HashSet<WorkerId>,
     sender: mpsc::Sender<(WorkerId, bool, Vec<ShardOutput>)>,
+}
+
+fn workload_topology_snapshot(
+    state: &DataPlaneState,
+    workload_id: WorkloadId,
+    catalog: &TopologyCatalog,
+    shard_manager: &ShardManager,
+) -> Option<rockstream_types::data_plane::WorkloadTopologySnapshot> {
+    let deployment = state.deployments.get(&workload_id)?;
+    let workers = catalog.all_workers();
+    let worker_addrs: HashMap<_, _> = workers
+        .iter()
+        .map(|worker| (worker.worker_id, worker.address.clone()))
+        .collect();
+    let mut shards: Vec<_> = deployment
+        .descriptors
+        .values()
+        .map(|descriptor| {
+            let lease = shard_manager
+                .get(descriptor.shard.shard_id)
+                .unwrap_or_else(|| descriptor.shard.clone());
+            rockstream_types::data_plane::WorkloadShardPlacement {
+                shard_id: lease.shard_id,
+                shard_index: descriptor.shard_index,
+                worker_id: lease.worker_id,
+                lease_token: lease.lease_token,
+                worker_address: worker_addrs
+                    .get(&lease.worker_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                operator_id: descriptor.sink_operator_id,
+                storage_identity: descriptor.storage_identity.clone(),
+                frontier: descriptor.frontier,
+            }
+        })
+        .collect();
+    shards.sort_by_key(|shard| (shard.shard_index, shard.shard_id));
+    Some(rockstream_types::data_plane::WorkloadTopologySnapshot {
+        topology_epoch: state.topology_epoch.max(1),
+        workload_id,
+        plan_json: deployment.request.plan_json.clone(),
+        routing_columns: deployment.request.routing_columns.clone(),
+        schemas: deployment.request.schemas.clone(),
+        shards,
+        workers,
+    })
+}
+
+async fn authorize_direct_epoch(
+    metadata: rockstream_types::direct_epoch::SourceEpochMetadata,
+    data_plane: &Arc<AsyncMutex<DataPlaneState>>,
+    worker_senders: &Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
+    catalog: &TopologyCatalog,
+    shard_manager: &ShardManager,
+) -> ControlMessage {
+    use rockstream_types::direct_epoch::DIRECT_EPOCH_GRANT_TTL_MS;
+    if !metadata.is_valid() {
+        return data_plane_failure("RS-1012: invalid direct epoch metadata");
+    }
+    let topology = {
+        let state = data_plane.lock().await;
+        let Some(deployment) = state.deployments.get(&metadata.workload_id) else {
+            return data_plane_failure("workload is not deployed");
+        };
+        match direct_completion_status(&state, &metadata) {
+            Ok(true) => return direct_completion_reply(&metadata),
+            Err(error) => return data_plane_failure(error),
+            Ok(false) => {}
+        }
+        if deployment.recovery_required
+            || deployment.ready_waiter.is_some()
+            || deployment
+                .descriptors
+                .keys()
+                .any(|shard| state.handoff_shards.contains(shard))
+            || deployment.descriptors.iter().any(|(id, descriptor)| {
+                !shard_manager
+                    .get(*id)
+                    .is_some_and(|lease| lease.same_owner(&descriptor.shard))
+            })
+        {
+            return data_plane_failure("RS-3004: workload ownership is changing");
+        }
+        let Some(topology) =
+            workload_topology_snapshot(&state, metadata.workload_id, catalog, shard_manager)
+        else {
+            return data_plane_failure("workload is not deployed");
+        };
+        topology
+    };
+    let target_workers: HashSet<_> = topology
+        .shards
+        .iter()
+        .map(|shard| shard.worker_id)
+        .collect();
+    if topology.shards.is_empty()
+        || topology.shards.len() > 4096
+        || topology
+            .shards
+            .iter()
+            .any(|shard| shard.worker_address.is_empty())
+        || target_workers
+            .iter()
+            .any(|id| !catalog.get(*id).is_some_and(|worker| worker.healthy))
+    {
+        return data_plane_failure("RS-3004: direct epoch recipients are not ready");
+    }
+    let grant = DirectEpochGrant {
+        grant_id: uuid::Uuid::new_v4(),
+        metadata,
+        expires_at_ms: now_ms().saturating_add(DIRECT_EPOCH_GRANT_TTL_MS),
+        members: topology
+            .shards
+            .iter()
+            .map(|shard| (shard.shard_id, shard.lease_token))
+            .collect(),
+    };
+    let (tx, mut rx) = mpsc::channel(target_workers.len());
+    let previous_reservation = {
+        let mut state = data_plane.lock().await;
+        match direct_completion_status(&state, &grant.metadata) {
+            Ok(true) => return direct_completion_reply(&grant.metadata),
+            Err(error) => return data_plane_failure(error),
+            Ok(false) => {}
+        }
+        match reserve_direct_grant(&mut state, &grant, tx, now_ms()) {
+            Ok(previous) => previous,
+            Err(error) => return data_plane_failure(error),
+        }
+    };
+    let targets: Vec<_> = {
+        let senders = worker_senders.lock().await;
+        target_workers
+            .iter()
+            .filter_map(|id| senders.get(id).cloned())
+            .collect()
+    };
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
+        if targets.len() != target_workers.len() {
+            return false;
+        }
+        for target in targets {
+            if target
+                .send(ControlMessage::InstallDirectEpochGrant {
+                    grant: grant.clone(),
+                })
+                .await
+                .is_err()
+            {
+                return false;
+            }
+        }
+        let mut accepted = HashSet::new();
+        while accepted.len() < target_workers.len() {
+            let Some((worker, ready)) = rx.recv().await else {
+                return false;
+            };
+            if !target_workers.contains(&worker) || !ready {
+                return false;
+            }
+            accepted.insert(worker);
+        }
+        true
+    })
+    .await
+    .unwrap_or(false);
+    let ownership_current = topology.shards.iter().all(|shard| {
+        shard_manager.get(shard.shard_id).is_some_and(|lease| {
+            lease.worker_id == shard.worker_id && lease.lease_token == shard.lease_token
+        })
+    });
+    {
+        let mut state = data_plane.lock().await;
+        state.direct_grant_waiters.remove(&grant.grant_id);
+        if result
+            && ownership_current
+            && state.direct_installing.get(&grant.metadata.workload_id) == Some(&grant.grant_id)
+            && state.direct_epochs.get(&grant.metadata.workload_id) == Some(&grant.metadata)
+            && state.direct_completed.get(&grant.metadata.workload_id) != Some(&grant.metadata)
+            && !state
+                .direct_completing
+                .contains_key(&grant.metadata.workload_id)
+        {
+            state.direct_installing.remove(&grant.metadata.workload_id);
+            return ControlMessage::DirectEpochAuthorized { grant, topology };
+        }
+    }
+    // A completion can arrive while recipients are acknowledging a renewal.
+    // The notification records it without waiting on this install, so its
+    // worker connection remains able to deliver the pending acknowledgements.
+    revoke_direct_grants(
+        &grant.metadata,
+        Some(grant.grant_id),
+        &target_workers,
+        worker_senders,
+    )
+    .await;
+    let completed = {
+        let mut state = data_plane.lock().await;
+        if state.direct_completed.get(&grant.metadata.workload_id) == Some(&grant.metadata) {
+            true
+        } else {
+            restore_failed_direct_reservation(&mut state, &grant, previous_reservation);
+            false
+        }
+    };
+    if completed {
+        revoke_direct_grants(&grant.metadata, None, &target_workers, worker_senders).await;
+        let mut state = data_plane.lock().await;
+        if state.direct_installing.get(&grant.metadata.workload_id) == Some(&grant.grant_id) {
+            state.direct_installing.remove(&grant.metadata.workload_id);
+            release_completed_direct_reservation(&mut state, &grant.metadata);
+        }
+        return direct_completion_reply(&grant.metadata);
+    }
+    data_plane_failure(if result && !ownership_current {
+        "RS-3004: direct epoch recipient ownership changed"
+    } else {
+        "RS-3004: direct epoch recipient authorization was not acknowledged"
+    })
+}
+
+fn direct_completion_status(
+    state: &DataPlaneState,
+    metadata: &SourceEpochMetadata,
+) -> Result<bool, &'static str> {
+    match state.direct_completed.get(&metadata.workload_id) {
+        Some(completed) if completed == metadata => Ok(true),
+        Some(completed) if metadata.epoch <= completed.epoch => {
+            Err("RS-1012: direct source epoch conflicts with completed input")
+        }
+        _ => Ok(false),
+    }
+}
+
+fn direct_completion_reply(metadata: &SourceEpochMetadata) -> ControlMessage {
+    ControlMessage::SourceDeltaCommitted {
+        request_id: metadata.request_id.clone(),
+        epoch: metadata.epoch,
+    }
+}
+
+type DirectReservation = Option<(SourceEpochMetadata, Option<u64>)>;
+
+fn reserve_direct_grant(
+    state: &mut DataPlaneState,
+    grant: &DirectEpochGrant,
+    waiter: mpsc::Sender<(WorkerId, bool)>,
+    now: u64,
+) -> Result<DirectReservation, &'static str> {
+    let workload = grant.metadata.workload_id;
+    if state.direct_installing.contains_key(&workload)
+        || state.direct_completing.contains_key(&workload)
+        || (state
+            .direct_epochs
+            .get(&workload)
+            .is_some_and(|pending| pending != &grant.metadata)
+            && state
+                .direct_epoch_deadlines
+                .get(&workload)
+                .is_none_or(|deadline| *deadline > now))
+        || state
+            .source_waiters
+            .values()
+            .any(|pending| pending.workload_id == workload)
+        || state
+            .workload_read_waiters
+            .values()
+            .any(|reader| reader.workload_id == workload)
+        || grant
+            .members
+            .keys()
+            .any(|shard| state.handoff_shards.contains(shard))
+    {
+        return Err("RS-3004: workload has an active read, write, or ownership handoff");
+    }
+    if state.direct_grant_waiters.len() >= rockstream_types::direct_epoch::MAX_DIRECT_EPOCH_GRANTS {
+        return Err("RS-5036: direct epoch authorization capacity exhausted");
+    }
+    let previous = state.direct_epochs.get(&workload).cloned().map(|metadata| {
+        (
+            metadata,
+            state.direct_epoch_deadlines.get(&workload).copied(),
+        )
+    });
+    state.direct_grant_waiters.insert(grant.grant_id, waiter);
+    state.direct_installing.insert(workload, grant.grant_id);
+    state.direct_epochs.insert(workload, grant.metadata.clone());
+    // Recipients validate durable pending journals before acknowledging a
+    // replacement; expiry only releases the control reservation's time bound.
+    state
+        .direct_epoch_deadlines
+        .insert(workload, grant.expires_at_ms);
+    Ok(previous)
+}
+
+/// Returns a revoke action only when no installer is responsible for cleanup.
+/// In-flight installation must continue receiving worker ACKs, not wait here.
+fn record_direct_completion(
+    state: &mut DataPlaneState,
+    metadata: SourceEpochMetadata,
+) -> Option<SourceEpochMetadata> {
+    let workload = metadata.workload_id;
+    if !state.deployments.contains_key(&workload)
+        || state.direct_epochs.get(&workload) != Some(&metadata)
+    {
+        return None;
+    }
+    state.direct_completed.insert(workload, metadata.clone());
+    if state.direct_completing.contains_key(&workload) {
+        return None;
+    }
+    state.direct_completing.insert(workload, metadata.clone());
+    (!state.direct_installing.contains_key(&workload)).then_some(metadata)
+}
+
+fn release_completed_direct_reservation(
+    state: &mut DataPlaneState,
+    metadata: &SourceEpochMetadata,
+) {
+    let workload = metadata.workload_id;
+    if state.direct_installing.contains_key(&workload)
+        || state.direct_completing.get(&workload) != Some(metadata)
+    {
+        return;
+    }
+    if state.direct_epochs.get(&workload) == Some(metadata) {
+        state.direct_epochs.remove(&workload);
+        state.direct_epoch_deadlines.remove(&workload);
+    }
+    state.direct_completing.remove(&workload);
+}
+
+fn routing_completion_members(
+    state: &DataPlaneState,
+    shard_manager: &ShardManager,
+    workload: WorkloadId,
+    worker: WorkerId,
+    anchor: ShardId,
+    anchor_lease: LeaseToken,
+    reported: &[(ShardId, LeaseToken)],
+) -> Option<BTreeMap<ShardId, LeaseToken>> {
+    if reported.is_empty()
+        || reported.len() > 4096
+        || reported.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+    {
+        return None;
+    }
+    let deployment = state.deployments.get(&workload)?;
+    let anchor_descriptor = deployment
+        .descriptors
+        .values()
+        .min_by_key(|descriptor| descriptor.shard.shard_id)?;
+    if anchor_descriptor.shard.shard_id != anchor
+        || anchor_descriptor.shard.worker_id != worker
+        || anchor_descriptor.shard.lease_token != anchor_lease
+    {
+        return None;
+    }
+    let mut expected = BTreeMap::new();
+    for (shard_id, descriptor) in &deployment.descriptors {
+        let lease = shard_manager.get(*shard_id)?;
+        if !lease.same_owner(&descriptor.shard) {
+            return None;
+        }
+        expected.insert(*shard_id, lease.lease_token);
+    }
+    let members: BTreeMap<_, _> = reported.iter().copied().collect();
+    (members == expected).then_some(members)
+}
+
+async fn revoke_direct_grants(
+    metadata: &rockstream_types::direct_epoch::SourceEpochMetadata,
+    grant_id: Option<uuid::Uuid>,
+    target_workers: &HashSet<WorkerId>,
+    worker_senders: &Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
+) {
+    let senders: Vec<_> = {
+        let senders = worker_senders.lock().await;
+        target_workers
+            .iter()
+            .filter_map(|id| senders.get(id).cloned())
+            .collect()
+    };
+    // Enqueue before releasing the admission pin. Subsequent installations use
+    // these same ordered control channels, so no stale capability survives a
+    // successfully committed epoch or a partially installed failed grant.
+    for sender in senders {
+        let _ = sender
+            .send(ControlMessage::RevokeDirectEpochGrants {
+                metadata: metadata.clone(),
+                grant_id,
+            })
+            .await;
+    }
+}
+
+fn restore_failed_direct_reservation(
+    state: &mut DataPlaneState,
+    grant: &DirectEpochGrant,
+    previous: DirectReservation,
+) {
+    let workload = grant.metadata.workload_id;
+    if state.direct_installing.get(&workload) != Some(&grant.grant_id)
+        || state.direct_epochs.get(&workload) != Some(&grant.metadata)
+    {
+        return;
+    }
+    state.direct_installing.remove(&workload);
+    match previous {
+        Some((metadata, deadline)) => {
+            state.direct_epochs.insert(workload, metadata);
+            if let Some(deadline) = deadline {
+                state.direct_epoch_deadlines.insert(workload, deadline);
+            } else {
+                state.direct_epoch_deadlines.remove(&workload);
+            }
+        }
+        None => {
+            state.direct_epochs.remove(&workload);
+            state.direct_epoch_deadlines.remove(&workload);
+        }
+    }
 }
 
 /// Convert the internal [`RaftRole`] to its wire-serializable mirror.
@@ -2447,6 +2880,9 @@ async fn deploy_workload(
         .source_waiters
         .values()
         .any(|waiter| waiter.workload_id == request.workload_id)
+        || state.direct_epochs.contains_key(&request.workload_id)
+        || state.direct_installing.contains_key(&request.workload_id)
+        || state.direct_completing.contains_key(&request.workload_id)
     {
         Some(data_plane_failure(
             "another source delta is already in flight for this workload",
@@ -2494,6 +2930,7 @@ async fn deploy_workload(
     }
 
     state.topology_epoch = state.topology_epoch.saturating_add(1);
+    state.direct_completed.remove(&workload_id);
     state.deployments.insert(
         request.workload_id,
         DeploymentState {
@@ -3000,6 +3437,24 @@ async fn submit_source_delta(
         } else if state.source_waiters.contains_key(&request.request_id) {
             Some(data_plane_failure(
                 "source delta request id is already in flight",
+            ))
+        } else if state.direct_epochs.contains_key(&request.workload_id)
+            || state
+                .workload_read_waiters
+                .values()
+                .any(|waiter| waiter.workload_id == request.workload_id)
+            || state
+                .deployments
+                .get(&request.workload_id)
+                .is_some_and(|deployment| {
+                    deployment
+                        .descriptors
+                        .keys()
+                        .any(|id| state.handoff_shards.contains(id))
+                })
+        {
+            Some(data_plane_failure(
+                "workload has an active read, direct epoch, or ownership handoff",
             ))
         } else if state
             .source_waiters
@@ -3837,6 +4292,7 @@ fn is_gateway_data_plane_message(message: &WorkerMessage) -> bool {
         WorkerMessage::DeployWorkload(_)
             | WorkerMessage::DeployWorkloadSharded { .. }
             | WorkerMessage::SubmitSourceDelta(_)
+            | WorkerMessage::AuthorizeSourceEpoch { .. }
             | WorkerMessage::ReadOperatorStats { .. }
             | WorkerMessage::ReadWorkload { .. }
             | WorkerMessage::GetWorkloadTopology { .. }
@@ -3879,6 +4335,29 @@ async fn gateway_data_plane_scope(
                     namespace: deployment.request.namespace.clone(),
                     kind: ResourceKind::Table,
                     name: delta.source.clone(),
+                },
+            ))
+        }
+        WorkerMessage::AuthorizeSourceEpoch { metadata } => {
+            if !metadata.is_valid() {
+                return None;
+            }
+            let state = data_plane.lock().await;
+            let deployment = state.deployments.get(&metadata.workload_id)?;
+            if !deployment
+                .request
+                .schemas
+                .iter()
+                .any(|schema| schema.relation.eq_ignore_ascii_case(&metadata.source))
+            {
+                return None;
+            }
+            Some((
+                SecurityAction::DataWrite,
+                PolicyScope::Resource {
+                    namespace: deployment.request.namespace.clone(),
+                    kind: ResourceKind::Table,
+                    name: metadata.source.clone(),
                 },
             ))
         }
@@ -4416,6 +4895,8 @@ fn claimed_worker_id(message: &WorkerMessage) -> Option<WorkerId> {
         | WorkerMessage::ShardCheckpointAck { worker_id, .. }
         | WorkerMessage::LifecycleState { worker_id, .. }
         | WorkerMessage::ShardLoadReport { worker_id, .. }
+        | WorkerMessage::RoutingEpochCommitted { worker_id, .. }
+        | WorkerMessage::DirectEpochGrantInstalled { worker_id, .. }
         | WorkerMessage::RequestDrain { worker_id } => Some(*worker_id),
         _ => None,
     }
@@ -4700,6 +5181,34 @@ async fn request_operator_stats(
     }
 }
 
+/// Reports with a routing certificate must describe one complete epoch on
+/// every participant. Legacy reports without a journal retain wire support.
+fn consistent_routing_snapshot(shards: &[ShardOutput]) -> bool {
+    if shards.is_empty() {
+        return false;
+    }
+    let anchors = shards
+        .iter()
+        .filter(|shard| shard.routing_epoch.is_some())
+        .collect::<Vec<_>>();
+    if shards
+        .iter()
+        .all(|shard| shard.committed_epoch.is_none() && shard.routing_epoch.is_none())
+    {
+        return true;
+    }
+    if anchors.len() != 1 {
+        return false;
+    }
+    let anchor = anchors[0];
+    if shards.iter().map(|shard| shard.shard_id).min() != Some(anchor.shard_id) {
+        return false;
+    }
+    shards
+        .iter()
+        .all(|shard| shard.committed_epoch == anchor.routing_epoch)
+}
+
 async fn request_workload_snapshot(
     workload_id: WorkloadId,
     data_plane: &Arc<AsyncMutex<DataPlaneState>>,
@@ -4868,6 +5377,11 @@ async fn request_workload_snapshot(
     }
     let mut shards: Vec<_> = outputs.drain().map(|(_, output)| output).collect();
     shards.sort_by_key(|shard| shard.shard_id);
+    if !consistent_routing_snapshot(&shards) {
+        return data_plane_failure(
+            "workload read crossed a routing epoch; retry the complete snapshot",
+        );
+    }
     ControlMessage::WorkloadSnapshot {
         snapshot: WorkloadSnapshot {
             version: rockstream_types::data_plane::WORKLOAD_SNAPSHOT_VERSION,
@@ -5717,18 +6231,20 @@ async fn handle_connection_stream<R, W>(
                             .remove(&output.request_id)
                             .map(|waiter| {
                                 SourceCompletion::Immediate(
-                                    waiter.sender,
+                                    Box::new(waiter),
                                     output.request_id.clone(),
-                                    waiter.epoch,
                                 )
                             })
                     }
                 };
                 match completion {
-                    Some(SourceCompletion::Immediate(waiter, request_id, epoch)) => {
+                    Some(SourceCompletion::Immediate(waiter, request_id)) => {
                         send_message(
-                            &waiter,
-                            &ControlMessage::SourceDeltaCommitted { request_id, epoch },
+                            &waiter.sender,
+                            &ControlMessage::SourceDeltaCommitted {
+                                request_id,
+                                epoch: waiter.epoch,
+                            },
                         )
                         .await;
                     }
@@ -5891,6 +6407,30 @@ async fn handle_connection_stream<R, W>(
                 )
                 .await;
             }
+            WorkerMessage::AuthorizeSourceEpoch { metadata } => {
+                let reply = authorize_direct_epoch(
+                    metadata,
+                    &data_plane,
+                    &worker_senders,
+                    &catalog,
+                    &shard_manager,
+                )
+                .await;
+                send_message(&sender, &reply).await;
+            }
+            WorkerMessage::DirectEpochGrantInstalled {
+                worker_id,
+                grant_id,
+                accepted,
+            } => {
+                if connected_worker_id == Some(worker_id) {
+                    if let Some(waiter) =
+                        data_plane.lock().await.direct_grant_waiters.get(&grant_id)
+                    {
+                        let _ = waiter.try_send((worker_id, accepted));
+                    }
+                }
+            }
             WorkerMessage::GetWorkloadTopology { workload_id } => {
                 let reply = {
                     let state = data_plane.lock().await;
@@ -5929,6 +6469,7 @@ async fn handle_connection_stream<R, W>(
                                 snapshot: rockstream_types::data_plane::WorkloadTopologySnapshot {
                                     topology_epoch: state.topology_epoch.max(1),
                                     workload_id,
+                                    plan_json: deployment.request.plan_json.clone(),
                                     routing_columns: deployment.request.routing_columns.clone(),
                                     schemas: deployment.request.schemas.clone(),
                                     shards,
@@ -6434,6 +6975,58 @@ async fn handle_connection_stream<R, W>(
                 );
                 if let Some(worker) = catalog.set_lifecycle(worker_id, state) {
                     persist_worker_if_needed(topology_store.as_ref(), &worker).await;
+                }
+            }
+            WorkerMessage::RoutingEpochCommitted {
+                worker_id,
+                workload_id,
+                anchor_shard_id,
+                anchor_lease_token,
+                epoch,
+                request_id,
+                input_digest,
+                shard_leases,
+                ..
+            } => {
+                if connected_worker_id != Some(worker_id) || shard_leases.len() > 4096 {
+                    continue;
+                }
+                let completion = {
+                    let mut state = data_plane.lock().await;
+                    routing_completion_members(
+                        &state,
+                        &shard_manager,
+                        workload_id,
+                        worker_id,
+                        anchor_shard_id,
+                        anchor_lease_token,
+                        &shard_leases,
+                    )
+                    .map(|members| {
+                        let metadata = state
+                            .direct_epochs
+                            .get(&workload_id)
+                            .filter(|pending| {
+                                pending.request_id == request_id
+                                    && pending.epoch == epoch
+                                    && pending.input_digest == input_digest
+                            })
+                            .cloned();
+                        let revoke = metadata
+                            .and_then(|metadata| record_direct_completion(&mut state, metadata));
+                        (members, revoke)
+                    })
+                };
+                if let Some((members, completed_metadata)) = completion {
+                    if let Some(metadata) = completed_metadata {
+                        let targets = members
+                            .keys()
+                            .filter_map(|id| shard_manager.get(*id).map(|lease| lease.worker_id))
+                            .collect();
+                        revoke_direct_grants(&metadata, None, &targets, &worker_senders).await;
+                        let mut state = data_plane.lock().await;
+                        release_completed_direct_reservation(&mut state, &metadata);
+                    }
                 }
             }
             WorkerMessage::ShardLoadReport { worker_id, samples } => {
@@ -7065,6 +7658,428 @@ mod tests {
     };
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpStream;
+
+    fn direct_lifecycle_fixture() -> (
+        DataPlaneState,
+        ShardManager,
+        TopologyCatalog,
+        DirectEpochGrant,
+    ) {
+        let manager = ShardManager::new();
+        let catalog = TopologyCatalog::new();
+        let request = DeploymentRequest {
+            version: rockstream_types::data_plane::DEPLOYMENT_DESCRIPTOR_VERSION,
+            workload_id: WorkloadId(3),
+            namespace: "public".into(),
+            workload_name: "direct".into(),
+            plan_json: "{}".into(),
+            join_strategy: Default::default(),
+            schemas: Vec::new(),
+            frontier: 0,
+            storage_root: "test".into(),
+            sink_operator_id: rockstream_types::ids::OperatorId(1),
+            output_columns: Vec::new(),
+            primary_key: vec![0],
+            merge_key_columns: Vec::new(),
+            routing_columns: BTreeMap::new(),
+        };
+        let mut descriptors = HashMap::new();
+        let mut members = BTreeMap::new();
+        for id in [1, 2] {
+            catalog.register(&WorkerRegistration::new(
+                WorkerId(id),
+                NodeRole::Worker,
+                format!("127.0.0.1:{}", 9000 + id),
+                CapacityHeadroom::new(0.8),
+            ));
+            let lease = manager.acquire(ShardId(id), WorkerId(id)).unwrap();
+            members.insert(lease.shard_id, lease.lease_token);
+            descriptors.insert(
+                lease.shard_id,
+                DeploymentDescriptor::with_shard_index(
+                    request.clone(),
+                    lease,
+                    format!("test/{id}"),
+                    (id - 1) as u32,
+                ),
+            );
+        }
+        let mut state = DataPlaneState::default();
+        state.deployments.insert(
+            request.workload_id,
+            DeploymentState {
+                request,
+                actor: None,
+                secret_names: Vec::new(),
+                descriptors,
+                workers: HashMap::new(),
+                ready_shards: members.keys().copied().collect(),
+                ready_waiter: None,
+                recovery_required: false,
+            },
+        );
+        let grant = DirectEpochGrant {
+            grant_id: uuid::Uuid::from_u128(1),
+            metadata: SourceEpochMetadata {
+                version: rockstream_types::data_plane::DEPLOYMENT_DESCRIPTOR_VERSION,
+                workload_id: WorkloadId(3),
+                source: "items".into(),
+                request_id: "direct-1".into(),
+                epoch: 7,
+                input_digest: [9; 32],
+            },
+            expires_at_ms: 100,
+            members,
+        };
+        (state, manager, catalog, grant)
+    }
+
+    #[test]
+    fn equal_deadline_renewals_have_distinct_install_owners_and_stale_rollback_is_inert() {
+        let (mut state, _, _, first) = direct_lifecycle_fixture();
+        let (waiter, _) = mpsc::channel(2);
+        assert_eq!(
+            reserve_direct_grant(&mut state, &first, waiter.clone(), 10),
+            Ok(None)
+        );
+        let mut second = first.clone();
+        second.grant_id = uuid::Uuid::from_u128(2);
+        assert_eq!(
+            reserve_direct_grant(&mut state, &second, waiter.clone(), 10),
+            Err("RS-3004: workload has an active read, write, or ownership handoff")
+        );
+        // The first install has returned successfully, leaving its live pin.
+        state.direct_installing.remove(&first.metadata.workload_id);
+        state.direct_grant_waiters.remove(&first.grant_id);
+        assert_eq!(
+            reserve_direct_grant(&mut state, &second, waiter, 10),
+            Ok(Some((first.metadata.clone(), Some(100))))
+        );
+        restore_failed_direct_reservation(&mut state, &first, None);
+        assert_eq!(
+            (
+                state.direct_epochs.clone(),
+                state.direct_epoch_deadlines.clone(),
+                state.direct_installing.clone()
+            ),
+            (
+                HashMap::from([(WorkloadId(3), second.metadata.clone())]),
+                HashMap::from([(WorkloadId(3), 100)]),
+                HashMap::from([(WorkloadId(3), second.grant_id)]),
+            )
+        );
+        restore_failed_direct_reservation(
+            &mut state,
+            &second,
+            Some((first.metadata.clone(), Some(100))),
+        );
+        assert_eq!(
+            (
+                state.direct_epochs,
+                state.direct_epoch_deadlines,
+                state.direct_installing
+            ),
+            (
+                HashMap::from([(WorkloadId(3), first.metadata)]),
+                HashMap::from([(WorkloadId(3), 100)]),
+                HashMap::new()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_during_install_keeps_acks_live_revokes_tentative_grants_and_replays_receipt(
+    ) {
+        let (state, manager, catalog, fixture) = direct_lifecycle_fixture();
+        let data_plane = Arc::new(AsyncMutex::new(state));
+        let mut receivers = Vec::new();
+        let mut senders = HashMap::new();
+        for id in [WorkerId(1), WorkerId(2)] {
+            let (sender, receiver) = mpsc::channel(4);
+            senders.insert(id, sender);
+            receivers.push((id, receiver));
+        }
+        let worker_senders = Arc::new(AsyncMutex::new(senders));
+        let authorize = tokio::spawn({
+            let metadata = fixture.metadata.clone();
+            let data_plane = data_plane.clone();
+            let worker_senders = worker_senders.clone();
+            let manager = manager.clone();
+            let catalog = catalog.clone();
+            async move {
+                authorize_direct_epoch(metadata, &data_plane, &worker_senders, &catalog, &manager)
+                    .await
+            }
+        });
+        let mut installed = Vec::new();
+        for (_, receiver) in &mut receivers {
+            let message = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let ControlMessage::InstallDirectEpochGrant { grant } = message else {
+                panic!("unexpected authorization message: {message:?}");
+            };
+            installed.push(grant);
+        }
+        let grant = installed[0].clone();
+        assert_eq!(installed, vec![grant.clone(), grant.clone()]);
+        {
+            let mut state = data_plane.lock().await;
+            assert_eq!(
+                record_direct_completion(&mut state, grant.metadata.clone()),
+                None
+            );
+            assert_eq!(
+                state.direct_installing.get(&WorkloadId(3)),
+                Some(&grant.grant_id)
+            );
+            // The completion notification does not await the install on the
+            // worker reader: both acknowledgement messages can still arrive.
+            let waiter = state.direct_grant_waiters[&grant.grant_id].clone();
+            waiter.try_send((WorkerId(1), true)).unwrap();
+            waiter.try_send((WorkerId(2), true)).unwrap();
+        }
+        let reply = authorize.await.unwrap();
+        assert_eq!(
+            serde_json::to_value(reply).unwrap(),
+            serde_json::json!({"type":"source_delta_committed","request_id":"direct-1","epoch":7})
+        );
+        for (_, receiver) in &mut receivers {
+            for grant_id in [Some(grant.grant_id), None] {
+                let actual = receiver.recv().await.unwrap();
+                assert_eq!(
+                    serde_json::to_value(actual).unwrap(),
+                    serde_json::json!({
+                        "type":"revoke_direct_epoch_grants", "metadata":grant.metadata, "grant_id":grant_id
+                    })
+                );
+            }
+        }
+        {
+            let state = data_plane.lock().await;
+            assert_eq!(
+                state.direct_completed,
+                HashMap::from([(WorkloadId(3), grant.metadata.clone())])
+            );
+            assert_eq!(
+                (
+                    state.direct_epochs.clone(),
+                    state.direct_epoch_deadlines.clone(),
+                    state.direct_installing.clone(),
+                    state.direct_completing.clone(),
+                    state
+                        .direct_grant_waiters
+                        .keys()
+                        .copied()
+                        .collect::<Vec<_>>()
+                ),
+                (
+                    HashMap::new(),
+                    HashMap::new(),
+                    HashMap::new(),
+                    HashMap::new(),
+                    Vec::new()
+                )
+            );
+        }
+        let replay = authorize_direct_epoch(
+            grant.metadata.clone(),
+            &data_plane,
+            &worker_senders,
+            &catalog,
+            &manager,
+        )
+        .await;
+        assert_eq!(
+            serde_json::to_value(replay).unwrap(),
+            serde_json::json!({"type":"source_delta_committed","request_id":"direct-1","epoch":7})
+        );
+        for (_, receiver) in &mut receivers {
+            assert_eq!(
+                receiver.try_recv().unwrap_err(),
+                mpsc::error::TryRecvError::Empty
+            );
+        }
+    }
+
+    #[test]
+    fn completion_revocation_blocks_renewal_until_cleanup_and_conflicting_replay_is_rejected() {
+        let (mut state, _, _, grant) = direct_lifecycle_fixture();
+        state
+            .direct_epochs
+            .insert(WorkloadId(3), grant.metadata.clone());
+        state.direct_epoch_deadlines.insert(WorkloadId(3), 100);
+        assert_eq!(
+            record_direct_completion(&mut state, grant.metadata.clone()),
+            Some(grant.metadata.clone())
+        );
+        let mut next = grant.clone();
+        next.metadata.epoch += 1;
+        next.metadata.request_id = "direct-2".into();
+        next.grant_id = uuid::Uuid::from_u128(2);
+        let (waiter, _) = mpsc::channel(2);
+        assert_eq!(
+            reserve_direct_grant(&mut state, &next, waiter.clone(), 101),
+            Err("RS-3004: workload has an active read, write, or ownership handoff")
+        );
+        assert_eq!(direct_completion_status(&state, &grant.metadata), Ok(true));
+        let mut changed = grant.metadata.clone();
+        changed.input_digest[0] ^= 1;
+        assert_eq!(
+            direct_completion_status(&state, &changed),
+            Err("RS-1012: direct source epoch conflicts with completed input")
+        );
+        release_completed_direct_reservation(&mut state, &grant.metadata);
+        assert_eq!(
+            reserve_direct_grant(&mut state, &next, waiter, 101),
+            Ok(None)
+        );
+        assert_eq!(
+            state.direct_epochs,
+            HashMap::from([(WorkloadId(3), next.metadata)])
+        );
+        assert_eq!(
+            state.direct_completed,
+            HashMap::from([(WorkloadId(3), grant.metadata)])
+        );
+    }
+
+    #[test]
+    fn routing_completion_rejects_missing_extra_duplicate_and_stale_members() {
+        let (state, manager, _, grant) = direct_lifecycle_fixture();
+        let valid: Vec<_> = grant
+            .members
+            .iter()
+            .map(|(id, token)| (*id, *token))
+            .collect();
+        let anchor_lease = valid[0].1;
+        let mut extra = valid.clone();
+        extra.push((ShardId(3), LeaseToken(1)));
+        let mut stale = valid.clone();
+        stale[1].1 = LeaseToken(stale[1].1 .0 + 1);
+        let mut reversed = valid.clone();
+        reversed.reverse();
+        let results = [
+            valid.clone(),
+            vec![valid[0]],
+            extra,
+            vec![valid[0], valid[0]],
+            stale,
+            reversed,
+            Vec::new(),
+        ]
+        .into_iter()
+        .map(|members| {
+            routing_completion_members(
+                &state,
+                &manager,
+                WorkloadId(3),
+                WorkerId(1),
+                ShardId(1),
+                anchor_lease,
+                &members,
+            )
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(
+            results,
+            vec![Some(grant.members), None, None, None, None, None, None]
+        );
+        assert_eq!(
+            routing_completion_members(
+                &state,
+                &manager,
+                WorkloadId(3),
+                WorkerId(2),
+                ShardId(1),
+                anchor_lease,
+                &valid
+            ),
+            None
+        );
+        let moved = manager.get(ShardId(2)).unwrap();
+        manager.transfer_if_owner(&moved, WorkerId(3)).unwrap();
+        assert_eq!(
+            routing_completion_members(
+                &state,
+                &manager,
+                WorkloadId(3),
+                WorkerId(1),
+                ShardId(1),
+                anchor_lease,
+                &valid
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn complete_routing_snapshots_reject_concurrent_mixed_and_missing_epoch_reports() {
+        let shard = |id, epoch, routing| ShardOutput {
+            shard_id: ShardId(id),
+            lease_token: Some(LeaseToken(id)),
+            committed_epoch: epoch,
+            routing_epoch: routing,
+            deltas: Vec::new(),
+            rows: vec![RuntimeRow {
+                values_tsv: format!("row-{id}"),
+                weight: 1,
+            }],
+        };
+        let cases = vec![
+            (
+                vec![shard(1, Some(8), Some(8)), shard(2, Some(8), None)],
+                true,
+            ),
+            // The anchor was read just before prepare and another shard just
+            // after commit; reversing arrival order must not change rejection.
+            (
+                vec![shard(1, Some(8), Some(8)), shard(2, Some(9), None)],
+                false,
+            ),
+            (
+                vec![shard(2, Some(9), None), shard(1, Some(8), Some(8))],
+                false,
+            ),
+            (
+                vec![shard(1, Some(9), Some(9)), shard(2, Some(8), None)],
+                false,
+            ),
+            (
+                vec![shard(1, Some(0), Some(0)), shard(2, Some(1), None)],
+                false,
+            ),
+            (
+                vec![shard(1, Some(8), Some(8)), shard(2, None, None)],
+                false,
+            ),
+            (
+                vec![shard(1, Some(8), None), shard(2, Some(8), None)],
+                false,
+            ),
+            (
+                vec![shard(1, Some(8), Some(8)), shard(2, Some(8), Some(8))],
+                false,
+            ),
+            (
+                vec![shard(1, Some(8), None), shard(2, Some(8), Some(8))],
+                false,
+            ),
+            (vec![shard(1, None, None), shard(2, None, None)], true),
+            (vec![], false),
+        ];
+        assert_eq!(
+            cases
+                .iter()
+                .map(|(shards, _)| consistent_routing_snapshot(shards))
+                .collect::<Vec<_>>(),
+            cases
+                .iter()
+                .map(|(_, expected)| *expected)
+                .collect::<Vec<_>>()
+        );
+    }
 
     #[test]
     fn source_waiter_completes_only_after_each_expected_shard_reports() {

@@ -2788,6 +2788,7 @@ impl GatewayHandler {
             request,
             WorkerMessage::DeployWorkload(_)
                 | WorkerMessage::SubmitSourceDelta(_)
+                | WorkerMessage::AuthorizeSourceEpoch { .. }
                 | WorkerMessage::ReadWorkload { .. }
                 | WorkerMessage::ReadOperatorStats { .. }
         ) {
@@ -13720,9 +13721,8 @@ impl GatewayHandler {
                                     kind: ResourceKind::Table,
                                     name: source,
                                 },
-                                &rockstream_types::topology::WorkerMessage::SubmitSourceDelta(
-                                    request.clone(),
-                                ),
+                                &DataPlaneClient::source_authorization_request(&request)
+                                    .map_err(|error| PgWireError::ApiError(Box::new(error)))?,
                             )
                             .await
                             .map_err(|error| {
@@ -13852,7 +13852,7 @@ impl GatewayHandler {
                     let response = match assertion {
                         Some(assertion) => {
                             data_plane
-                                .submit_delta_delegated(request.clone(), assertion)
+                                .submit_delta_authorized(request.clone(), assertion)
                                 .await
                         }
                         None => data_plane.submit_delta(request.clone()).await,
@@ -20052,7 +20052,9 @@ fn source_routing_column(
             };
             source_routing_column(input, *input_column)
         }
-        PlanNode::ViewSink { child, .. } => source_routing_column(child, output_column),
+        PlanNode::ViewSink { child, .. } | PlanNode::Exchange { child, .. } => {
+            source_routing_column(child, output_column)
+        }
         _ => None,
     }
 }
@@ -20078,7 +20080,9 @@ fn join_routing_columns(plan: &rockstream_plan::PlanNode) -> Option<BTreeMap<Str
         | PlanNode::Project { input, .. }
         | PlanNode::Map { input, .. }
         | PlanNode::Aggregate { input, .. } => join_routing_columns(input),
-        PlanNode::ViewSink { child, .. } => join_routing_columns(child),
+        PlanNode::ViewSink { child, .. } | PlanNode::Exchange { child, .. } => {
+            join_routing_columns(child)
+        }
         _ => None,
     }
 }
@@ -20103,10 +20107,26 @@ fn aggregate_routing(
                 (0..group_by.len()).collect(),
             ))
         }
-        PlanNode::Filter { input, .. }
-        | PlanNode::Project { input, .. }
-        | PlanNode::Map { input, .. } => aggregate_routing(input),
-        PlanNode::ViewSink { child, .. } => aggregate_routing(child),
+        PlanNode::Project { input, columns } => {
+            let (routing, merge_keys) = aggregate_routing(input)?;
+            let projected_keys = merge_keys
+                .iter()
+                .map(|key| {
+                    columns.iter().position(
+                        |column| matches!(column, Expr::Column(input_column) if input_column == key),
+                    )
+                })
+                .collect::<Option<Vec<_>>>();
+            // Each source group already has one canonical owner. If a
+            // projection omits its key, preserve the output bag instead of
+            // treating an aggregate value as the key and merging distinct
+            // groups that happen to produce the same value.
+            Some((routing, projected_keys.unwrap_or_default()))
+        }
+        PlanNode::Filter { input, .. } | PlanNode::Map { input, .. } => aggregate_routing(input),
+        PlanNode::ViewSink { child, .. } | PlanNode::Exchange { child, .. } => {
+            aggregate_routing(child)
+        }
         _ => None,
     }
 }
@@ -20296,6 +20316,8 @@ mod distributed_workload_snapshot_tests {
             shards: vec![ShardOutput {
                 shard_id: ShardId(1),
                 lease_token: Some(LeaseToken(1)),
+                committed_epoch: None,
+                routing_epoch: None,
                 deltas: Vec::new(),
                 rows: vec![
                     RuntimeRow {
@@ -20331,6 +20353,208 @@ mod distributed_workload_snapshot_tests {
     #[test]
     fn incomplete_snapshot_is_rejected() {
         assert!(merge_workload_snapshot(&snapshot(false)).is_err());
+    }
+
+    #[tokio::test]
+    async fn sql_aggregate_output_projection_preserves_distinct_groups_and_hidden_key_bags(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use rockstream_plan::{ExchangeKind, Expr, PlanNode};
+
+        let frontend = SqlFrontend::new();
+        frontend.register_table(
+            "items",
+            Arc::new(Schema::new(vec![
+                Field::new("unused", DataType::Int64, false),
+                Field::new("k", DataType::Int64, false),
+                Field::new("v", DataType::Int64, false),
+            ])),
+        )?;
+
+        for (sql, output_columns, expected_keys, rows) in [
+            (
+                "SELECT SUM(v), k FROM items GROUP BY k",
+                vec!["sum", "k"],
+                vec![1],
+                vec!["5\t1", "5\t2"],
+            ),
+            (
+                "SELECT COUNT(*), k FROM items GROUP BY k",
+                vec!["count", "k"],
+                vec![1],
+                vec!["2\t1", "2\t2"],
+            ),
+            (
+                "SELECT COUNT(v), k FROM items GROUP BY k",
+                vec!["count", "k"],
+                vec![1],
+                vec!["2\t1", "2\t2"],
+            ),
+            (
+                "SELECT AVG(v), k FROM items GROUP BY k",
+                vec!["avg", "k"],
+                vec![1],
+                vec!["2.5\t1", "2.5\t2"],
+            ),
+            (
+                "SELECT SUM(v) FROM items GROUP BY k",
+                vec!["sum"],
+                Vec::new(),
+                vec!["5", "5"],
+            ),
+        ] {
+            let plan = PlanNode::ViewSink {
+                view_name: "view".into(),
+                pk: (0..output_columns.len()).collect(),
+                child: Box::new(PlanNode::Exchange {
+                    kind: ExchangeKind::Hash,
+                    partition_key: Vec::new(),
+                    child: Box::new(frontend.sql_to_plan_node(sql).await?),
+                }),
+            };
+            let expected_routing = BTreeMap::from([("items".to_owned(), 1)]);
+            assert_eq!(
+                deployment_routing(&plan),
+                Some((expected_routing.clone(), expected_keys.clone())),
+                "SQL: {sql}; plan: {plan:?}"
+            );
+            let mut result = snapshot(true);
+            result.deployment.plan_json = serde_json::to_string(&plan)?;
+            result.deployment.output_columns = output_columns
+                .iter()
+                .map(|column| (*column).into())
+                .collect();
+            result.deployment.primary_key = (0..output_columns.len()).collect();
+            result.deployment.routing_columns = expected_routing;
+            result.deployment.merge_key_columns = expected_keys;
+            result.shards = rows
+                .iter()
+                .enumerate()
+                .map(|(index, row)| ShardOutput {
+                    shard_id: ShardId(index as u64 + 1),
+                    lease_token: Some(LeaseToken(1)),
+                    committed_epoch: Some(1),
+                    routing_epoch: (index == 0).then_some(1),
+                    deltas: Vec::new(),
+                    rows: vec![RuntimeRow {
+                        values_tsv: (*row).into(),
+                        weight: 1,
+                    }],
+                })
+                .collect();
+            assert_eq!(
+                merge_workload_snapshot(&result)?,
+                rows.iter()
+                    .map(|row| row.as_bytes().to_vec())
+                    .collect::<Vec<_>>(),
+                "SQL: {sql}"
+            );
+
+            if output_columns.len() == 2 {
+                let reordered = PlanNode::Project {
+                    input: Box::new(plan),
+                    columns: vec![Expr::Column(1), Expr::Column(0)],
+                };
+                assert_eq!(
+                    deployment_routing(&reordered),
+                    Some((result.deployment.routing_columns.clone(), vec![0])),
+                    "nested projection: {sql}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn optimized_sql_aggregates_preserve_raw_columns_through_projections_and_exchanges(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use rockstream_plan::{AggregateFunc, ExchangeKind, PlanNode};
+        use rockstream_runtime::skew_aggregate::{aggregate_spec, AggregateSpec};
+
+        fn add_source_exchange(plan: &mut PlanNode) {
+            match plan {
+                PlanNode::Source { .. } => {
+                    *plan = PlanNode::Exchange {
+                        kind: ExchangeKind::Hash,
+                        partition_key: vec![1],
+                        child: Box::new(plan.clone()),
+                    };
+                }
+                PlanNode::Project { input, .. } | PlanNode::Aggregate { input, .. } => {
+                    add_source_exchange(input);
+                }
+                _ => panic!("unexpected aggregate SQL shape: {plan:?}"),
+            }
+        }
+
+        let frontend = SqlFrontend::new();
+        frontend.register_table(
+            "items",
+            Arc::new(Schema::new(vec![
+                Field::new("unused", DataType::Int64, false),
+                Field::new("k", DataType::Int64, false),
+                Field::new("v", DataType::Int64, false),
+            ])),
+        )?;
+        let schemas = vec![DeploymentSchema {
+            relation: "items".into(),
+            columns: ["unused", "k", "v"]
+                .into_iter()
+                .map(|name| DeploymentColumn {
+                    name: name.into(),
+                    data_type: "bigint".into(),
+                })
+                .collect(),
+        }];
+        for (sql, function, value_column, literal_value) in [
+            (
+                "SELECT k, SUM(v) FROM items GROUP BY k",
+                AggregateFunc::Sum,
+                Some(2),
+                None,
+            ),
+            (
+                "SELECT k, COUNT(*) FROM items GROUP BY k",
+                AggregateFunc::Count,
+                None,
+                Some(1),
+            ),
+            (
+                "SELECT k, AVG(v) FROM items GROUP BY k",
+                AggregateFunc::Avg,
+                Some(2),
+                None,
+            ),
+        ] {
+            let mut plan = frontend.sql_to_plan_node(sql).await?;
+            let expected = Some(AggregateSpec {
+                source: "items".into(),
+                key_column: 1,
+                value_column,
+                literal_value,
+                column_count: 3,
+                function,
+            });
+            assert_eq!(
+                aggregate_spec(&serde_json::to_string(&plan)?, &schemas, "items"),
+                expected,
+                "optimized SQL: {sql}; plan: {plan:?}"
+            );
+            add_source_exchange(&mut plan);
+            let plan = PlanNode::Exchange {
+                kind: ExchangeKind::Hash,
+                partition_key: vec![0],
+                child: Box::new(plan),
+            };
+            assert_eq!(
+                aggregate_spec(&serde_json::to_string(&plan)?, &schemas, "items"),
+                expected
+            );
+            assert_eq!(
+                deployment_routing(&plan),
+                Some((BTreeMap::from([("items".to_owned(), 1)]), vec![0]))
+            );
+        }
+        Ok(())
     }
 }
 

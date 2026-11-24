@@ -277,6 +277,8 @@ async fn owned_epoch_is_prepared_before_dispatch_and_finished_before_reply() {
                             .map(|shard_id| rockstream_types::data_plane::ShardOutput {
                                 shard_id,
                                 lease_token: Some(descriptor.shard.lease_token),
+                                committed_epoch: None,
+                                routing_epoch: None,
                                 deltas: Vec::new(),
                                 rows: Vec::new(),
                             })

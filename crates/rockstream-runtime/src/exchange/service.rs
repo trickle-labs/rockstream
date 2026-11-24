@@ -67,7 +67,11 @@ impl Drop for SecurityAuditWaiterGuard {
 }
 
 pub(crate) type OwnedShuffleHandler = Arc<
-    dyn Fn(ShuffleFrame, bytes::Bytes) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+    dyn Fn(
+            ShuffleFrame,
+            bytes::Bytes,
+            bool,
+        ) -> Pin<Box<dyn Future<Output = Result<bytes::Bytes, String>> + Send>>
         + Send
         + Sync,
 >;
@@ -291,6 +295,33 @@ impl ExchangeRegistry {
             scope: AuditField::Known("worker_shuffle".to_owned()),
             action: SecurityAuditClass::AuthorizationDenial,
             outcome: SecurityAuditOutcome::Denied,
+            correlation: AuditCorrelation::Observed(format!(
+                "exchange:{}:source:{}:target:{}:epoch:{}:sequence:{}",
+                frame.exchange_id, frame.src_shard, frame.target_shard, frame.epoch, frame.seq
+            )),
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::NotApplicable,
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        })
+        .await
+    }
+
+    pub(crate) async fn audit_direct_epoch_denial(
+        &self,
+        frame: &ShuffleFrame,
+    ) -> Result<(), Box<Status>> {
+        self.append_security_audit(SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: format!("direct-epoch-authorization:{}", uuid::Uuid::new_v4()),
+            timestamp_ms: crate::direct_grants::now_ms().max(1),
+            actor: AuditIdentity::Unknown,
+            target: AuditField::Unverified(format!("workload:{}", frame.exchange_id)),
+            scope: AuditField::Known("direct_source_epoch".to_owned()),
+            action: SecurityAuditClass::AuthorizationDenial,
+            outcome: SecurityAuditOutcome::Denied,
+            // Only fixed-size frame identifiers enter the audit record. Never
+            // include capability tokens, input rows, or unverified source text.
             correlation: AuditCorrelation::Observed(format!(
                 "exchange:{}:source:{}:target:{}:epoch:{}:sequence:{}",
                 frame.exchange_id, frame.src_shard, frame.target_shard, frame.epoch, frame.seq
@@ -863,6 +894,8 @@ impl ShuffleService for ShuffleServer {
             .transpose()
             .map_err(|_| Status::invalid_argument("invalid owned shuffle context"))?;
         if let Some(context) = owned_context {
+            let require_actor_grant =
+                self.require_worker_identity && authenticated_worker_id.is_none();
             let handler = self
                 .owned_handler
                 .clone()
@@ -904,15 +937,19 @@ impl ShuffleService for ShuffleServer {
                         return;
                     }
                 }
-                let ack = ShuffleAck {
+                let mut ack = ShuffleAck {
                     exchange_id: frame.exchange_id,
                     src_shard: frame.src_shard,
                     target_shard: frame.target_shard,
                     epoch: frame.epoch,
                     seq: frame.seq,
                     credit_grant: frame.row_count.max(1),
+                    owned_result: Default::default(),
                 };
-                let result = handler(frame, context).await;
+                let result = handler(frame, context, require_actor_grant).await;
+                if let Ok(result) = &result {
+                    ack.owned_result = result.to_vec();
+                }
                 if tx.send(Ok(ack)).await.is_err() {
                     return;
                 }
@@ -1038,6 +1075,7 @@ impl ShuffleService for ShuffleServer {
                             epoch: frame.epoch,
                             seq: frame.seq,
                             credit_grant: frame.row_count.max(1),
+                            owned_result: Default::default(),
                         };
 
                         if tx.send(Ok(ack)).await.is_err() {
@@ -1150,6 +1188,75 @@ mod tests {
     /// `rockstream_types::metrics::tests`.
     static SHM_TEST_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
     static FLOW_CONTROL_TEST_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn direct_epoch_denial_audit_is_bounded_and_waits_for_durable_receipt() {
+        let _metrics_guard = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
+        let (sender, mut receiver) = mpsc::channel::<WorkerMessage>(1);
+        let waiters = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let registry = ExchangeRegistry::new().with_security_audit(sender, waiters.clone());
+        let frame = ShuffleFrame {
+            exchange_id: 7,
+            src_shard: 2,
+            target_shard: 3,
+            epoch: 19,
+            seq: 0,
+            payload: b"private source values must not be audited".to_vec(),
+            row_count: 1,
+        };
+        let append = tokio::spawn({
+            let registry = registry.clone();
+            let frame = frame.clone();
+            async move { registry.audit_direct_epoch_denial(&frame).await }
+        });
+        let Some(WorkerMessage::ReportSecurityAudit { request_id, record }) = receiver.recv().await
+        else {
+            panic!("direct epoch denial did not reach the required audit transport");
+        };
+        assert_eq!(
+            record,
+            SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: request_id.clone(),
+                timestamp_ms: record.timestamp_ms,
+                actor: AuditIdentity::Unknown,
+                target: AuditField::Unverified("workload:7".to_owned()),
+                scope: AuditField::Known("direct_source_epoch".to_owned()),
+                action: SecurityAuditClass::AuthorizationDenial,
+                outcome: SecurityAuditOutcome::Denied,
+                correlation: AuditCorrelation::Observed(
+                    "exchange:7:source:2:target:3:epoch:19:sequence:0".to_owned()
+                ),
+                operation_id: AuditField::NotApplicable,
+                policy_revision: AuditField::NotApplicable,
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::NotApplicable,
+            }
+        );
+        assert!(record.timestamp_ms > 0);
+        let error = registry
+            .audit_direct_epoch_denial(&frame)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (error.code(), error.message()),
+            (
+                tonic::Code::Unavailable,
+                "RS-0003: required security audit capacity is unavailable"
+            )
+        );
+        assert!(!append.is_finished());
+        remove_security_audit_waiter(&waiters, &request_id, 1)
+            .unwrap()
+            .send(true)
+            .unwrap();
+        assert_eq!(
+            append.await.unwrap().map_err(|error| error.to_string()),
+            Ok(())
+        );
+        assert!(waiters.lock().is_empty());
+    }
 
     // Keep global metric resets and snapshots isolated across async waits.
     #[allow(clippy::await_holding_lock)]
@@ -1428,6 +1535,7 @@ mod tests {
                         epoch: frame.epoch,
                         seq: frame.seq,
                         credit_grant: frame.row_count.max(1),
+                        owned_result: Default::default(),
                     }))
                     .await
                     .map_err(|_| Status::cancelled("ack receiver dropped"))?;
@@ -1852,6 +1960,7 @@ mod tests {
             epoch: 1,
             seq: 1,
             credit_grant: 1,
+            owned_result: Default::default(),
         };
         flow_controller.handle_ack(&ack);
 
@@ -1882,6 +1991,7 @@ mod tests {
             epoch: 1,
             seq: 1,
             credit_grant: 5,
+            owned_result: Default::default(),
         });
         assert_eq!(flow_controller.get_credits(7, 1, 2), 8);
         assert_eq!(flow_controller.rows_in_flight(7, 1, 2), 0);

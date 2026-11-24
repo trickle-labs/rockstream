@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::StreamExt;
 use parking_lot::RwLock;
 use rockstream_ops::zset::ArrowZSet;
 use rockstream_types::data_plane::{
@@ -55,6 +56,7 @@ pub struct DataPlaneClient {
     topology_cache: Arc<RwLock<HashMap<WorkloadId, WorkloadTopologySnapshot>>>,
     shuffle_pool: ShuffleClientPool,
     shuffle_mux: WorkerStreamMultiplexer,
+    direct_grant: Option<rockstream_types::direct_epoch::DirectEpochGrant>,
 }
 
 pub type ControlDataPlaneClient = DataPlaneClient;
@@ -71,6 +73,7 @@ impl DataPlaneClient {
             topology_cache: Arc::new(RwLock::new(HashMap::new())),
             shuffle_pool,
             shuffle_mux,
+            direct_grant: None,
         }
     }
 
@@ -377,7 +380,11 @@ impl DataPlaneClient {
     /// Submit a source delta using the direct Arrow IPC path to shard owners
     /// (bypassing `ControlService` for all row payloads).
     pub async fn submit_delta(&self, request: SourceDeltaRequest) -> io::Result<u64> {
-        self.submit_delta_direct(request).await
+        if self.uses_insecure_internal_dev() {
+            self.submit_delta_with_assertion(request, None).await
+        } else {
+            self.submit_delta_direct(request).await
+        }
     }
 
     pub async fn submit_delta_delegated(
@@ -387,6 +394,88 @@ impl DataPlaneClient {
     ) -> io::Result<u64> {
         self.submit_delta_via_control(request, Some(actor_assertion))
             .await
+    }
+
+    /// Metadata request signed by the gateway actor. Source rows stay on the
+    /// direct worker path; current policy and every target fence are checked
+    /// before control installs the bounded capability on recipients.
+    pub fn source_authorization_request(request: &SourceDeltaRequest) -> io::Result<WorkerMessage> {
+        Ok(WorkerMessage::AuthorizeSourceEpoch {
+            metadata: rockstream_types::direct_epoch::SourceEpochMetadata::from_request(request)
+                .map_err(io::Error::other)?,
+        })
+    }
+
+    pub async fn submit_delta_authorized(
+        &self,
+        request: SourceDeltaRequest,
+        actor_assertion: &str,
+    ) -> io::Result<u64> {
+        self.submit_delta_with_assertion(request, Some(actor_assertion))
+            .await
+    }
+
+    async fn submit_delta_with_assertion(
+        &self,
+        request: SourceDeltaRequest,
+        actor_assertion: Option<&str>,
+    ) -> io::Result<u64> {
+        let metadata = Self::source_authorization_request(&request)?;
+        let mut last_error = None;
+        for _ in 0..MAX_STALE_TOPOLOGY_RETRIES {
+            let reply = self
+                .request_with_assertion(metadata.clone(), actor_assertion)
+                .await?;
+            let (grant, topology) = match reply {
+                ControlMessage::DirectEpochAuthorized { grant, topology } => (grant, topology),
+                ControlMessage::SourceDeltaCommitted { request_id, epoch }
+                    if request_id == request.request_id && epoch == request.epoch =>
+                {
+                    return Ok(epoch);
+                }
+                reply => {
+                    let error = Self::unexpected(reply);
+                    if error.to_string().contains("RS-3004") {
+                        last_error = Some(error);
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
+            let mut authorized = self.clone();
+            authorized.direct_grant = Some(grant);
+            authorized.seed_cached_topology(topology);
+            match authorized.submit_delta_direct(request.clone()).await {
+                Ok(epoch) => return Ok(epoch),
+                Err(error)
+                    if error.to_string().contains("RS-3004")
+                        || error.to_string().contains("RS-1702")
+                        || error.to_string().contains("RS-2401: direct epoch capability is unknown or evicted")
+                        || error.to_string().contains("RS-2401: direct epoch capability is expired or bound to another request") =>
+                {
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            io::Error::other("RS-3004: direct epoch ownership changed during authorization")
+        }))
+    }
+
+    pub(crate) fn owned_context<T: serde::Serialize>(&self, context: &T) -> io::Result<Vec<u8>> {
+        match &self.direct_grant {
+            Some(grant) => {
+                serde_json::to_vec(&rockstream_types::direct_epoch::AuthorizedOwnedContext {
+                    direct_grant_id: grant.grant_id,
+                    metadata: grant.metadata.clone(),
+                    inner: serde_json::to_value(context).map_err(io::Error::other)?,
+                })
+            }
+            None => serde_json::to_vec(context),
+        }
+        .map_err(io::Error::other)
     }
 
     /// Partition and stream a native [`ArrowZSet`] directly to shard owners
@@ -401,7 +490,7 @@ impl DataPlaneClient {
         zset: &ArrowZSet,
     ) -> io::Result<u64> {
         let rows = crate::client::zset_to_rows(zset)?;
-        self.submit_delta_direct(SourceDeltaRequest {
+        self.submit_delta(SourceDeltaRequest {
             version: DEPLOYMENT_DESCRIPTOR_VERSION,
             request_id,
             workload_id,
@@ -459,6 +548,29 @@ impl DataPlaneClient {
                 self.shuffle_pool.upsert_peer_info(w.clone());
             }
 
+            match self.submit_skew_epoch(&topology, &request).await {
+                Ok(true) => return Ok(request.epoch),
+                Ok(false) => {}
+                Err(error) => {
+                    if self.direct_grant.is_some() {
+                        return Err(error);
+                    }
+                    let message = error.to_string();
+                    if attempt + 1 < MAX_STALE_TOPOLOGY_RETRIES
+                        && (message.contains("RS-3004")
+                            || message.contains("RS-1702")
+                            || message.contains("not deployed")
+                            || message.contains("transport")
+                            || message.contains("connection"))
+                    {
+                        self.invalidate_topology(request.workload_id);
+                        last_err = Some(error);
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
+
             let partitioned = Self::partition_request(&topology, &request)?;
             let schemas = crate::client::deployment_schemas_from_slice(&topology.schemas)?;
             let source_schema = schemas.get(&request.source).cloned().ok_or_else(|| {
@@ -494,8 +606,7 @@ impl DataPlaneClient {
                     source: request.source.clone(),
                     rows: Vec::new(),
                 };
-                let context_bytes = serde_json::to_vec(&owner_context)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let context_bytes = self.owned_context(&owner_context)?;
                 let shuffle = crate::exchange::proto::ShuffleFrame {
                     exchange_id: request.workload_id.0,
                     src_shard: 0,
@@ -564,6 +675,330 @@ impl DataPlaneClient {
                 "{RS_3004}: direct routing failed after topology refresh"
             ))
         }))
+    }
+
+    /// Exact persisted routing decisions, including trigger thresholds,
+    /// admission fallback keys and partial worker row counts.
+    pub async fn routing_diagnostics(
+        &self,
+        workload_id: WorkloadId,
+    ) -> io::Result<crate::skew_routing::RoutingSnapshot> {
+        let topology = self.get_workload_topology(workload_id).await?;
+        for worker in &topology.workers {
+            self.shuffle_pool.upsert_peer_info(worker.clone());
+        }
+        let anchor = crate::skew_routing::stable_shards(&topology)
+            .into_iter()
+            .next()
+            .ok_or_else(|| io::Error::other("workload has no routing anchor"))?;
+        self.routing_command(
+            &topology,
+            anchor,
+            0,
+            crate::skew_routing::RoutingOperation::Read,
+            &serde_json::Value::Null,
+        )
+        .await
+    }
+
+    async fn routing_command<T: serde::Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        topology: &WorkloadTopologySnapshot,
+        shard_id: ShardId,
+        epoch: u64,
+        operation: crate::skew_routing::RoutingOperation,
+        payload: &T,
+    ) -> io::Result<R> {
+        let shard = topology
+            .shards
+            .iter()
+            .find(|shard| shard.shard_id == shard_id)
+            .ok_or_else(|| io::Error::other("RS-3004: routing shard is absent"))?;
+        let command = crate::skew_routing::RoutingCommand {
+            routing_version: crate::skew_routing::ROUTING_VERSION,
+            workload_id: topology.workload_id,
+            shard_id,
+            lease_token: shard.lease_token,
+            operation,
+        };
+        let context = self.owned_context(&command)?;
+        let payload = serde_json::to_vec(payload).map_err(io::Error::other)?;
+        if payload.len() > crate::skew_routing::MAX_ROUTING_METADATA_BYTES {
+            return Err(io::Error::other(
+                "routing command exceeds per-epoch byte budget",
+            ));
+        }
+        let frame = crate::exchange::proto::ShuffleFrame {
+            exchange_id: topology.workload_id.0,
+            src_shard: 0,
+            target_shard: shard.shard_index,
+            epoch,
+            seq: 0,
+            payload,
+            row_count: 0,
+        };
+        let result = self
+            .shuffle_mux
+            .send_owned_command(shard.worker_id, frame, context.into())
+            .await
+            .map_err(io::Error::other)?;
+        if result.len() > crate::skew_routing::MAX_ROUTING_METADATA_BYTES {
+            return Err(io::Error::other(
+                "routing response exceeds per-epoch byte budget",
+            ));
+        }
+        serde_json::from_slice(&result).map_err(io::Error::other)
+    }
+
+    async fn submit_skew_epoch(
+        &self,
+        topology: &WorkloadTopologySnapshot,
+        request: &SourceDeltaRequest,
+    ) -> io::Result<bool> {
+        use crate::skew_routing::{RoutingEpochRecord, RoutingOperation, RoutingSnapshot};
+        if topology.shards.is_empty() {
+            return Ok(false);
+        }
+        let shards = crate::skew_routing::stable_shards(topology);
+        let anchor = shards[0];
+        let snapshot: RoutingSnapshot = self
+            .routing_command(
+                topology,
+                anchor,
+                request.epoch,
+                RoutingOperation::Read,
+                &serde_json::Value::Null,
+            )
+            .await?;
+        if let Some(completed) = &snapshot.completed {
+            if crate::skew_routing::matches_request(completed, request).map_err(io::Error::other)? {
+                // Authorization may have installed a new control reservation
+                // for this retry. Reissue the durable completion certificate
+                // even though no participant needs to execute again.
+                self.finish_skew_epoch(topology, completed).await?;
+                return Ok(true);
+            }
+        }
+        let record = if let Some(pending) = snapshot.pending {
+            if !crate::skew_routing::matches_request(&pending, request).map_err(io::Error::other)?
+                || pending.shard_ids != shards
+            {
+                return Err(io::Error::other(
+                    "a different skew routing epoch requires replay before new input",
+                ));
+            }
+            pending
+        } else {
+            let planned = crate::skew_aggregate::prepare_aggregate_epoch(
+                Some(&snapshot.state),
+                request,
+                topology,
+            )
+            .map_err(io::Error::other)?;
+            let (plan, next_state) = match planned {
+                Some(planned) => (planned.plan, planned.next_state),
+                None => (
+                    serde_json::json!({"kind":"passthrough","reason":"operands_not_admitted"}),
+                    serde_json::Value::Null,
+                ),
+            };
+            let record = RoutingEpochRecord {
+                version: crate::skew_routing::ROUTING_VERSION,
+                workload_id: request.workload_id,
+                source: request.source.clone(),
+                request_id: request.request_id.clone(),
+                epoch: request.epoch,
+                input_digest: crate::skew_routing::input_digest(request)
+                    .map_err(io::Error::other)?,
+                generation: snapshot
+                    .generation
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("routing generation exhausted"))?,
+                shard_ids: shards.clone(),
+                plan,
+                next_state,
+                point_mutations: BTreeMap::new(),
+            };
+            let prepared: RoutingSnapshot = self
+                .routing_command(
+                    topology,
+                    anchor,
+                    request.epoch,
+                    RoutingOperation::Prepare,
+                    &record,
+                )
+                .await?;
+            if prepared.completed.as_ref() == Some(&record) && prepared.pending.is_none() {
+                self.finish_skew_epoch(topology, &record).await?;
+                return Ok(true);
+            }
+            if prepared.pending.as_ref() != Some(&record) {
+                return Err(io::Error::other(
+                    "routing prepare returned another decision",
+                ));
+            }
+            record
+        };
+        let mut routed = if record.plan.get("kind").and_then(serde_json::Value::as_str)
+            == Some("aggregate")
+        {
+            let dispatch =
+                crate::skew_aggregate::dispatch_aggregate(&record.plan, request, &shards)
+                    .map_err(io::Error::other)?;
+            let mut raw = dispatch.raw;
+            // Partial work happens concurrently on distinct worker owners. Sort
+            // responses back into task order before creating the replay digest.
+            let mut results = futures::stream::iter(dispatch.tasks.into_iter().enumerate())
+                .map(|(index, (shard, task))| async move {
+                    let result: crate::skew_aggregate::PartialAggregateResult = self
+                        .routing_command(
+                            topology,
+                            shard,
+                            request.epoch,
+                            RoutingOperation::AggregatePartial,
+                            &task,
+                        )
+                        .await?;
+                    Ok::<_, io::Error>((index, result))
+                })
+                .buffer_unordered(crate::skew_aggregate::MAX_PARTIAL_BUCKETS)
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .collect::<io::Result<Vec<_>>>()?;
+            results.sort_by_key(|(index, _)| *index);
+            for (_, result) in results {
+                crate::skew_aggregate::append_final_operands(
+                    &record.plan,
+                    result,
+                    &shards,
+                    &mut raw,
+                )
+                .map_err(io::Error::other)?;
+            }
+            raw
+        } else if record.plan.get("kind").and_then(serde_json::Value::as_str) == Some("passthrough")
+        {
+            Self::partition_request(topology, request)?
+                .into_iter()
+                .map(|(shard, rows)| (shard.shard_id, rows))
+                .collect()
+        } else {
+            return Err(io::Error::other(
+                "unsupported persisted skew routing decision",
+            ));
+        };
+        // Every virtual shard commits the source epoch, even when it receives
+        // no rows. The completion certificate therefore describes a complete
+        // membership frontier, not the maximum progress of one worker.
+        for shard in &shards {
+            routed.entry(*shard).or_default();
+        }
+        let schemas = crate::client::deployment_schemas_from_slice(&topology.schemas)?;
+        let schema = schemas
+            .get(&request.source)
+            .cloned()
+            .ok_or_else(|| io::Error::other("unknown aggregate source"))?;
+        let results = futures::stream::iter(routed)
+            .map(|(shard, rows)| {
+                let schema = schema.clone();
+                async move {
+                    self.send_skew_final(topology, request, shard, rows, schema)
+                        .await
+                }
+            })
+            .buffer_unordered(crate::skew_aggregate::MAX_PARTIAL_BUCKETS)
+            .collect::<Vec<_>>()
+            .await;
+        for result in results {
+            result?;
+        }
+        self.finish_skew_epoch(topology, &record).await?;
+        Ok(true)
+    }
+
+    async fn finish_skew_epoch(
+        &self,
+        topology: &WorkloadTopologySnapshot,
+        record: &crate::skew_routing::RoutingEpochRecord,
+    ) -> io::Result<()> {
+        use crate::skew_routing::{FinishRoutingEpoch, RoutingOperation, RoutingSnapshot};
+        let shards = crate::skew_routing::stable_shards(topology);
+        if record.workload_id != topology.workload_id
+            || shards.is_empty()
+            || record.shard_ids != shards
+        {
+            return Err(io::Error::other(
+                "routing completion membership has changed",
+            ));
+        }
+        let mut leases = topology
+            .shards
+            .iter()
+            .map(|shard| (shard.shard_id, shard.lease_token))
+            .collect::<Vec<_>>();
+        leases.sort_by_key(|(shard, _)| *shard);
+        let finished: RoutingSnapshot = self
+            .routing_command(
+                topology,
+                shards[0],
+                record.epoch,
+                RoutingOperation::Finish,
+                &FinishRoutingEpoch {
+                    record: record.clone(),
+                    shard_leases: leases,
+                },
+            )
+            .await?;
+        if finished.pending.is_some() || finished.completed.as_ref() != Some(record) {
+            return Err(io::Error::other("routing epoch did not finish durably"));
+        }
+        Ok(())
+    }
+
+    async fn send_skew_final(
+        &self,
+        topology: &WorkloadTopologySnapshot,
+        request: &SourceDeltaRequest,
+        shard_id: ShardId,
+        rows: Vec<RuntimeRow>,
+        schema: arrow::datatypes::SchemaRef,
+    ) -> io::Result<()> {
+        let shard = topology
+            .shards
+            .iter()
+            .find(|shard| shard.shard_id == shard_id)
+            .ok_or_else(|| io::Error::other("RS-3004: final shard absent"))?;
+        let input = crate::client::rows_to_zset(&rows, schema)?;
+        let payload =
+            crate::exchange::serialization::serialize_zset(&input).map_err(io::Error::other)?;
+        let owner = RuntimeExchangeMessage {
+            attempt_id: None,
+            version: request.version,
+            request_id: request.request_id.clone(),
+            workload_id: request.workload_id,
+            shard_id,
+            epoch: request.epoch,
+            operator_id: shard.operator_id,
+            lease_token: shard.lease_token,
+            source: request.source.clone(),
+            rows: Vec::new(),
+        };
+        let context = self.owned_context(&owner)?;
+        let row_count = u32::try_from(input.num_rows()).map_err(io::Error::other)?;
+        let frame = crate::exchange::proto::ShuffleFrame {
+            exchange_id: request.workload_id.0,
+            src_shard: 0,
+            target_shard: shard.shard_index,
+            epoch: request.epoch,
+            seq: 0,
+            payload: payload.into(),
+            row_count,
+        };
+        self.shuffle_mux
+            .send_owned_frame(shard.worker_id, frame, context.into())
+            .await
+            .map_err(io::Error::other)
     }
 
     fn partition_request<'a>(

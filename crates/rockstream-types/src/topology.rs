@@ -313,6 +313,17 @@ pub enum ControlMessage {
         request_id: String,
         epoch: crate::timestamp::Epoch,
     },
+    InstallDirectEpochGrant {
+        grant: crate::direct_epoch::DirectEpochGrant,
+    },
+    RevokeDirectEpochGrants {
+        metadata: crate::direct_epoch::SourceEpochMetadata,
+        grant_id: Option<uuid::Uuid>,
+    },
+    DirectEpochAuthorized {
+        grant: crate::direct_epoch::DirectEpochGrant,
+        topology: crate::data_plane::WorkloadTopologySnapshot,
+    },
     WorkloadSnapshot {
         snapshot: crate::data_plane::WorkloadSnapshot,
     },
@@ -894,6 +905,14 @@ pub const DATA_PLANE_DELEGATION_VERSION: u16 = 1;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkerMessage {
+    AuthorizeSourceEpoch {
+        metadata: crate::direct_epoch::SourceEpochMetadata,
+    },
+    DirectEpochGrantInstalled {
+        worker_id: WorkerId,
+        grant_id: uuid::Uuid,
+        accepted: bool,
+    },
     /// Actor-authorized gateway request over the internal data-plane transport.
     DelegatedDataPlane {
         version: u16,
@@ -1031,6 +1050,20 @@ pub enum WorkerMessage {
     ShardLoadReport {
         worker_id: WorkerId,
         samples: Vec<ShardLoadSample>,
+    },
+    /// The current anchor reports a routing epoch only after its all-shard
+    /// commit journal has been durably finished. This is metadata, not row data.
+    RoutingEpochCommitted {
+        worker_id: WorkerId,
+        workload_id: crate::ids::WorkloadId,
+        anchor_shard_id: ShardId,
+        anchor_lease_token: crate::ids::LeaseToken,
+        epoch: u64,
+        generation: u64,
+        request_id: String,
+        input_digest: [u8; 32],
+        decision: serde_json::Value,
+        shard_leases: Vec<(ShardId, crate::ids::LeaseToken)>,
     },
     /// Query this control node's current Raft leadership status (v0.45.2
     /// M7 S4). Any connected client (worker, ops tooling, or a test) may
