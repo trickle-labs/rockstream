@@ -6384,7 +6384,7 @@ async fn mtls_certificate_rejections_run_in_release_process_and_audit_after_rest
     let store =
         rockstream_storage::build_runtime_object_store(&shard_dir, "gateway-shard").unwrap();
     DurableCatalogStore::new(store, "gateway")
-        .preprovision_first_administrator(principal, 1)
+        .preprovision_first_administrator(principal.clone(), 1)
         .await
         .unwrap();
 
@@ -6506,12 +6506,66 @@ async fn mtls_certificate_rejections_run_in_release_process_and_audit_after_rest
     assert_eq!(records[0].outcome, SecurityAuditOutcome::Success);
     assert_eq!(records[1].action, SecurityAuditClass::AuthenticationSuccess);
     assert!(matches!(records[1].actor, AuditIdentity::Verified(_)));
-    for record in &records[2..] {
-        assert_eq!(record.action, SecurityAuditClass::AuthenticationFailure);
-        assert_eq!(record.outcome, SecurityAuditOutcome::Failure);
-        assert_eq!(record.actor, AuditIdentity::Unknown);
-        assert_eq!(record.target, AuditField::Unknown);
-    }
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.action == SecurityAuditClass::AuthenticationSuccess)
+            .count(),
+        1
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.action == SecurityAuditClass::AuthenticationFailure)
+            .count(),
+        2
+    );
+    let normalized_failures = records[2..]
+        .iter()
+        .map(|record| {
+            let mut normalized = record.clone();
+            let event_id = std::mem::replace(&mut normalized.event_id, "<event_id>".to_owned());
+            let timestamp_ms = std::mem::replace(&mut normalized.timestamp_ms, 0);
+            let correlation =
+                std::mem::replace(&mut normalized.correlation, AuditCorrelation::Unknown);
+            assert!(event_id.starts_with("gateway-authn-"));
+            assert_eq!(event_id.len(), "gateway-authn-".len() + 32);
+            assert!(event_id["gateway-authn-".len()..]
+                .chars()
+                .all(|character| character.is_ascii_hexdigit()));
+            assert!(timestamp_ms > 0);
+            assert!(matches!(
+                &correlation,
+                AuditCorrelation::Observed(id)
+                    if id.len() == 32 && id.chars().all(|character| character.is_ascii_hexdigit())
+            ));
+            normalized
+        })
+        .collect::<Vec<_>>();
+    assert_ne!(records[2].correlation, records[3].correlation);
+    let expected_failure = SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: "<event_id>".to_owned(),
+        timestamp_ms: 0,
+        actor: AuditIdentity::Unknown,
+        target: AuditField::Unknown,
+        scope: AuditField::NotApplicable,
+        action: SecurityAuditClass::AuthenticationFailure,
+        outcome: SecurityAuditOutcome::Failure,
+        correlation: AuditCorrelation::Unknown,
+        operation_id: AuditField::NotApplicable,
+        policy_revision: AuditField::Unknown,
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::NotApplicable,
+    };
+    assert_eq!(
+        normalized_failures,
+        vec![expected_failure.clone(), expected_failure]
+    );
+    assert_eq!(
+        recovered.list_security_principals().await.unwrap(),
+        vec![principal]
+    );
 }
 
 #[tokio::test]
