@@ -470,7 +470,8 @@ mod tests {
 
         let error = manager
             .resolve_token(&over_token, over_token.issued_at)
-            .unwrap_err();
+            .err()
+            .expect("overflow must be rejected");
         assert_eq!(
             error.to_string(),
             "[RS-3601] secret token cache is full. Next steps: remove unused secret bindings before retrying."
