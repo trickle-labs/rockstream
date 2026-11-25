@@ -10,6 +10,17 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{RootCertStore, ServerConfig};
 use tokio_rustls::TlsAcceptor;
+use x509_parser::prelude::{FromDer, X509Certificate};
+
+/// Validate the current validity window of a server's leaf certificate.
+pub fn validate_server_certificate(certificate: &CertificateDer<'_>) -> Result<(), String> {
+    let (_, certificate) = X509Certificate::from_der(certificate.as_ref())
+        .map_err(|error| format!("failed to parse server certificate: {error}"))?;
+    if !certificate.validity().is_valid() {
+        return Err("server certificate is expired or not yet valid".to_string());
+    }
+    Ok(())
+}
 
 /// Build a `TlsAcceptor` configured for internal mutual TLS (mTLS).
 pub fn build_server_tls_acceptor(config: &InternalTlsConfig) -> Result<TlsAcceptor, String> {
@@ -32,6 +43,7 @@ fn build_server_tls_acceptor_with_extra(
 
     let certs = load_certs(cert_path)?;
     let key = load_key(key_path)?;
+    validate_server_certificate(&certs[0]).map_err(|error| format!("RS-2411: {error}"))?;
 
     let mut roots = RootCertStore::empty();
     if let Some(ca_path) = &config.ca_cert_path {
