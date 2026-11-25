@@ -3908,7 +3908,7 @@
           {
             "name": "auth",
             "long": "auth",
-            "help": "Authentication mode. SCRAM requires an enabled durable login; OIDC and mTLS require their configuration. MD5 is rejected. Omitted uses `[auth].mode`",
+            "help": "Authentication mode. SCRAM requires an enabled durable login; OIDC uses RS256, limits tokens to 16 KiB, and requires its issuer, audience, TLS, and JWKS settings; mTLS requires its gateway credentials. MD5 is rejected. Omitted uses `[auth].mode`",
             "required": false,
             "value_name": "AUTH",
             "possible_values": [
@@ -5095,7 +5095,7 @@
         "key": "auth.mode",
         "data_type": "String",
         "default_value": "off",
-        "description": "Explicit --auth selects off, SCRAM, OIDC, or gateway mTLS. SCRAM requires an enabled durable login; OIDC and gateway mTLS require their settings. MD5 is rejected.",
+        "description": "Explicit --auth selects off, SCRAM, OIDC, or gateway mTLS. SCRAM requires an enabled durable login; OIDC uses RS256 with a 16 KiB token limit; gateway mTLS requires its settings. MD5 is rejected.",
         "deprecated": false,
         "env_var": "ROCKSTREAM_AUTH_MODE",
         "source_origin": "rockstream-types::config::AuthSection"
@@ -5122,7 +5122,7 @@
         "key": "auth.oidc_jwks_url",
         "data_type": "Option<String>",
         "default_value": "None",
-        "description": "HTTPS or loopback HTTP JWKS endpoint used to verify RS256 tokens; required when auth.mode is oidc",
+        "description": "HTTPS or loopback HTTP JWKS endpoint for RS256 tokens; response limit 1 MiB and 100 keys, cache TTL at most 60 seconds honoring shorter issuer lifetime, 5-second fetch timeout, and one retry after 250 milliseconds for transient failures; required when auth.mode is oidc",
         "deprecated": false,
         "env_var": "ROCKSTREAM_AUTH_OIDC_JWKS_URL",
         "source_origin": "rockstream-types::config::AuthSection"

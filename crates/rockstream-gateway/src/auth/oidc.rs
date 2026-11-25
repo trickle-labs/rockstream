@@ -658,6 +658,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accepts_exact_jwks_body_limit_and_rejects_chunked_limit_plus_one() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut exact, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let _ = exact.read(&mut request).await.unwrap();
+            let mut exact_body = TEST_JWKS.as_bytes().to_vec();
+            exact_body.resize(MAX_JWKS_RESPONSE_BYTES, b' ');
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: max-age=60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                exact_body.len()
+            );
+            exact.write_all(header.as_bytes()).await.unwrap();
+            exact.write_all(&exact_body).await.unwrap();
+
+            let (mut oversized, _) = listener.accept().await.unwrap();
+            let _ = oversized.read(&mut request).await.unwrap();
+            oversized
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: max-age=60\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let oversized_body = vec![b' '; MAX_JWKS_RESPONSE_BYTES + 1];
+            oversized
+                .write_all(format!("{:X}\r\n", oversized_body.len()).as_bytes())
+                .await
+                .unwrap();
+            oversized.write_all(&oversized_body).await.unwrap();
+            oversized.write_all(b"\r\n0\r\n\r\n").await.unwrap();
+        });
+
+        let config = OidcConfig::new(
+            "https://issuer.example",
+            "rockstream",
+            format!("http://{address}/jwks"),
+        )
+        .unwrap();
+        let verifier = OidcVerifier::new(config.clone()).await.unwrap();
+        assert_eq!(verifier.cache_size(), 1);
+        let error = match OidcVerifier::new(config).await {
+            Err(error) => error,
+            Ok(_) => panic!("the verifier accepted a JWKS body over the byte limit"),
+        };
+        assert_eq!(
+            error.to_string(),
+            "[RS-2400] auth.unauthenticated: OIDC JWKS response exceeds the 1 MiB limit"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn expired_jwks_are_not_used_when_refresh_fails() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
