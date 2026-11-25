@@ -845,7 +845,10 @@ async fn interrupted_dispatch_blocks_distributed_reads_after_gateway_restart() {
         request,
         rockstream_types::direct_epoch::SourceEpochMetadata::from_request(&expected).unwrap()
     );
-    assert!(serde_json::to_value(&request).unwrap().get("rows").is_none());
+    assert!(serde_json::to_value(&request)
+        .unwrap()
+        .get("rows")
+        .is_none());
     gateway.0.kill().unwrap();
     gateway.0.wait().unwrap();
     assert!(insert.await.unwrap().is_err());
