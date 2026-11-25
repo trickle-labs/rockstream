@@ -51,7 +51,7 @@ bash "$CHECKER" "$ROOT" >/dev/null || fail "real documentation did not pass"
 
 setup_tree
 python3 -c 'from pathlib import Path; p=Path("'$TMP_ROOT'/docs/README.md"); p.write_text(p.read_text().replace("reference/cli.md", "reference/missing.md", 1))'
-run_bad missing_link "missing documentation target: docs/README.md:16 -> reference/missing.md"
+run_bad missing_link "missing documentation target: docs/README.md:18 -> reference/missing.md"
 
 setup_tree
 python3 -c 'from pathlib import Path; p=Path("'$TMP_ROOT'/docs/operator.md"); p.write_text(p.read_text().replace("README.md#reference", "README.md#missing"))'
@@ -63,7 +63,7 @@ run_bad unsupported_claim "unsupported documentation claim: docs/schema-evolutio
 
 setup_tree
 python3 -c 'from pathlib import Path; p=Path("'$TMP_ROOT'/docs/README.md"); p.write_text(p.read_text().replace("A **view** is", "A **pipeline** is", 1))'
-run_bad obsolete_term "obsolete term 'pipeline'; use 'view' at docs/README.md:29"
+run_bad obsolete_term "obsolete term 'pipeline'; use 'view' at docs/README.md:31"
 
 setup_tree
 python3 -c 'from pathlib import Path; p=Path("'$TMP_ROOT'/docs/test-commands.md"); p.write_text(p.read_text().replace("make fmt", "make missing", 1))'
