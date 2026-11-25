@@ -320,6 +320,8 @@ an audit-page read with RS-2050 and leaves retained history unchanged.
 
 Run trusted offline tooling while all RockStream processes for the deployment are stopped. Invoke `rockstream security preprovision-admin --storage <root> --layout <all|gateway> --principal-file <path> --operation-id <id> [--yes]`. The command accepts a JSON `SecurityPrincipal` with an enabled interactive cluster administrator; provide only verifier or public certificate identity material, never a plaintext password or private key. Select `--layout all` for an `all` role deployment, or `--layout gateway` for a `gateway` or `control` deployment. `--storage` must match the deployment's `start --storage` value, and `--operation-id` must be unique for the catalog and reused on retry. The command requires `--yes` in non-interactive use.
 
+A control deployment that starts the native management API also needs an enabled cluster Administrator with an mTLS login method. The preprovision command accepts SCRAM- or OIDC-only administrators, but `ManagementService` initialization fails with `RS-2405` until the catalog contains an mTLS administrator. Keep processes stopped and use `security recover-admin` to replace the administrator's login-method set with one that includes mTLS before starting control.
+
 The principal and its grant-change audit event commit together; the audit actor is `unknown` because bootstrap has no authenticated application session. The operation rejects a nonempty security catalog, and a retry verifies the committed principal and audit record. It is not a public network operation. Catalog mutations also reject removal, disablement, or downgrade of the last active administrator.
 
 ### Offline administrator credential recovery
