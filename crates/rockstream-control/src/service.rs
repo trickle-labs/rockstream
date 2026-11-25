@@ -416,6 +416,20 @@ async fn authorize_direct_epoch(
         let Some(deployment) = state.deployments.get(&metadata.workload_id) else {
             return data_plane_failure("workload is not deployed");
         };
+        // Reject unknown sources before reserving the epoch or installing grants.
+        // Recipients independently enforce the same deployed schema boundary.
+        if !deployment
+            .request
+            .schemas
+            .iter()
+            .any(|schema| schema.relation == metadata.source)
+        {
+            return ControlMessage::OperationFailed {
+                code: rockstream_types::error_code::RS_1012.to_string(),
+                message: "unknown source relation for direct epoch".to_owned(),
+                next_steps: "Use a source relation registered for the workload.".to_owned(),
+            };
+        }
         match direct_completion_status(&state, &metadata) {
             Ok(true) => return direct_completion_reply(&metadata),
             Err(error) => return data_plane_failure(error),
