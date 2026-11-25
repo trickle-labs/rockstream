@@ -1584,6 +1584,18 @@ metrics export are outside the internal M1–M7 FizzBee consensus models, health
 and status evaluations reflect durable shard/worker state and are verified by
 integration test suites and deterministic simulation tests.
 
+PR #453 (issue #304) bounds KEK rotation staging at 1,000,000 entries and 64
+MiB of serialized values (including the durable audit outbox record), and caps
+secret-store rotation-lock admissions at 64. An over-limit item is rejected
+before it is added to the durable batch or applied to in-memory secrets. The
+`secret_store.rs` tests `kek_rotation_staging_accepts_exact_limits_and_rejects_overflow`,
+`secret_rotation_waiter_overflow_reports_exact_error_and_fill`, and
+`kek_rotation_staging_gauges_clear_after_drop` check the exact boundary and
+error, waiter fill and rejection, and staging-gauge reset. These are
+implementation-level resource-admission assertions: M1–M7 do not model secret
+rotation or store waiters, so this slice adds no FizzBee transition. Connector
+credential-rotation continuity remains open.
+
 A failing `exists` assertion means the fault is not being explored and the
 corresponding `always` proofs are untrustworthy — treated as a build failure.
 
