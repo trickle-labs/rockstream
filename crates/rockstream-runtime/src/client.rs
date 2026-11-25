@@ -45,7 +45,9 @@ use rockstream_storage::{ShardDb, WriteBatch};
 fn log_invalid_control_message(error: &serde_json::Error, message_bytes: usize) {
     tracing::error!(
         code = %rockstream_types::error_code::RS_0001,
-        error = ?error,
+        error_kind = ?error.classify(),
+        error_line = error.line(),
+        error_column = error.column(),
         message_bytes,
         "Invalid message from control plane"
     );
@@ -1057,7 +1059,7 @@ mod data_plane_tests {
 
     #[test]
     fn invalid_control_message_log_has_exact_redacted_output() {
-        let line = r#"{"secret":"redaction-marker",}"#;
+        let line = r#"{"type":"redaction-marker"}"#;
         let error = serde_json::from_str::<ControlMessage>(line).unwrap_err();
         let output = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::fmt()
@@ -1073,8 +1075,11 @@ mod data_plane_tests {
 
         let actual = String::from_utf8(output.lock().clone()).unwrap();
         let expected = format!(
-            "ERROR Invalid message from control plane code={} error={error:?} message_bytes={}\n",
+            "ERROR Invalid message from control plane code={} error_kind={:?} error_line={} error_column={} message_bytes={}\n",
             rockstream_types::error_code::RS_0001,
+            error.classify(),
+            error.line(),
+            error.column(),
             line.len()
         );
         assert_eq!(actual, expected);
