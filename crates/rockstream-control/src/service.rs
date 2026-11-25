@@ -7687,7 +7687,13 @@ mod tests {
             workload_name: "direct".into(),
             plan_json: "{}".into(),
             join_strategy: Default::default(),
-            schemas: Vec::new(),
+            schemas: vec![rockstream_types::data_plane::DeploymentSchema {
+                relation: "items".into(),
+                columns: vec![rockstream_types::data_plane::DeploymentColumn {
+                    name: "id".into(),
+                    data_type: "BIGINT".into(),
+                }],
+            }],
             frontier: 0,
             storage_root: "test".into(),
             sink_operator_id: rockstream_types::ids::OperatorId(1),
