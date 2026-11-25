@@ -746,10 +746,11 @@ async fn interrupted_dispatch_blocks_distributed_reads_after_gateway_restart() {
                     let wire = serde_json::to_string(&response).unwrap() + "\n";
                     write.write_all(wire.as_bytes()).await.unwrap();
                 }
-                WorkerMessage::SubmitSourceDelta(request) => {
-                    request_tx.take().unwrap().send(request).unwrap();
-                    // Keep the source dispatch unanswered while continuing to
-                    // accept shard discovery requests after the gateway restarts.
+                WorkerMessage::AuthorizeSourceEpoch { metadata } => {
+                    request_tx.take().unwrap().send(metadata).unwrap();
+                    // Interrupt the admission RPC after control receives the
+                    // request, before the gateway can learn its outcome.
+                    // Continue accepting shard discovery after restart.
                     tokio::spawn(async move {
                         let _pending_connection = write;
                         std::future::pending::<()>().await;
@@ -767,8 +768,8 @@ async fn interrupted_dispatch_blocks_distributed_reads_after_gateway_restart() {
                 }
                 WorkerMessage::GetWorkloadTopology { workload_id } => {
                     // This mock fixture has no live workers; returning an empty
-                    // shard list lets the gateway fall back to the interrupted
-                    // SubmitSourceDelta path under test.
+                    // shard list is sufficient for restart/read recovery;
+                    // this mock never issues a direct epoch grant.
                     let response = ControlMessage::WorkloadTopology {
                         snapshot: rockstream_types::data_plane::WorkloadTopologySnapshot {
                             topology_epoch: 1,
@@ -820,20 +821,31 @@ async fn interrupted_dispatch_blocks_distributed_reads_after_gateway_restart() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(request.source, "pending_items");
-    assert_eq!(
-        request.rows,
-        vec![
+    assert!(request.is_valid());
+    assert_eq!(request.epoch, 1);
+    // Authorization carries a digest, not rows. Check the exact original input.
+    let expected = rockstream_types::data_plane::SourceDeltaRequest {
+        version: rockstream_types::data_plane::DEPLOYMENT_DESCRIPTOR_VERSION,
+        workload_id: request.workload_id,
+        request_id: request.request_id.clone(),
+        source: "pending_items".to_string(),
+        epoch: 1,
+        rows: vec![
             rockstream_types::data_plane::RuntimeRow {
                 values_tsv: "1\t10".to_string(),
-                weight: 1
+                weight: 1,
             },
             rockstream_types::data_plane::RuntimeRow {
                 values_tsv: "2\t20".to_string(),
-                weight: 1
+                weight: 1,
             },
-        ]
+        ],
+    };
+    assert_eq!(
+        request,
+        rockstream_types::direct_epoch::SourceEpochMetadata::from_request(&expected).unwrap()
     );
+    assert!(serde_json::to_value(&request).unwrap().get("rows").is_none());
     gateway.0.kill().unwrap();
     gateway.0.wait().unwrap();
     assert!(insert.await.unwrap().is_err());
