@@ -717,8 +717,9 @@ model; no new FizzBee transition or invariant is asserted.
 PR #455 (issue #303) changes only malformed control-message diagnostics in
 `crates/rockstream-runtime/src/client.rs`: the read loop still skips invalid
 lines, while logs retain the error code, decoder error, and byte length without
-the raw message. No coordinator or worker state transitions change, so the
-existing model assumptions remain unchanged.
+the raw message. `client::data_plane_tests::invalid_control_message_log_has_exact_redacted_output`
+asserts the complete log record. No coordinator or worker state transitions
+change, so the existing model assumptions remain unchanged.
 
 PR #420 (issue #400) completes the direct distributed execution path across
 `rockstream-control`, `rockstream-runtime`, `rockstream-storage`, and
