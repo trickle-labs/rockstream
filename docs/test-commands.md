@@ -6,6 +6,7 @@ current command taxonomy.
 ```console
 $ make build
 $ make fmt
+$ make pr-preflight
 $ make clippy
 $ make test
 $ make error-codes
@@ -19,6 +20,11 @@ $ cargo audit
 $ bash scripts/check-documentation.test.sh
 $ cargo test -p rockstream-cli --test documentation_transcript_tests
 ```
+
+`make pr-preflight` runs workspace formatting and documentation admission with
+its negative controls before pushing. CI uses the same script in its lane
+selection job before scheduling expensive checks; only the existing prose
+scope omits formatting. A successful preflight is not full CI qualification.
 
 The CI workflow runs the same Rust checks and the scheduled dependency audit.
 Use the [dependency policy](../DEPENDENCY_POLICY.md) for license and advisory

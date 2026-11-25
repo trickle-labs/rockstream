@@ -17,6 +17,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: pgwire-pr-fuzz-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 env:
   RUSTUP_TOOLCHAIN: nightly-2026-02-01
 

@@ -73,6 +73,30 @@ class PolicyTests(unittest.TestCase):
             self.assertIn("if: needs.ci-policy.outputs.scope == 'full'", blocks[job])
         self.assertIn("needs: docker-build", blocks["control-plane-ha"])
 
+    def test_preflight_is_part_of_required_selection_before_expensive_fanout(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        blocks = dict(re.findall(r"^  ([\w-]+):\n(.*?)(?=^  [\w-]+:|\Z)", workflow, re.M | re.S))
+        policy = blocks["ci-policy"]
+        self.assertIn("if: steps.select.outputs.scope == 'full'", policy)
+        self.assertIn('components: rustfmt', policy)
+        self.assertIn('CI_SCOPE: ${{ steps.select.outputs.scope }}', policy)
+        self.assertIn('run: bash scripts/ci-preflight.sh "$CI_SCOPE"', policy)
+        self.assertLess(policy.index("run: python3 scripts/ci-selection.py"),
+                        policy.index("run: bash scripts/ci-preflight.sh"))
+        self.assertNotIn("continue-on-error", policy)
+        self.assertNotIn("cargo fmt --all --check", blocks["check-quality"])
+        self.assertNotIn("bash scripts/check-documentation.sh", blocks["check-quality"])
+        self.assertNotIn("bash scripts/check-documentation.test.sh", blocks["check-quality"])
+        self.assertIn("bash scripts/ci-preflight.sh full", (ROOT / "Makefile").read_text())
+        for job in ("check-quality", "current-stable-compile", "check-tests", "gateway",
+                    "postgres-differential", "formal-verify", "docker-build",
+                    "benchmark-suites", "verus-consumer", "verus-qualify",
+                    "security-release-process", "nexmark-regression-gate"):
+            with self.subTest(job=job):
+                self.assertIn("needs: ci-policy", blocks[job])
+                self.assertNotIn("if: always()", blocks[job].split("    steps:", 1)[0])
+        self.assertIn("needs: docker-build", blocks["control-plane-ha"])
+
     def test_balanced_shards_benchmarks_and_clean_consumer_keep_their_gates(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         blocks = dict(re.findall(r"^  ([\w-]+):\n(.*?)(?=^  [\w-]+:|\Z)", workflow, re.M | re.S))
