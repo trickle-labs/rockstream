@@ -1104,3 +1104,57 @@ async fn management_release_process_authenticates_and_authorizes_real_cli_reques
         }
     );
 }
+
+#[tokio::test]
+async fn management_start_rejects_scram_only_administrator() {
+    let pki = TestPki::generate();
+    let principal = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(1),
+        display_name: "SCRAM-only administrator".to_owned(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::ScramSha256 {
+            username: "bootstrap-admin".to_owned(),
+            salt: vec![4; 16],
+            iterations: 4096,
+            stored_key: vec![5; 32],
+            server_key: vec![6; 32],
+        }],
+        preset_grants: [PermissionPreset::Administrator, PermissionPreset::Operator]
+            .into_iter()
+            .map(|preset| ScopedPresetGrant {
+                preset,
+                scope: PolicyScope::Cluster,
+            })
+            .collect(),
+        scoped_grants: Vec::new(),
+    };
+    let catalog = Arc::new(DurableCatalogStore::new(
+        Arc::new(InMemory::new()),
+        "scram-only-management-startup",
+    ));
+    catalog
+        .preprovision_first_administrator(principal, 1)
+        .await
+        .unwrap();
+    let service = ManagementService::new(
+        TopologyCatalog::new(),
+        ShardManager::new(),
+        ManagementOperationStore::new(Arc::new(InMemory::new())),
+        NodeConfig::default(),
+    )
+    .with_security_catalog(catalog as Arc<dyn CatalogStore>);
+    let tls = Arc::new(
+        rockstream_control::tls::TlsCertificateReloader::new(pki.control_tls_config()).unwrap(),
+    );
+
+    let error = match service.start("127.0.0.1:0", tls).await {
+        Ok(_) => panic!("SCRAM-only administrator must not start management"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.to_string(),
+        "RS-2405: management API requires a preprovisioned mTLS administrator"
+    );
+}
