@@ -8075,6 +8075,8 @@ async fn support_artifact_reconciles_durable_boundaries_after_process_exit() {
     let control_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
     let management_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
     let principal = mtls_support_admin_with_fingerprint(certificate_sha256(&pki.cli_cert_path));
+    let other_actor =
+        mtls_operator_with_fingerprint(certificate_sha256(&pki.secondary_cli_cert_path));
     let security_store: Arc<dyn ObjectStore> = Arc::new(object_store::prefix::PrefixStore::new(
         rockstream_test_support::minio::minio_object_store(minio_port, bucket),
         "gateway-shard",
@@ -8111,7 +8113,7 @@ async fn support_artifact_reconciles_durable_boundaries_after_process_exit() {
             &pki,
             Some((minio_port, bucket)),
             true,
-            None,
+            (index == 0).then(|| other_actor.clone()),
             true,
             false,
             Some(*boundary),
@@ -8270,6 +8272,54 @@ async fn support_artifact_reconciles_durable_boundaries_after_process_exit() {
         recovered.0.wait().unwrap();
     }
 
+    let expired_id = operation_ids[0].clone();
+    let mut survivor_process = start_control_process(
+        temp.path(),
+        &storage,
+        control_address,
+        management_address,
+        &pki,
+        Some((minio_port, bucket)),
+        true,
+    )
+    .await;
+    wait_for_gateway(&mut survivor_process.0, control_address).await;
+    let _admin_ready = wait_for_management_client(management_address, &pki).await;
+    let mut survivor_client = management_client_with_identity(
+        management_address,
+        &pki,
+        &pki.secondary_cli_cert_path,
+        &pki.secondary_cli_key_path,
+    )
+    .await
+    .unwrap();
+    let survivor_id = uuid::Uuid::new_v4().to_string();
+    let survivor_response = survivor_client
+        .generate_support_artifact(GenerateSupportArtifactRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            node_id: String::new(),
+            idempotency_key: survivor_id.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(survivor_response.opaque_id, survivor_id);
+    let survivor_expected_content = format!(
+        "{{\"format_version\":1,\"generated_at_ms\":{},\"scope\":\"cluster\",\"source_version\":\"rockstream:{}\",\"topology_revision\":1,\"active_operations\":1,\"retained_operations\":8,\"node\":null}}",
+        survivor_response.expires_at_ms - 600_000,
+        env!("CARGO_PKG_VERSION")
+    );
+    let (survivor_content, survivor_expiry) =
+        download_support_artifact(&mut survivor_client, &survivor_id).await;
+    assert_eq!(
+        String::from_utf8(survivor_content.clone()).unwrap(),
+        survivor_expected_content
+    );
+    assert_eq!(survivor_expiry, survivor_response.expires_at_ms);
+    survivor_process.0.kill().unwrap();
+    survivor_process.0.wait().unwrap();
+    operation_ids.push(survivor_id.clone());
+
     let ledger = serde_json::from_slice::<serde_json::Value>(
         &management_store
             .get(&ledger_path)
@@ -8290,9 +8340,7 @@ async fn support_artifact_reconciles_durable_boundaries_after_process_exit() {
     operation_ids.sort();
     assert_eq!(actual_ids, operation_ids);
 
-    let expired_id = operation_ids[0].clone();
     let expired_path = support_artifact_object_path(&management_store, &expired_id).await;
-    let survivor_id = operation_ids[1].clone();
     let survivor_path = support_artifact_object_path(&management_store, &survivor_id).await;
     let survivor_bytes = management_store
         .get(&survivor_path)
@@ -8369,6 +8417,33 @@ async fn support_artifact_reconciles_durable_boundaries_after_process_exit() {
         management_store.get(&expired_path).await,
         Err(object_store::Error::NotFound { .. })
     ));
+    let admin_denial = client
+        .download_support_artifact(DownloadSupportArtifactRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            opaque_id: survivor_id.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(admin_denial.code(), tonic::Code::NotFound);
+    assert_eq!(
+        admin_denial.message(),
+        "support artifact not found or expired"
+    );
+    let mut survivor_client = management_client_with_identity(
+        management_address,
+        &pki,
+        &pki.secondary_cli_cert_path,
+        &pki.secondary_cli_key_path,
+    )
+    .await
+    .unwrap();
+    let (survivor_content_after_cleanup, survivor_expiry_after_cleanup) =
+        download_support_artifact(&mut survivor_client, &survivor_id).await;
+    assert_eq!(survivor_content_after_cleanup, survivor_content);
+    assert_eq!(
+        survivor_expiry_after_cleanup,
+        survivor_response.expires_at_ms
+    );
     assert_eq!(
         management_store
             .get(&survivor_path)
