@@ -419,6 +419,16 @@ async fn authorize_direct_epoch(
                     .is_some_and(|lease| lease.same_owner(&descriptor.shard))
             })
         {
+            // A disconnected owner is unavailable, not merely a stale fence.
+            // Preserve the explicit diagnostic without admitting the epoch.
+            if deployment.descriptors.values().any(|descriptor| {
+                let owner = shard_manager
+                    .get(descriptor.shard.shard_id)
+                    .map_or(descriptor.shard.worker_id, |lease| lease.worker_id);
+                catalog.get(owner).is_none()
+            }) {
+                return data_plane_failure("a routed shard owner has no active worker connection");
+            }
             return data_plane_failure("RS-3004: workload ownership is changing");
         }
         let Some(topology) =
