@@ -3575,7 +3575,7 @@ async fn security_audit_history_uses_release_pgwire_pages_after_denial() {
 }
 
 #[tokio::test]
-async fn management_storage_outage_rejects_grant_change_across_process_restart() {
+async fn management_grant_persists_across_restart_and_storage_outage_rejects_mutations() {
     let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let bucket = "release-audit-outage";
@@ -3623,8 +3623,6 @@ async fn management_storage_outage_rejects_grant_change_across_process_restart()
     let mut principals_before = catalog.list_security_principals().await.unwrap();
     principals_before.sort_by_key(|principal| principal.id);
     let audit_before = catalog.list_security_audit_records().await.unwrap();
-    let revision_before = catalog.get_revision().await;
-
     let address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
     let management_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
     let mut process = start_control_process_with_operator(
@@ -3712,18 +3710,115 @@ async fn management_storage_outage_rejects_grant_change_across_process_restart()
         }
     );
 
+    let grant_operation_id = uuid::Uuid::new_v4().to_string();
+    let grant_operation = management
+        .set_security_principal_grants(SetSecurityPrincipalGrantsRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            principal_id: 2,
+            expected_revision: 1,
+            expected_grantor_revision: 1,
+            idempotency_key: grant_operation_id.clone(),
+            preset_grants: vec![SecurityPresetGrant {
+                preset: "data_reader".to_owned(),
+                scope_json: r#"{"namespace":{"namespace":"release"}}"#.to_owned(),
+            }],
+            scoped_grants: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .operation
+        .unwrap();
+    assert_eq!(grant_operation.operation_id, grant_operation_id);
+    assert_eq!(grant_operation.kind, "security_principal_grants");
+    assert_eq!(grant_operation.state, "succeeded");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&grant_operation.result_json).unwrap(),
+        serde_json::json!({
+            "principal_id": 2,
+            "revision": 2,
+            "preset_grants": [{
+                "preset": "data_reader",
+                "scope": {"namespace": {"namespace": "release"}}
+            }],
+            "scoped_grants": [],
+            "effective_permissions": [
+                {"action": "metadata_inspect", "scope": {"namespace": {"namespace": "release"}}},
+                {"action": "data_read", "scope": {"namespace": {"namespace": "release"}}},
+                {"action": "data_subscribe", "scope": {"namespace": {"namespace": "release"}}}
+            ]
+        })
+    );
+
     catalog.refresh().await.unwrap();
     let mut principals_authenticated = catalog.list_security_principals().await.unwrap();
     principals_authenticated.sort_by_key(|principal| principal.id);
     let audit_authenticated = catalog.list_security_audit_records().await.unwrap();
     let revision_authenticated = catalog.get_revision().await;
-    assert_eq!(principals_authenticated, principals_before);
-    assert_eq!(audit_authenticated.len(), audit_before.len() + 1);
+    let mut expected_principals = principals_before.clone();
+    let updated_principal = expected_principals
+        .iter_mut()
+        .find(|principal| principal.id == PrincipalId(2))
+        .unwrap();
+    updated_principal.revision = 2;
+    updated_principal.preset_grants = vec![ScopedPresetGrant {
+        preset: PermissionPreset::DataReader,
+        scope: PolicyScope::Namespace {
+            namespace: "release".to_owned(),
+        },
+    }];
+    assert_eq!(principals_authenticated, expected_principals);
     assert_eq!(
         &audit_authenticated[..audit_before.len()],
         audit_before.as_slice()
     );
-    assert_eq!(revision_authenticated, revision_before + 1);
+    let grant_audit = audit_authenticated
+        .iter()
+        .find(|record| {
+            record.event_id == format!("management-security-grants:{grant_operation_id}")
+        })
+        .expect("successful grant mutation must be audited");
+    let audit_state = |principal: &SecurityPrincipal| {
+        format!(
+            "revision={};policy={}",
+            principal.revision,
+            serde_json::to_string(&(
+                principal.enabled,
+                &principal.preset_grants,
+                &principal.scoped_grants
+            ))
+            .unwrap()
+        )
+    };
+    let principal_before = principals_before
+        .iter()
+        .find(|principal| principal.id == PrincipalId(2))
+        .unwrap();
+    let principal_after = principals_authenticated
+        .iter()
+        .find(|principal| principal.id == PrincipalId(2))
+        .unwrap();
+    assert_eq!(
+        SecurityAuditRecord {
+            timestamp_ms: 0,
+            ..grant_audit.clone()
+        },
+        SecurityAuditRecord {
+            format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: format!("management-security-grants:{grant_operation_id}"),
+            timestamp_ms: 0,
+            actor: AuditIdentity::Verified("principal:1".to_owned()),
+            target: AuditField::Known("principal:2".to_owned()),
+            scope: AuditField::Known("cluster".to_owned()),
+            action: SecurityAuditClass::GrantChange,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::Observed(grant_operation_id.clone()),
+            operation_id: AuditField::Known(grant_operation_id.clone()),
+            policy_revision: AuditField::Known(2),
+            before_state: AuditField::Known(audit_state(principal_before)),
+            after_state: AuditField::Known(audit_state(principal_after)),
+        }
+    );
 
     let operation_id = uuid::Uuid::new_v4().to_string();
     minio_container.stop().await.unwrap();
@@ -3731,7 +3826,7 @@ async fn management_storage_outage_rejects_grant_change_across_process_restart()
         .set_security_principal_grants(SetSecurityPrincipalGrantsRequest {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
             principal_id: 2,
-            expected_revision: 1,
+            expected_revision: 2,
             expected_grantor_revision: 1,
             idempotency_key: operation_id.clone(),
             preset_grants: Vec::new(),
@@ -3797,6 +3892,17 @@ async fn management_storage_outage_rejects_grant_change_across_process_restart()
             }
         }
     };
+    let recovered_grant = recovered_management
+        .get_operation(GetOperationRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            operation_id: grant_operation_id.clone(),
+        })
+        .await
+        .expect("successful grant operation should survive process restart")
+        .into_inner()
+        .operation
+        .unwrap();
+    assert_eq!(recovered_grant, grant_operation);
     let missing = recovered_management
         .get_operation(GetOperationRequest {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
