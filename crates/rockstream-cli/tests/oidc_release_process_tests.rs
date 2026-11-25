@@ -1242,6 +1242,16 @@ async fn management_client_with_identity(
     cert_path: &Path,
     key_path: &Path,
 ) -> Result<ManagementServiceClient<tonic::transport::Channel>, String> {
+    let channel = management_channel_with_identity(address, pki, cert_path, key_path).await?;
+    Ok(ManagementServiceClient::new(channel))
+}
+
+async fn management_channel_with_identity(
+    address: std::net::SocketAddr,
+    pki: &rockstream_test_support::pki::TestPki,
+    cert_path: &Path,
+    key_path: &Path,
+) -> Result<tonic::transport::Channel, String> {
     let tls = ClientTlsConfig::new()
         .ca_certificate(Certificate::from_pem(
             std::fs::read(&pki.ca_cert_path).unwrap(),
@@ -1250,14 +1260,66 @@ async fn management_client_with_identity(
             std::fs::read(cert_path).unwrap(),
             std::fs::read(key_path).unwrap(),
         ));
-    let channel = Endpoint::from_shared(format!("https://{address}"))
+    Endpoint::from_shared(format!("https://{address}"))
         .map_err(|error| error.to_string())?
         .tls_config(tls)
         .map_err(|error| error.to_string())?
         .connect()
         .await
-        .map_err(|error| error.to_string())?;
-    Ok(ManagementServiceClient::new(channel))
+        .map_err(|error| error.to_string())
+}
+
+#[derive(Clone)]
+struct DropFirstGrantResponse<S> {
+    inner: S,
+    dropped: Arc<AtomicBool>,
+}
+
+impl<S> tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::BoxBody>>
+    for DropFirstGrantResponse<S>
+where
+    S: tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::BoxBody>>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+    S::Error: std::error::Error + Send + Sync + 'static,
+    S::Response: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = std::io::Error;
+    type Future = tonic::codegen::BoxFuture<Self::Response, Self::Error>;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(
+        &mut self,
+        request: tonic::codegen::http::Request<tonic::body::BoxBody>,
+    ) -> Self::Future {
+        let is_grant_mutation = request.uri().path()
+            == "/rockstream.management.v1.ManagementService/SetSecurityPrincipalGrants";
+        let dropped = Arc::clone(&self.dropped);
+        let mut inner = self.inner.clone();
+        Box::pin(async move {
+            futures::future::poll_fn(|cx| inner.poll_ready(cx))
+                .await
+                .map_err(std::io::Error::other)?;
+            let response = inner.call(request).await.map_err(std::io::Error::other)?;
+            if is_grant_mutation && !dropped.swap(true, Ordering::SeqCst) {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "injected lost grant-operation response",
+                ))
+            } else {
+                Ok(response)
+            }
+        })
+    }
 }
 
 async fn wait_for_management_client(
@@ -1788,7 +1850,8 @@ async fn management_rejects_stale_grantor_revision_by_release_process() {
 }
 
 #[tokio::test]
-async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
+async fn delegated_gateway_sql_rechecks_control_policy_and_recovers_lost_grant_response_in_release_process(
+) {
     let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let temp = tempfile::tempdir().unwrap();
@@ -2301,7 +2364,20 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
     );
 
     let scoped_operation_id = uuid::Uuid::new_v4().to_string();
-    let scoped_response = management
+    let response_dropped = Arc::new(AtomicBool::new(false));
+    let channel = management_channel_with_identity(
+        management_address,
+        &pki,
+        &pki.cli_cert_path,
+        &pki.cli_key_path,
+    )
+    .await
+    .unwrap();
+    let mut response_loss_client = ManagementServiceClient::new(DropFirstGrantResponse {
+        inner: channel,
+        dropped: Arc::clone(&response_dropped),
+    });
+    let response_loss = response_loss_client
         .set_security_principal_grants(SetSecurityPrincipalGrantsRequest {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
             principal_id: 2,
@@ -2317,22 +2393,16 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
                 scope_json: serde_json::to_string(&backup_scope).unwrap(),
             }],
         })
-        .await
-        .expect("the administrator should add a scoped backup-create grant")
-        .into_inner();
-    assert_eq!(
-        scoped_response.protocol_version,
-        rockstream_management_proto::PROTOCOL_VERSION
+        .await;
+    assert!(
+        response_loss.is_err(),
+        "the successful grant response is lost"
     );
-    let mut scoped_operation = scoped_response.operation.expect("scoped grant operation");
-    assert_eq!(scoped_operation.operation_id, scoped_operation_id);
-    assert!(chrono::DateTime::parse_from_rfc3339(&scoped_operation.started_at).is_ok());
-    assert!(chrono::DateTime::parse_from_rfc3339(&scoped_operation.updated_at).is_ok());
-    scoped_operation.started_at = "<timestamp>".to_owned();
-    scoped_operation.updated_at = "<timestamp>".to_owned();
-    assert_eq!(
-        scoped_operation,
-        ManagementWireOperation {
+    assert!(
+        response_dropped.load(Ordering::SeqCst),
+        "the response is dropped only after the server returns success"
+    );
+    let expected_scoped_operation = ManagementWireOperation {
             operation_id: scoped_operation_id.clone(),
             kind: "security_principal_grants".to_owned(),
             state: "succeeded".to_owned(),
@@ -2364,8 +2434,7 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
                 ]
             })
             .to_string(),
-        }
-    );
+        };
 
     let mut scoped_actor = operator_only_actor.clone();
     scoped_actor.revision = 3;
@@ -2385,20 +2454,94 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
     let audit_after_scoped_grant = control_catalog.list_security_audit_records().await.unwrap();
     assert_eq!(
         audit_after_scoped_grant.len(),
-        audit_before_scoped_grant.len() + 3
+        audit_before_scoped_grant.len() + 4
     );
     assert_eq!(
         &audit_after_scoped_grant[..audit_before_scoped_grant.len()],
         audit_before_scoped_grant.as_slice()
     );
-    let scoped_grant_record = &audit_after_scoped_grant[audit_before_scoped_grant.len() + 1];
-    assert_eq!(scoped_grant_record.action, SecurityAuditClass::GrantChange);
-    assert_eq!(scoped_grant_record.outcome, SecurityAuditOutcome::Success);
+    let authentication = &audit_after_scoped_grant[audit_before_scoped_grant.len()];
+    let authentication_id = authentication
+        .event_id
+        .strip_prefix("management-authn-")
+        .expect("lost-response client authentication audit event");
+    assert!(uuid::Uuid::parse_str(authentication_id).is_ok());
+    assert!(authentication.timestamp_ms > 0);
     assert_eq!(
-        scoped_grant_record.correlation,
-        AuditCorrelation::Observed(scoped_operation_id.clone())
+        authentication,
+        &SecurityAuditRecord {
+            format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: authentication.event_id.clone(),
+            timestamp_ms: authentication.timestamp_ms,
+            actor: AuditIdentity::Verified("principal:1".to_owned()),
+            target: AuditField::Known("management-api".to_owned()),
+            scope: AuditField::NotApplicable,
+            action: SecurityAuditClass::AuthenticationSuccess,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::Known(1),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
     );
-    assert_eq!(scoped_grant_record.policy_revision, AuditField::Known(3));
+    let start = &audit_after_scoped_grant[audit_before_scoped_grant.len() + 1];
+    assert!(start.timestamp_ms > 0);
+    assert_eq!(
+        start,
+        &SecurityAuditRecord {
+            format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: format!("management-security-grants-start:{scoped_operation_id}"),
+            timestamp_ms: start.timestamp_ms,
+            actor: AuditIdentity::Verified("principal:1".to_owned()),
+            target: AuditField::Known("principal:2".to_owned()),
+            scope: AuditField::Known("cluster".to_owned()),
+            action: SecurityAuditClass::AdminOperationStart,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::Observed(scoped_operation_id.clone()),
+            operation_id: AuditField::Known(scoped_operation_id.clone()),
+            policy_revision: AuditField::Known(1),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
+    );
+    let before_policy = serde_json::to_string(&(
+        operator_only_actor.enabled,
+        &operator_only_actor.preset_grants,
+        &operator_only_actor.scoped_grants,
+    ))
+    .unwrap();
+    let after_policy = serde_json::to_string(&(
+        scoped_actor.enabled,
+        &scoped_actor.preset_grants,
+        &scoped_actor.scoped_grants,
+    ))
+    .unwrap();
+    let scoped_grant_record = &audit_after_scoped_grant[audit_before_scoped_grant.len() + 2];
+    assert!(scoped_grant_record.timestamp_ms > 0);
+    let expected_scoped_grant = SecurityAuditRecord {
+        format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: format!("management-security-grants:{scoped_operation_id}"),
+        timestamp_ms: scoped_grant_record.timestamp_ms,
+        actor: AuditIdentity::Verified("principal:1".to_owned()),
+        target: AuditField::Known("principal:2".to_owned()),
+        scope: AuditField::Known("cluster".to_owned()),
+        action: SecurityAuditClass::GrantChange,
+        outcome: SecurityAuditOutcome::Success,
+        correlation: AuditCorrelation::Observed(scoped_operation_id.clone()),
+        operation_id: AuditField::Known(scoped_operation_id.clone()),
+        policy_revision: AuditField::Known(3),
+        before_state: AuditField::Known(format!("revision=2;policy={before_policy}")),
+        after_state: AuditField::Known(format!("revision=3;policy={after_policy}")),
+    };
+    assert_eq!(scoped_grant_record, &expected_scoped_grant);
+    let completion = &audit_after_scoped_grant[audit_before_scoped_grant.len() + 3];
+    assert_eq!(completion.timestamp_ms, scoped_grant_record.timestamp_ms);
+    let mut expected_completion = expected_scoped_grant;
+    expected_completion.event_id =
+        format!("management-security-grants-completion:{scoped_operation_id}");
+    expected_completion.action = SecurityAuditClass::AdminOperationCompletion;
+    assert_eq!(completion, &expected_completion);
 
     tokio::time::sleep(Duration::from_secs(2)).await;
     let backup_response = operator_management
@@ -2565,6 +2708,77 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
             after_state: AuditField::NotApplicable,
         }
     );
+
+    drop(management);
+    let mut recovered_control_process = start_control_process_with_operator(
+        &control_working_dir,
+        &control_storage,
+        control_address,
+        management_address,
+        &pki,
+        None,
+        false,
+        None,
+        false,
+        false,
+    )
+    .await;
+    wait_for_gateway(&mut recovered_control_process.0, control_address).await;
+    let mut recovered_management = wait_for_management_client(management_address, &pki).await;
+    let recovered_response = recovered_management
+        .get_operation(GetOperationRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            operation_id: scoped_operation_id,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        recovered_response.protocol_version,
+        rockstream_management_proto::PROTOCOL_VERSION
+    );
+    let mut recovered_operation = recovered_response
+        .operation
+        .expect("the committed grant operation remains queryable after restart");
+    assert!(chrono::DateTime::parse_from_rfc3339(&recovered_operation.started_at).is_ok());
+    assert!(chrono::DateTime::parse_from_rfc3339(&recovered_operation.updated_at).is_ok());
+    recovered_operation.started_at = "<timestamp>".to_owned();
+    recovered_operation.updated_at = "<timestamp>".to_owned();
+    assert_eq!(recovered_operation, expected_scoped_operation);
+    recovered.refresh().await.unwrap();
+    let recovered_records = recovered.list_security_audit_records().await.unwrap();
+    assert_eq!(recovered_records.len(), records.len() + 1);
+    assert_eq!(&recovered_records[..records.len()], records.as_slice());
+    let recovery_auth = &recovered_records[records.len()];
+    let event_id = recovery_auth
+        .event_id
+        .strip_prefix("management-authn-")
+        .expect("recovery lookup authentication audit event");
+    assert!(uuid::Uuid::parse_str(event_id).is_ok());
+    assert!(recovery_auth.timestamp_ms > 0);
+    let mut normalized_auth = recovery_auth.clone();
+    normalized_auth.event_id = "<event_id>".to_owned();
+    normalized_auth.timestamp_ms = 0;
+    assert_eq!(
+        normalized_auth,
+        SecurityAuditRecord {
+            format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: "<event_id>".to_owned(),
+            timestamp_ms: 0,
+            actor: AuditIdentity::Verified("principal:1".to_owned()),
+            target: AuditField::Known("management-api".to_owned()),
+            scope: AuditField::NotApplicable,
+            action: SecurityAuditClass::AuthenticationSuccess,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::Known(1),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
+    );
+    recovered_control_process.0.kill().unwrap();
+    recovered_control_process.0.wait().unwrap();
 }
 
 #[tokio::test]
