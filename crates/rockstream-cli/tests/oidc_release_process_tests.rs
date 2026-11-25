@@ -7212,56 +7212,89 @@ async fn mtls_certificate_rejections_run_in_release_process_and_audit_after_rest
     let expired_server_key_pem = expired_key.serialize_pem();
     std::fs::write(&expired_server_cert_path, expired_cert.pem()).unwrap();
     std::fs::write(&expired_server_key_path, &expired_server_key_pem).unwrap();
-    let mut expired_server_process = start_gateway_process(
-        temp.path(),
-        &storage,
-        address,
-        &expired_server_cert_path,
-        &expired_server_key_path,
-        "mtls",
-        Some(&ca_path),
-        "",
-        "",
-        "",
-    );
-    let status = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if let Some(status) = expired_server_process.0.try_wait().unwrap() {
-                break status;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("release gateway did not reject the expired server certificate");
-    assert_eq!(status.code(), Some(1));
-    let mut stderr = String::new();
-    expired_server_process
-        .0
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut stderr)
+
+    let mut future_server_params =
+        rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    future_server_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "gateway");
+    future_server_params.not_before = rcgen::date_time_ymd(2099, 1, 1);
+    future_server_params.not_after = rcgen::date_time_ymd(2100, 1, 2);
+    let future_server_key = rcgen::KeyPair::generate().unwrap();
+    let future_server_cert = future_server_params
+        .signed_by(&future_server_key, &ca_cert, &ca_key)
         .unwrap();
-    let correlation_id = stderr
-        .split_once("correlation_id=")
-        .and_then(|(_, value)| value.split_whitespace().next())
-        .expect("startup diagnostic should include its correlation ID");
-    assert_eq!(correlation_id.len(), 36);
-    let normalized_stderr = stderr.replace(correlation_id, "<correlation-id>");
+    let future_server_cert_path = temp.path().join("gateway-not-yet-valid.pem");
+    let future_server_key_path = temp.path().join("gateway-not-yet-valid-key.pem");
+    let future_server_key_pem = future_server_key.serialize_pem();
+    std::fs::write(&future_server_cert_path, future_server_cert.pem()).unwrap();
+    std::fs::write(&future_server_key_path, &future_server_key_pem).unwrap();
+
     let expected_error = "[RS-0002] config.invalid: Configuration error (detail=gateway mTLS configuration is invalid: [RS-2405] auth.tls_config_invalid: server certificate is expired or not yet valid. next_steps: Verify the configured paths point to valid PEM-encoded certificate/key files readable by the gateway process.) (correlation_id=<correlation-id> context=detail=gateway mTLS configuration is invalid: [RS-2405] auth.tls_config_invalid: server certificate is expired or not yet valid. next_steps: Verify the configured paths point to valid PEM-encoded certificate/key files readable by the gateway process.) next_steps: Check configuration file and CLI flags.\n  next steps: Check the gateway certificate, key, and client CA files.";
-    assert!(
-        normalized_stderr
-            .strip_suffix('\n')
-            .unwrap_or(&normalized_stderr)
-            == expected_error,
-        "unexpected expired server certificate error: {normalized_stderr}"
-    );
-    assert!(!stderr.contains(&expired_server_key_pem));
-    let listener = tokio::net::TcpListener::bind(address)
+    for (case, cert_path, key_path, key_pem) in [
+        (
+            "expired",
+            expired_server_cert_path.as_path(),
+            expired_server_key_path.as_path(),
+            expired_server_key_pem.as_str(),
+        ),
+        (
+            "not-yet-valid",
+            future_server_cert_path.as_path(),
+            future_server_key_path.as_path(),
+            future_server_key_pem.as_str(),
+        ),
+    ] {
+        let mut invalid_server_process = start_gateway_process(
+            temp.path(),
+            &storage,
+            address,
+            cert_path,
+            key_path,
+            "mtls",
+            Some(&ca_path),
+            "",
+            "",
+            "",
+        );
+        let status = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(status) = invalid_server_process.0.try_wait().unwrap() {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
         .await
-        .expect("expired server certificate left the gateway listener bound");
-    drop(listener);
+        .unwrap_or_else(|_| panic!("release gateway accepted the {case} server certificate"));
+        assert_eq!(status.code(), Some(1));
+        let mut stderr = String::new();
+        invalid_server_process
+            .0
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        let correlation_id = stderr
+            .split_once("correlation_id=")
+            .and_then(|(_, value)| value.split_whitespace().next())
+            .expect("startup diagnostic should include its correlation ID");
+        assert_eq!(correlation_id.len(), 36);
+        let normalized_stderr = stderr.replace(correlation_id, "<correlation-id>");
+        assert_eq!(
+            normalized_stderr
+                .strip_suffix('\n')
+                .unwrap_or(&normalized_stderr),
+            expected_error,
+            "unexpected {case} server certificate error"
+        );
+        assert!(!stderr.contains(key_pem));
+        let listener = tokio::net::TcpListener::bind(address)
+            .await
+            .expect("invalid server certificate left the gateway listener bound");
+        drop(listener);
+    }
 
     let mut process = start_gateway_process(
         temp.path(),
