@@ -305,7 +305,7 @@ async fn aggregate_loaders_reject_noncanonical_persisted_records() {
     db.write_batch(batch).await.unwrap();
     db.flush().await.unwrap();
 
-    let expected_value_error = "[RS-0001] Storage error: key encoding error: RS-3616: corrupted recovery record: aggregate value must be exactly 16 bytes; next_steps: check disk space and object store connectivity";
+    let expected_value_error = "[RS-0001] Storage error: key encoding error: RS-3616: corrupted recovery record: aggregate value must be 16 or 17 bytes; next_steps: check disk space and object store connectivity";
     let load_error = match AggregateOp::load_from_storage(&db, op_id).await {
         Ok(_) => panic!("trailing aggregate value bytes were accepted"),
         Err(error) => error.to_string(),

@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,11 +20,13 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
+use rockstream_types::config::ExchangeConfig;
 use rockstream_types::data_plane::{
-    DeploymentDescriptor, RuntimeExchangeMessage, RuntimeOutputDelta, RuntimeRow,
-    DEPLOYMENT_DESCRIPTOR_VERSION,
+    DeploymentDescriptor, RuntimeExchangeMessage, RuntimeOutputDelta, RuntimeRow, ShardOutput,
+    DEPLOYMENT_DESCRIPTOR_VERSION, WORKLOAD_SNAPSHOT_VERSION,
 };
 use rockstream_types::identity::InternalTlsConfig;
 use rockstream_types::ids::{LeaseToken, OperatorId, ShardId, WorkerId, WorkloadId};
@@ -35,9 +38,20 @@ use rockstream_types::topology::{
 
 use crate::epoch_compaction::{EpochCompactionConfig, EpochCompactor};
 use crate::secrets::WorkerSecretManager;
-use crate::shard_actor::{FrameExecutor, ShardActorRegistry};
+use crate::shard_actor::{CancellationReporter, OwnedFrameExecutor, ShardActorRegistry};
 use rockstream_ops::PhysicalCommitGroup;
 use rockstream_storage::{ShardDb, WriteBatch};
+
+fn log_invalid_control_message(error: &serde_json::Error, message_bytes: usize) {
+    tracing::error!(
+        code = %rockstream_types::error_code::RS_0001,
+        error_kind = ?error.classify(),
+        error_line = error.line(),
+        error_column = error.column(),
+        message_bytes,
+        "Invalid message from control plane"
+    );
+}
 
 pub struct WorkerDeployment {
     pub descriptor: DeploymentDescriptor,
@@ -46,6 +60,9 @@ pub struct WorkerDeployment {
     pub compiled: rockstream_ops::compile::CompiledView,
     pub commit_group: Arc<PhysicalCommitGroup>,
     pub compactor: Arc<EpochCompactor>,
+    execution_requires_recovery: tokio::sync::Mutex<bool>,
+    owned_epoch: crate::owned_epoch::OwnedEpochJournal,
+    recovery_on_open: bool,
 }
 
 impl WorkerDeployment {
@@ -54,13 +71,94 @@ impl WorkerDeployment {
     }
 }
 
+async fn read_workload_shards(
+    deployments: &WorkerDeployments,
+    active_shards: &Arc<RwLock<HashMap<ShardId, ShardState>>>,
+    workload_id: WorkloadId,
+    shard_ids: &[ShardId],
+) -> io::Result<Vec<ShardOutput>> {
+    let targets = {
+        let deployed = deployments.read();
+        let active = active_shards.read();
+        let mut seen = std::collections::HashSet::new();
+        let mut targets = Vec::with_capacity(shard_ids.len());
+        for shard_id in shard_ids {
+            if !seen.insert(*shard_id) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "duplicate shard in workload read request",
+                ));
+            }
+            let deployment = deployed
+                .get(&(workload_id, *shard_id))
+                .cloned()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "shard is not deployed"))?;
+            if !active.get(shard_id).is_some_and(|state| {
+                state.lease.worker_id == deployment.descriptor.shard.worker_id
+                    && state.lease.lease_token == deployment.descriptor.shard.lease_token
+                    && state.db.is_some()
+            }) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "shard lease is not active",
+                ));
+            }
+            targets.push(deployment);
+        }
+        targets
+    };
+    if targets.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "workload read requires at least one shard",
+        ));
+    }
+
+    let mut outputs = Vec::with_capacity(targets.len());
+    for deployment in targets {
+        let descriptor = &deployment.descriptor;
+        let stored = rockstream_ops::read_view_output(
+            &deployment.db,
+            descriptor.sink_operator_id,
+            descriptor.output_columns.len(),
+        )
+        .await
+        .map_err(io::Error::other)?;
+        let rows = rockstream_ops::sink::materialize_view_state(stored, &descriptor.primary_key)
+            .into_values()
+            .filter(|(_, count)| *count > 0)
+            .map(|(row, weight)| {
+                let values_tsv =
+                    String::from_utf8(rockstream_ops::sink::column_values_to_tsv_bytes(&row))
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                Ok(RuntimeRow { values_tsv, weight })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        outputs.push(ShardOutput {
+            shard_id: descriptor.shard.shard_id,
+            lease_token: Some(descriptor.shard.lease_token),
+            deltas: Vec::new(),
+            rows,
+        });
+    }
+    outputs.sort_by_key(|shard| shard.shard_id);
+    Ok(outputs)
+}
+
 pub type WorkerDeployments = Arc<RwLock<HashMap<(WorkloadId, ShardId), Arc<WorkerDeployment>>>>;
 type FrontierReportWaiter =
     Arc<parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<Result<u64, String>>>>>;
 
-fn deployment_schema(descriptor: &DeploymentDescriptor) -> io::Result<HashMap<String, SchemaRef>> {
-    descriptor
-        .schemas
+pub(crate) fn deployment_schema(
+    descriptor: &DeploymentDescriptor,
+) -> io::Result<HashMap<String, SchemaRef>> {
+    deployment_schemas_from_slice(&descriptor.schemas)
+}
+
+pub(crate) fn deployment_schemas_from_slice(
+    schemas: &[rockstream_types::data_plane::DeploymentSchema],
+) -> io::Result<HashMap<String, SchemaRef>> {
+    schemas
         .iter()
         .map(|schema| {
             let fields = schema
@@ -76,7 +174,7 @@ fn deployment_schema(descriptor: &DeploymentDescriptor) -> io::Result<HashMap<St
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 format!("unsupported deployment type {other}"),
-                            ))
+                            ));
                         }
                     };
                     Ok(Field::new(&column.name, data_type, true))
@@ -87,7 +185,7 @@ fn deployment_schema(descriptor: &DeploymentDescriptor) -> io::Result<HashMap<St
         .collect()
 }
 
-fn rows_to_zset(
+pub(crate) fn rows_to_zset(
     rows: &[RuntimeRow],
     schema: SchemaRef,
 ) -> io::Result<rockstream_ops::zset::ArrowZSet> {
@@ -161,7 +259,7 @@ fn rows_to_zset(
     ))
 }
 
-fn zset_to_rows(zset: &rockstream_ops::zset::ArrowZSet) -> io::Result<Vec<RuntimeRow>> {
+pub(crate) fn zset_to_rows(zset: &rockstream_ops::zset::ArrowZSet) -> io::Result<Vec<RuntimeRow>> {
     (0..zset.data.num_rows())
         .map(|row| {
             let values_tsv = zset
@@ -193,7 +291,7 @@ fn zset_to_rows(zset: &rockstream_ops::zset::ArrowZSet) -> io::Result<Vec<Runtim
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 format!("unsupported Arrow type {other}"),
-                            ))
+                            ));
                         }
                     }
                     .ok_or_else(|| {
@@ -210,6 +308,58 @@ fn zset_to_rows(zset: &rockstream_ops::zset::ArrowZSet) -> io::Result<Vec<Runtim
         .collect()
 }
 
+fn failure_identity(frame: &RuntimeExchangeMessage) -> RuntimeOutputDelta {
+    RuntimeOutputDelta {
+        attempt_id: frame.attempt_id,
+        version: frame.version,
+        request_id: frame.request_id.clone(),
+        workload_id: frame.workload_id,
+        shard_id: frame.shard_id,
+        epoch: frame.epoch,
+        operator_id: frame.operator_id,
+        lease_token: frame.lease_token,
+        source: frame.source.clone(),
+        rows: Vec::new(),
+    }
+}
+
+fn execution_record(frame: &RuntimeExchangeMessage) -> io::Result<(Vec<u8>, [u8; 32])> {
+    // shortcut: retain execution records until a durable replay-retention watermark is available.
+    let mut key = rockstream_storage::keys::ShardKeyEncoder::meta_key(b"owned-execution/");
+    key.extend_from_slice(&frame.epoch.to_be_bytes());
+    let input = serde_json::to_vec(&(
+        frame.version,
+        &frame.request_id,
+        frame.workload_id,
+        frame.shard_id,
+        frame.operator_id,
+        frame.epoch,
+        &frame.source,
+        &frame.rows,
+    ))
+    .map_err(io::Error::other)?;
+    Ok((key, *blake3::hash(&input).as_bytes()))
+}
+
+fn cancellation_reporter(sender: mpsc::Sender<WorkerMessage>) -> CancellationReporter {
+    Arc::new(move |frame| {
+        let output = failure_identity(frame);
+        let sender = sender.clone();
+        Box::new(move || {
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    let _ = sender
+                        .send(WorkerMessage::ExecutionFailed {
+                            output,
+                            message: "worker execution interrupted before completion".to_owned(),
+                        })
+                        .await;
+                });
+            }
+        })
+    })
+}
+
 pub async fn execute_frame(
     client: &WorkerClientHandle,
     deployments: &WorkerDeployments,
@@ -220,12 +370,15 @@ pub async fn execute_frame(
         .get(&(frame.workload_id, frame.shard_id))
         .cloned()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "workload is not deployed"))?;
+    let mut needs_recovery = deployment.execution_requires_recovery.lock().await;
     let descriptor = &deployment.descriptor;
+    client
+        .secret_manager
+        .initialize_workload_epoch(frame.workload_id, descriptor.frontier);
     if frame.version != DEPLOYMENT_DESCRIPTOR_VERSION
         || frame.shard_id != descriptor.shard.shard_id
         || frame.operator_id != descriptor.sink_operator_id
         || frame.lease_token != descriptor.shard.lease_token
-        || frame.epoch < descriptor.frontier
         || client.worker_id() != Some(descriptor.shard.worker_id)
     {
         return Err(io::Error::new(
@@ -233,20 +386,104 @@ pub async fn execute_frame(
             "stale or mismatched execution identity",
         ));
     }
-    if !client
-        .check_fence_write(frame.shard_id, frame.lease_token)
-        .await?
-    {
+    if !client.verify_local_lease_fence(frame.shard_id, frame.lease_token) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "lease fence rejected execution",
+            "RS-1702: lease fence rejected execution",
         ));
+    }
+    deployment
+        .db
+        .verify_lease_token(frame.lease_token)
+        .await
+        .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error.to_string()))?;
+    if *needs_recovery {
+        return Err(io::Error::other(
+            "worker deployment requires recovery after failed execution",
+        ));
+    }
+    if let Some(intent) = deployment
+        .owned_epoch
+        .load()
+        .await
+        .map_err(io::Error::other)?
+    {
+        if intent.workload_id != frame.workload_id
+            || Some(intent.attempt_id) != frame.attempt_id
+            || intent.request_id != frame.request_id
+            || intent.epoch != frame.epoch
+            || intent.source != frame.source
+            || !intent.target_shards.contains(&frame.shard_id)
+        {
+            return Err(io::Error::other(
+                "another owned source epoch requires reconciliation",
+            ));
+        }
     }
     let schema = deployment
         .schemas
         .get(&frame.source)
         .cloned()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unknown source relation"))?;
+    client
+        .secret_manager
+        .advance_workload_epoch(frame.workload_id, frame.epoch);
+    let (execution_key, execution_digest) = execution_record(&frame)?;
+    if let Some(frontier) = deployment
+        .db
+        .get(&rockstream_storage::keys::ShardKeyEncoder::frontier_key())
+        .await
+        .map_err(io::Error::other)?
+    {
+        let bytes: [u8; 8] = frontier.as_ref().try_into().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid committed frontier")
+        })?;
+        let frontier = u64::from_be_bytes(bytes);
+        if frame.epoch <= frontier {
+            match deployment
+                .db
+                .get(&execution_key)
+                .await
+                .map_err(io::Error::other)?
+            {
+                Some(recorded) if recorded.as_ref() == execution_digest.as_slice() => {
+                    client
+                        .msg_tx
+                        .send(WorkerMessage::ExecutionProgress {
+                            output: failure_identity(&frame),
+                            input_rows: 0,
+                            output_rows: 0,
+                        })
+                        .await
+                        .map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::ConnectionAborted,
+                                "client channel closed",
+                            )
+                        })?;
+                    return Ok(());
+                }
+                Some(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "committed execution does not match replay",
+                    ));
+                }
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "committed execution record is unavailable",
+                    ));
+                }
+            }
+        }
+    }
+    if frame.epoch < descriptor.frontier {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "execution epoch precedes the deployment frontier",
+        ));
+    }
     let worker_id = client
         .worker_id()
         .expect("execution identity checked above");
@@ -265,11 +502,32 @@ pub async fn execute_frame(
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let compacted_input_rows = deployment.compactor.compact_slice(&frame.rows);
     if compacted_input_rows.is_empty() {
+        if !client.verify_local_lease_fence(frame.shard_id, frame.lease_token) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "RS-1702: lease fence rejected persistence",
+            ));
+        }
+        deployment
+            .db
+            .verify_lease_token(frame.lease_token)
+            .await
+            .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error.to_string()))?;
+        *needs_recovery = true;
+        let mut writes = WriteBatch::new();
+        writes.put(&execution_key, &execution_digest);
+        deployment
+            .commit_group
+            .commit_epoch(frame.epoch, writes)
+            .await
+            .map_err(io::Error::other)?;
+        *needs_recovery = false;
         rockstream_types::metrics::add_r1_worker_rows(worker_id, frame.rows.len() as u64, 0);
-        client
+        let _ = client
             .msg_tx
             .send(WorkerMessage::ExecutionProgress {
                 output: RuntimeOutputDelta {
+                    attempt_id: frame.attempt_id,
                     version: frame.version,
                     request_id: frame.request_id,
                     workload_id: frame.workload_id,
@@ -283,14 +541,12 @@ pub async fn execute_frame(
                 input_rows: frame.rows.len() as u64,
                 output_rows: 0,
             })
-            .await
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::ConnectionAborted, "client channel closed")
-            })?;
+            .await;
         return Ok(());
     }
 
     let input = rows_to_zset(&compacted_input_rows, schema)?;
+    *needs_recovery = true;
     let output = rockstream_types::metrics::with_r1_execution_context(
         rockstream_types::metrics::R1ExecutionContext {
             worker_id,
@@ -326,15 +582,17 @@ pub async fn execute_frame(
             }
         },
     )?;
-    if !client
-        .check_fence_write(frame.shard_id, frame.lease_token)
-        .await?
-    {
+    if !client.verify_local_lease_fence(frame.shard_id, frame.lease_token) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "lease fence rejected persistence",
+            "RS-1702: lease fence rejected persistence",
         ));
     }
+    deployment
+        .db
+        .verify_lease_token(frame.lease_token)
+        .await
+        .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error.to_string()))?;
     let raw_output_rows = zset_to_rows(&output)?;
     let output_rows = deployment.compactor.compact_slice(&raw_output_rows);
     let output_for_sink = if output_rows.len() != raw_output_rows.len() {
@@ -343,6 +601,7 @@ pub async fn execute_frame(
         output
     };
     let mut writes = WriteBatch::new();
+    writes.put(&execution_key, &execution_digest);
     deployment
         .compiled
         .sink
@@ -365,15 +624,17 @@ pub async fn execute_frame(
         .commit_epoch(frame.epoch, writes)
         .await
         .map_err(io::Error::other)?;
+    *needs_recovery = false;
     rockstream_types::metrics::add_r1_worker_rows(
         worker_id,
         frame.rows.len() as u64,
         output_rows.len() as u64,
     );
-    client
+    let _ = client
         .msg_tx
         .send(WorkerMessage::ExecutionProgress {
             output: RuntimeOutputDelta {
+                attempt_id: frame.attempt_id,
                 version: frame.version,
                 request_id: frame.request_id,
                 workload_id: frame.workload_id,
@@ -387,8 +648,206 @@ pub async fn execute_frame(
             input_rows: frame.rows.len() as u64,
             output_rows: output_rows.len() as u64,
         })
+        .await;
+    Ok(())
+}
+
+async fn execute_frame_and_report(
+    client: &WorkerClientHandle,
+    deployments: &WorkerDeployments,
+    frame: RuntimeExchangeMessage,
+) -> Result<(), String> {
+    let output = failure_identity(&frame);
+    if let Err(error) = execute_frame(client, deployments, frame).await {
+        tracing::warn!(
+            code = %rockstream_types::error_code::RS_0001,
+            %error,
+            "worker execution refused"
+        );
+        let message = error.to_string();
+        let _ = client
+            .msg_tx
+            .send(WorkerMessage::ExecutionFailed {
+                output,
+                message: message.clone(),
+            })
+            .await;
+        return Err(message);
+    }
+    Ok(())
+}
+
+pub(crate) fn owned_shuffle_handler(
+    actors: ShardActorRegistry,
+    deployments: WorkerDeployments,
+    client: WorkerClientHandle,
+) -> crate::exchange::service::OwnedShuffleHandler {
+    Arc::new(move |frame, context| {
+        let actors = actors.clone();
+        let deployments = deployments.clone();
+        let client = client.clone();
+        Box::pin(async move {
+            let mut owner: RuntimeExchangeMessage = serde_json::from_slice(&context)
+                .map_err(|error| format!("invalid shuffle execution context: {error}"))?;
+            let output = failure_identity(&owner);
+            let prepared = (|| -> Result<(), String> {
+                let (expected_target_shard, schema) = deployments
+                    .read()
+                    .get(&(owner.workload_id, owner.shard_id))
+                    .and_then(|deployment| {
+                        deployment
+                            .schemas
+                            .get(&owner.source)
+                            .cloned()
+                            .map(|schema| (deployment.descriptor.shard_index, schema))
+                    })
+                    .ok_or_else(|| {
+                        "RS-3004: shuffle source is not deployed on this worker".to_owned()
+                    })?;
+                if !owner.rows.is_empty()
+                    || frame.exchange_id != owner.workload_id.0
+                    || (frame.target_shard != expected_target_shard
+                        && frame.target_shard != (owner.shard_id.0 as u32)
+                        && frame.target_shard
+                            != owned_shuffle_shard(owner.workload_id, owner.shard_id)
+                                .unwrap_or(u32::MAX))
+                    || frame.epoch != owner.epoch
+                    || frame.seq != 0
+                {
+                    return Err("owned shuffle identity does not match frame".to_owned());
+                }
+                let input =
+                    crate::exchange::serialization::deserialize_zset(&frame.payload, schema)?;
+                if input.num_rows() != frame.row_count as usize {
+                    return Err("owned shuffle row count does not match payload".to_owned());
+                }
+                owner.rows = zset_to_rows(&input).map_err(|error| error.to_string())?;
+                Ok(())
+            })();
+            let receipt = match prepared.and_then(|()| {
+                actors
+                    .enqueue_with_completion(owner)
+                    .map_err(|error| error.to_string())
+            }) {
+                Ok(receipt) => receipt,
+                Err(message) => {
+                    let _ = client
+                        .msg_tx
+                        .send(WorkerMessage::ExecutionFailed {
+                            output,
+                            message: message.clone(),
+                        })
+                        .await;
+                    return Err(message);
+                }
+            };
+            receipt
+                .await
+                .map_err(|_| "worker execution receipt was lost".to_owned())?
+        })
+    })
+}
+
+fn owned_shuffle_shard(workload_id: WorkloadId, shard_id: ShardId) -> Result<u32, String> {
+    let index = shard_id.0.wrapping_sub(workload_id.0.wrapping_mul(16));
+    u32::try_from(index)
+        .map_err(|_| "owned shuffle shard index exceeds the supported range".to_owned())
+}
+
+async fn dispatch_owned_shuffle(
+    mux: &crate::exchange::multiplexer::WorkerStreamMultiplexer,
+    deployments: &WorkerDeployments,
+    target_worker: WorkerId,
+    frame: RuntimeExchangeMessage,
+) -> Result<(), String> {
+    let (src_shard, schema) = deployments
+        .read()
+        .values()
+        .filter(|deployment| deployment.descriptor.workload_id == frame.workload_id)
+        .filter_map(|deployment| {
+            deployment
+                .schemas
+                .get(&frame.source)
+                .cloned()
+                .map(|schema| (deployment.descriptor.shard_index, schema))
+        })
+        .min_by_key(|(shard_idx, _)| *shard_idx)
+        .ok_or_else(|| "shuffle source is not deployed".to_owned())?;
+    let target_shard = deployments
+        .read()
+        .get(&(frame.workload_id, frame.shard_id))
+        .map(|deployment| deployment.descriptor.shard_index)
+        .unwrap_or_else(|| {
+            owned_shuffle_shard(frame.workload_id, frame.shard_id)
+                .unwrap_or(frame.shard_id.0 as u32)
+        });
+    let input = rows_to_zset(&frame.rows, schema).map_err(|error| error.to_string())?;
+    let row_count = u32::try_from(input.num_rows())
+        .map_err(|_| "shuffle batch has too many rows".to_owned())?;
+    let payload = crate::exchange::serialization::serialize_zset(&input)?;
+    let context =
+        serde_json::to_vec(&failure_identity(&frame)).map_err(|error| error.to_string())?;
+    let shuffle = crate::exchange::proto::ShuffleFrame {
+        exchange_id: frame.workload_id.0,
+        src_shard,
+        target_shard,
+        epoch: frame.epoch,
+        seq: 0,
+        payload: payload.into(),
+        row_count,
+    };
+    mux.send_owned_frame(target_worker, shuffle, context.into())
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::ConnectionAborted, "client channel closed"))
+}
+
+async fn update_owned_epoch(
+    client: &WorkerClientHandle,
+    deployments: &WorkerDeployments,
+    intent: &rockstream_types::data_plane::OwnedEpochIntent,
+    finish: bool,
+) -> Result<(), String> {
+    if intent.version != DEPLOYMENT_DESCRIPTOR_VERSION
+        || intent.attempt_id.is_nil()
+        || intent.request_id.is_empty()
+        || intent.source.is_empty()
+        || intent.target_shards.is_empty()
+        || !intent.target_shards.contains(&intent.anchor_shard)
+        || intent
+            .target_shards
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+    {
+        return Err("invalid owned source epoch".to_owned());
+    }
+    let deployment = deployments
+        .read()
+        .get(&(intent.workload_id, intent.anchor_shard))
+        .cloned()
+        .ok_or_else(|| "owned epoch anchor is not deployed".to_owned())?;
+    if client.worker_id() != Some(deployment.descriptor.shard.worker_id) {
+        return Err("owned epoch anchor is not assigned to this worker".to_owned());
+    }
+    if !client
+        .check_fence_write(intent.anchor_shard, deployment.descriptor.shard.lease_token)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        return Err("owned epoch anchor is no longer current".to_owned());
+    }
+    let mut needs_recovery = deployment.execution_requires_recovery.lock().await;
+    if *needs_recovery {
+        return Err("worker deployment requires recovery after failed execution".to_owned());
+    }
+    *needs_recovery = true;
+    let result = if finish {
+        deployment.owned_epoch.finish(intent).await
+    } else {
+        deployment.owned_epoch.prepare(intent).await
+    };
+    if result.is_ok() {
+        *needs_recovery = false;
+    }
+    result
 }
 
 /// Helper to construct a test worker deployment with in-memory / local storage and epoch compaction.
@@ -406,6 +865,8 @@ pub async fn setup_test_deployment(
     let worker_id = Arc::new(RwLock::new(Some(WorkerId(42))));
     let active_shards = Arc::new(RwLock::new(HashMap::new()));
     let topology_workers = Arc::new(RwLock::new(HashMap::new()));
+    let shard_leases = Arc::new(RwLock::new(HashMap::new()));
+    let security_audit_waiters = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let fence_waiters = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let frontier_report_waiter = Arc::new(parking_lot::Mutex::new(None));
     let secret_manager = Arc::new(WorkerSecretManager::new("worker-42".to_string()));
@@ -418,17 +879,28 @@ pub async fn setup_test_deployment(
     let deployments = Arc::new(RwLock::new(HashMap::new()));
     let comp_config_lock = Arc::new(RwLock::new(compaction_config.clone()));
 
+    let exchange_registry = crate::exchange::service::ExchangeRegistry::with_worker_state(
+        active_shards.clone(),
+        topology_workers.clone(),
+    )
+    .with_shard_leases(shard_leases.clone())
+    .with_security_audit(msg_tx.clone(), security_audit_waiters.clone());
+
     let client = WorkerClientHandle {
         worker_id,
-        active_shards,
+        active_shards: active_shards.clone(),
         topology_workers,
+        shard_leases,
         msg_tx,
+        security_audit_waiters,
         fence_waiters: fence_waiters.clone(),
         frontier_report_waiter: frontier_report_waiter.clone(),
         secret_manager,
         storage_context: storage_context.clone(),
         compaction_config: comp_config_lock,
         deployments: deployments.clone(),
+        tls_reloader: None,
+        exchange_registry,
     };
 
     let store = rockstream_storage::build_runtime_object_store(storage_dir, "test_root").unwrap();
@@ -438,6 +910,14 @@ pub async fn setup_test_deployment(
             .build()
             .await
             .unwrap(),
+    );
+    db.fence_lease_token(LeaseToken(777)).await.unwrap();
+    active_shards.write().insert(
+        ShardId(100),
+        ShardState {
+            lease: ShardLease::new(ShardId(100), WorkerId(42), LeaseToken(777)),
+            db: Some((*db).clone()),
+        },
     );
 
     let plan = rockstream_plan::PlanNode::ViewSink {
@@ -475,6 +955,7 @@ pub async fn setup_test_deployment(
         routing_columns: std::collections::BTreeMap::new(),
         shard: ShardLease::new(ShardId(100), WorkerId(42), LeaseToken(777)),
         storage_identity: format!("lfs:{}", storage_dir.display()),
+        shard_index: 84,
     };
 
     let schemas = deployment_schema(&descriptor).unwrap();
@@ -487,8 +968,10 @@ pub async fn setup_test_deployment(
     )
     .unwrap();
 
-    let commit_group = Arc::new(PhysicalCommitGroup::new(db.clone()));
+    let commit_group = Arc::new(PhysicalCommitGroup::open(db.clone()).await.unwrap());
     let compactor = Arc::new(EpochCompactor::new(compaction_config));
+    let owned_epoch = crate::owned_epoch::OwnedEpochJournal::new(db.clone());
+    let recovery_on_open = owned_epoch.load().await.unwrap().is_some();
 
     let deployment = Arc::new(WorkerDeployment {
         descriptor: descriptor.clone(),
@@ -497,6 +980,9 @@ pub async fn setup_test_deployment(
         compiled,
         commit_group,
         compactor: compactor.clone(),
+        execution_requires_recovery: tokio::sync::Mutex::new(recovery_on_open),
+        owned_epoch,
+        recovery_on_open,
     });
 
     deployments.write().insert(
@@ -516,7 +1002,7 @@ pub async fn setup_test_deployment(
                         }
                     }
                 }
-                WorkerMessage::ExecutionProgress { .. } => {
+                WorkerMessage::ExecutionProgress { .. } | WorkerMessage::ExecutionFailed { .. } => {
                     let _ = progress_tx.send(msg).await;
                 }
                 _ => {}
@@ -529,8 +1015,97 @@ pub async fn setup_test_deployment(
 
 #[cfg(test)]
 mod data_plane_tests {
+    #[test]
+    fn local_mode_checks_control_peer() {
+        let local = std::net::IpAddr::from([127, 0, 0, 1]);
+        let remote = std::net::IpAddr::from([192, 0, 2, 1]);
+        let error = super::validate_local_control_peer(true, false, remote).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "explicit local mode requires a loopback control address"
+        );
+        assert!(super::validate_local_control_peer(true, false, local).is_ok());
+        assert!(super::validate_local_control_peer(true, true, remote).is_ok());
+        assert!(super::validate_local_control_peer(false, false, remote).is_ok());
+    }
+
     use super::*;
     use rockstream_types::ids::OperatorId;
+
+    #[derive(Clone)]
+    struct CapturedLogWriter(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    struct CapturedLogWriterGuard(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogWriter {
+        type Writer = CapturedLogWriterGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogWriterGuard(self.0.clone())
+        }
+    }
+
+    impl std::io::Write for CapturedLogWriterGuard {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn invalid_control_message_log_has_exact_redacted_output() {
+        let line = r#"{"type":"redaction-marker"}"#;
+        let error = serde_json::from_str::<ControlMessage>(line).unwrap_err();
+        let output = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_writer(CapturedLogWriter(output.clone()))
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            super::log_invalid_control_message(&error, line.len());
+        });
+
+        let actual = String::from_utf8(output.lock().clone()).unwrap();
+        let expected = format!(
+            "ERROR Invalid message from control plane code={} error_kind={:?} error_line={} error_column={} message_bytes={}\n",
+            rockstream_types::error_code::RS_0001,
+            error.classify(),
+            error.line(),
+            error.column(),
+            line.len()
+        );
+        assert_eq!(actual, expected);
+        assert!(!actual.contains("redaction-marker"));
+    }
+
+    #[tokio::test]
+    async fn worker_tls_reload_rejects_missing_credentials_and_disabled_mtls() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (client, ..) =
+            setup_test_deployment(temp_dir.path(), EpochCompactionConfig::default()).await;
+        let pki = rockstream_test_support::pki::TestPki::generate();
+
+        assert_eq!(
+            client
+                .reload_tls(rockstream_types::identity::InternalTlsConfig::default())
+                .unwrap_err(),
+            "RS-2410: worker shuffle TLS certificate and private key are required"
+        );
+        let mut without_mtls = pki.worker_tls_config(1);
+        without_mtls.client_auth_required = false;
+        assert_eq!(
+            client.reload_tls(without_mtls).unwrap_err(),
+            "RS-2410: worker shuffle requires mutual TLS"
+        );
+    }
 
     #[test]
     fn linux_memory_headroom_uses_available_memory() {
@@ -576,6 +1151,348 @@ mod data_plane_tests {
     }
 
     #[tokio::test]
+    async fn rejected_worker_execution_reports_failure_without_advancing_frontier() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (client, deployments, db, _, mut progress_rx) =
+            setup_test_deployment(temp_dir.path(), EpochCompactionConfig::default()).await;
+        let frame = RuntimeExchangeMessage {
+            attempt_id: None,
+            version: DEPLOYMENT_DESCRIPTOR_VERSION,
+            request_id: "rejected-request".to_owned(),
+            workload_id: WorkloadId(1),
+            shard_id: ShardId(100),
+            operator_id: OperatorId(10),
+            lease_token: LeaseToken(777),
+            epoch: 1,
+            source: "unknown".to_owned(),
+            rows: vec![RuntimeRow {
+                values_tsv: "10\talice".to_owned(),
+                weight: 1,
+            }],
+        };
+        let expected = failure_identity(&frame);
+        let interrupted = cancellation_reporter(client.msg_tx.clone())(&frame);
+        assert_eq!(
+            execute_frame_and_report(&client, &deployments, frame).await,
+            Err("unknown source relation".to_owned())
+        );
+        match progress_rx.recv().await.unwrap() {
+            WorkerMessage::ExecutionFailed { output, message } => {
+                assert_eq!(
+                    (output, message),
+                    (expected.clone(), "unknown source relation".to_owned())
+                );
+            }
+            other => panic!("unexpected worker response: {other:?}"),
+        }
+        assert_eq!(
+            db.get(&rockstream_storage::keys::ShardKeyEncoder::frontier_key())
+                .await
+                .unwrap(),
+            None
+        );
+        interrupted();
+        match progress_rx.recv().await.unwrap() {
+            WorkerMessage::ExecutionFailed { output, message } => assert_eq!(
+                (output, message),
+                (
+                    expected,
+                    "worker execution interrupted before completion".to_owned()
+                )
+            ),
+            other => panic!("unexpected worker response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn owned_shuffle_shard_uses_checked_workload_relative_index() {
+        let workload = WorkloadId((1_u64 << 60) + 91);
+        let base = workload.0.wrapping_mul(16);
+        assert_eq!(
+            owned_shuffle_shard(workload, ShardId(base.wrapping_add(42))),
+            Ok(42)
+        );
+        assert_eq!(
+            owned_shuffle_shard(workload, ShardId(base.wrapping_add(1_u64 << 32))),
+            Err("owned shuffle shard index exceeds the supported range".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_shuffle_runs_the_worker_and_waits_for_commit() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (client, deployments, db, _, mut progress_rx) =
+            setup_test_deployment(temp_dir.path(), EpochCompactionConfig::default()).await;
+        {
+            let mut deployments = deployments.write();
+            let deployment =
+                Arc::get_mut(deployments.get_mut(&(WorkloadId(1), ShardId(100))).unwrap()).unwrap();
+            deployment.descriptor.schemas[0].columns[1].data_type = "i64".to_owned();
+            let schemas = deployment_schema(&deployment.descriptor).unwrap();
+            let plan = serde_json::from_str(&deployment.descriptor.plan_json).unwrap();
+            deployment.compiled = rockstream_ops::compile_plan_with_sink_id_and_strategy(
+                &plan,
+                db.clone(),
+                &schemas,
+                deployment.descriptor.sink_operator_id,
+                deployment.descriptor.join_strategy,
+            )
+            .unwrap();
+            deployment.schemas = schemas;
+        }
+        let owner = RuntimeExchangeMessage {
+            attempt_id: None,
+            version: DEPLOYMENT_DESCRIPTOR_VERSION,
+            request_id: "owned-shuffle".to_owned(),
+            workload_id: WorkloadId(1),
+            shard_id: ShardId(100),
+            operator_id: OperatorId(10),
+            lease_token: LeaseToken(777),
+            epoch: 1,
+            source: "items".to_owned(),
+            rows: Vec::new(),
+        };
+        let rows = vec![
+            RuntimeRow {
+                values_tsv: "1\t10".to_owned(),
+                weight: 1,
+            },
+            RuntimeRow {
+                values_tsv: "2\t20".to_owned(),
+                weight: 1,
+            },
+        ];
+        let schema = deployments.read()[&(WorkloadId(1), ShardId(100))].schemas["items"].clone();
+        let input = rows_to_zset(&rows, schema.clone()).unwrap();
+        let frame = crate::exchange::proto::ShuffleFrame {
+            exchange_id: 1,
+            src_shard: 0,
+            target_shard: 84,
+            epoch: 1,
+            seq: 0,
+            payload: crate::exchange::serialization::serialize_zset(&input)
+                .unwrap()
+                .into(),
+            row_count: 2,
+        };
+        let actors = ShardActorRegistry::new();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let actor_started = started.clone();
+        let actor_release = release.clone();
+        let executor_client = client.clone();
+        let executor_deployments = deployments.clone();
+        let execute: OwnedFrameExecutor = Arc::new(move |frame| {
+            let client = executor_client.clone();
+            let deployments = executor_deployments.clone();
+            let started = actor_started.clone();
+            let release = actor_release.clone();
+            let first = first.clone();
+            Box::pin(async move {
+                if first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    started.notify_one();
+                    release.notified().await;
+                }
+                execute_frame_and_report(&client, &deployments, frame).await
+            })
+        });
+        let actors_for_test = actors.clone();
+        let sender_deployments = deployments.clone();
+        let handle = owned_shuffle_handler(actors, deployments, client);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let registry = crate::exchange::service::ExchangeRegistry::new();
+        let (inlet_tx, inlet_rx) = mpsc::channel(1);
+        registry.register(1, 84, inlet_tx, schema.clone());
+        drop(inlet_rx);
+        let service = crate::exchange::service::ExchangeService::new(registry.clone())
+            .with_owned_handler(handle)
+            .with_insecure_internal_dev();
+        let server_task = service.start_listener(listener).await.unwrap();
+        let info = |id, address: String, host: &str| {
+            let registration = WorkerRegistration::new(
+                WorkerId(id),
+                NodeRole::Worker,
+                address,
+                CapacityHeadroom::FULL,
+            )
+            .with_location(WorkerLocation::new(host, "same-zone"));
+            rockstream_types::topology::WorkerInfo::from_registration(&registration)
+        };
+        let peers = Arc::new(RwLock::new(HashMap::from([(
+            WorkerId(42),
+            addr.to_string(),
+        )])));
+        let pool = crate::exchange::pool::ShuffleClientPool::new(peers);
+        pool.set_local_worker_info(info(811, "127.0.0.1:9811".to_owned(), "host-a"));
+        pool.upsert_peer_info(info(42, addr.to_string(), "host-b"));
+        let flow = crate::exchange::flow_control::FlowController::new();
+        let mux = crate::exchange::multiplexer::WorkerStreamMultiplexer::new(pool, flow.clone());
+        let context = bytes::Bytes::from(serde_json::to_vec(&owner).unwrap());
+        let wrong = crate::exchange::proto::ShuffleFrame {
+            epoch: 2,
+            ..frame.clone()
+        };
+        assert_eq!(
+            mux.send_owned_frame(WorkerId(42), wrong, context.clone())
+                .await,
+            Err("owned shuffle identity does not match frame".to_owned())
+        );
+        match progress_rx.recv().await.unwrap() {
+            WorkerMessage::ExecutionFailed { output, message } => assert_eq!(
+                (output, message),
+                (
+                    failure_identity(&owner),
+                    "owned shuffle identity does not match frame".to_owned()
+                )
+            ),
+            other => panic!("unexpected worker response: {other:?}"),
+        }
+        let unavailable =
+            crate::shard_actor::ShardActorError::UnknownShard(owner.shard_id).to_string();
+        assert_eq!(
+            mux.send_owned_frame(WorkerId(42), frame.clone(), context.clone())
+                .await,
+            Err(unavailable.clone())
+        );
+        match progress_rx.recv().await.unwrap() {
+            WorkerMessage::ExecutionFailed { output, message } => {
+                assert_eq!((output, message), (failure_identity(&owner), unavailable))
+            }
+            other => panic!("unexpected unavailable-target response: {other:?}"),
+        }
+        assert_eq!(
+            db.get(&rockstream_storage::keys::ShardKeyEncoder::frontier_key())
+                .await
+                .unwrap(),
+            None
+        );
+        let (inlet_tx, mut reopened_inlet) = mpsc::channel(1);
+        registry.register(1, 84, inlet_tx, schema);
+        actors_for_test.register_owned(owner.shard_id, owner.lease_token, execute);
+        let sending = {
+            let mux = mux.clone();
+            let deployments = sender_deployments.clone();
+            let source = RuntimeExchangeMessage {
+                rows: rows.clone(),
+                ..owner.clone()
+            };
+            tokio::spawn(async move {
+                dispatch_owned_shuffle(&mux, &deployments, WorkerId(42), source).await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(3), started.notified())
+            .await
+            .unwrap();
+        assert!(!sending.is_finished());
+        assert_eq!(flow.rows_in_flight(1, 84, 84), 2);
+        assert_eq!(
+            db.get(&rockstream_storage::keys::ShardKeyEncoder::frontier_key())
+                .await
+                .unwrap(),
+            None
+        );
+        release.notify_one();
+        assert_eq!(sending.await.unwrap(), Ok(()));
+        assert!(matches!(
+            reopened_inlet.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        match progress_rx.recv().await.unwrap() {
+            WorkerMessage::ExecutionProgress {
+                output,
+                input_rows,
+                output_rows,
+            } => assert_eq!((output.rows, input_rows, output_rows), (rows, 2, 2)),
+            other => panic!("unexpected worker response: {other:?}"),
+        }
+        assert_eq!(
+            db.get(&rockstream_storage::keys::ShardKeyEncoder::frontier_key())
+                .await
+                .unwrap()
+                .map(|value| value.to_vec()),
+            Some(1_u64.to_be_bytes().to_vec())
+        );
+        use rockstream_ops::sink::{read_view_output, ColumnValue};
+        let stored = read_view_output(&db, OperatorId(10), 2).await.unwrap();
+        let expected = vec![
+            (1, vec![ColumnValue::Int64(1), ColumnValue::Int64(10)], 1),
+            (1, vec![ColumnValue::Int64(2), ColumnValue::Int64(20)], 1),
+        ];
+        assert_eq!(
+            stored
+                .into_iter()
+                .map(|(epoch, _, row, weight)| (epoch, row, weight))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            mux.send_owned_frame(WorkerId(42), frame.clone(), context)
+                .await,
+            Ok(())
+        );
+        match progress_rx.recv().await.unwrap() {
+            WorkerMessage::ExecutionProgress {
+                output,
+                input_rows,
+                output_rows,
+            } => assert_eq!(
+                (output, input_rows, output_rows),
+                (failure_identity(&owner), 0, 0)
+            ),
+            other => panic!("unexpected replay response: {other:?}"),
+        }
+        actors_for_test.revoke(owner.shard_id);
+        let next_owner = RuntimeExchangeMessage {
+            epoch: 2,
+            ..owner.clone()
+        };
+        let next_frame = crate::exchange::proto::ShuffleFrame { epoch: 2, ..frame };
+        let context = bytes::Bytes::from(serde_json::to_vec(&next_owner).unwrap());
+        let unavailable =
+            crate::shard_actor::ShardActorError::UnknownShard(owner.shard_id).to_string();
+        assert_eq!(
+            mux.send_owned_frame(WorkerId(42), next_frame, context)
+                .await,
+            Err(unavailable.clone())
+        );
+        match progress_rx.recv().await.unwrap() {
+            WorkerMessage::ExecutionFailed { output, message } => assert_eq!(
+                (output, message),
+                (failure_identity(&next_owner), unavailable)
+            ),
+            other => panic!("unexpected unavailable-target response: {other:?}"),
+        }
+        assert_eq!(
+            db.get(&rockstream_storage::keys::ShardKeyEncoder::frontier_key())
+                .await
+                .unwrap()
+                .map(|value| value.to_vec()),
+            Some(1_u64.to_be_bytes().to_vec())
+        );
+        assert_eq!(
+            read_view_output(&db, OperatorId(10), 2)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(epoch, _, row, weight)| (epoch, row, weight))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            (
+                flow.rows_in_flight(1, 84, 84),
+                flow.batches_in_flight(1, 84, 84)
+            ),
+            (0, 0)
+        );
+        mux.shutdown().await;
+        service.shutdown().await;
+        server_task.abort();
+    }
+
+    #[tokio::test]
     async fn test_zero_weight_omission_prior_to_pipeline_and_storage() {
         let temp_dir = tempfile::tempdir().unwrap();
         let (client, deployments, db, compactor, mut progress_rx) =
@@ -584,6 +1501,7 @@ mod data_plane_tests {
         // Frame with offsetting updates (+1 and -1) on key "10\talice"
         // and a non-zero row (+1) on key "20\tbob"
         let frame = RuntimeExchangeMessage {
+            attempt_id: None,
             version: DEPLOYMENT_DESCRIPTOR_VERSION,
             request_id: "req-1".to_string(),
             workload_id: WorkloadId(1),
@@ -608,7 +1526,17 @@ mod data_plane_tests {
             ],
         };
 
-        execute_frame(&client, &deployments, frame).await.unwrap();
+        let executor_client = client.clone();
+        let executor_deployments = deployments.clone();
+        let execute: OwnedFrameExecutor = Arc::new(move |frame| {
+            let client = executor_client.clone();
+            let deployments = executor_deployments.clone();
+            Box::pin(async move { execute_frame_and_report(&client, &deployments, frame).await })
+        });
+        let actors = ShardActorRegistry::new();
+        actors.register_owned(frame.shard_id, frame.lease_token, execute);
+        let receipt = actors.enqueue_with_completion(frame).unwrap();
+        assert_eq!(receipt.await.unwrap(), Ok(()));
 
         // 1. Check emitted progress delta: only key 20 survived
         let msg = progress_rx.recv().await.expect("progress message expected");
@@ -652,13 +1580,14 @@ mod data_plane_tests {
     }
 
     #[tokio::test]
-    async fn test_all_rows_net_zero_omits_pipeline_and_storage_flush() {
+    async fn net_zero_input_commits_frontier_without_output_rows() {
         let temp_dir = tempfile::tempdir().unwrap();
         let (client, deployments, db, compactor, mut progress_rx) =
             setup_test_deployment(temp_dir.path(), EpochCompactionConfig::default()).await;
 
         // Frame where all rows offset to net-zero (+1 and -1 on same key)
         let frame = RuntimeExchangeMessage {
+            attempt_id: None,
             version: DEPLOYMENT_DESCRIPTOR_VERSION,
             request_id: "req-net-zero".to_string(),
             workload_id: WorkloadId(1),
@@ -679,7 +1608,9 @@ mod data_plane_tests {
             ],
         };
 
-        execute_frame(&client, &deployments, frame).await.unwrap();
+        execute_frame(&client, &deployments, frame.clone())
+            .await
+            .unwrap();
 
         // 1. Check emitted progress delta: empty rows, output_rows == 0
         let msg = progress_rx.recv().await.expect("progress message expected");
@@ -696,18 +1627,331 @@ mod data_plane_tests {
             other => panic!("unexpected worker message: {other:?}"),
         }
 
+        execute_frame(&client, &deployments, frame.clone())
+            .await
+            .unwrap();
+        match progress_rx.recv().await.unwrap() {
+            WorkerMessage::ExecutionProgress {
+                output,
+                input_rows,
+                output_rows,
+            } => assert_eq!(
+                (output, input_rows, output_rows),
+                (failure_identity(&frame), 0, 0)
+            ),
+            other => panic!("unexpected zero-input replay: {other:?}"),
+        }
+        assert_eq!(
+            db.get(&rockstream_storage::keys::ShardKeyEncoder::frontier_key())
+                .await
+                .unwrap()
+                .map(|value| value.to_vec()),
+            Some(1_u64.to_be_bytes().to_vec())
+        );
+
         // 2. Check compaction metrics: cancelled = 1, emitted = 0
         let metrics = compactor.metrics_snapshot();
         assert_eq!(metrics.input_updates, 2);
         assert_eq!(metrics.cancelled_zero_weight_updates, 1);
         assert_eq!(metrics.emitted_updates, 0);
 
-        // 3. Check storage: no rows written at all!
+        // 3. The frontier advances without writing view rows.
         use rockstream_ops::sink::read_view_output;
         let stored = read_view_output(&db, OperatorId(10), 2).await.unwrap();
-        assert!(
-            stored.is_empty(),
-            "storage flush must be omitted when all rows offset to net-zero"
+        assert!(stored.is_empty(), "net-zero input must not write view rows");
+    }
+
+    #[tokio::test]
+    async fn failed_empty_epoch_reports_failure_without_progress() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (client, deployments, db, _, mut progress_rx) =
+            setup_test_deployment(temp_dir.path(), EpochCompactionConfig::default()).await;
+        db.set_fail_writes(true);
+        let frame = RuntimeExchangeMessage {
+            attempt_id: None,
+            version: DEPLOYMENT_DESCRIPTOR_VERSION,
+            request_id: "empty-failed".to_owned(),
+            workload_id: WorkloadId(1),
+            shard_id: ShardId(100),
+            operator_id: OperatorId(10),
+            lease_token: LeaseToken(777),
+            epoch: 1,
+            source: "items".to_owned(),
+            rows: Vec::new(),
+        };
+        let expected = failure_identity(&frame);
+        assert_eq!(
+            execute_frame_and_report(&client, &deployments, frame).await,
+            Err("[RS-0001] Internal error: unsupported operation: injected storage write failure; next_steps: report this issue".to_owned())
+        );
+        match progress_rx.recv().await.unwrap() {
+            WorkerMessage::ExecutionFailed { output, message } => {
+                assert_eq!(
+                    (output, message),
+                    (
+                        expected,
+                        "[RS-0001] Internal error: unsupported operation: injected storage write failure; next_steps: report this issue".to_owned()
+                    )
+                );
+            }
+            other => panic!("unexpected worker response: {other:?}"),
+        }
+        assert_eq!(
+            db.get(&rockstream_storage::keys::ShardKeyEncoder::frontier_key())
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(matches!(
+            progress_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn reopened_worker_deduplicates_only_matching_committed_input() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (client, deployments, db, _, mut progress_rx) =
+            setup_test_deployment(temp_dir.path(), EpochCompactionConfig::default()).await;
+        let frame = RuntimeExchangeMessage {
+            attempt_id: None,
+            version: DEPLOYMENT_DESCRIPTOR_VERSION,
+            request_id: "replay".to_owned(),
+            workload_id: WorkloadId(1),
+            shard_id: ShardId(100),
+            operator_id: OperatorId(10),
+            lease_token: LeaseToken(777),
+            epoch: 1,
+            source: "items".to_owned(),
+            rows: vec![RuntimeRow {
+                values_tsv: "10\talice".to_owned(),
+                weight: 1,
+            }],
+        };
+        execute_frame(&client, &deployments, frame.clone())
+            .await
+            .unwrap();
+        match progress_rx.recv().await.unwrap() {
+            WorkerMessage::ExecutionProgress {
+                output,
+                input_rows,
+                output_rows,
+            } => {
+                assert_eq!(
+                    (output.rows, input_rows, output_rows),
+                    (frame.rows.clone(), 1, 1)
+                );
+            }
+            other => panic!("unexpected worker response: {other:?}"),
+        }
+        (*db).clone().close().await.unwrap();
+        drop((client, deployments, db, progress_rx));
+
+        let (client, deployments, db, compactor, mut progress_rx) =
+            setup_test_deployment(temp_dir.path(), EpochCompactionConfig::default()).await;
+        assert_eq!(
+            deployments.read()[&(WorkloadId(1), ShardId(100))]
+                .commit_group
+                .last_committed(),
+            1
+        );
+        assert_eq!(
+            execute_frame(&client, &deployments, frame.clone())
+                .await
+                .map_err(|error| error.to_string()),
+            Ok(())
+        );
+        match progress_rx.recv().await.unwrap() {
+            WorkerMessage::ExecutionProgress {
+                output,
+                input_rows,
+                output_rows,
+            } => assert_eq!(
+                (output, input_rows, output_rows),
+                (failure_identity(&frame), 0, 0)
+            ),
+            other => panic!("unexpected replay response: {other:?}"),
+        }
+        let conflicting = RuntimeExchangeMessage {
+            rows: vec![RuntimeRow {
+                values_tsv: "11\tbob".to_owned(),
+                weight: 1,
+            }],
+            ..frame.clone()
+        };
+        assert_eq!(
+            execute_frame(&client, &deployments, conflicting)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "committed execution does not match replay"
+        );
+        let (record, _) = execution_record(&frame).unwrap();
+        db.delete(&record).await.unwrap();
+        assert_eq!(
+            execute_frame(&client, &deployments, frame)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "committed execution record is unavailable"
+        );
+        assert_eq!(compactor.metrics_snapshot().input_updates, 0);
+        assert_eq!(
+            db.get(&rockstream_storage::keys::ShardKeyEncoder::frontier_key())
+                .await
+                .unwrap()
+                .map(|v| v.to_vec()),
+            Some(1_u64.to_be_bytes().to_vec())
+        );
+        assert!(matches!(
+            progress_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_duplicate_input_is_processed_once() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (client, deployments, _, compactor, mut progress_rx) =
+            setup_test_deployment(temp_dir.path(), EpochCompactionConfig::default()).await;
+        let frame = RuntimeExchangeMessage {
+            attempt_id: None,
+            version: DEPLOYMENT_DESCRIPTOR_VERSION,
+            request_id: "concurrent-replay".to_owned(),
+            workload_id: WorkloadId(1),
+            shard_id: ShardId(100),
+            operator_id: OperatorId(10),
+            lease_token: LeaseToken(777),
+            epoch: 1,
+            source: "items".to_owned(),
+            rows: vec![RuntimeRow {
+                values_tsv: "10\talice".to_owned(),
+                weight: 1,
+            }],
+        };
+        let (first, second) = tokio::join!(
+            execute_frame(&client, &deployments, frame.clone()),
+            execute_frame(&client, &deployments, frame.clone())
+        );
+        let mut outcomes = [
+            first.map_err(|e| e.to_string()),
+            second.map_err(|e| e.to_string()),
+        ];
+        outcomes.sort();
+        assert_eq!(outcomes, [Ok(()), Ok(())]);
+        match progress_rx.recv().await.unwrap() {
+            WorkerMessage::ExecutionProgress {
+                output,
+                input_rows,
+                output_rows,
+            } => assert_eq!(
+                (output.rows, input_rows, output_rows),
+                (frame.rows.clone(), 1, 1)
+            ),
+            other => panic!("unexpected worker response: {other:?}"),
+        }
+        match progress_rx.recv().await.unwrap() {
+            WorkerMessage::ExecutionProgress {
+                output,
+                input_rows,
+                output_rows,
+            } => assert_eq!(
+                (output, input_rows, output_rows),
+                (failure_identity(&frame), 0, 0)
+            ),
+            other => panic!("unexpected replay response: {other:?}"),
+        }
+        assert_eq!(compactor.metrics_snapshot().input_updates, 2);
+        assert!(matches!(
+            progress_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_commit_refuses_later_input_before_processing() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (client, deployments, db, compactor, mut progress_rx) =
+            setup_test_deployment(temp_dir.path(), EpochCompactionConfig::default()).await;
+        let frame = RuntimeExchangeMessage {
+            attempt_id: None,
+            version: DEPLOYMENT_DESCRIPTOR_VERSION,
+            request_id: "failed-commit".to_owned(),
+            workload_id: WorkloadId(1),
+            shard_id: ShardId(100),
+            operator_id: OperatorId(10),
+            lease_token: LeaseToken(777),
+            epoch: 1,
+            source: "items".to_owned(),
+            rows: vec![RuntimeRow {
+                values_tsv: "10\talice".to_owned(),
+                weight: 1,
+            }],
+        };
+        db.set_fail_writes(true);
+        assert_eq!(
+            execute_frame(&client, &deployments, frame.clone())
+                .await
+                .unwrap_err()
+                .to_string(),
+            "[RS-0001] Internal error: unsupported operation: injected storage write failure; next_steps: report this issue"
+        );
+        db.set_fail_writes(false);
+        let retry = RuntimeExchangeMessage {
+            epoch: 2,
+            ..frame.clone()
+        };
+        assert_eq!(
+            execute_frame(&client, &deployments, retry)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "worker deployment requires recovery after failed execution"
+        );
+        assert_eq!(compactor.metrics_snapshot().input_updates, 2);
+        assert_eq!(
+            db.get(&rockstream_storage::keys::ShardKeyEncoder::frontier_key())
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(matches!(
+            progress_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        (*db).clone().close().await.unwrap();
+        drop((client, deployments, db, compactor, progress_rx));
+
+        let (client, deployments, db, _, mut progress_rx) =
+            setup_test_deployment(temp_dir.path(), EpochCompactionConfig::default()).await;
+        execute_frame(&client, &deployments, frame.clone())
+            .await
+            .unwrap();
+        match progress_rx.recv().await.unwrap() {
+            WorkerMessage::ExecutionProgress {
+                output,
+                input_rows,
+                output_rows,
+            } => {
+                assert_eq!((output.rows, input_rows, output_rows), (frame.rows, 1, 1));
+            }
+            other => panic!("unexpected worker response: {other:?}"),
+        }
+        use rockstream_ops::sink::{read_view_output, ColumnValue};
+        let stored = read_view_output(&db, OperatorId(10), 2).await.unwrap();
+        assert_eq!(
+            stored
+                .into_iter()
+                .map(|(epoch, _, row, weight)| (epoch, row, weight))
+                .collect::<Vec<_>>(),
+            vec![(
+                1,
+                vec![
+                    ColumnValue::Int64(10),
+                    ColumnValue::Utf8("alice".to_owned())
+                ],
+                1
+            )]
         );
     }
 
@@ -719,6 +1963,7 @@ mod data_plane_tests {
 
         // Multiple updates on key 42: +3 and -1 -> net weight +2
         let frame = RuntimeExchangeMessage {
+            attempt_id: None,
             version: DEPLOYMENT_DESCRIPTOR_VERSION,
             request_id: "req-collapse".to_string(),
             workload_id: WorkloadId(1),
@@ -823,7 +2068,10 @@ pub struct WorkerClientHandle {
     worker_id: Arc<RwLock<Option<WorkerId>>>,
     active_shards: Arc<RwLock<HashMap<ShardId, ShardState>>>,
     topology_workers: Arc<RwLock<HashMap<WorkerId, WorkerInfo>>>,
+    shard_leases: Arc<RwLock<HashMap<ShardId, ShardLease>>>,
     msg_tx: mpsc::Sender<WorkerMessage>,
+    #[allow(dead_code)]
+    security_audit_waiters: crate::exchange::service::SecurityAuditWaiters,
     fence_waiters:
         Arc<parking_lot::Mutex<HashMap<ShardId, Vec<tokio::sync::oneshot::Sender<bool>>>>>,
     frontier_report_waiter: FrontierReportWaiter,
@@ -831,9 +2079,31 @@ pub struct WorkerClientHandle {
     storage_context: Arc<rockstream_storage::storage_context::WorkerStorageContext>,
     compaction_config: Arc<RwLock<EpochCompactionConfig>>,
     deployments: WorkerDeployments,
+    tls_reloader: Option<Arc<rockstream_types::tls::TlsCertificateReloader>>,
+    exchange_registry: crate::exchange::service::ExchangeRegistry,
 }
 
 impl WorkerClientHandle {
+    /// Reload the worker shuffle listener's mTLS credentials without closing active streams.
+    pub fn reload_tls(
+        &self,
+        config: rockstream_types::identity::InternalTlsConfig,
+    ) -> Result<(), String> {
+        if !config.is_enabled() {
+            return Err(
+                "RS-2410: worker shuffle TLS certificate and private key are required".to_string(),
+            );
+        }
+        if !config.client_auth_required {
+            return Err("RS-2410: worker shuffle requires mutual TLS".to_string());
+        }
+        config.validate()?;
+        self.tls_reloader
+            .as_ref()
+            .ok_or_else(|| "RS-2410: worker shuffle TLS is not enabled".to_string())?
+            .reload(config)
+    }
+
     /// Returns the worker-wide epoch compaction config.
     pub fn compaction_config(&self) -> EpochCompactionConfig {
         self.compaction_config.read().clone()
@@ -910,14 +2180,54 @@ impl WorkerClientHandle {
         self.topology_workers.read().values().cloned().collect()
     }
 
+    /// Shared exchange registry backing this worker's gRPC `ShuffleService`
+    /// and deployed application exchange inlets (Issue #400 R2).
+    pub fn exchange_registry(&self) -> crate::exchange::service::ExchangeRegistry {
+        self.exchange_registry.clone()
+    }
+
+    /// Number of gRPC Arrow IPC shuffle frames received by this worker.
+    pub fn grpc_frames_received(&self) -> u64 {
+        self.exchange_registry.grpc_frames_received()
+    }
+
+    /// Control-free hot-path local lease fence check (Issue #400 R4).
+    ///
+    /// Verifies that this worker still owns `shard_id` with `lease_token` and
+    /// that no strictly higher `LeaseToken` is known in the local topology
+    /// lease snapshot, without making a synchronous RPC to `ControlService`.
+    pub fn verify_local_lease_fence(&self, shard_id: ShardId, lease_token: LeaseToken) -> bool {
+        let Some(local_worker_id) = self.worker_id() else {
+            return false;
+        };
+        let active_ok = self.active_shards.read().get(&shard_id).is_some_and(|s| {
+            s.lease.worker_id == local_worker_id && s.lease.lease_token == lease_token
+        });
+        if !active_ok {
+            return false;
+        }
+        if let Some(known) = self.shard_leases.read().get(&shard_id) {
+            if known.lease_token.0 > lease_token.0 || known.worker_id != local_worker_id {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Request a fresh short-lived token over the authenticated control channel.
     pub async fn request_secret_token(
         &self,
+        workload_id: rockstream_types::ids::WorkloadId,
         secret_name: impl Into<String>,
     ) -> Result<(), io::Error> {
+        let secret_name = secret_name.into();
+        self.secret_manager
+            .track_refresh(workload_id, secret_name.clone())
+            .map_err(io::Error::other)?;
         self.msg_tx
-            .send(WorkerMessage::ResolveSecretToken {
-                secret_name: secret_name.into(),
+            .send(WorkerMessage::ResolveWorkloadSecretToken {
+                workload_id,
+                secret_name,
             })
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::ConnectionAborted, "Client channel closed"))
@@ -926,10 +2236,11 @@ impl WorkerClientHandle {
     /// Read a decrypted credential from memory. No storage path is consulted.
     pub fn secret(
         &self,
+        workload_id: rockstream_types::ids::WorkloadId,
         secret_name: &str,
         now_secs: u64,
     ) -> Option<crate::secrets::ResolvedSecret> {
-        self.secret_manager.get(secret_name, now_secs)
+        self.secret_manager.get(workload_id, secret_name, now_secs)
     }
 
     pub fn secret_manager(&self) -> Arc<WorkerSecretManager> {
@@ -1009,6 +2320,34 @@ impl WorkerClientHandle {
             })?;
         rx.await
             .map_err(|_| "Control response channel closed".to_owned())?
+    }
+}
+
+fn validate_local_control_peer(
+    local_mode: bool,
+    protected: bool,
+    peer: std::net::IpAddr,
+) -> io::Result<()> {
+    if local_mode && !protected && !peer.is_loopback() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "explicit local mode requires a loopback control address",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkerExchangeEndpoint {
+    pub bind_addr: SocketAddr,
+    pub advertise_addr: String,
+}
+
+struct CancelOnDrop(CancellationToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
     }
 }
 
@@ -1116,14 +2455,131 @@ pub async fn start_worker_client_with_tls_metadata_and_compaction(
     tls_config: InternalTlsConfig,
     compaction_config: EpochCompactionConfig,
 ) -> io::Result<(WorkerClientHandle, tokio::task::JoinHandle<()>)> {
+    start_worker_client_with_runtime(
+        proposed_worker_id,
+        control_url,
+        storage_dir,
+        location,
+        capabilities,
+        tls_config,
+        compaction_config,
+        None,
+        ExchangeConfig::default(),
+        false,
+    )
+    .await
+}
+
+pub async fn start_worker_client_with_insecure_internal_dev_and_metadata(
+    proposed_worker_id: u64,
+    control_url: &str,
+    storage_dir: &Path,
+    location: WorkerLocation,
+    capabilities: WorkerCapabilities,
+) -> io::Result<(WorkerClientHandle, tokio::task::JoinHandle<()>)> {
+    start_worker_client_with_runtime(
+        proposed_worker_id,
+        control_url,
+        storage_dir,
+        location,
+        capabilities,
+        InternalTlsConfig::default(),
+        EpochCompactionConfig::default(),
+        None,
+        ExchangeConfig::default(),
+        true,
+    )
+    .await
+}
+
+pub async fn start_worker_client_with_insecure_internal_dev_and_metadata_and_tls(
+    proposed_worker_id: u64,
+    control_url: &str,
+    storage_dir: &Path,
+    location: WorkerLocation,
+    capabilities: WorkerCapabilities,
+    tls_config: InternalTlsConfig,
+) -> io::Result<(WorkerClientHandle, tokio::task::JoinHandle<()>)> {
+    start_worker_client_with_runtime(
+        proposed_worker_id,
+        control_url,
+        storage_dir,
+        location,
+        capabilities,
+        tls_config,
+        EpochCompactionConfig::default(),
+        None,
+        ExchangeConfig::default(),
+        true,
+    )
+    .await
+}
+
+/// Start a worker with its peer shuffle listener available before registration.
+#[allow(clippy::too_many_arguments)]
+pub async fn start_worker_client_with_exchange_endpoint(
+    proposed_worker_id: u64,
+    control_url: &str,
+    storage_dir: &Path,
+    location: WorkerLocation,
+    capabilities: WorkerCapabilities,
+    tls_config: InternalTlsConfig,
+    exchange_config: ExchangeConfig,
+    endpoint: WorkerExchangeEndpoint,
+    allow_insecure_internal_dev: bool,
+) -> io::Result<(WorkerClientHandle, tokio::task::JoinHandle<()>)> {
+    start_worker_client_with_runtime(
+        proposed_worker_id,
+        control_url,
+        storage_dir,
+        location,
+        capabilities,
+        tls_config,
+        EpochCompactionConfig::default(),
+        Some(endpoint),
+        exchange_config,
+        allow_insecure_internal_dev,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_worker_client_with_runtime(
+    proposed_worker_id: u64,
+    control_url: &str,
+    storage_dir: &Path,
+    location: WorkerLocation,
+    capabilities: WorkerCapabilities,
+    tls_config: InternalTlsConfig,
+    compaction_config: EpochCompactionConfig,
+    exchange_endpoint: Option<WorkerExchangeEndpoint>,
+    exchange_config: ExchangeConfig,
+    allow_insecure_internal_dev: bool,
+) -> io::Result<(WorkerClientHandle, tokio::task::JoinHandle<()>)> {
     compaction_config
         .validate()
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let registration_address = exchange_endpoint
+        .as_ref()
+        .map(|endpoint| endpoint.advertise_addr.clone())
+        .unwrap_or_else(|| "127.0.0.1:0".to_owned());
     let initial_headroom = system_memory_headroom()?;
     let clean_url = control_url
         .trim_start_matches("https://")
         .trim_start_matches("http://");
     let stream = TcpStream::connect(clean_url).await?;
+    validate_local_control_peer(
+        allow_insecure_internal_dev,
+        tls_config.is_enabled(),
+        stream.peer_addr()?.ip(),
+    )?;
+    let local_ip = stream.local_addr()?.ip();
+    let exchange_ip = if !tls_config.is_enabled() && !local_ip.is_loopback() {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    } else {
+        local_ip
+    };
+    let exchange_addr = std::net::SocketAddr::new(exchange_ip, 0);
 
     if tls_config.is_enabled() {
         let connector = crate::tls::build_client_tls_connector(&tls_config).map_err(|e| {
@@ -1151,6 +2607,12 @@ pub async fn start_worker_client_with_tls_metadata_and_compaction(
             capabilities,
             initial_headroom,
             compaction_config,
+            registration_address,
+            exchange_addr,
+            exchange_endpoint.clone(),
+            tls_config.clone(),
+            exchange_config.clone(),
+            allow_insecure_internal_dev,
             reader,
             writer,
         )
@@ -1164,6 +2626,12 @@ pub async fn start_worker_client_with_tls_metadata_and_compaction(
             capabilities,
             initial_headroom,
             compaction_config,
+            registration_address,
+            exchange_addr,
+            exchange_endpoint,
+            tls_config,
+            exchange_config,
+            allow_insecure_internal_dev,
             reader,
             writer,
         )
@@ -1241,6 +2709,12 @@ async fn run_worker_client<R, W>(
     capabilities: WorkerCapabilities,
     initial_headroom: CapacityHeadroom,
     compaction_config: EpochCompactionConfig,
+    mut registration_address: String,
+    exchange_addr: std::net::SocketAddr,
+    exchange_endpoint: Option<WorkerExchangeEndpoint>,
+    tls_config: InternalTlsConfig,
+    exchange_config: ExchangeConfig,
+    allow_insecure_internal_dev: bool,
     reader: R,
     mut writer: W,
 ) -> io::Result<(WorkerClientHandle, tokio::task::JoinHandle<()>)>
@@ -1253,7 +2727,10 @@ where
     let worker_id = Arc::new(RwLock::new(None));
     let active_shards = Arc::new(RwLock::new(HashMap::new()));
     let topology_workers = Arc::new(RwLock::new(HashMap::new()));
+    let shard_leases = Arc::new(RwLock::new(HashMap::new()));
     let (msg_tx, mut msg_rx) = mpsc::channel::<WorkerMessage>(32);
+    let security_audit_waiters = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let security_audit_capacity = msg_tx.max_capacity();
     let fence_waiters = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let frontier_report_waiter = Arc::new(parking_lot::Mutex::new(None));
     let secret_manager = Arc::new(WorkerSecretManager::new(format!(
@@ -1271,38 +2748,103 @@ where
         (WorkloadId, ShardId),
         Arc<WorkerDeployment>,
     >::new()));
+    let tls_reloader = if tls_config.is_enabled() {
+        Some(Arc::new(
+            rockstream_types::tls::TlsCertificateReloader::new(tls_config.clone())
+                .map_err(io::Error::other)?,
+        ))
+    } else {
+        None
+    };
+
+    let exchange_registry = crate::exchange::service::ExchangeRegistry::with_worker_state(
+        active_shards.clone(),
+        topology_workers.clone(),
+    )
+    .with_shard_leases(shard_leases.clone())
+    .with_security_audit(msg_tx.clone(), security_audit_waiters.clone());
 
     let handle = WorkerClientHandle {
         worker_id: worker_id.clone(),
         active_shards: active_shards.clone(),
         topology_workers: topology_workers.clone(),
+        shard_leases: shard_leases.clone(),
         msg_tx: msg_tx.clone(),
+        security_audit_waiters: security_audit_waiters.clone(),
         fence_waiters: fence_waiters.clone(),
         frontier_report_waiter: frontier_report_waiter.clone(),
         secret_manager: secret_manager.clone(),
         storage_context: storage_context.clone(),
         compaction_config: compaction_config.clone(),
         deployments: deployments.clone(),
+        tls_reloader: tls_reloader.clone(),
+        exchange_registry: exchange_registry.clone(),
     };
 
-    let actor_registry = ShardActorRegistry::new();
+    let actor_registry =
+        ShardActorRegistry::new().with_cancellation_reporter(cancellation_reporter(msg_tx.clone()));
     let executor_client = handle.clone();
     let executor_deployments = deployments.clone();
-    let execute: FrameExecutor = Arc::new(move |frame| {
+    let execute: OwnedFrameExecutor = Arc::new(move |frame| {
         let client = executor_client.clone();
         let deployments = executor_deployments.clone();
-        Box::pin(async move {
-            if let Err(error) = execute_frame(&client, &deployments, frame).await {
-                tracing::warn!(
-                    code = %rockstream_types::error_code::RS_0001,
-                    %error,
-                    "worker execution refused"
-                );
-            }
-        })
+        Box::pin(async move { execute_frame_and_report(&client, &deployments, frame).await })
     });
 
+    let mut shuffle_pool =
+        crate::exchange::pool::ShuffleClientPool::new(Arc::new(RwLock::new(HashMap::new())));
+    let exchange_bind_addr = exchange_endpoint
+        .as_ref()
+        .map_or(exchange_addr, |endpoint| endpoint.bind_addr);
+    let should_start_exchange =
+        exchange_endpoint.is_some() || allow_insecure_internal_dev || tls_config.is_enabled();
+    let mut exchange_service =
+        crate::exchange::service::ExchangeService::new(handle.exchange_registry())
+            .with_exchange_config(exchange_config.clone())
+            .with_owned_handler(owned_shuffle_handler(
+                actor_registry.clone(),
+                deployments.clone(),
+                handle.clone(),
+            ));
+    if tls_config.is_enabled() {
+        exchange_service = exchange_service.with_internal_tls(tls_config.clone());
+        if let Some(reloader) = tls_reloader.clone() {
+            exchange_service = exchange_service.with_tls_reloader(reloader);
+        }
+        shuffle_pool = shuffle_pool.with_internal_tls(tls_config.clone());
+    } else if allow_insecure_internal_dev {
+        exchange_service = exchange_service.with_insecure_internal_dev();
+    }
+    let exchange_shutdown = if should_start_exchange {
+        let listener = tokio::net::TcpListener::bind(exchange_bind_addr).await?;
+        let local_addr = listener.local_addr()?;
+        registration_address = match exchange_endpoint.as_ref() {
+            Some(endpoint) if endpoint.bind_addr.port() == 0 => endpoint
+                .advertise_addr
+                .parse::<std::net::SocketAddr>()
+                .ok()
+                .filter(|addr| addr.port() == 0)
+                .map(|addr| std::net::SocketAddr::new(addr.ip(), local_addr.port()).to_string())
+                .unwrap_or(registration_address),
+            Some(_) => registration_address,
+            None => local_addr.to_string(),
+        };
+        let shutdown = exchange_service.cancel_token().clone();
+        let _exchange_task = exchange_service
+            .start_listener(listener)
+            .await
+            .map_err(io::Error::other)?;
+        Some(shutdown)
+    } else {
+        None
+    };
+    let shuffle_mux = crate::exchange::multiplexer::WorkerStreamMultiplexer::new(
+        shuffle_pool.clone(),
+        crate::exchange::flow_control::FlowController::new(),
+    )
+    .with_src_worker(WorkerId(proposed_worker_id));
     let worker_id_clone = worker_id.clone();
+    let epoch_client = handle.clone();
     let active_shards_clone = active_shards.clone();
     let fence_waiters_clone = fence_waiters.clone();
     let frontier_report_waiter_clone = frontier_report_waiter.clone();
@@ -1315,19 +2857,21 @@ where
     let compaction_config_clone = compaction_config.clone();
 
     let join_handle = tokio::spawn(async move {
+        let _exchange_shutdown = exchange_shutdown.map(CancelOnDrop);
         // 1. Send Registration message.
         let reg = WorkerRegistration::new(
             WorkerId(proposed_worker_id),
             NodeRole::Worker,
-            "127.0.0.1:0", // Default loopback
+            registration_address,
             initial_headroom,
         )
         .with_location(location.clone())
         .with_capabilities(capabilities)
         .with_compatibility(
-            rockstream_types::compatibility::SupportedVersionRange::v1_through_v2(),
+            rockstream_types::compatibility::SupportedVersionRange::v4_only(),
             rockstream_types::compatibility::SupportedStorageFormatRange::v1_through_v2(),
         );
+        let mut local_info = rockstream_types::topology::WorkerInfo::from_registration(&reg);
         let reg_msg = WorkerMessage::Register(reg);
         let reg_line = serde_json::to_string(&reg_msg).unwrap() + "\n";
         if let Err(e) = writer.write_all(reg_line.as_bytes()).await {
@@ -1393,8 +2937,39 @@ where
             }
         }));
 
+        let refresh_msg_tx = msg_tx.clone();
+        let refresh_secret_manager = secret_manager_clone.clone();
+        let refresh_deployments = deployments_clone.clone();
+        let _secret_refresh_task = AbortOnDropHandle::new(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let active_workloads: std::collections::HashSet<_> = refresh_deployments
+                    .read()
+                    .keys()
+                    .map(|(workload_id, _)| *workload_id)
+                    .collect();
+                for (workload_id, secret_name) in
+                    refresh_secret_manager.refresh_targets(&active_workloads)
+                {
+                    if refresh_msg_tx
+                        .send(WorkerMessage::ResolveWorkloadSecretToken {
+                            workload_id,
+                            secret_name,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        }));
+
         // 4. Read Loop: process ControlMessage commands from control plane.
         let mut lines = BufReader::new(reader).lines();
+        let mut explicit_shutdown = false;
         while let Ok(Some(line)) = lines.next_line().await {
             if line.trim().is_empty() {
                 continue;
@@ -1402,17 +2977,24 @@ where
             let msg: ControlMessage = match serde_json::from_str(&line) {
                 Ok(m) => m,
                 Err(e) => {
-                    tracing::error!(
-                        code = %rockstream_types::error_code::RS_0001,
-                        "Invalid message from control plane: {:?}, raw: {}",
-                        e,
-                        line
-                    );
+                    log_invalid_control_message(&e, line.len());
                     continue;
                 }
             };
 
             match msg {
+                ControlMessage::SecurityAuditRecorded {
+                    request_id,
+                    persisted,
+                } => {
+                    if let Some(waiter) = crate::exchange::service::remove_security_audit_waiter(
+                        &security_audit_waiters,
+                        &request_id,
+                        security_audit_capacity,
+                    ) {
+                        let _ = waiter.send(persisted);
+                    }
+                }
                 ControlMessage::BeginDrain(request) => {
                     let Some(id) = *worker_id_clone.read() else {
                         continue;
@@ -1470,14 +3052,48 @@ where
                         }
                     }
                 }
-                ControlMessage::Registered { worker_id: wid } => {
+                ControlMessage::Registered {
+                    worker_id: wid,
+                    protocol_version,
+                } => {
+                    if !rockstream_types::compatibility::SupportedVersionRange::v4_only()
+                        .contains(protocol_version)
+                    {
+                        tracing::error!(
+                            code = %rockstream_types::error_code::RS_5021,
+                            %protocol_version,
+                            "control plane does not support the worker protocol required for audited shard ownership and complete workload reads"
+                        );
+                        break;
+                    }
                     tracing::info!("Worker client registered successfully as {:?}", wid);
                     *worker_id_clone.write() = Some(wid);
+                    local_info.worker_id = wid;
+                    shuffle_pool.set_local_worker_info(local_info.clone());
+                    shuffle_pool.upsert_peer_info(local_info.clone());
+                    let _ = msg_tx
+                        .send(WorkerMessage::OwnedShuffleReady { worker_id: wid })
+                        .await;
                 }
-                ControlMessage::TopologyChanged { workers } => {
+                ControlMessage::TopologyChanged {
+                    workers,
+                    shard_leases: leases,
+                } => {
+                    shuffle_pool.replace_peer_infos(workers.clone());
+                    if let Some(worker) = workers
+                        .iter()
+                        .find(|worker| Some(worker.worker_id) == *worker_id_clone.read())
+                    {
+                        local_info = worker.clone();
+                    }
+                    shuffle_pool.set_local_worker_info(local_info.clone());
+                    shuffle_pool.upsert_peer_info(local_info.clone());
                     let mut topology = topology_workers.write();
                     topology.clear();
                     topology.extend(workers.into_iter().map(|worker| (worker.worker_id, worker)));
+                    let mut current_leases = shard_leases.write();
+                    current_leases.clear();
+                    current_leases.extend(leases.into_iter().map(|lease| (lease.shard_id, lease)));
                 }
                 ControlMessage::Deploy { descriptor } => {
                     let result: io::Result<Arc<WorkerDeployment>> = async {
@@ -1510,6 +3126,11 @@ where
                                 .await
                                 .map_err(io::Error::other)?,
                         );
+                        db.fence_lease_token(descriptor.shard.lease_token)
+                            .await
+                            .map_err(|error| {
+                                io::Error::new(io::ErrorKind::PermissionDenied, error.to_string())
+                            })?;
                         let schemas = deployment_schema(&descriptor)?;
                         let plan: rockstream_plan::PlanNode =
                             serde_json::from_str(&descriptor.plan_json).map_err(|error| {
@@ -1538,13 +3159,22 @@ where
                                 comp_cfg.with_primary_key_columns(descriptor.primary_key.clone());
                         }
                         let compactor = Arc::new(EpochCompactor::new(comp_cfg));
+                        let owned_epoch = crate::owned_epoch::OwnedEpochJournal::new(db.clone());
+                        let recovery_on_open = !matches!(owned_epoch.load().await, Ok(None));
                         Ok(Arc::new(WorkerDeployment {
                             descriptor,
                             schemas,
-                            commit_group: Arc::new(PhysicalCommitGroup::new(db.clone())),
+                            commit_group: Arc::new(
+                                PhysicalCommitGroup::open(db.clone())
+                                    .await
+                                    .map_err(io::Error::other)?,
+                            ),
                             db,
                             compiled,
                             compactor,
+                            execution_requires_recovery: tokio::sync::Mutex::new(recovery_on_open),
+                            owned_epoch,
+                            recovery_on_open,
                         }))
                     }
                     .await;
@@ -1572,6 +3202,37 @@ where
                                 (descriptor.workload_id, descriptor.shard.shard_id),
                                 deployment.clone(),
                             );
+                            // Wire bounded application exchange inlets into this worker's
+                            // ExchangeRegistry so direct Arrow IPC shuffle frames and
+                            // receiver credit backpressure flow end-to-end (Issue #400 R2).
+                            if let Some((_source_name, source_schema)) =
+                                deployment.schemas.iter().next()
+                            {
+                                let inlet_cap = exchange_config.frame_channel_capacity.max(1);
+                                let (inlet_tx, mut inlet_rx) =
+                                    mpsc::channel::<rockstream_ops::zset::ArrowZSet>(inlet_cap);
+                                exchange_registry.register(
+                                    descriptor.workload_id.0,
+                                    descriptor.shard_index,
+                                    inlet_tx,
+                                    source_schema.clone(),
+                                );
+                                tokio::spawn(async move {
+                                    while let Some(_zset) = inlet_rx.recv().await {
+                                        // Draining bounded channel releases receiver buffer
+                                        // capacity and propagates credit backpressure upstream.
+                                    }
+                                });
+                            }
+                            if deployment.recovery_on_open {
+                                let _ = msg_tx
+                                    .send(WorkerMessage::OwnedEpochRecoveryRequired {
+                                        worker_id: descriptor.shard.worker_id,
+                                        workload_id: descriptor.workload_id,
+                                        shard_id: descriptor.shard.shard_id,
+                                    })
+                                    .await;
+                            }
                             let _ = msg_tx
                                 .send(WorkerMessage::DeploymentReady {
                                     version: descriptor.version,
@@ -1588,13 +3249,122 @@ where
                     }
                 }
                 ControlMessage::Execute { frame } => {
+                    let output = failure_identity(&frame);
                     if let Err(error) = actor_registry_clone.enqueue(frame) {
                         tracing::warn!(
                             code = %rockstream_types::error_code::RS_0001,
                             %error,
                             "worker execution frame refused"
                         );
+                        let _ = msg_tx
+                            .send(WorkerMessage::ExecutionFailed {
+                                output,
+                                message: error.to_string(),
+                            })
+                            .await;
                     }
+                }
+                ControlMessage::ReadWorkload {
+                    version,
+                    request_id,
+                    workload_id,
+                    shard_ids,
+                } => {
+                    let result = if version == WORKLOAD_SNAPSHOT_VERSION {
+                        read_workload_shards(
+                            &deployments_clone,
+                            &active_shards_clone,
+                            workload_id,
+                            &shard_ids,
+                        )
+                        .await
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "unsupported workload snapshot version",
+                        ))
+                    };
+                    let (available, shards) = match result {
+                        Ok(shards) => (true, shards),
+                        Err(_) => {
+                            tracing::warn!(%workload_id, "worker workload read unavailable");
+                            (false, Vec::new())
+                        }
+                    };
+                    let worker_id = *worker_id_clone.read();
+                    if let Some(worker_id) = worker_id {
+                        if msg_tx
+                            .send(WorkerMessage::WorkloadReadReport {
+                                version: WORKLOAD_SNAPSHOT_VERSION,
+                                request_id,
+                                workload_id,
+                                worker_id,
+                                available,
+                                shards,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            tracing::warn!(%worker_id, "workload read report could not be queued");
+                        }
+                    }
+                }
+                ControlMessage::PrepareOwnedEpoch { intent } => {
+                    let Some(worker_id) = *worker_id_clone.read() else {
+                        continue;
+                    };
+                    let client = epoch_client.clone();
+                    let deployments = deployments_clone.clone();
+                    let sender = msg_tx.clone();
+                    tokio::spawn(async move {
+                        let error = update_owned_epoch(&client, &deployments, &intent, false)
+                            .await
+                            .err();
+                        let _ = sender
+                            .send(WorkerMessage::OwnedEpochPrepared {
+                                worker_id,
+                                intent,
+                                error,
+                            })
+                            .await;
+                    });
+                }
+                ControlMessage::FinishOwnedEpoch { intent } => {
+                    let Some(worker_id) = *worker_id_clone.read() else {
+                        continue;
+                    };
+                    let client = epoch_client.clone();
+                    let deployments = deployments_clone.clone();
+                    let sender = msg_tx.clone();
+                    tokio::spawn(async move {
+                        let error = update_owned_epoch(&client, &deployments, &intent, true)
+                            .await
+                            .err();
+                        let _ = sender
+                            .send(WorkerMessage::OwnedEpochFinished {
+                                worker_id,
+                                intent,
+                                error,
+                            })
+                            .await;
+                    });
+                }
+                ControlMessage::DispatchOwnedShuffle { target, frame } => {
+                    shuffle_pool.upsert_peer_info(target.clone());
+                    let target_worker = target.worker_id;
+                    let mux = shuffle_mux.clone();
+                    let deployments = deployments_clone.clone();
+                    let sender = msg_tx.clone();
+                    tokio::spawn(async move {
+                        let output = failure_identity(&frame);
+                        if let Err(message) =
+                            dispatch_owned_shuffle(&mux, &deployments, target_worker, frame).await
+                        {
+                            let _ = sender
+                                .send(WorkerMessage::ShuffleDispatchFailed { output, message })
+                                .await;
+                        }
+                    });
                 }
                 ControlMessage::ReadOperatorStats {
                     request_id,
@@ -1689,12 +3459,21 @@ where
                         }
                     };
 
+                    let inline_compaction = !matches!(
+                        std::env::var("ROCKSTREAM_COMPACTION_MODE")
+                            .ok()
+                            .as_deref()
+                            .map(str::to_ascii_lowercase)
+                            .as_deref(),
+                        Some("remote")
+                    );
                     // Attempt to open the ShardDb
                     let mut builder = ShardDb::builder("db", store)
                         .with_supported_format_range(
                             rockstream_types::compatibility::SupportedStorageFormatRange::v1_through_v2(
                             ),
                         )
+                        .with_inline_compaction(inline_compaction)
                         .with_storage_context(storage_context_clone.clone());
                     if let Ok(metric_shard_id) = u16::try_from(lease.shard_id.0) {
                         builder = builder
@@ -1712,7 +3491,7 @@ where
                                     db: Some(db),
                                 },
                             );
-                            actor_registry_clone.register(
+                            actor_registry_clone.register_owned(
                                 shard_id,
                                 lease_token,
                                 execute_clone.clone(),
@@ -1863,16 +3642,6 @@ where
                         if *worker_id_clone.read() != Some(lease.worker_id) {
                             return Err("worker identity does not match the shard lease".to_owned());
                         }
-                        if deployments_clone
-                            .read()
-                            .keys()
-                            .any(|(_, shard_id)| *shard_id == lease.shard_id)
-                        {
-                            return Err(
-                                "shard has an active workload; backup requires an idle shard"
-                                    .to_owned(),
-                            );
-                        }
                         let db = active_shards_clone
                             .read()
                             .get(&lease.shard_id)
@@ -1881,6 +3650,12 @@ where
                             .ok_or_else(|| {
                                 "worker does not hold the requested active shard lease".to_owned()
                             })?;
+                        // Flush any buffered writes before pinning a durable SlateDB checkpoint so
+                        // active workloads produce a complete, point-in-time snapshot without
+                        // blocking foreground ingestion.
+                        db.flush()
+                            .await
+                            .map_err(|error| format!("flush shard before checkpoint: {error}"))?;
                         db.create_checkpoint()
                             .await
                             .map(|handle| (handle.shard_checkpoint_id, handle.snapshot_id))
@@ -1928,6 +3703,15 @@ where
                             worker_id,
                             active_shards_clone.read().len() as u64,
                         );
+                    }
+                    let revoked_inlets: Vec<(u64, u32)> = deployments_clone
+                        .read()
+                        .values()
+                        .filter(|d| d.descriptor.shard.shard_id == shard_id)
+                        .map(|d| (d.descriptor.workload_id.0, d.descriptor.shard_index))
+                        .collect();
+                    for (exchange_id, target_shard) in revoked_inlets {
+                        exchange_registry.unregister(exchange_id, target_shard);
                     }
                     deployments_clone
                         .write()
@@ -2013,38 +3797,89 @@ where
                         );
                     }
                 }
-                ControlMessage::SecretRotated { rotation } => {
+                ControlMessage::SecretRefreshRequired {
+                    workload_id,
+                    secret_name,
+                } => {
+                    if let Err(error) =
+                        secret_manager_clone.track_refresh(workload_id, secret_name.clone())
+                    {
+                        tracing::error!(
+                            code = %rockstream_types::error_code::RS_3601,
+                            %error,
+                            "worker secret refresh target limit reached"
+                        );
+                        continue;
+                    }
                     if let Err(error) = msg_tx
-                        .send(WorkerMessage::ResolveSecretToken {
-                            secret_name: rotation.secret_name,
+                        .send(WorkerMessage::ResolveWorkloadSecretToken {
+                            workload_id,
+                            secret_name,
                         })
                         .await
                     {
                         tracing::warn!(code = %rockstream_types::error_code::RS_0001, error = %error, "secret rotation refresh request could not be queued");
                     }
                 }
+                ControlMessage::SecretTokenRejected {
+                    workload_id,
+                    secret_name,
+                    code,
+                    message,
+                    retry,
+                } => {
+                    secret_manager_clone.reject_refresh(workload_id, &secret_name, retry);
+                    tracing::warn!(
+                        %code,
+                        %message,
+                        workload_id = %workload_id,
+                        %secret_name,
+                        "worker secret token refresh was rejected"
+                    );
+                }
                 ControlMessage::Shutdown => {
                     tracing::info!("Control plane requested shutdown");
+                    explicit_shutdown = true;
                     break;
                 }
                 _ => {}
             }
         }
 
+        for waiter in
+            crate::exchange::service::drain_security_audit_waiters(&security_audit_waiters)
+        {
+            let _ = waiter.send(false);
+        }
         if let Some(waiter) = frontier_report_waiter_clone.lock().take() {
             let _ = waiter.send(Err("Control channel closed".to_owned()));
         }
-        // Clean up remaining active shards on shutdown/disconnect
-        let dbs_to_close: Vec<ShardDb> = {
-            let mut shards = active_shards_clone.write();
-            shards.drain().filter_map(|(_, state)| state.db).collect()
-        };
-        for db in dbs_to_close {
-            let _ = db.close().await;
-        }
-        actor_registry_clone.shutdown();
-
         let _ = shutdown_tx.send(true);
+        if explicit_shutdown || deployments_clone.read().is_empty() {
+            if let Some(shutdown) = &_exchange_shutdown {
+                shutdown.0.cancel();
+            }
+            topology_workers.write().clear();
+            shard_leases.write().clear();
+            actor_registry_clone.shutdown();
+            exchange_service.shutdown().await;
+            shuffle_mux.shutdown().await;
+            let dbs_to_close: Vec<ShardDb> = {
+                let mut shards = active_shards_clone.write();
+                shards.drain().filter_map(|(_, state)| state.db).collect()
+            };
+            for db in dbs_to_close {
+                let _ = db.close().await;
+            }
+        } else {
+            // Issue #400 R4: Control-node restart / outage tolerance.
+            // Keep `_exchange_shutdown`, `exchange_service`, `actor_registry`,
+            // and active shard leases alive until this task is aborted.
+            tracing::warn!(
+                "control channel closed while deployments are active; keeping direct data-plane exchange alive"
+            );
+            std::future::pending::<()>().await;
+        }
     });
 
     Ok((handle, join_handle))

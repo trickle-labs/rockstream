@@ -214,6 +214,7 @@ const KNOWN_GATEWAY_KEYS: &[&str] = &[
     "tls_cert_path",
     "tls_key_path",
     "tls_ca_cert_path",
+    "serving",
 ];
 
 const KNOWN_INTERNAL_TLS_KEYS: &[&str] = &[
@@ -224,7 +225,29 @@ const KNOWN_INTERNAL_TLS_KEYS: &[&str] = &[
     "reload_enabled",
 ];
 
-const KNOWN_STORAGE_KEYS: &[&str] = &["tiering"];
+const KNOWN_STORAGE_KEYS: &[&str] = &["tiering", "compaction"];
+
+const KNOWN_GATEWAY_SERVING_KEYS: &[&str] = &[
+    "manifest_poll_interval_ms",
+    "max_concurrent_reads",
+    "max_read_queue_depth",
+    "max_read_queue_wait_ms",
+    "max_read_memory_bytes",
+    "max_estimated_scan_rows",
+    "freshness_wait_timeout_ms",
+    "nvme_cache_dir",
+    "nvme_cache_bytes",
+    "ram_cache_bytes",
+];
+
+const KNOWN_STORAGE_COMPACTION_KEYS: &[&str] = &[
+    "mode",
+    "max_concurrent_compactions",
+    "poll_interval_ms",
+    "manifest_poll_interval_ms",
+    "max_sst_size_bytes",
+    "discovery_interval_ms",
+];
 
 const KNOWN_EXECUTION_KEYS: &[&str] = &["join_strategy"];
 
@@ -239,16 +262,23 @@ const KNOWN_NODE_CONFIG_ROOT_KEYS: &[&str] = &[
     "runtime",
 ];
 
-const KNOWN_NODE_SECTION_KEYS: &[&str] = &["role", "host_id", "availability_zone"];
+const KNOWN_NODE_SECTION_KEYS: &[&str] = &["role", "deployment_id", "host_id", "availability_zone"];
 const KNOWN_GATEWAY_SECTION_KEYS: &[&str] = &[
     "listen_addr",
     "max_connections",
     "query_timeout_secs",
     "tls",
     "webhook_listen_addr",
+    "serving",
 ];
 const KNOWN_GATEWAY_TLS_KEYS: &[&str] = &["cert_path", "key_path", "ca_cert_path"];
-const KNOWN_CONTROL_SECTION_KEYS: &[&str] = &["listen_addr", "url", "shared_storage", "raft"];
+const KNOWN_CONTROL_SECTION_KEYS: &[&str] = &[
+    "listen_addr",
+    "management_addr",
+    "url",
+    "shared_storage",
+    "raft",
+];
 const KNOWN_CONTROL_RAFT_KEYS: &[&str] = &["peers", "node_id", "bind", "bootstrap"];
 const KNOWN_WORKER_SECTION_KEYS: &[&str] = &[
     "worker_id",
@@ -264,7 +294,8 @@ const KNOWN_WORKER_SECTION_KEYS: &[&str] = &[
     "disk_cache_bytes",
     "capabilities",
 ];
-const KNOWN_STORAGE_SECTION_KEYS: &[&str] = &["url", "temp_dir", "spill_dir", "tiering"];
+const KNOWN_STORAGE_SECTION_KEYS: &[&str] =
+    &["url", "temp_dir", "spill_dir", "tiering", "compaction"];
 const KNOWN_METRICS_SECTION_KEYS: &[&str] = &["listen_addr", "enabled", "scrape_interval_secs"];
 const KNOWN_AUTH_SECTION_KEYS: &[&str] = &[
     "mode",
@@ -273,6 +304,8 @@ const KNOWN_AUTH_SECTION_KEYS: &[&str] = &[
     "oidc_issuer",
     "oidc_audience",
     "oidc_jwks_url",
+    "actor_assertion_signing_key_path",
+    "actor_assertion_public_key_path",
 ];
 const KNOWN_LOGGING_SECTION_KEYS: &[&str] = &["level", "format"];
 const KNOWN_RUNTIME_SECTION_KEYS: &[&str] = &[
@@ -386,6 +419,13 @@ fn validate_keys_in_table(
                     toml_str,
                     diagnostics,
                 ),
+                "gateway.serving" => validate_keys_in_table(
+                    sub,
+                    "gateway.serving",
+                    KNOWN_GATEWAY_SERVING_KEYS,
+                    toml_str,
+                    diagnostics,
+                ),
                 "internal_tls" => validate_keys_in_table(
                     sub,
                     "internal_tls",
@@ -397,6 +437,13 @@ fn validate_keys_in_table(
                     sub,
                     "storage",
                     KNOWN_STORAGE_KEYS,
+                    toml_str,
+                    diagnostics,
+                ),
+                "storage.compaction" => validate_keys_in_table(
+                    sub,
+                    "storage.compaction",
+                    KNOWN_STORAGE_COMPACTION_KEYS,
                     toml_str,
                     diagnostics,
                 ),
@@ -498,6 +545,13 @@ fn validate_node_config_keys(
                     toml_str,
                     diagnostics,
                 ),
+                "gateway.serving" => validate_node_config_keys(
+                    sub,
+                    "gateway.serving",
+                    KNOWN_GATEWAY_SERVING_KEYS,
+                    toml_str,
+                    diagnostics,
+                ),
                 "control" => validate_node_config_keys(
                     sub,
                     "control",
@@ -523,6 +577,13 @@ fn validate_node_config_keys(
                     sub,
                     "storage",
                     KNOWN_STORAGE_SECTION_KEYS,
+                    toml_str,
+                    diagnostics,
+                ),
+                "storage.compaction" => validate_node_config_keys(
+                    sub,
+                    "storage.compaction",
+                    KNOWN_STORAGE_COMPACTION_KEYS,
                     toml_str,
                     diagnostics,
                 ),
@@ -997,14 +1058,22 @@ pub fn validate_node_config_semantic_bounds(
     }
 
     let role_norm = node_cfg.node.role.trim().to_lowercase();
-    let valid_roles = ["all", "control", "worker", "gateway", "metrics", "frontier"];
+    let valid_roles = [
+        "all",
+        "control",
+        "worker",
+        "gateway",
+        "metrics",
+        "frontier",
+        "compactor",
+    ];
     if !valid_roles.contains(&role_norm.as_str()) {
         diagnostics.push(ConfigDiagnostic {
             path: "node.role".to_string(),
             severity: ConfigDiagnosticSeverity::Error,
             code: "RS-0002".to_string(),
             message: format!(
-                "unknown role `{}`; supported: all, control, worker, gateway, metrics",
+                "unknown role `{}`; supported: all, control, worker, gateway, metrics, frontier, compactor",
                 node_cfg.node.role
             ),
             suggestion: Some("Set `role = \"all\"` or one of the supported roles".to_string()),
@@ -1013,7 +1082,9 @@ pub fn validate_node_config_semantic_bounds(
         });
     }
 
-    if (role_norm == "worker" || role_norm == "frontier") && node_cfg.control.url.is_none() {
+    if (role_norm == "worker" || role_norm == "frontier" || role_norm == "compactor")
+        && node_cfg.control.url.is_none()
+    {
         diagnostics.push(ConfigDiagnostic {
             path: "node.role".to_string(),
             severity: ConfigDiagnosticSeverity::Error,
@@ -1080,17 +1151,28 @@ pub fn validate_node_config_semantic_bounds(
 
     // auth mode
     let auth_mode_norm = node_cfg.auth.mode.trim().to_lowercase();
-    let valid_auth = ["off", "scram", "md5", "oidc", "mtls"];
+    let valid_auth = ["off", "scram", "oidc", "mtls"];
     if !valid_auth.contains(&auth_mode_norm.as_str()) {
+        let (message, suggestion) = if auth_mode_norm == "md5" {
+            (
+                "authentication mode `md5` is unavailable: MD5 is not a release authentication mode".to_string(),
+                "Use a release-supported authentication mode.".to_string(),
+            )
+        } else {
+            (
+                format!(
+                    "unknown auth mode `{}`; supported: off, scram, oidc, mtls",
+                    node_cfg.auth.mode
+                ),
+                "Set auth mode to off, scram, oidc, or mtls".to_string(),
+            )
+        };
         diagnostics.push(ConfigDiagnostic {
             path: "auth.mode".to_string(),
             severity: ConfigDiagnosticSeverity::Error,
             code: "RS-0002".to_string(),
-            message: format!(
-                "unknown auth mode `{}`; supported: off, scram, md5, oidc, mtls",
-                node_cfg.auth.mode
-            ),
-            suggestion: Some("Set auth mode to off, scram, md5, oidc, or mtls".to_string()),
+            message,
+            suggestion: Some(suggestion),
             line: None,
             column: None,
         });
@@ -1140,6 +1222,32 @@ pub fn validate_node_config_semantic_bounds(
             message: "mTLS requires gateway TLS certificate, key, and client CA paths".to_string(),
             suggestion: Some(
                 "Configure gateway.tls.cert_path, key_path, and ca_cert_path".to_string(),
+            ),
+            line: None,
+            column: None,
+        });
+    }
+
+    let assertion_keys_configured = node_cfg.auth.actor_assertion_signing_key_path.is_some()
+        || node_cfg.auth.actor_assertion_public_key_path.is_some();
+    let deployment_id_missing = node_cfg
+        .node
+        .deployment_id
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty());
+    if (assertion_keys_configured && deployment_id_missing)
+        || (node_cfg.control.url.is_some()
+            && matches!(node_cfg.node.role.trim(), "gateway" | "all")
+            && auth_mode_norm != "off"
+            && (node_cfg.auth.actor_assertion_signing_key_path.is_none() || deployment_id_missing))
+    {
+        diagnostics.push(ConfigDiagnostic {
+            path: "auth.actor_assertion_signing_key_path".to_string(),
+            severity: ConfigDiagnosticSeverity::Error,
+            code: "RS-0002".to_string(),
+            message: "cross-process gateway delegation requires a dedicated RS256 signing key and deployment ID".to_string(),
+            suggestion: Some(
+                "Configure node.deployment_id and auth.actor_assertion_signing_key_path; distribute the matching public JWK to control".to_string(),
             ),
             line: None,
             column: None,

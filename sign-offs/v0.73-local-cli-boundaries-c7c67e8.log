@@ -1,0 +1,16 @@
+Code revision: c7c67e8f
+
+Command: RUSTUP_TOOLCHAIN=1.99.1 rtk cargo test --locked -p rockstream-cli --test cli_disaster_recovery_tests
+Result: cargo test: 2 passed (1 suite, 5.93s)
+
+Command: RUSTUP_TOOLCHAIN=1.99.1 rtk cargo fmt --all -- --check
+Result: passed
+
+Command: rtk bash scripts/check-documentation.sh
+Result: OK: documentation checks passed.
+
+Command: rtk bash scripts/check-error-codes.sh
+Result: OK: all logged/returned errors carry an RS-XXXX code.
+
+Command: rtk git diff --check
+Result: passed

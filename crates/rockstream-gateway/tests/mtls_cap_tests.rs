@@ -1,5 +1,5 @@
 use rockstream_gateway::tls::{
-    lookup_mtls_cn, mtls_cn_cache_size, remove_mtls_cn, MTLS_CN_BY_PEER_ADDR,
+    lookup_mtls_cn, mtls_cn_cache_size, remove_mtls_cn, VerifiedMtlsIdentity, MTLS_CN_BY_PEER_ADDR,
 };
 use rockstream_types::metrics::*;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -20,7 +20,13 @@ fn test_mtls_cn_map_cap_rejection_and_disconnect_cleanup() {
     let num_peers: usize = 5;
     for i in 0..num_peers {
         let addr = sock(10000 + i as u16);
-        MTLS_CN_BY_PEER_ADDR.insert(addr, format!("client-{i}"));
+        MTLS_CN_BY_PEER_ADDR.insert(
+            addr,
+            VerifiedMtlsIdentity {
+                common_name: format!("client-{i}"),
+                certificate_sha256: [i as u8; 32],
+            },
+        );
     }
     rockstream_types::metrics::set_mtls_cn_cache_size(MTLS_CN_BY_PEER_ADDR.len() as u64);
     assert_eq!(read_mtls_cn_cache_size(), 5);

@@ -137,7 +137,10 @@ async fn test_source_id_invariance_across_status_changes() {
         name: "kafka_stream".to_string(),
         connector_type: "kafka".to_string(),
         table_name: None,
+        format: "json".to_string(),
         options: opts,
+        secret_consumer: None,
+        secret_namespace: None,
     };
     let txn1 = CatalogTxn::new(1, 1, vec![CatalogMutation::PutSource(src.clone())]).unwrap();
     catalog.commit_txn(txn1).await.unwrap();
@@ -199,7 +202,7 @@ async fn assert_single_workload_identity(snapshot: bool) {
                 definition: original.clone(),
             }]
         );
-        assert_eq!(catalog.compact_logs(1).await.unwrap(), 1);
+        assert_eq!(catalog.compact_logs(1).await.unwrap(), 2);
     }
 
     let recovered = DurableCatalogStore::recover(store, "identity")
@@ -269,7 +272,7 @@ async fn assert_gaps_deletion_and_second_recovery(snapshot: bool) {
 
     if snapshot {
         catalog.create_snapshot().await.unwrap();
-        assert_eq!(catalog.compact_logs(5).await.unwrap(), 5);
+        assert_eq!(catalog.compact_logs(5).await.unwrap(), 10);
     }
 
     let recovered = DurableCatalogStore::recover(store.clone(), "gaps")

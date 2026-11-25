@@ -105,6 +105,7 @@ async fn test_sim_concurrent_maintenance_and_fencing() {
 
     // Stale message with old lease token must be fenced
     let stale_msg = RuntimeExchangeMessage {
+        attempt_id: None,
         version: 1,
         request_id: "sim_stale_1".to_string(),
         workload_id: WorkloadId(1),
@@ -124,6 +125,7 @@ async fn test_sim_concurrent_maintenance_and_fencing() {
 
     // Current lease message succeeds
     let current_msg = RuntimeExchangeMessage {
+        attempt_id: None,
         version: 1,
         request_id: "sim_current_1".to_string(),
         workload_id: WorkloadId(1),

@@ -167,9 +167,17 @@ pub struct HotKeyDetector {
 }
 
 #[derive(Debug, Clone)]
+struct HotKeyWindow {
+    shard_id: ShardId,
+    key_prefix: Vec<u8>,
+    started_at_ms: u64,
+    last_observed_at_ms: u64,
+}
+
+#[derive(Debug, Clone)]
 pub struct AdaptiveSkewSplitter {
     config: SkewSplitConfig,
-    overload_started_at_ms: BTreeMap<OperatorId, u64>,
+    overload_started_at_ms: BTreeMap<OperatorId, HotKeyWindow>,
 }
 
 #[derive(Debug, Clone)]
@@ -629,7 +637,12 @@ impl AdaptiveSkewSplitter {
         now_ms: u64,
         audit: Option<&FileAuditLog>,
     ) -> Result<Option<SkewSplitDecision>, HotKeyDetectorError> {
-        if !self.config.enabled || shard_samples.is_empty() {
+        if !self.config.enabled
+            || !self.config.hot_key_factor.is_finite()
+            || self.config.hot_key_factor < 1.0
+            || self.config.max_skew_buckets == 0
+            || shard_samples.is_empty()
+        {
             self.overload_started_at_ms.remove(&operator_id);
             return Ok(None);
         }
@@ -644,7 +657,11 @@ impl AdaptiveSkewSplitter {
 
         let worst = shard_samples
             .iter()
-            .max_by_key(|sample| shard_load_score(sample))
+            .max_by(|left, right| {
+                shard_load_score(left)
+                    .cmp(&shard_load_score(right))
+                    .then_with(|| right.shard_id.cmp(&left.shard_id))
+            })
             .expect("shard_samples checked non-empty");
         let worst_score = shard_load_score(worst);
         let load_factor = worst_score as f64 / median as f64;
@@ -653,41 +670,71 @@ impl AdaptiveSkewSplitter {
             return Ok(None);
         }
 
-        let overloaded_since = self
+        // Only continuous observations of the same hot key on the same shard
+        // count towards promotion. A missing or invalid sample breaks the window.
+        let hot_key = match detect_hot_key(worst, self.config.hot_key_factor) {
+            Ok(Some(report)) => report,
+            Ok(None) => {
+                self.overload_started_at_ms.remove(&operator_id);
+                return Ok(None);
+            }
+            Err(error) => {
+                self.overload_started_at_ms.remove(&operator_id);
+                return Err(error);
+            }
+        };
+        let new_window = || HotKeyWindow {
+            shard_id: worst.shard_id,
+            key_prefix: hot_key.key_prefix.clone(),
+            started_at_ms: now_ms,
+            last_observed_at_ms: now_ms,
+        };
+        let window = self
             .overload_started_at_ms
             .entry(operator_id)
-            .or_insert(now_ms);
-        if now_ms.saturating_sub(*overloaded_since) < SKEW_SPLIT_TRIGGER_WINDOW.as_millis() as u64 {
+            .or_insert_with(new_window);
+        if window.shard_id != worst.shard_id
+            || window.key_prefix != hot_key.key_prefix
+            || now_ms < window.last_observed_at_ms
+        {
+            *window = new_window();
+        }
+        window.last_observed_at_ms = now_ms;
+        let overloaded_since = window.started_at_ms;
+        if now_ms.saturating_sub(overloaded_since) < SKEW_SPLIT_TRIGGER_WINDOW.as_millis() as u64 {
             return Ok(None);
         }
-
-        let Some(hot_key) = detect_hot_key(worst, self.config.hot_key_factor)? else {
-            return Ok(None);
-        };
-        let bucket_count = overrides
+        let requested_buckets = overrides
             .and_then(|override_cfg| override_cfg.skew_buckets)
             .unwrap_or(self.config.max_skew_buckets)
             .clamp(1, self.config.max_skew_buckets);
+        // Round down so the normalized power of two never exceeds the cap.
+        let bucket_count = 1u16 << (u16::BITS - 1 - requested_buckets.leading_zeros());
         let plan = plan_hot_key_mitigation(law, operator_id, bucket_count, spill_shard);
         if let Some(audit) = audit {
+            let action = match &plan {
+                HotKeyMitigationPlan::Split { .. } => "split",
+                HotKeyMitigationPlan::Spill { .. } => "single_owner_fallback",
+            };
             let event = rockstream_types::audit::AuditEvent::now(
                 "auto_tuner",
                 "skew_splitting.adjusted",
                 operator_id.to_string(),
             )
             .with_detail(format!(
-                "shard_id={}, hot_key={}, load_factor={load_factor:.3}, worst_score={}, median_score={}, hot_key_factor={}, bucket_count={}, sustained_ms={}",
+                "shard_id={}, hot_key={}, load_factor={load_factor:.3}, worst_score={}, median_score={}, hot_key_factor={}, bucket_count={}, sustained_ms={}, decision={action}, reassociation_admitted={}",
                 worst.shard_id,
                 hex_key(&hot_key.key_prefix),
                 worst_score,
                 median,
                 self.config.hot_key_factor,
                 bucket_count,
-                now_ms.saturating_sub(*overloaded_since)
+                now_ms.saturating_sub(overloaded_since),
+                law.can_reassociate()
             ));
             let _ = audit.append(&event);
         }
-        self.overload_started_at_ms.insert(operator_id, now_ms);
+        window.started_at_ms = now_ms;
         Ok(Some(SkewSplitDecision {
             operator_id,
             shard_id: worst.shard_id,
@@ -709,7 +756,7 @@ pub fn detect_hot_key(
             max: MAX_TRACKED_KEY_LOADS,
         });
     }
-    if sample.key_loads.is_empty() {
+    if sample.key_loads.is_empty() || !hot_key_factor.is_finite() || hot_key_factor < 1.0 {
         return Ok(None);
     }
 
@@ -723,7 +770,17 @@ pub fn detect_hot_key(
     let hottest = sample
         .key_loads
         .iter()
-        .max_by_key(|load| load_score(load))
+        .max_by(|left, right| {
+            load_score(left)
+                .cmp(&load_score(right))
+                .then_with(|| right.key_prefix.cmp(&left.key_prefix))
+                .then_with(|| left.cpu_nanos.cmp(&right.cpu_nanos))
+                .then_with(|| left.bytes_per_epoch.cmp(&right.bytes_per_epoch))
+                .then_with(|| {
+                    left.state_writes_per_epoch
+                        .cmp(&right.state_writes_per_epoch)
+                })
+        })
         .expect("key_loads checked non-empty");
     let key_score = load_score(hottest);
     let hotness_factor = key_score as f64 / median_score as f64;
@@ -761,7 +818,7 @@ pub fn plan_hot_key_mitigation(
     bucket_count: u16,
     spill_shard: ShardId,
 ) -> HotKeyMitigationPlan {
-    if law.can_reassociate() {
+    if law.can_reassociate() && bucket_count > 1 {
         let bucket_count = normalize_power_of_two_bucket_count(bucket_count);
         HotKeyMitigationPlan::Split {
             bucket_count,

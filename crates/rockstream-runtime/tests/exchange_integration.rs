@@ -227,7 +227,16 @@ async fn test_durable_shuffle_fallback() {
     assert_eq!(received.num_rows(), 1);
     assert_eq!(received.positive_ab_rows(), vec![(42, 100)]);
 
-    // Run catch_up_durable again to assert no duplicates are created
+    // A queued frame remains pending until its epoch commits.
+    assert_eq!(
+        multiplexer
+            .catch_up_durable(100, 1, WorkerId(1), WorkerId(2), &registry, store.as_ref())
+            .await,
+        Err("Durable shuffle batch is pending above the committed frontier".to_owned())
+    );
+    rockstream_runtime::exchange::persistence::advance_committed_frontier(&db, 1)
+        .await
+        .unwrap();
     multiplexer
         .catch_up_durable(100, 1, WorkerId(1), WorkerId(2), &registry, store.as_ref())
         .await

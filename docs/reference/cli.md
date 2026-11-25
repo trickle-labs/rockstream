@@ -16,7 +16,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ### `rockstream admin backup`
 
-Point-in-time durable backup operations (create, inspect, verify)
+Create backups through authenticated management; inspect or verify local backup files
 
 Exit codes
 
@@ -30,7 +30,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 #### `rockstream admin backup create`
 
-Create a full point-in-time backup
+Create a full point-in-time backup through authenticated management
 
 Options
 
@@ -91,7 +91,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ### `rockstream admin checkpoint`
 
-Checkpoint administration and manual triggering
+Checkpoint administration (currently unavailable: no authenticated management endpoint)
 
 Exit codes
 
@@ -323,7 +323,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ### `rockstream admin restore`
 
-Restore a database backup into a clean or authorized destination
+Unavailable until the CLI exposes an authenticated backup-restore endpoint
 
 Options
 
@@ -345,7 +345,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ## `rockstream audit`
 
-Audit log inspection commands
+Local audit-history commands are unavailable; use authenticated `SHOW SECURITY AUDIT`
 
 Exit codes
 
@@ -359,7 +359,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ### `rockstream audit query`
 
-Query audit log events matching a filter
+Unavailable for local logs; use authenticated `SHOW SECURITY AUDIT`
 
 Options
 
@@ -380,7 +380,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ### `rockstream audit tail`
 
-Tail recent audit log events
+Unavailable for local logs; use authenticated `SHOW SECURITY AUDIT`
 
 Options
 
@@ -414,7 +414,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ## `rockstream checkpoint`
 
-Checkpoint inspection commands
+Checkpoint commands (currently unavailable: no authenticated management endpoint)
 
 Exit codes
 
@@ -1440,6 +1440,69 @@ Exit codes
 
 Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
+## `rockstream security`
+
+Offline security administration against the durable catalog
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0002, RS-0003, RS-0005 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0002, RS-0003, RS-0005 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0002, RS-0003, RS-0005 |
+
+Error codes: `RS-0002`, `RS-0003`, `RS-0005`
+
+### `rockstream security preprovision-admin`
+
+Preprovision the first administrator before opening application listeners
+
+Options
+
+| Name | Short | Long | Value | Required | Default | Values | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| layout | — | --layout | LAYOUT | yes | — | all, gateway | Select `all` for `--role all`, or `gateway` for `--role gateway`/`control` |
+| operation_id | — | --operation-id | OPERATION_ID | yes | — | — | Stable catalog operation ID to reuse if this command must be retried |
+| principal_file | — | --principal-file | PRINCIPAL_FILE | yes | — | — | JSON-serialized SecurityPrincipal containing an enabled interactive cluster administrator |
+| storage | — | --storage | STORAGE | yes | — | — | Node storage directory used by `start --storage` for this deployment |
+| yes | — | --yes | YES | no | — | true, false | Confirm the deployment is stopped and the selected durable store is correct |
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0002, RS-0003, RS-0005 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0002, RS-0003, RS-0005 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0002, RS-0003, RS-0005 |
+
+Error codes: `RS-0002`, `RS-0003`, `RS-0005`
+
+### `rockstream security recover-admin`
+
+Replace login methods for an existing administrator while the deployment is stopped
+
+Options
+
+| Name | Short | Long | Value | Required | Default | Values | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| layout | — | --layout | LAYOUT | yes | — | all, gateway | Select `all` for `--role all`, or `gateway` for `--role gateway`/`control` |
+| login_methods_file | — | --login-methods-file | LOGIN_METHODS_FILE | yes | — | — | JSON array of replacement `LoginMethod` entries; contains no plaintext password |
+| operation_id | — | --operation-id | OPERATION_ID | yes | — | — | Stable catalog operation ID to reuse if this command must be retried |
+| principal_id | — | --principal-id | PRINCIPAL_ID | yes | — | — | ID of the existing active cluster administrator to recover |
+| storage | — | --storage | STORAGE | yes | — | — | Node storage directory used by `start --storage` for this deployment |
+| yes | — | --yes | YES | no | — | true, false | Confirm the deployment is stopped and the selected durable store is correct |
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0002, RS-0003, RS-0005 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0002, RS-0003, RS-0005 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0002, RS-0003, RS-0005 |
+
+Error codes: `RS-0002`, `RS-0003`, `RS-0005`
+
 ## `rockstream shard`
 
 Shard inspection commands
@@ -1668,10 +1731,10 @@ Options
 
 | Name | Short | Long | Value | Required | Default | Values | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| auth | — | --auth | AUTH | no | — | off, scram, md5, oidc, mtls | Authentication mode. Only `off` is available; others fail closed. Omitted uses `[auth].mode` |
+| auth | — | --auth | AUTH | no | — | off, scram, md5, oidc, mtls | Authentication mode. SCRAM requires an enabled durable login; OIDC uses RS256, limits tokens to 16 KiB, and requires its issuer, audience, TLS, and JWKS settings; mTLS requires its gateway credentials. MD5 is rejected. Omitted uses `[auth].mode` |
 | availability_zone | — | --availability-zone | AVAILABILITY_ZONE | no | — | — | Availability zone advertised during worker registration |
 | checkpoint_retention_count | — | --checkpoint-retention-count | CHECKPOINT_RETENTION_COUNT | no | — | — |  |
-| control | — | --control | CONTROL | no | — | — | Control service URL (required for the worker and frontier roles) |
+| control | — | --control | CONTROL | no | — | — | Control service URL (required for the worker, frontier, and compactor roles) |
 | control_bind | — | --control-bind | CONTROL_BIND | no | — | — | Override address worker-facing ControlService binds to |
 | control_shared_storage | — | --control-shared-storage | CONTROL_SHARED_STORAGE | no | — | — | Directory for state shared across control nodes in Raft group |
 | daemon | — | --daemon | DAEMON | no | false | true, false | Run the control role as a daemon |
@@ -1690,7 +1753,7 @@ Options
 | raft_bootstrap | — | --raft-bootstrap | RAFT_BOOTSTRAP | no | false | true, false | Start an election immediately on boot |
 | raft_node_id | — | --raft-node-id | RAFT_NODE_ID | no | — | — | This node's ID within its Raft group |
 | raft_peers | — | --raft-peers | RAFT_PEERS | no | — | — | Comma-separated list of other control nodes in Raft group |
-| role | — | --role | ROLE | no | all | all, gateway, worker, control | Node role |
+| role | — | --role | ROLE | no | all | all, gateway, worker, control, compactor | Node role |
 | same_host_shm_segment_bytes | — | --same-host-shm-segment-bytes | SAME_HOST_SHM_SEGMENT_BYTES | no | — | — |  |
 | same_host_shm_segments_per_peer | — | --same-host-shm-segments-per-peer | SAME_HOST_SHM_SEGMENTS_PER_PEER | no | — | — |  |
 | shutdown_timeout_secs | — | --shutdown-timeout-secs | SHUTDOWN_TIMEOUT_SECS | no | — | — | Configurable shutdown timeout deadline in seconds (default: 30) |
@@ -1725,7 +1788,63 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ## `rockstream support`
 
-Diagnostic support commands
+Generate actor-bound support artifacts through the authenticated management API
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+### `rockstream support artifact`
+
+Generate or download an actor-bound management support artifact
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+#### `rockstream support artifact create`
+
+Generate a sanitized artifact through the authenticated management API
+
+Options
+
+| Name | Short | Long | Value | Required | Default | Values | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| idempotency_key | — | --idempotency-key | IDEMPOTENCY_KEY | no | — | — | Client-generated identity used to retry or reconcile this request |
+| node_id | — | --node-id | NODE_ID | no | — | — | Optional node scope; omit to capture cluster metadata |
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
+#### `rockstream support artifact download`
+
+Download an artifact returned by `support artifact create`
+
+Options
+
+| Name | Short | Long | Value | Required | Default | Values | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| opaque_id | — | — | OPAQUE_ID | yes | — | — | Opaque artifact UUID returned by the management API |
+| out | — | --out | OUT | yes | — | — | Local destination for the downloaded bytes |
 
 Exit codes
 
@@ -1739,7 +1858,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ### `rockstream support bundle`
 
-Generate on-demand diagnostic support bundle
+Unavailable without authenticated support authorization; use `support artifact create`
 
 Options
 
@@ -1761,7 +1880,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ### `rockstream support diagnose`
 
-Look up one runtime diagnostic and write its support bundle
+Unavailable without authenticated diagnostic authorization; use `support artifact create`
 
 Options
 

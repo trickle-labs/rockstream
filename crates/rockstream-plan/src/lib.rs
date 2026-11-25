@@ -19,6 +19,17 @@ use serde::{Deserialize, Serialize};
 /// defined in `rockstream_types::explain`.
 pub use rockstream_types::explain::NotMergeSafeReason;
 
+/// Ordering specification for a single `ORDER BY` key in [`PlanNode::TopK`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TopKOrderKey {
+    /// 0-based column index in the TopK input schema.
+    pub col: usize,
+    /// `true` for `ASC`, `false` for `DESC`.
+    pub asc: bool,
+    /// `true` for `NULLS FIRST`, `false` for `NULLS LAST`.
+    pub nulls_first: bool,
+}
+
 /// A logical plan node in the IVM plan IR.
 ///
 /// The plan IR is a tree of declarative operations that describe *what* to
@@ -197,6 +208,10 @@ pub enum PlanNode {
         gap_ms: i64,
         /// Policy for rows that arrive after the session frontier has closed.
         late_data_policy: LateDataPolicy,
+        /// Optional explicit partition column indices (from SQL `GROUP BY`).
+        /// When `None`, defaults to all input columns except `time_col`.
+        #[serde(default)]
+        partition_by: Option<Vec<usize>>,
     },
     /// Top-K operator (v0.21).
     ///
@@ -217,6 +232,10 @@ pub enum PlanNode {
         rank_col: usize,
         /// Column indices to partition by.  Empty = single global partition.
         partition_by: Vec<usize>,
+        /// Explicit multi-column ordering keys (ASC/DESC, NULLS FIRST/LAST).
+        /// When empty, defaults to descending `rank_col` with NULLS LAST.
+        #[serde(default)]
+        order_by: Vec<TopKOrderKey>,
     },
     /// Recursive operator (v0.22).
     ///
@@ -316,15 +335,16 @@ pub enum PlanNode {
         child: Box<PlanNode>,
     },
 
-    /// Exchange operator stub (v0.4).
+    /// Exchange operator (hash / broadcast / single / range / loopback).
     ///
-    /// In the embedded single-process runtime (v0.4), Exchange is always
-    /// `Loopback`: data passes through without any network call or shuffle
-    /// object.  Full hash/broadcast/range exchange over gRPC + durable
-    /// shuffle objects is implemented in v0.16.
+    /// Carries the physical `kind` and, for `Hash`/`Range` exchanges, the
+    /// column indices (`partition_key`) used to partition rows across shards.
     Exchange {
         /// How this exchange partitions data.
         kind: ExchangeKind,
+        /// Column indices used to hash- or range-partition rows.
+        #[serde(default)]
+        partition_key: Vec<usize>,
         /// The input plan to re-partition.
         child: Box<PlanNode>,
     },

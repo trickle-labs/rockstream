@@ -4,11 +4,11 @@ use tokio_util::task::TaskTracker;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
 
 use futures::{Stream, StreamExt};
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use parking_lot::{Mutex, RwLock};
 use rockstream_types::config::{ExchangeConfig, WorkerConfig};
 use rockstream_types::exchange::{
@@ -21,6 +21,10 @@ use crate::exchange::pool::ShuffleClientPool;
 use crate::exchange::proto::ShuffleFrame;
 use crate::exchange::shared_memory::{ticket, SharedMemorySegmentPool};
 use rockstream_types::ids::{ExchangeId, ShardId, WorkerId};
+
+// shortcut: serialize durable inbox claims process-wide; partition this lock when durable catch-up needs parallel throughput.
+static DURABLE_INBOX_CLAIM: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 /// Stream wrapper to adapt mpsc::Receiver to Stream for tonic.
 struct RxStream<T> {
@@ -236,6 +240,120 @@ impl WorkerStreamMultiplexer {
             .await
     }
 
+    /// Sends one owned frame and waits for the execution result, separately from credits.
+    pub(crate) async fn send_owned_frame(
+        &self,
+        target_worker: WorkerId,
+        frame: ShuffleFrame,
+        context: bytes::Bytes,
+    ) -> Result<(), String> {
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let sender = self.clone();
+        self.task_tracker.spawn(async move {
+            // shortcut: use a fixed deadline until execution deadlines are propagated by the owner.
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                sender.send_owned_frame_inner(target_worker, frame, context),
+            )
+            .await
+            .unwrap_or_else(|_| Err("owned shuffle execution timed out".to_owned()));
+            let _ = result_tx.send(result);
+        });
+        result_rx
+            .await
+            .map_err(|_| "owned shuffle sender stopped".to_owned())?
+    }
+
+    async fn send_owned_frame_inner(
+        &self,
+        target_worker: WorkerId,
+        frame: ShuffleFrame,
+        context: bytes::Bytes,
+    ) -> Result<(), String> {
+        let _permit = self
+            .flow_controller
+            .acquire_batch_permit(
+                frame.exchange_id,
+                frame.src_shard,
+                frame.target_shard,
+                frame.payload.len(),
+                frame.row_count,
+            )
+            .await?;
+        let route = self.classify_route(target_worker, &frame);
+        if matches!(route.transport, ExchangeTransport::DurableObject) {
+            return Err("owned shuffle requires a directly reachable peer".to_owned());
+        }
+        let direct_bytes = frame.payload.len() as u64;
+        let payload = self.encode_payload_for_route(target_worker, &route, &frame.payload)?;
+        let frame = ShuffleFrame {
+            payload: payload.into(),
+            ..frame
+        };
+        let mut client = self
+            .client_pool
+            .get_client(target_worker)
+            .await
+            .map_err(|error| error.to_string())?;
+        let (tx, rx) = mpsc::channel(1);
+        let mut request = Request::new(RxStream { rx });
+        let protocol_version = self.client_pool.protocol_version_for_peer(target_worker);
+        request.metadata_mut().insert(
+            "protocol_version",
+            MetadataValue::from_str(&protocol_version.0.to_string())
+                .map_err(|error| error.to_string())?,
+        );
+        request.metadata_mut().insert_bin(
+            "rs-owned-context-bin",
+            tonic::metadata::MetadataValue::from_bytes(&context),
+        );
+        let response = client
+            .shuffle_stream(request)
+            .await
+            .map_err(|error| error.message().to_owned())?;
+        if response
+            .metadata()
+            .get("rs-owned-version")
+            .and_then(|value| value.to_str().ok())
+            != Some("1")
+        {
+            return Err("peer does not support owned shuffle execution".to_owned());
+        }
+        tx.send(frame.clone())
+            .await
+            .map_err(|_| "owned shuffle stream closed before delivery".to_owned())?;
+        rockstream_types::metrics::add_shuffle_direct_bytes_total(direct_bytes);
+        drop(tx);
+        let mut stream = response.into_inner();
+        let ack = match stream.next().await {
+            Some(Ok(ack)) => ack,
+            Some(Err(error)) => return Err(error.message().to_owned()),
+            None => return Err("owned shuffle stream ended before returning credit".to_owned()),
+        };
+        if (
+            ack.exchange_id,
+            ack.src_shard,
+            ack.target_shard,
+            ack.epoch,
+            ack.seq,
+            ack.credit_grant,
+        ) != (
+            frame.exchange_id,
+            frame.src_shard,
+            frame.target_shard,
+            frame.epoch,
+            frame.seq,
+            frame.row_count.max(1),
+        ) {
+            return Err("owned shuffle returned mismatched credit".to_owned());
+        }
+        match stream.next().await {
+            None => Ok(()),
+            Some(Err(error)) => Err(error.message().to_owned()),
+            Some(Ok(_)) => Err("owned shuffle returned unexpected additional credit".to_owned()),
+        }
+    }
+
     async fn send_frame_after_credit(
         &self,
         target_worker: WorkerId,
@@ -431,15 +549,47 @@ impl WorkerStreamMultiplexer {
                 frame.exchange_id, frame.epoch, src_worker.0, target_worker.0
             );
             let path = object_store::path::Path::from(path_str);
+            // shortcut: interrupted appends retain the claim; reconcile it before retrying.
+            let claim_path = object_store::path::Path::from(format!("{}.append", path));
+            let options = object_store::PutOptions {
+                mode: object_store::PutMode::Create,
+                ..Default::default()
+            };
+            match store
+                .put_opts(&claim_path, bytes::Bytes::new().into(), options)
+                .await
+            {
+                Ok(_) => {}
+                Err(object_store::Error::AlreadyExists { .. }) => {
+                    return Err(
+                        "Durable shuffle append is already in progress or requires recovery"
+                            .to_owned(),
+                    );
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "{}: durable shuffle append claim failed: {error}",
+                        rockstream_types::error_code::RS_3012
+                    ))
+                }
+            }
 
+            let append_result: Result<(), String> = async {
             // Coalesce frame writing: check if file already exists in object store.
             // If it exists, read footer and all frames, reconstruct the writer, and append.
             let mut writer = crate::exchange::durable::DurableShuffleWriter::new();
+            let mut already_present = false;
 
-            match crate::exchange::durable::DurableShuffleReader::read_footer(store.as_ref(), &path)
-                .await
-            {
-                Ok(footer) => {
+            match store.head(&path).await {
+                Ok(_) => {
+                    let footer = crate::exchange::durable::DurableShuffleReader::read_footer(
+                        store.as_ref(),
+                        &path,
+                    )
+                    .await
+                    .map_err(|error| {
+                        format!("Durable shuffle existing object read failed: {error}")
+                    })?;
                     for entry in footer.entries {
                         match crate::exchange::durable::DurableShuffleReader::read_frame(
                             store.as_ref(),
@@ -449,6 +599,15 @@ impl WorkerStreamMultiplexer {
                         .await
                         {
                             Ok(existing_payload) => {
+                                if entry.src_shard == frame.src_shard
+                                    && entry.target_shard == frame.target_shard
+                                    && entry.seq == frame.seq
+                                {
+                                    if existing_payload.as_ref() != frame.payload.as_slice() {
+                                        return Err("Durable shuffle frame identity has different content".to_owned());
+                                    }
+                                    already_present = true;
+                                }
                                 if let Err(e) = writer.add_frame(
                                     entry.src_shard,
                                     entry.target_shard,
@@ -472,11 +631,13 @@ impl WorkerStreamMultiplexer {
                         }
                     }
                 }
-                Err(_) => {
-                    // File does not exist or footer is invalid; start with a clean writer.
-                }
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(error) => return Err(format!("{}: durable shuffle object lookup failed: {error}", rockstream_types::error_code::RS_3012)),
             }
 
+            if already_present {
+                return Ok(());
+            }
             // Add the new frame
             writer
                 .add_frame(
@@ -501,6 +662,25 @@ impl WorkerStreamMultiplexer {
                     e
                 )
             })?;
+            Ok(())
+            }.await;
+            let release_result = store.delete(&claim_path).await;
+            match (append_result, release_result) {
+                (Ok(()), Ok(())) => {}
+                (Err(error), Ok(())) => return Err(error),
+                (Ok(()), Err(error)) => {
+                    return Err(format!(
+                        "{}: durable shuffle append claim release failed: {error}",
+                        rockstream_types::error_code::RS_3012
+                    ))
+                }
+                (Err(error), Err(release)) => {
+                    return Err(format!(
+                        "{}: {error}; append claim release failed: {release}",
+                        rockstream_types::error_code::RS_3012
+                    ))
+                }
+            }
 
             // No local outbox to delete: with fast-path WAL elision (v0.51) the
             // outbox is never written; the durable object upload above is the
@@ -542,8 +722,8 @@ impl WorkerStreamMultiplexer {
         }
     }
 
-    /// Pull and process durable shuffle frames for a given exchange, epoch, and sender worker.
-    /// This allows a receiver worker to catch up on frames that were written to the object store.
+    /// Queue durable shuffle frames for an exchange, epoch, and sender worker.
+    /// Success does not imply processing or a committed frontier.
     pub async fn catch_up_durable(
         &self,
         exchange_id: u64,
@@ -559,63 +739,99 @@ impl WorkerStreamMultiplexer {
         );
         let path = object_store::path::Path::from(path_str);
 
-        // Read footer. If the file is not found, we simply return Ok(()) as there's nothing to catch up.
+        match store.head(&path).await {
+            Ok(_) => {}
+            Err(object_store::Error::NotFound { .. }) => return Ok(()),
+            Err(error) => {
+                return Err(format!(
+                    "{}: durable shuffle object lookup failed: {error}",
+                    rockstream_types::error_code::RS_3012
+                ))
+            }
+        }
         let footer =
-            match crate::exchange::durable::DurableShuffleReader::read_footer(store, &path).await {
-                Ok(f) => f,
-                Err(e) => {
-                    tracing::warn!("No durable shuffle footer found for {:?}: {:?}", path, e);
-                    return Ok(());
-                }
-            };
+            crate::exchange::durable::DurableShuffleReader::read_footer(store, &path).await?;
 
         for entry in footer.entries {
-            // Check if the target shard is active on this worker by checking if the inlet is registered
-            if let Some(inlet) = registry.get(exchange_id, entry.target_shard) {
-                // Check if this frame is a duplicate by checking if it already exists in the inbox db
-                if let Some(db) = registry.get_shard_db(entry.target_shard) {
-                    let inbox_key = crate::exchange::persistence::inbox_key(
-                        exchange_id,
-                        entry.src_shard,
-                        epoch,
-                        entry.seq,
-                    );
-                    if db
-                        .get(&inbox_key)
-                        .await
-                        .map_err(|e| format!("Inbox DB get error: {:?}", e))?
-                        .is_some()
-                    {
-                        // Frame already processed; skip to avoid duplicates.
-                        continue;
-                    }
+            let db = registry.get_shard_db(entry.target_shard).ok_or_else(|| {
+                format!(
+                    "Durable shuffle target storage is unavailable: shard {}",
+                    entry.target_shard
+                )
+            })?;
+            let claim = DURABLE_INBOX_CLAIM.lock().await;
+            let inbox_key = crate::exchange::persistence::inbox_key(
+                exchange_id,
+                entry.src_shard,
+                epoch,
+                entry.seq,
+            );
+            let frontier = db
+                .get(&rockstream_storage::keys::ShardKeyEncoder::frontier_key())
+                .await
+                .map_err(|e| format!("Committed frontier read error: {:?}", e))?
+                .map(|bytes| {
+                    bytes
+                        .as_ref()
+                        .try_into()
+                        .map(u64::from_be_bytes)
+                        .map_err(|_| "Committed frontier is not a valid epoch".to_owned())
+                })
+                .transpose()?;
+            if frontier.is_some_and(|frontier| epoch <= frontier) {
+                continue;
+            }
+            let inlet = registry.get(exchange_id, entry.target_shard).ok_or_else(|| {
+                format!(
+                    "Durable shuffle target inlet is not registered: exchange {exchange_id}, shard {}",
+                    entry.target_shard
+                )
+            })?;
+            if db
+                .get(&inbox_key)
+                .await
+                .map_err(|e| format!("Inbox DB get error: {:?}", e))?
+                .is_some()
+            {
+                return Err(
+                    "Durable shuffle batch is pending above the committed frontier".to_owned(),
+                );
+            }
 
-                    // Not a duplicate: read payload from object store
-                    let payload = crate::exchange::durable::DurableShuffleReader::read_frame(
-                        store, &path, &entry,
-                    )
+            // Not a duplicate: read payload from object store
+            let payload =
+                crate::exchange::durable::DurableShuffleReader::read_frame(store, &path, &entry)
                     .await?;
 
-                    // Persist to inbox db
-                    crate::exchange::persistence::persist_inbox(
-                        &db,
-                        exchange_id,
-                        entry.src_shard,
-                        epoch,
-                        entry.seq,
-                        &payload,
-                    )
-                    .await?;
+            // Reject corrupt input before recording it as received.
+            let zset =
+                crate::exchange::serialization::deserialize_zset(&payload, inlet.schema.clone())?;
 
-                    // Deserialize ZSet and forward to target inlet
-                    let zset = crate::exchange::serialization::deserialize_zset(
-                        &payload,
-                        inlet.schema.clone(),
-                    )?;
-                    if inlet.sender.send(zset).await.is_err() {
-                        tracing::warn!("Failed to forward durable shuffle batch to local inlet");
-                    }
-                }
+            // Persist to inbox db
+            crate::exchange::persistence::persist_inbox(
+                &db,
+                exchange_id,
+                entry.src_shard,
+                epoch,
+                entry.seq,
+                &payload,
+            )
+            .await?;
+            drop(claim);
+
+            if inlet.sender.send(zset).await.is_err() {
+                let _claim = DURABLE_INBOX_CLAIM.lock().await;
+                crate::exchange::persistence::delete_inbox(
+                    &db,
+                    exchange_id,
+                    entry.src_shard,
+                    epoch,
+                    entry.seq,
+                )
+                .await?;
+                return Err(
+                    "Failed to forward durable shuffle batch: target inlet is closed".to_owned(),
+                );
             }
         }
 

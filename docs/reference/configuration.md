@@ -2,10 +2,12 @@
 
 | Key | Type | Default | Environment | Deprecated | Source | Description |
 | --- | --- | --- | --- | --- | --- | --- |
-| auth.mode | String | off | ROCKSTREAM_AUTH_MODE | false | rockstream-types::config::AuthSection | Explicit --auth selects a mode; OIDC and gateway mTLS require their settings. SCRAM remains unavailable until durable principal grants are enforced. |
+| auth.actor_assertion_public_key_path | Option<PathBuf> | None | ROCKSTREAM_AUTH_ACTOR_ASSERTION_PUBLIC_KEY_PATH | false | rockstream-types::config::AuthSection | Matching single-key RSA RS256 public JWK used by control to verify gateway actor assertions |
+| auth.actor_assertion_signing_key_path | Option<PathBuf> | None | ROCKSTREAM_AUTH_ACTOR_ASSERTION_SIGNING_KEY_PATH | false | rockstream-types::config::AuthSection | Dedicated RSA private key used by an authenticated gateway connected to control; use a distinct key pair from gateway and internal TLS |
+| auth.mode | String | off | ROCKSTREAM_AUTH_MODE | false | rockstream-types::config::AuthSection | Explicit --auth selects off, SCRAM, OIDC, or gateway mTLS. SCRAM requires an enabled durable login; OIDC uses RS256 with a 16 KiB token limit; gateway mTLS requires its settings. MD5 is rejected. |
 | auth.oidc_audience | Option<String> | None | ROCKSTREAM_AUTH_OIDC_AUDIENCE | false | rockstream-types::config::AuthSection | Expected audience for RS256 OIDC bearer tokens; required when auth.mode is oidc |
 | auth.oidc_issuer | Option<String> | None | ROCKSTREAM_AUTH_OIDC_ISSUER | false | rockstream-types::config::AuthSection | Expected issuer for RS256 OIDC bearer tokens; required when auth.mode is oidc |
-| auth.oidc_jwks_url | Option<String> | None | ROCKSTREAM_AUTH_OIDC_JWKS_URL | false | rockstream-types::config::AuthSection | HTTPS or loopback HTTP JWKS endpoint used to verify RS256 tokens; required when auth.mode is oidc |
+| auth.oidc_jwks_url | Option<String> | None | ROCKSTREAM_AUTH_OIDC_JWKS_URL | false | rockstream-types::config::AuthSection | HTTPS or loopback HTTP JWKS endpoint for RS256 tokens; response limit 1 MiB and 100 keys, cache TTL at most 60 seconds honoring shorter issuer lifetime, 5-second fetch timeout, and one retry after 250 milliseconds for transient failures; required when auth.mode is oidc |
 | autotuner.compression_disable_hysteresis_windows | usize | 2 | ROCKSTREAM_AUTOTUNER_COMPRESSION_DISABLE_HYSTERESIS_WINDOWS | false | rockstream-types::config::AutotunerConfig | Windows of high CPU before disabling direct compression |
 | autotuner.compression_reenable_hysteresis_windows | usize | 4 | ROCKSTREAM_AUTOTUNER_COMPRESSION_REENABLE_HYSTERESIS_WINDOWS | false | rockstream-types::config::AutotunerConfig | Windows of low CPU before re-enabling direct compression |
 | autotuner.default_parallelism | usize | 4 | ROCKSTREAM_AUTOTUNER_DEFAULT_PARALLELISM | false | rockstream-types::config::AutotunerConfig | Default operator execution parallelism |
@@ -15,6 +17,7 @@
 | autotuner.hysteresis_scale_up_windows | usize | 3 | ROCKSTREAM_AUTOTUNER_HYSTERESIS_SCALE_UP_WINDOWS | false | rockstream-types::config::AutotunerConfig | Number of consecutive overloaded windows before scale-up |
 | autotuner.max_parallelism | usize | 32 | ROCKSTREAM_AUTOTUNER_MAX_PARALLELISM | false | rockstream-types::config::AutotunerConfig | Maximum allowed operator parallelism |
 | autotuner.min_parallelism | usize | 1 | ROCKSTREAM_AUTOTUNER_MIN_PARALLELISM | false | rockstream-types::config::AutotunerConfig | Minimum allowed operator parallelism |
+| node.deployment_id | Option<String> | None | ROCKSTREAM_NODE_DEPLOYMENT_ID | false | rockstream-types::config::NodeSection | Shared deployment identifier required by gateway actor assertions; configure the same value on gateway and control |
 | scatter_pruning.shard_bloom_budget_bytes | usize | 65536 | ROCKSTREAM_SCATTER_PRUNING_SHARD_BLOOM_BUDGET_BYTES | false | rockstream-types::config::ScatterPruningConfig | Memory budget in bytes allocated for shard bloom filters |
 | scatter_pruning.shard_stats_max_age_checkpoints | u64 | 5 | ROCKSTREAM_SCATTER_PRUNING_SHARD_STATS_MAX_AGE_CHECKPOINTS | false | rockstream-types::config::ScatterPruningConfig | Maximum checkpoint age for shard key statistics |
 | server.listen_addr | String | 127.0.0.1:5432 | ROCKSTREAM_LISTEN_ADDR | false | rockstream-runtime::server | PostgreSQL wire protocol server listen address |
@@ -24,4 +27,6 @@
 | skew_split.max_skew_buckets | u16 | 16 | ROCKSTREAM_SKEW_SPLIT_MAX_SKEW_BUCKETS | false | rockstream-types::config::SkewSplitConfig | Maximum number of sub-buckets per skewed key |
 | storage.base_dir | String | ./data | ROCKSTREAM_STORAGE_DIR | false | rockstream-storage | Local filesystem storage directory root |
 | storage.object_store_url | Option<String> | None | ROCKSTREAM_OBJECT_STORE_URL | false | rockstream-storage | Object store bucket URL (e.g. s3://bucket or minio://bucket) |
+| worker.exchange_advertise_addr | Option<String> | None | — | false | rockstream-types::config::WorkerSection | Reachable host:port registered for worker-to-worker shuffle; must not be a wildcard or use port 0 |
+| worker.exchange_bind_addr | Option<String> | None | — | false | rockstream-types::config::WorkerSection | Local socket address for the worker-to-worker shuffle listener; configure with worker.exchange_advertise_addr |
 

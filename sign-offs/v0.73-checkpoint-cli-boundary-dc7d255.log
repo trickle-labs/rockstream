@@ -1,0 +1,3 @@
+Code revision: dc7d255cba9482a7b4a2e51b35624f31a672d056
+Command: RUSTUP_TOOLCHAIN=1.99.1 rtk cargo test --locked -p rockstream-cli --test cli_disaster_recovery_tests --test disaster_recovery_runbook_tests
+Result: cargo test: 2 passed (2 suites, 5.67s)

@@ -379,3 +379,75 @@ listen_addr = "999.999.999.999:5432"
     assert_eq!(diag_addr.code, "RS-0002");
     assert!(diag_addr.message.contains("invalid socket address"));
 }
+
+#[test]
+fn test_md5_auth_mode_is_rejected_with_release_diagnostic() {
+    let report = validate_config_str("version = 1\n[auth]\nmode = \"md5\"\n", false);
+
+    assert!(!report.valid);
+    assert_eq!(
+        report.to_text(),
+        "[ERROR] auth.mode (RS-0002): authentication mode `md5` is unavailable: MD5 is not a release authentication mode (suggestion: Use a release-supported authentication mode.)"
+    );
+}
+
+#[test]
+fn serving_and_compaction_settings_are_validated_for_both_config_formats() {
+    use rockstream_types::config::{CompactionMode, NodeConfig, RockstreamConfig};
+
+    // The legacy config is also emitted by the doctor diagnostic path.
+    let mut legacy = RockstreamConfig::default();
+    legacy.storage.compaction.mode = CompactionMode::Remote;
+    legacy.gateway.serving.manifest_poll_interval_ms = 50;
+    let report = validate_config_str(&legacy.to_string().unwrap(), false);
+    assert!(
+        report.valid,
+        "legacy config diagnostics: {:?}",
+        report.diagnostics
+    );
+
+    let node = NodeConfig::from(&legacy);
+    let serialized = node.to_string().unwrap();
+    let report = validate_config_str(&serialized, false);
+    assert!(
+        report.valid,
+        "node config diagnostics: {:?}",
+        report.diagnostics
+    );
+    let round_trip = RockstreamConfig::from(&node);
+    assert_eq!(round_trip.storage.compaction.mode, CompactionMode::Remote);
+    assert_eq!(round_trip.gateway.serving.manifest_poll_interval_ms, 50);
+
+    for toml in [
+        "[gateway.serving]\nunknown_setting = true\n",
+        "version = 1\n[gateway.serving]\nunknown_setting = true\n",
+        "[storage.compaction]\nunknown_setting = true\n",
+        "version = 1\n[storage.compaction]\nunknown_setting = true\n",
+    ] {
+        let report = validate_config_str(toml, false);
+        assert!(!report.valid, "unknown config key was accepted: {toml}");
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|d| d.path.ends_with("unknown_setting")));
+    }
+}
+
+#[test]
+fn compactor_role_requires_control_url_in_node_config() {
+    let missing = validate_config_str("version = 1\n[node]\nrole = \"compactor\"\n", false);
+    assert!(missing
+        .diagnostics
+        .iter()
+        .any(|d| { d.path == "node.role" && d.message.contains("requires `control.url`") }));
+
+    let configured = validate_config_str(
+        "version = 1\n[node]\nrole = \"compactor\"\n[control]\nurl = \"127.0.0.1:9200\"\n",
+        false,
+    );
+    assert!(
+        configured.valid,
+        "diagnostics: {:?}",
+        configured.diagnostics
+    );
+}

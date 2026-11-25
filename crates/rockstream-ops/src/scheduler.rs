@@ -51,6 +51,19 @@ impl CreditScheduler {
         self.ops.push(op);
     }
 
+    /// Compile and append a fused stateless kernel (`Filter -> Project -> Map`)
+    /// so adjacent stateless operators execute in a single task without
+    /// inter-stage channels or intermediate `ArrowZSet` allocations.
+    pub fn push_fused_stateless(&mut self, steps: Vec<crate::fused::StatelessStep>) {
+        self.ops
+            .push(Arc::new(crate::fused::FusedStatelessKernel::compile(steps)));
+    }
+
+    /// Number of physical operator tasks currently queued in this scheduler.
+    pub fn op_count(&self) -> usize {
+        self.ops.len()
+    }
+
     /// Build the pipeline: spawn all operator tasks and return the
     /// (source sender, sink receiver) pair.
     ///

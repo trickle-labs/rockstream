@@ -9,17 +9,27 @@ use rockstream_cli::output::{
     ManagementOperationInfo, ManagementOperationsInfo, ManagementShardDetailInfo,
     ManagementShardsInfo,
 };
-use rockstream_control::{CheckpointExportOutcome, CheckpointExportService};
+use rockstream_control::{
+    CheckpointExportOutcome, CheckpointExportService, MANAGEMENT_OPERATION_RECORD_VERSION,
+};
 use rockstream_management_proto::v1::{
-    management_service_client::ManagementServiceClient, CreateBackupRequest,
-    GetClusterStatusRequest, GetOperationRequest, Operation as WireOperation,
+    CreateBackupRequest, GetClusterStatusRequest, GetOperationRequest, Operation as WireOperation,
 };
 use rockstream_storage::build_migration_object_store;
+use rockstream_test_support::pki::TestPki;
 use rockstream_types::checkpoint::ClusterCheckpoint;
 use rockstream_types::ids::ShardId;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
+
+#[path = "common/management_auth.rs"]
+mod management_auth;
+
+use management_auth::{
+    add_client_tls_args, add_identity_tls_args, management_client,
+    preprovision_backup_administrator, try_management_client,
+};
 
 struct RunningNode(Child);
 
@@ -42,6 +52,7 @@ fn start_embedded(
     management_addr: Option<SocketAddr>,
     shared_management_storage: Option<&Path>,
     worker_id: Option<u64>,
+    pki: &TestPki,
 ) -> RunningNode {
     let mut args = vec![
         "start".to_owned(),
@@ -51,7 +62,6 @@ fn start_embedded(
         "all".to_owned(),
         "--auth".to_owned(),
         "off".to_owned(),
-        "--allow-insecure-internal-dev".to_owned(),
         "--listen".to_owned(),
         listen_addr.to_string(),
     ];
@@ -67,15 +77,18 @@ fn start_embedded(
     if let Some(worker_id) = worker_id {
         args.extend(["--worker-id".to_owned(), worker_id.to_string()]);
     }
-    RunningNode(
-        Command::new(binary)
-            .env("RUST_LOG", "off")
-            .args(args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .expect("start embedded role-all node"),
-    )
+    let mut command = Command::new(binary);
+    command
+        .env("RUST_LOG", "off")
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    let (certificate, key) = pki
+        .worker_certs
+        .get(&worker_id.unwrap_or(1))
+        .expect("test PKI has the embedded worker identity");
+    add_identity_tls_args(&mut command, certificate, key, pki);
+    RunningNode(command.spawn().expect("start embedded role-all node"))
 }
 
 async fn connect_gateway(addr: SocketAddr) -> Client {
@@ -110,11 +123,12 @@ async fn wait_for_management(
     management: SocketAddr,
     node: &mut RunningNode,
     expected_nodes: usize,
+    pki: &TestPki,
 ) {
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut last_error;
     loop {
-        match ManagementServiceClient::connect(format!("http://{management}")).await {
+        match try_management_client(management, pki).await {
             Ok(mut client) => match client
                 .get_cluster_status(GetClusterStatusRequest {
                     protocol_version: 1,
@@ -179,9 +193,16 @@ async fn seed_backup_value(storage: &Path, padding_size: usize) {
     db.close().await.expect("close seed shard database");
 }
 
-fn run_backup_create(binary: &Path, management: SocketAddr, destination: &Path) -> Output {
-    Command::new(binary)
-        .env("RUST_LOG", "off")
+fn run_backup_create(
+    binary: &Path,
+    management: SocketAddr,
+    destination: &Path,
+    pki: &TestPki,
+) -> Output {
+    let mut command = Command::new(binary);
+    command.env("RUST_LOG", "off");
+    add_client_tls_args(&mut command, pki);
+    command
         .args([
             "--output",
             "json",
@@ -196,9 +217,16 @@ fn run_backup_create(binary: &Path, management: SocketAddr, destination: &Path) 
         .expect("run management backup create")
 }
 
-fn run_operation_show(binary: &Path, management: SocketAddr, operation_id: &str) -> Output {
-    Command::new(binary)
-        .env("RUST_LOG", "off")
+fn run_operation_show(
+    binary: &Path,
+    management: SocketAddr,
+    operation_id: &str,
+    pki: &TestPki,
+) -> Output {
+    let mut command = Command::new(binary);
+    command.env("RUST_LOG", "off");
+    add_client_tls_args(&mut command, pki);
+    command
         .args([
             "--output",
             "json",
@@ -213,9 +241,11 @@ fn run_operation_show(binary: &Path, management: SocketAddr, operation_id: &str)
         .expect("run management operation show")
 }
 
-fn run_json_status(binary: &Path, management: SocketAddr) -> Output {
-    Command::new(binary)
-        .env("RUST_LOG", "off")
+fn run_json_status(binary: &Path, management: SocketAddr, pki: &TestPki) -> Output {
+    let mut command = Command::new(binary);
+    command.env("RUST_LOG", "off");
+    add_client_tls_args(&mut command, pki);
+    command
         .args([
             "--output",
             "json",
@@ -231,6 +261,7 @@ fn run_documented_management_examples(
     binary: &Path,
     management: SocketAddr,
     operation_id: &str,
+    pki: &TestPki,
 ) -> Vec<Output> {
     let docs = include_str!("../../../docs/reference/management-api.md");
     let examples = docs
@@ -256,8 +287,10 @@ fn run_documented_management_examples(
                     other => other.to_owned(),
                 })
                 .collect::<Vec<_>>();
-            let output = Command::new(binary)
-                .env("RUST_LOG", "off")
+            let mut command = Command::new(binary);
+            command.env("RUST_LOG", "off");
+            add_client_tls_args(&mut command, pki);
+            let output = command
                 .args(args)
                 .output()
                 .expect("run documented management CLI command");
@@ -294,10 +327,9 @@ async fn submit_backup_request(
     management: SocketAddr,
     destination: &Path,
     idempotency_key: &str,
+    pki: &TestPki,
 ) -> ManagementOperationInfo {
-    let mut client = ManagementServiceClient::connect(format!("http://{management}"))
-        .await
-        .expect("connect to management RPC");
+    let mut client = management_client(management, pki).await;
     let response = client
         .create_backup(CreateBackupRequest {
             protocol_version: 1,
@@ -322,7 +354,7 @@ fn expected_operation(state: &str, progress: &str, phase: &str) -> ManagementOpe
         phase: phase.to_owned(),
         error_code: String::new(),
         next_steps: Vec::new(),
-        source_version: "operation-record:2".to_owned(),
+        source_version: format!("operation-record:{MANAGEMENT_OPERATION_RECORD_VERSION}"),
     }
 }
 
@@ -365,6 +397,7 @@ fn normalize_operation(mut operation: ManagementOperationInfo) -> ManagementOper
 fn assert_operation_transcript(
     output: &Output,
     expected: &ManagementOperationInfo,
+    announces_idempotency_key: bool,
 ) -> ManagementOperationInfo {
     assert!(
         output.status.success(),
@@ -375,12 +408,12 @@ fn assert_operation_transcript(
     let transcript = String::from_utf8(output.stdout.clone()).expect("CLI JSON is UTF-8");
     let operation: ManagementOperationInfo =
         serde_json::from_slice(&output.stdout).expect("management operation JSON");
-    assert!(
-        output.stderr.is_empty()
-            || output.stderr == format!("Idempotency-Key: {}\n", operation.operation_id).as_bytes(),
-        "stderr must be empty or contain only the operation's client-visible idempotency key: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let expected_stderr = if announces_idempotency_key {
+        format!("Idempotency-Key: {}\n", operation.operation_id)
+    } else {
+        String::new()
+    };
+    assert_eq!(output.stderr, expected_stderr.as_bytes());
     assert_eq!(
         transcript,
         format!("{}\n", serde_json::to_string_pretty(&operation).unwrap()),
@@ -424,6 +457,13 @@ fn assert_status_transcript(output: &Output, active_operations: u32, retained_op
     assert_eq!(status.nodes[0].source_version, status.source_version);
     let capacity_headroom = status.nodes[0].capacity_headroom;
     assert!((0.0..=1.0).contains(&capacity_headroom));
+    let worker_address = status.nodes[0].address.clone();
+    let address: std::net::SocketAddr = worker_address.parse().expect("worker address");
+    assert_eq!(
+        address.ip(),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    );
+    assert_ne!(address.port(), 0);
 
     status.observed_at = "<timestamp>".to_owned();
     status.source_version = "<source-revision>".to_owned();
@@ -440,7 +480,7 @@ fn assert_status_transcript(output: &Output, active_operations: u32, retained_op
             nodes: vec![ManagementNodeInfo {
                 node_id: 1,
                 role: "worker".to_owned(),
-                address: "127.0.0.1:0".to_owned(),
+                address: worker_address,
                 state: "active".to_owned(),
                 capacity_headroom,
                 host_id: String::new(),
@@ -478,10 +518,11 @@ async fn wait_for_backup_success(
     binary: &Path,
     management: SocketAddr,
     operation_id: &str,
+    pki: &TestPki,
 ) -> ManagementOperationInfo {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let output = run_operation_show(binary, management, operation_id);
+        let output = run_operation_show(binary, management, operation_id, pki);
         assert!(
             output.status.success(),
             "operation show failed: stdout={}, stderr={}",
@@ -492,7 +533,10 @@ async fn wait_for_backup_success(
             serde_json::from_slice(&output.stdout).expect("operation show JSON");
         assert_eq!(operation.operation_id, operation_id);
         assert_eq!(operation.kind, "create_backup");
-        assert_eq!(operation.source_version, "operation-record:2");
+        assert_eq!(
+            operation.source_version,
+            format!("operation-record:{MANAGEMENT_OPERATION_RECORD_VERSION}")
+        );
         let expected = match operation.state.as_str() {
             "pending" => expected_operation("pending", "", ""),
             "running" if operation.phase.starts_with("backup_checkpoint:") => {
@@ -508,7 +552,7 @@ async fn wait_for_backup_success(
             }
             other => panic!("unexpected backup operation state {other:?}"),
         };
-        let verified = assert_operation_transcript(&output, &expected);
+        let verified = assert_operation_transcript(&output, &expected, false);
         if verified.state == "succeeded" {
             return verified;
         }
@@ -522,10 +566,11 @@ async fn wait_for_backup_failure(
     management: SocketAddr,
     operation_id: &str,
     expected: &ManagementOperationInfo,
+    pki: &TestPki,
 ) -> ManagementOperationInfo {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let output = run_operation_show(binary, management, operation_id);
+        let output = run_operation_show(binary, management, operation_id, pki);
         assert!(
             output.status.success(),
             "operation show failed: stdout={}, stderr={}",
@@ -535,7 +580,7 @@ async fn wait_for_backup_failure(
         let operation: ManagementOperationInfo =
             serde_json::from_slice(&output.stdout).expect("failed backup operation JSON");
         match operation.state.as_str() {
-            "failed" => return assert_operation_transcript(&output, expected),
+            "failed" => return assert_operation_transcript(&output, expected, false),
             "pending" | "running" => {}
             other => panic!("backup ended in unexpected state {other}: {operation:?}"),
         }
@@ -548,10 +593,11 @@ async fn wait_for_registered_worker(
     binary: &Path,
     management: SocketAddr,
     retained_operations: u32,
+    pki: &TestPki,
 ) {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        let output = run_json_status(binary, management);
+        let output = run_json_status(binary, management, pki);
         if output.status.success()
             && serde_json::from_slice::<ManagementClusterStatusInfo>(&output.stdout)
                 .is_ok_and(|status| status.nodes.len() == 1)
@@ -577,9 +623,18 @@ async fn release_management_backup_commits_and_restores_real_shard_data() {
     let root = TempDir::new().expect("create backup fixture");
     let storage = root.path().join("source-storage");
     let destination = root.path().join("backup");
+    let invalid_destination = root.path().join("backup-destination-file");
     let restored_storage = root.path().join("restored-storage");
     let listen_addr = free_addr();
     let management_addr = free_addr();
+    let pki = TestPki::generate();
+    preprovision_backup_administrator(
+        binary,
+        &storage,
+        &pki,
+        "all",
+        &[&destination, &invalid_destination],
+    );
     seed_backup_value(&storage, 0).await;
     let node = start_embedded(
         binary,
@@ -588,6 +643,7 @@ async fn release_management_backup_commits_and_restores_real_shard_data() {
         Some(management_addr),
         None,
         None,
+        &pki,
     );
 
     let client = connect_gateway(listen_addr).await;
@@ -614,23 +670,19 @@ async fn release_management_backup_commits_and_restores_real_shard_data() {
         .collect();
     assert_eq!(values, [("1", "662066")]);
 
-    assert_status_transcript(&run_json_status(binary, management_addr), 0, 0);
+    assert_status_transcript(&run_json_status(binary, management_addr, &pki), 0, 0);
 
-    let created = run_backup_create(binary, management_addr, &destination);
+    let created = run_backup_create(binary, management_addr, &destination, &pki);
     let create_response =
-        assert_operation_transcript(&created, &expected_operation("pending", "", ""));
-    assert_eq!(
-        created.stderr,
-        format!("Idempotency-Key: {}\n", create_response.operation_id).as_bytes(),
-        "the client must learn the retry key before a create response can be lost"
-    );
+        assert_operation_transcript(&created, &expected_operation("pending", "", ""), true);
     let operation_id = create_response.operation_id.clone();
     assert!(uuid::Uuid::parse_str(&operation_id).is_ok());
 
-    let terminal = wait_for_backup_success(binary, management_addr, &operation_id).await;
+    let terminal = wait_for_backup_success(binary, management_addr, &operation_id, &pki).await;
     assert_eq!(terminal.state, "succeeded");
 
-    let documented = run_documented_management_examples(binary, management_addr, &operation_id);
+    let documented =
+        run_documented_management_examples(binary, management_addr, &operation_id, &pki);
     assert_eq!(documented.len(), 10);
     assert_status_transcript(&documented[0], 0, 1);
     let status: ManagementClusterStatusInfo = deserialize_exact_json(&documented[0]);
@@ -659,6 +711,8 @@ async fn release_management_backup_commits_and_restores_real_shard_data() {
             "ListShards",
             "GetShard",
             "ListOperations",
+            "ListSecurityPrincipals",
+            "SetSecurityPrincipalGrants",
             "GetOperation",
             "GetConfigSummary",
             "GetCapabilities",
@@ -667,6 +721,8 @@ async fn release_management_backup_commits_and_restores_real_shard_data() {
             "CancelOperation",
             "MigrateShard",
             "CreateBackup",
+            "GenerateSupportArtifact",
+            "DownloadSupportArtifact",
         ]
     );
 
@@ -766,7 +822,7 @@ async fn release_management_backup_commits_and_restores_real_shard_data() {
         "backup must include non-empty shard 0 data"
     );
 
-    assert_status_transcript(&run_json_status(binary, management_addr), 0, 1);
+    assert_status_transcript(&run_json_status(binary, management_addr, &pki), 0, 1);
 
     let restored_store = build_migration_object_store(restored_storage.to_str().unwrap())
         .expect("open restored local object store");
@@ -804,14 +860,14 @@ async fn release_management_backup_commits_and_restores_real_shard_data() {
         b"durable-value"
     );
 
-    let invalid_destination = root.path().join("backup-destination-file");
     std::fs::write(&invalid_destination, b"not a directory")
         .expect("create file at invalid backup destination");
     let os_error = std::fs::create_dir_all(&invalid_destination).unwrap_err();
     let accepted_failure = submit_backup_request(
         management_addr,
         &invalid_destination,
-        "52c0c598-56e5-47de-a191-e1a15f57e21b",
+        "06600000-0000-4000-8000-000000000001",
+        &pki,
     )
     .await;
     assert_eq!(
@@ -829,10 +885,11 @@ async fn release_management_backup_commits_and_restores_real_shard_data() {
         management_addr,
         &accepted_failure.operation_id,
         &expected_failure,
+        &pki,
     )
     .await;
     assert_eq!(failure.state, "failed");
-    assert_status_transcript(&run_json_status(binary, management_addr), 0, 2);
+    assert_status_transcript(&run_json_status(binary, management_addr, &pki), 0, 2);
     drop(client);
     drop(node);
 }
@@ -843,9 +900,18 @@ async fn release_management_backup_idempotency_survives_role_all_restart() {
     let root = TempDir::new().expect("create restart fixture");
     let storage = root.path().join("source-storage");
     let destination = root.path().join("backup");
-    let idempotency_key = "9e4f5d58-0b9f-4f9b-a8b8-50e021713ebb";
+    let different_destination = root.path().join("different-backup");
+    let idempotency_key = "06600000-0000-4000-8000-000000000002";
     let first_listen = free_addr();
     let first_management = free_addr();
+    let pki = TestPki::generate();
+    preprovision_backup_administrator(
+        binary,
+        &storage,
+        &pki,
+        "all",
+        &[&destination, &different_destination],
+    );
     seed_backup_value(&storage, 32 * 1024 * 1024).await;
 
     let mut first_node = start_embedded(
@@ -855,18 +921,17 @@ async fn release_management_backup_idempotency_survives_role_all_restart() {
         Some(first_management),
         None,
         None,
+        &pki,
     );
     let first_client = connect_gateway(first_listen).await;
-    let accepted = submit_backup_request(first_management, &destination, idempotency_key).await;
+    let accepted =
+        submit_backup_request(first_management, &destination, idempotency_key, &pki).await;
     assert_eq!(
         normalize_operation(accepted.clone()),
         expected_operation("pending", "", "")
     );
     let operation_id = accepted.operation_id.clone();
-    let mut first_management_client =
-        ManagementServiceClient::connect(format!("http://{first_management}"))
-            .await
-            .expect("connect to accepted backup operation");
+    let mut first_management_client = management_client(first_management, &pki).await;
     let export_deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let operation = first_management_client
@@ -916,10 +981,11 @@ async fn release_management_backup_idempotency_survives_role_all_restart() {
         Some(second_management),
         None,
         None,
+        &pki,
     );
     let second_client = connect_gateway(second_listen).await;
-    wait_for_registered_worker(binary, second_management, 1).await;
-    let completed = wait_for_backup_success(binary, second_management, &operation_id).await;
+    wait_for_registered_worker(binary, second_management, 1, &pki).await;
+    let completed = wait_for_backup_success(binary, second_management, &operation_id, &pki).await;
     assert_eq!(completed.state, "succeeded");
     drop(second_client);
     second_node
@@ -941,23 +1007,22 @@ async fn release_management_backup_idempotency_survives_role_all_restart() {
         Some(third_management),
         None,
         None,
+        &pki,
     );
     let third_client = connect_gateway(third_listen).await;
-    wait_for_registered_worker(binary, third_management, 1).await;
+    wait_for_registered_worker(binary, third_management, 1, &pki).await;
 
-    let retried = submit_backup_request(third_management, &destination, idempotency_key).await;
+    let retried =
+        submit_backup_request(third_management, &destination, idempotency_key, &pki).await;
     assert_eq!(
         retried, completed,
         "same idempotency key must return the exact durable record"
     );
-    let mut conflict_client =
-        ManagementServiceClient::connect(format!("http://{third_management}"))
-            .await
-            .expect("connect after restart for conflicting retry");
+    let mut conflict_client = management_client(third_management, &pki).await;
     let conflict = conflict_client
         .create_backup(CreateBackupRequest {
             protocol_version: 1,
-            destination: root.path().join("different-backup").display().to_string(),
+            destination: different_destination.display().to_string(),
             idempotency_key: idempotency_key.to_owned(),
         })
         .await
@@ -969,10 +1034,11 @@ async fn release_management_backup_idempotency_survives_role_all_restart() {
             "idempotency key is already bound to operation {operation_id} with a different request"
         )
     );
-    let shown = run_operation_show(binary, third_management, &operation_id);
+    let shown = run_operation_show(binary, third_management, &operation_id, &pki);
     let after_restart = assert_operation_transcript(
         &shown,
         &expected_operation("succeeded", "100%", "completed"),
+        false,
     );
     assert_eq!(after_restart, completed);
 
@@ -1002,36 +1068,57 @@ async fn release_management_backup_idempotency_is_atomic_across_processes() {
     let shared_storage = root.path().join("shared-control");
     let first_management = free_addr();
     let second_management = free_addr();
+    let first_storage = root.path().join("control-one");
+    let second_storage = root.path().join("control-two");
+    let destination = root.path().join("backup");
+    let different_destination = root.path().join("different-backup");
+    let idempotency_key = "06600000-0000-4000-8000-000000000003";
+    let pki = TestPki::generate();
+    preprovision_backup_administrator(
+        binary,
+        &first_storage,
+        &pki,
+        "all",
+        &[&destination, &different_destination],
+    );
+    preprovision_backup_administrator(
+        binary,
+        &second_storage,
+        &pki,
+        "all",
+        &[&destination, &different_destination],
+    );
     let mut first_node = start_embedded(
         binary,
-        &root.path().join("control-one"),
+        &first_storage,
         free_addr(),
         Some(first_management),
         Some(&shared_storage),
         Some(1),
+        &pki,
     );
     let mut second_node = start_embedded(
         binary,
-        &root.path().join("control-two"),
+        &second_storage,
         free_addr(),
         Some(second_management),
         Some(&shared_storage),
         Some(2),
+        &pki,
     );
-    wait_for_management(first_management, &mut first_node, 1).await;
-    wait_for_management(second_management, &mut second_node, 1).await;
+    wait_for_management(first_management, &mut first_node, 1, &pki).await;
+    wait_for_management(second_management, &mut second_node, 1, &pki).await;
 
-    let destination = root.path().join("backup");
-    let idempotency_key = "8588bd32-b83a-4cb1-a4de-13c0c2e2cc19";
     let (first, second) = tokio::join!(
-        submit_backup_request(first_management, &destination, idempotency_key),
-        submit_backup_request(second_management, &destination, idempotency_key),
+        submit_backup_request(first_management, &destination, idempotency_key, &pki),
+        submit_backup_request(second_management, &destination, idempotency_key, &pki),
     );
     assert_eq!(
         first.operation_id, second.operation_id,
         "independent management processes must share one durable idempotency claim"
     );
-    let completed = wait_for_backup_success(binary, first_management, &first.operation_id).await;
+    let completed =
+        wait_for_backup_success(binary, first_management, &first.operation_id, &pki).await;
     assert_eq!(completed.state, "succeeded");
     let generation = format!("management-{}", first.operation_id);
     let generation_root = destination.join("checkpoint-exports");
@@ -1043,13 +1130,11 @@ async fn release_management_backup_idempotency_is_atomic_across_processes() {
     assert_eq!(generations.as_slice(), std::slice::from_ref(&generation));
     assert!(generation_root.join(&generation).join("commit").is_file());
 
-    let mut client = ManagementServiceClient::connect(format!("http://{second_management}"))
-        .await
-        .expect("connect to second management process");
+    let mut client = management_client(second_management, &pki).await;
     let conflict = client
         .create_backup(CreateBackupRequest {
             protocol_version: 1,
-            destination: root.path().join("different-backup").display().to_string(),
+            destination: different_destination.display().to_string(),
             idempotency_key: idempotency_key.to_owned(),
         })
         .await
@@ -1071,28 +1156,46 @@ async fn release_management_backups_allocate_distinct_checkpoints_concurrently()
     let binary = Path::new(env!("CARGO_BIN_EXE_rockstream"));
     let root = TempDir::new().expect("create concurrent-backup fixture");
     let storage = root.path().join("source-storage");
-    seed_backup_value(&storage, 0).await;
-    let management = free_addr();
-    let mut node = start_embedded(binary, &storage, free_addr(), Some(management), None, None);
-    wait_for_management(management, &mut node, 1).await;
     let first_destination = root.path().join("backup-one");
     let second_destination = root.path().join("backup-two");
+    let pki = TestPki::generate();
+    preprovision_backup_administrator(
+        binary,
+        &storage,
+        &pki,
+        "all",
+        &[&first_destination, &second_destination],
+    );
+    seed_backup_value(&storage, 0).await;
+    let management = free_addr();
+    let mut node = start_embedded(
+        binary,
+        &storage,
+        free_addr(),
+        Some(management),
+        None,
+        None,
+        &pki,
+    );
+    wait_for_management(management, &mut node, 1, &pki).await;
     let (first, second) = tokio::join!(
         submit_backup_request(
             management,
             &first_destination,
-            "7f3a4c19-6ef5-43ed-8861-8bf9ee64065f",
+            "06600000-0000-4000-8000-000000000004",
+            &pki,
         ),
         submit_backup_request(
             management,
             &second_destination,
-            "a541d597-0e77-4ec5-9fe4-3d5dd7c42d4e",
+            "06600000-0000-4000-8000-000000000005",
+            &pki,
         ),
     );
     assert_ne!(first.operation_id, second.operation_id);
 
-    let first = wait_for_backup_success(binary, management, &first.operation_id).await;
-    let second = wait_for_backup_success(binary, management, &second.operation_id).await;
+    let first = wait_for_backup_success(binary, management, &first.operation_id, &pki).await;
+    let second = wait_for_backup_success(binary, management, &second.operation_id, &pki).await;
     assert_eq!(first.state, "succeeded");
     assert_eq!(second.state, "succeeded");
 

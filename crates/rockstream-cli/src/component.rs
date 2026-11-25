@@ -28,6 +28,7 @@ pub type ComponentState = LifecycleState;
 
 /// Common interface for all runtime components.
 #[async_trait::async_trait]
+#[allow(clippy::double_must_use)]
 pub trait Component: Send + Sync {
     /// Return the static name of this component.
     fn name(&self) -> &'static str;

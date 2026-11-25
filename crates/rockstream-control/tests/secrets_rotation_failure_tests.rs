@@ -3,6 +3,7 @@ use object_store::{path::Path as ObjectPath, ObjectStore};
 use rockstream_control::audit::FileAuditLog;
 use rockstream_control::kek::{EnvKekProvider, KekError, KekProvider, RetainedKekProvider};
 use rockstream_control::secret_store::{SecretStore, CATALOG_SECRETS_PREFIX};
+use rockstream_storage::catalog::DurableCatalogStore;
 use rockstream_types::secret::{Secret, SecretType};
 use slatedb::Db;
 use std::collections::{BTreeMap, HashMap};
@@ -21,6 +22,19 @@ async fn open_db(dir: &TempDir) -> Arc<Db> {
         .await
         .unwrap(),
     )
+}
+
+fn test_secret_store(db: Option<Arc<Db>>, provider: Arc<dyn KekProvider>) -> SecretStore {
+    let durable = db.is_some();
+    let store = SecretStore::new(db, provider);
+    if !durable {
+        return store;
+    }
+    let audit_catalog = Arc::new(DurableCatalogStore::new(
+        Arc::new(object_store::memory::InMemory::new()),
+        "rotation-test",
+    ));
+    store.with_security_audit_catalog(audit_catalog)
 }
 
 struct FailSecondWrap {
@@ -126,7 +140,7 @@ async fn failed_second_wrap_preserves_every_secret_and_allows_retry() {
             None
         };
         let audit_path = dir.path().join("audit.jsonl");
-        let store = SecretStore::new(db.clone(), Arc::new(EnvKekProvider::new([1; 32])))
+        let store = test_secret_store(db.clone(), Arc::new(EnvKekProvider::new([1; 32])))
             .with_audit_log(Arc::new(FileAuditLog::open(&audit_path).unwrap()));
         let expected = seed(&store).await;
         let before = if let Some(db) = &db {
@@ -171,7 +185,7 @@ async fn failed_second_wrap_preserves_every_secret_and_allows_retry() {
             drop(store);
             db.close().await.unwrap();
             let db = open_db(&dir).await;
-            let store = SecretStore::new(Some(db.clone()), Arc::new(EnvKekProvider::new([2; 32])));
+            let store = test_secret_store(Some(db.clone()), Arc::new(EnvKekProvider::new([2; 32])));
             assert_secrets(&store, &expected).await;
             db.close().await.unwrap();
         }
@@ -220,7 +234,7 @@ async fn cancelled_preparation_and_rejected_commit_survive_reopen_and_retry() {
     for cancel in [true, false] {
         let dir = TempDir::new().unwrap();
         let db = open_db(&dir).await;
-        let store = Arc::new(SecretStore::new(
+        let store = Arc::new(test_secret_store(
             Some(db.clone()),
             Arc::new(EnvKekProvider::new([1; 32])),
         ));
@@ -253,7 +267,7 @@ async fn cancelled_preparation_and_rejected_commit_survive_reopen_and_retry() {
         }
         drop(store);
         let db = open_db(&dir).await;
-        let store = SecretStore::new(Some(db.clone()), Arc::new(EnvKekProvider::new([1; 32])));
+        let store = test_secret_store(Some(db.clone()), Arc::new(EnvKekProvider::new([1; 32])));
         assert_secrets(&store, &expected).await;
         assert_eq!(
             store
@@ -270,7 +284,7 @@ async fn cancelled_preparation_and_rejected_commit_survive_reopen_and_retry() {
 #[tokio::test]
 async fn rotation_serializes_reads_writes_and_other_rotations() {
     for operation in ["read", "create", "alter", "drop", "rotate"] {
-        let store = Arc::new(SecretStore::new(
+        let store = Arc::new(test_secret_store(
             None,
             Arc::new(EnvKekProvider::new([1; 32])),
         ));
@@ -478,7 +492,7 @@ async fn submitted_rotation_survives_cancellation_and_wal_errors() {
         );
         let previous = Arc::new(EnvKekProvider::new([1; 32]));
         let replacement = Arc::new(EnvKekProvider::new([2; 32]));
-        let store = Arc::new(SecretStore::new(Some(db.clone()), previous.clone()));
+        let store = Arc::new(test_secret_store(Some(db.clone()), previous.clone()));
         let expected = seed(&store).await;
         db.flush().await.unwrap();
         let before = catalog(&db).await;
@@ -531,7 +545,7 @@ async fn submitted_rotation_survives_cancellation_and_wal_errors() {
             catalog(&db).await,
             if action == 2 { before } else { submitted }
         );
-        let store = SecretStore::new(
+        let store = test_secret_store(
             Some(db.clone()),
             Arc::new(RetainedKekProvider::new(replacement.clone(), previous)),
         );
@@ -544,7 +558,7 @@ async fn submitted_rotation_survives_cancellation_and_wal_errors() {
         drop(store);
         db.close().await.unwrap();
         let db = open_db(&dir).await;
-        let store = SecretStore::new(Some(db.clone()), replacement);
+        let store = test_secret_store(Some(db.clone()), replacement);
         assert_secrets(&store, &expected).await;
         db.close().await.unwrap();
     }
@@ -556,7 +570,7 @@ async fn retained_keys_recover_a_legacy_partial_rotation() {
     let db = open_db(&dir).await;
     let previous = Arc::new(EnvKekProvider::new([1; 32]));
     let replacement = Arc::new(EnvKekProvider::new([2; 32]));
-    let store = SecretStore::new(Some(db.clone()), previous.clone());
+    let store = test_secret_store(Some(db.clone()), previous.clone());
     let expected = seed(&store).await;
     // Build the on-disk state produced by older releases after their first replacement.
     let (key, bytes) = catalog(&db).await.into_iter().next().unwrap();
@@ -574,7 +588,7 @@ async fn retained_keys_recover_a_legacy_partial_rotation() {
     drop(store);
     db.close().await.unwrap();
     let db = open_db(&dir).await;
-    let store = SecretStore::new(
+    let store = test_secret_store(
         Some(db.clone()),
         Arc::new(RetainedKekProvider::new(replacement.clone(), previous)),
     );
@@ -586,7 +600,7 @@ async fn retained_keys_recover_a_legacy_partial_rotation() {
     drop(store);
     db.close().await.unwrap();
     let db = open_db(&dir).await;
-    let store = SecretStore::new(Some(db.clone()), replacement);
+    let store = test_secret_store(Some(db.clone()), replacement);
     assert_secrets(&store, &expected).await;
     db.close().await.unwrap();
 }
@@ -600,7 +614,7 @@ async fn empty_and_successful_rotation_preserve_all_records() {
         } else {
             None
         };
-        let store = SecretStore::new(db.clone(), Arc::new(EnvKekProvider::new([1; 32])));
+        let store = test_secret_store(db.clone(), Arc::new(EnvKekProvider::new([1; 32])));
         assert_eq!(
             store
                 .rotate_kek(Arc::new(EnvKekProvider::new([2; 32])), "test")
@@ -621,7 +635,7 @@ async fn empty_and_successful_rotation_preserve_all_records() {
             drop(store);
             db.close().await.unwrap();
             let db = open_db(&dir).await;
-            let store = SecretStore::new(Some(db.clone()), Arc::new(EnvKekProvider::new([3; 32])));
+            let store = test_secret_store(Some(db.clone()), Arc::new(EnvKekProvider::new([3; 32])));
             assert_secrets(&store, &expected).await;
             db.close().await.unwrap();
         }

@@ -17,7 +17,6 @@ in the test corpus.
 | `AuthenticationSASL` | B→F | `auth_scram_tests.rs::test_scram_tokio_postgres_connects` |
 | `AuthenticationSASLContinue` | B→F | `gateway_proof_tests.rs::test_scram_auth_flow_unit` |
 | `AuthenticationSASLFinal` | B→F | `gateway_proof_tests.rs::test_scram_auth_flow_unit` |
-| `AuthenticationMD5Password` | B→F | `auth_scram_tests.rs::test_md5_tokio_postgres_connects` |
 | `AuthenticationOk` | B→F | `gateway_proof_tests.rs::test_scram_auth_flow_unit` |
 
 ---

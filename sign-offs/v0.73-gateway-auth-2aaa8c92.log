@@ -1,0 +1,806 @@
+warning: unused field `repository` in `workspace.package`
+  --> Cargo.toml:36:1
+   |
+36 | repository = "https://github.com/trickle-labs/rockstream"
+   | ^^^^^^^^^^
+   |
+   = note: `cargo::unused_workspace_package_fields` is set to `warn` by default
+help: consider removing the field `workspace.package.repository`
+warning: workspace (manifest) generated 1 warning
+warning: missing `[lints]` to inherit `[workspace.lints]`
+  --> crates/rockstream-types/Cargo.toml
+   = note: `cargo::missing_lints_inheritance` is set to `warn` by default
+help: to inherit `workspace.lints, add:
+   |
+34 ~ tempfile = "3"
+35 + [lints]
+36 + workspace = true
+   |
+help: to clarify your intent to not inherit, add:
+   |
+34 ~ tempfile = "3"
+35 + [lints]
+   |
+warning: `rockstream-types` (manifest) generated 1 warning
+warning: missing `[lints]` to inherit `[workspace.lints]`
+  --> crates/rockstream-plan/Cargo.toml
+   = note: `cargo::missing_lints_inheritance` is set to `warn` by default
+help: to inherit `workspace.lints, add:
+   |
+15 ~ serde_json = { workspace = true }
+16 + [lints]
+17 + workspace = true
+   |
+help: to clarify your intent to not inherit, add:
+   |
+15 ~ serde_json = { workspace = true }
+16 + [lints]
+   |
+warning: `rockstream-plan` (manifest) generated 1 warning
+warning: missing `[lints]` to inherit `[workspace.lints]`
+  --> crates/rockstream-storage/Cargo.toml
+   = note: `cargo::missing_lints_inheritance` is set to `warn` by default
+help: to inherit `workspace.lints, add:
+   |
+48 ~ criterion = { workspace = true, features = ["async_tokio"] }
+49 + [lints]
+50 + workspace = true
+   |
+help: to clarify your intent to not inherit, add:
+   |
+48 ~ criterion = { workspace = true, features = ["async_tokio"] }
+49 + [lints]
+   |
+warning: `rockstream-storage` (manifest) generated 1 warning
+warning: missing `[lints]` to inherit `[workspace.lints]`
+  --> crates/rockstream-test-support/Cargo.toml
+   = note: `cargo::missing_lints_inheritance` is set to `warn` by default
+help: to inherit `workspace.lints, add:
+   |
+23 ~ sha2 = { workspace = true }
+24 + [lints]
+25 + workspace = true
+   |
+help: to clarify your intent to not inherit, add:
+   |
+23 ~ sha2 = { workspace = true }
+24 + [lints]
+   |
+warning: `rockstream-test-support` (manifest) generated 1 warning
+warning: missing `[lints]` to inherit `[workspace.lints]`
+  --> crates/rockstream-management-proto/Cargo.toml
+   = note: `cargo::missing_lints_inheritance` is set to `warn` by default
+help: to inherit `workspace.lints, add:
+   |
+19 ~ tokio = { workspace = true }
+20 + [lints]
+21 + workspace = true
+   |
+help: to clarify your intent to not inherit, add:
+   |
+19 ~ tokio = { workspace = true }
+20 + [lints]
+   |
+warning: `rockstream-management-proto` (manifest) generated 1 warning
+warning: missing `[lints]` to inherit `[workspace.lints]`
+  --> crates/rockstream-ops/Cargo.toml
+   = note: `cargo::missing_lints_inheritance` is set to `warn` by default
+help: to inherit `workspace.lints, add:
+   |
+93 ~ workspace = true
+94 + [lints]
+95 + workspace = true
+   |
+help: to clarify your intent to not inherit, add:
+   |
+93 ~ workspace = true
+94 + [lints]
+   |
+warning: `rockstream-ops` (manifest) generated 1 warning
+warning: missing `[lints]` to inherit `[workspace.lints]`
+  --> crates/rockstream-diff/Cargo.toml
+   = note: `cargo::missing_lints_inheritance` is set to `warn` by default
+help: to inherit `workspace.lints, add:
+   |
+13 ~ tracing = { workspace = true }
+14 + [lints]
+15 + workspace = true
+   |
+help: to clarify your intent to not inherit, add:
+   |
+13 ~ tracing = { workspace = true }
+14 + [lints]
+   |
+warning: `rockstream-diff` (manifest) generated 1 warning
+warning: missing `[lints]` to inherit `[workspace.lints]`
+  --> crates/rockstream-runtime/Cargo.toml
+   = note: `cargo::missing_lints_inheritance` is set to `warn` by default
+help: to inherit `workspace.lints, add:
+   |
+69 ~ criterion = { workspace = true, features = ["async_tokio"] }
+70 + [lints]
+71 + workspace = true
+   |
+help: to clarify your intent to not inherit, add:
+   |
+69 ~ criterion = { workspace = true, features = ["async_tokio"] }
+70 + [lints]
+   |
+warning: `rockstream-runtime` (manifest) generated 1 warning
+warning: missing `[lints]` to inherit `[workspace.lints]`
+  --> fuzz/Cargo.toml
+   = note: `cargo::missing_lints_inheritance` is set to `warn` by default
+help: to inherit `workspace.lints, add:
+   |
+64 ~ doc = false
+65 + [lints]
+66 + workspace = true
+   |
+help: to clarify your intent to not inherit, add:
+   |
+64 ~ doc = false
+65 + [lints]
+   |
+warning: `rockstream-fuzz` (manifest) generated 1 warning
+warning: missing `[lints]` to inherit `[workspace.lints]`
+  --> crates/rockstream-sql/Cargo.toml
+   = note: `cargo::missing_lints_inheritance` is set to `warn` by default
+help: to inherit `workspace.lints, add:
+   |
+47 ~ bytes = { workspace = true }
+48 + [lints]
+49 + workspace = true
+   |
+help: to clarify your intent to not inherit, add:
+   |
+47 ~ bytes = { workspace = true }
+48 + [lints]
+   |
+warning: `rockstream-sql` (manifest) generated 1 warning
+warning: missing `[lints]` to inherit `[workspace.lints]`
+  --> crates/rockstream-sim/Cargo.toml
+   = note: `cargo::missing_lints_inheritance` is set to `warn` by default
+help: to inherit `workspace.lints, add:
+   |
+59 ~ rockstream-docgen = { workspace = true }
+60 + [lints]
+61 + workspace = true
+   |
+help: to clarify your intent to not inherit, add:
+   |
+59 ~ rockstream-docgen = { workspace = true }
+60 + [lints]
+   |
+warning: `rockstream-sim` (manifest) generated 1 warning
+warning: missing `[lints]` to inherit `[workspace.lints]`
+  --> crates/rockstream-control/Cargo.toml
+   = note: `cargo::missing_lints_inheritance` is set to `warn` by default
+help: to inherit `workspace.lints, add:
+   |
+65 ~ serde_json = { workspace = true }
+66 + [lints]
+67 + workspace = true
+   |
+help: to clarify your intent to not inherit, add:
+   |
+65 ~ serde_json = { workspace = true }
+66 + [lints]
+   |
+warning: `rockstream-control` (manifest) generated 1 warning
+warning: missing `[lints]` to inherit `[workspace.lints]`
+  --> crates/rockstream-connectors/Cargo.toml
+   = note: `cargo::missing_lints_inheritance` is set to `warn` by default
+help: to inherit `workspace.lints, add:
+   |
+49 ~ rand = { version = "0.8", features = ["small_rng"] }
+50 + [lints]
+51 + workspace = true
+   |
+help: to clarify your intent to not inherit, add:
+   |
+49 ~ rand = { version = "0.8", features = ["small_rng"] }
+50 + [lints]
+   |
+warning: `rockstream-connectors` (manifest) generated 1 warning
+warning: missing `[lints]` to inherit `[workspace.lints]`
+  --> crates/rockstream-oracle/Cargo.toml
+   = note: `cargo::missing_lints_inheritance` is set to `warn` by default
+help: to inherit `workspace.lints, add:
+   |
+43 ~ toml = { workspace = true }
+44 + [lints]
+45 + workspace = true
+   |
+help: to clarify your intent to not inherit, add:
+   |
+43 ~ toml = { workspace = true }
+44 + [lints]
+   |
+warning: `rockstream-oracle` (manifest) generated 1 warning
+warning: missing `[lints]` to inherit `[workspace.lints]`
+  --> crates/rockstream-docgen/Cargo.toml
+   = note: `cargo::missing_lints_inheritance` is set to `warn` by default
+help: to inherit `workspace.lints, add:
+   |
+34 ~ tokio = { workspace = true }
+35 + [lints]
+36 + workspace = true
+   |
+help: to clarify your intent to not inherit, add:
+   |
+34 ~ tokio = { workspace = true }
+35 + [lints]
+   |
+warning: `rockstream-docgen` (manifest) generated 1 warning
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.45
+   Compiling unicode-ident v1.0.24
+   Compiling libc v0.2.186
+   Compiling cfg-if v1.0.4
+   Compiling serde_core v1.0.228
+   Compiling serde v1.0.228
+   Compiling memchr v2.8.1
+   Compiling shlex v2.0.1
+   Compiling find-msvc-tools v0.1.9
+   Compiling equivalent v1.0.2
+   Compiling itoa v1.0.18
+   Compiling once_cell v1.21.4
+   Compiling autocfg v1.5.1
+   Compiling pin-project-lite v0.2.17
+   Compiling smallvec v1.15.1
+   Compiling pkg-config v0.3.33
+   Compiling parking_lot_core v0.9.12
+   Compiling scopeguard v1.2.0
+   Compiling foldhash v0.2.0
+   Compiling allocator-api2 v0.2.21
+   Compiling lock_api v0.4.14
+   Compiling bitflags v2.11.1
+   Compiling futures-core v0.3.32
+   Compiling libm v0.2.16
+   Compiling version_check v0.9.5
+   Compiling num-traits v0.2.19
+   Compiling log v0.4.30
+   Compiling core-foundation-sys v0.8.7
+   Compiling hashbrown v0.17.1
+   Compiling jobserver v0.1.34
+   Compiling slab v0.4.12
+   Compiling zerocopy v0.8.50
+   Compiling futures-sink v0.3.32
+   Compiling futures-channel v0.3.32
+   Compiling cc v1.2.63
+   Compiling errno v0.3.14
+   Compiling syn v2.0.117
+   Compiling signal-hook-registry v1.4.8
+   Compiling mio v1.2.1
+   Compiling socket2 v0.6.4
+   Compiling futures-io v0.3.32
+   Compiling parking_lot v0.12.5
+   Compiling futures-task v0.3.32
+   Compiling zmij v1.0.21
+   Compiling serde_json v1.0.154
+   Compiling getrandom v0.3.4
+   Compiling indexmap v2.14.0
+   Compiling tracing-core v0.1.36
+   Compiling iana-time-zone v0.1.65
+   Compiling percent-encoding v2.3.2
+   Compiling foldhash v0.1.5
+   Compiling regex-syntax v0.8.10
+   Compiling hashbrown v0.15.5
+   Compiling stable_deref_trait v1.2.1
+   Compiling siphasher v1.0.3
+   Compiling getrandom v0.4.2
+   Compiling rand_core v0.9.5
+   Compiling rand_core v0.10.1
+   Compiling zstd-sys v2.1.2+zstd.1.5.7
+   Compiling ryu v1.0.23
+   Compiling phf_shared v0.12.1
+   Compiling num-integer v0.1.46
+   Compiling ahash v0.8.12
+   Compiling writeable v0.6.3
+   Compiling typenum v1.20.1
+   Compiling chrono-tz v0.10.4
+   Compiling litemap v0.8.2
+   Compiling num-bigint v0.5.1
+   Compiling arrow-schema v59.3.2
+   Compiling phf v0.12.1
+   Compiling utf8_iter v1.0.4
+   Compiling icu_normalizer_data v2.2.0
+   Compiling icu_properties_data v2.2.0
+   Compiling num-complex v0.4.6
+   Compiling subtle v2.6.1
+   Compiling either v1.16.0
+   Compiling base64 v0.23.1
+   Compiling form_urlencoded v1.2.2
+   Compiling zstd-safe v7.4.1
+   Compiling lexical-util v1.0.7
+   Compiling thiserror v2.0.18
+   Compiling rustix v1.1.6
+   Compiling semver v1.0.28
+   Compiling synstructure v0.13.2
+   Compiling rustc_version v0.4.1
+   Compiling uuid v1.23.2
+   Compiling aho-corasick v1.1.4
+   Compiling lexical-write-integer v1.0.6
+   Compiling lexical-parse-integer v1.0.6
+   Compiling flatbuffers v25.12.19
+   Compiling lexical-parse-float v1.0.6
+   Compiling lexical-write-float v1.0.6
+   Compiling unicode-segmentation v1.13.3
+   Compiling unicode-width v0.2.2
+   Compiling atoi v2.0.0
+   Compiling itertools v0.14.0
+   Compiling csv-core v0.1.13
+   Compiling lexical-core v1.0.6
+   Compiling crc32fast v1.5.4
+   Compiling same-file v1.0.6
+   Compiling comfy-table v7.2.2
+   Compiling simdutf8 v0.1.5
+   Compiling walkdir v2.5.0
+   Compiling csv v1.4.0
+   Compiling regex-automata v0.4.14
+   Compiling serde_derive v1.0.228
+   Compiling tokio-macros v2.7.0
+   Compiling futures-macro v0.3.32
+   Compiling zerocopy-derive v0.8.50
+   Compiling tracing-attributes v0.1.31
+   Compiling displaydoc v0.2.6
+   Compiling zerofrom-derive v0.1.7
+   Compiling yoke-derive v0.8.2
+   Compiling futures-util v0.3.32
+   Compiling zerovec-derive v0.11.3
+   Compiling async-trait v0.1.89
+   Compiling tracing v0.1.44
+   Compiling thiserror-impl v2.0.18
+   Compiling zerofrom v0.1.8
+   Compiling regex v1.12.3
+   Compiling pin-project-internal v1.1.13
+   Compiling hybrid-array v0.4.12
+   Compiling yoke v0.8.2
+   Compiling generic-array v0.14.7
+   Compiling humantime v2.3.0
+   Compiling zerovec v0.11.6
+   Compiling zerotrie v0.2.4
+   Compiling pin-project v1.1.13
+   Compiling crossbeam-utils v0.8.21
+   Compiling cmov v0.5.4
+   Compiling crypto-common v0.2.2
+   Compiling tinystr v0.8.3
+   Compiling potential_utf v0.1.5
+   Compiling bytes v1.12.1
+   Compiling chrono v0.4.45
+   Compiling icu_locale_core v2.2.0
+   Compiling icu_collections v2.2.0
+   Compiling futures-executor v0.3.32
+   Compiling ctutils v0.4.4
+   Compiling futures v0.3.32
+   Compiling block-buffer v0.12.1
+   Compiling itertools v0.15.0
+   Compiling object v0.37.3
+   Compiling tokio v1.53.3
+   Compiling http v1.4.1
+   Compiling fastrand v2.4.1
+   Compiling const-oid v0.10.2
+   Compiling digest v0.11.3
+   Compiling icu_provider v2.2.0
+   Compiling icu_normalizer v2.2.0
+   Compiling icu_properties v2.2.0
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling ppv-lite86 v0.2.21
+   Compiling half v2.7.1
+   Compiling digest v0.10.7
+   Compiling rand_chacha v0.9.0
+   Compiling md-5 v0.11.0
+   Compiling cmake v0.1.58
+   Compiling arrow-buffer v59.3.2
+   Compiling rand v0.9.4
+   Compiling idna_adapter v1.2.2
+   Compiling getrandom v0.2.17
+   Compiling base64 v0.22.1
+   Compiling idna v1.1.0
+   Compiling adler2 v2.0.1
+   Compiling twox-hash v2.1.2
+   Compiling fs_extra v1.3.0
+   Compiling dunce v1.0.5
+   Compiling simd-adler32 v0.3.9
+   Compiling url v2.5.8
+   Compiling arrow-data v59.3.2
+   Compiling aws-lc-sys v0.45.0
+   Compiling lz4_flex v0.14.0
+   Compiling miniz_oxide v0.8.9
+   Compiling ring v0.17.14
+   Compiling stacker v0.1.24
+   Compiling zeroize v1.8.2
+   Compiling alloc-no-stdlib v2.0.4
+   Compiling zlib-rs v0.6.3
+   Compiling ar_archive_writer v0.5.1
+   Compiling alloc-stdlib v0.2.2
+   Compiling cpufeatures v0.3.0
+   Compiling snap v1.1.1
+   Compiling fixedbitset v0.5.7
+   Compiling hex v0.4.3
+   Compiling sha2 v0.11.0
+   Compiling brotli-decompressor v5.0.1
+   Compiling psm v0.1.31
+   Compiling rustls-pki-types v1.14.1
+   Compiling tokio-util v0.7.18
+   Compiling http-body v1.0.1
+   Compiling recursive-proc-macro-impl v0.1.1
+   Compiling aws-lc-rs v1.18.1
+   Compiling tower-service v0.3.3
+   Compiling brotli v8.0.3
+   Compiling object_store v0.13.2
+   Compiling recursive v0.1.1
+   Compiling arrow-array v59.3.2
+   Compiling sqlparser_derive v0.5.0
+   Compiling hashbrown v0.14.5
+   Compiling seq-macro v0.3.6
+   Compiling untrusted v0.9.0
+   Compiling dashmap v6.2.1
+   Compiling sqlparser v0.62.0
+   Compiling anyhow v1.0.104
+   Compiling untrusted v0.7.1
+   Compiling arrayvec v0.7.6
+   Compiling fnv v1.0.7
+   Compiling rustls v0.23.46
+   Compiling flate2 v1.1.9
+   Compiling arrow-select v59.3.2
+   Compiling arrow-arith v59.3.2
+   Compiling arrow-row v59.3.2
+   Compiling httparse v1.10.1
+   Compiling try-lock v0.2.5
+   Compiling atomic-waker v1.1.2
+   Compiling h2 v0.4.16
+   Compiling want v0.3.1
+   Compiling http-body-util v0.1.3
+   Compiling datafusion-doc v55.2.0
+   Compiling httpdate v1.0.3
+   Compiling socket2 v0.5.10
+   Compiling tower-layer v0.3.3
+   Compiling ipnet v2.12.0
+   Compiling arrow-ord v59.3.2
+   Compiling arrow-string v59.3.2
+   Compiling sync_wrapper v1.0.2
+   Compiling tempfile v3.27.0
+   Compiling petgraph v0.8.3
+   Compiling blake3 v1.8.5
+   Compiling syn v3.0.9
+   Compiling security-framework-sys v2.17.0
+   Compiling arrow-cast v59.3.2
+   Compiling hyper v1.10.1
+   Compiling core-foundation v0.10.1
+   Compiling security-framework v3.7.0
+   Compiling zstd v0.13.4
+   Compiling arrow-ipc v59.3.2
+   Compiling arrow-json v59.3.2
+   Compiling arrow-csv v59.3.2
+   Compiling hyper-util v0.1.20
+   Compiling datafusion-macros v55.2.0
+   Compiling tower v0.5.3
+   Compiling rustversion v1.0.22
+   Compiling arrow v59.3.2
+   Compiling parquet v59.3.2
+   Compiling num-conv v0.2.2
+   Compiling powerfmt v0.2.0
+   Compiling time-core v0.1.8
+   Compiling constant_time_eq v0.4.2
+   Compiling arrayref v0.3.9
+   Compiling time-macros v0.2.27
+   Compiling deranged v0.5.8
+   Compiling zstd-safe v8.2.0
+   Compiling time v0.3.47
+   Compiling rustls-native-certs v0.8.3
+   Compiling blake2 v0.10.6
+   Compiling chacha20 v0.10.2
+   Compiling thiserror v1.0.69
+   Compiling rand v0.10.1
+   Compiling thiserror-impl v1.0.69
+   Compiling liblzma-sys v0.4.6
+   Compiling zstd v0.14.3
+   Compiling verus_syn v0.0.0-2026-09-06-0133
+   Compiling tinyvec_macros v0.1.1
+   Compiling verus_prettyplease v0.0.0-2026-09-06-0133
+   Compiling minimal-lexical v0.2.1
+   Compiling nom v7.1.3
+   Compiling tinyvec v1.11.0
+   Compiling rustls-pemfile v2.2.0
+   Compiling num-bigint v0.4.6
+   Compiling heck v0.4.1
+   Compiling libbz2-rs-sys v0.2.5
+   Compiling unicode-normalization v0.1.25
+   Compiling bzip2 v0.6.1
+   Compiling rusticata-macros v4.1.0
+   Compiling datafusion-common-runtime v55.2.0
+   Compiling serde_urlencoded v0.7.1
+   Compiling asn1-rs-impl v0.2.0
+   Compiling asn1-rs-derive v0.5.1
+   Compiling unicode-properties v0.1.4
+   Compiling convert_case v0.4.0
+   Compiling compression-core v0.4.34
+   Compiling unicode-bidi v0.3.18
+   Compiling vstd v0.0.0-2026-09-06-0133
+   Compiling prost-derive v0.13.5
+   Compiling tokio-stream v0.1.18
+   Compiling asn1-rs v0.6.2
+   Compiling stringprep v0.1.5
+   Compiling hmac v0.13.0
+   Compiling proc-macro2-diagnostics v0.10.1
+   Compiling fallible-iterator v0.2.0
+   Compiling verus_builtin v0.0.0-2026-09-06-0133
+   Compiling cfg_aliases v0.2.1
+   Compiling oid-registry v0.7.1
+   Compiling byteorder v1.5.0
+   Compiling nix v0.31.3
+   Compiling postgres-protocol v0.6.12
+   Compiling datafusion-common v55.2.0
+   Compiling tower-http v0.6.11
+   Compiling objc2-core-foundation v0.3.2
+   Compiling memoffset v0.9.1
+   Compiling array-init v2.1.0
+   Compiling glob v0.3.3
+   Compiling yansi v1.0.1
+   Compiling winnow v1.0.3
+   Compiling crc-catalog v2.5.0
+   Compiling crc v3.3.0
+   Compiling toml_parser v1.1.5+spec-1.1.0
+   Compiling postgres-types v0.2.14
+   Compiling verus_state_machines_macros v0.0.0-2026-09-06-0133
+   Compiling verus_builtin_macros v0.0.0-2026-09-06-0133
+   Compiling der-parser v9.0.0
+   Compiling rand_core v0.6.4
+   Compiling lz4-sys v1.11.1+lz4-1.10.0
+   Compiling serde_spanned v1.1.2
+   Compiling toml_datetime v1.1.2+spec-1.1.0
+   Compiling lru v0.18.2
+   Compiling cpufeatures v0.2.17
+   Compiling mime v0.3.17
+   Compiling parking v2.2.1
+   Compiling lazy_static v1.5.0
+   Compiling data-encoding v2.11.0
+   Compiling toml_writer v1.1.3+spec-1.1.0
+   Compiling prettyplease v0.2.37
+   Compiling paste v1.0.15
+   Compiling spin v0.10.1
+   Compiling crc-fast v1.9.0
+   Compiling prost v0.13.5
+   Compiling x509-parser v0.16.0
+   Compiling toml v1.1.8+spec-1.1.0
+   Compiling event-listener v5.4.2
+   Compiling datafusion-expr-common v55.2.0
+   Compiling datafusion-physical-expr-common v55.2.0
+   Compiling sha2 v0.10.9
+   Compiling datafusion-functions-aggregate-common v55.2.0
+   Compiling datafusion-functions-window-common v55.2.0
+   Compiling rand_chacha v0.3.1
+   Compiling foyer-tokio v0.22.3
+   Compiling bincode v1.3.3
+   Compiling antichain v0.3.1
+   Compiling quick-xml v0.41.0
+   Compiling datafusion-expr v55.2.0
+   Compiling mixtrics v0.2.3
+   Compiling crossbeam-epoch v0.9.20
+   Compiling rust_decimal v1.43.0
+   Compiling foyer-common v0.22.3
+   Compiling foyer-intrusive-collections v0.10.0-dev
+   Compiling rand v0.8.6
+   Compiling event-listener-strategy v0.5.4
+   Compiling prost-types v0.13.5
+   Compiling petgraph v0.7.1
+   Compiling serde_spanned v0.6.9
+   Compiling toml_datetime v0.6.11
+   Compiling mea v0.6.4
+   Compiling uncased v0.9.10
+   Compiling hashbrown v0.16.1
+   Compiling toml_write v0.1.2
+   Compiling small_ctor v0.1.2
+   Compiling winnow v0.7.15
+   Compiling cmsketch v0.2.4
+   Compiling web-time v1.1.0
+   Compiling multimap v0.10.1
+   Compiling fastant v0.1.11
+   Compiling prost-build v0.13.5
+   Compiling foyer-memory v0.22.3
+   Compiling rockstream-verified v0.72.0 (/private/tmp/rockstream-v073-ledger-refresh/crates/rockstream-verified)
+   Compiling liblzma v0.4.6
+   Compiling compression-codecs v0.4.46
+   Compiling toml_edit v0.22.27
+   Compiling pear_codegen v0.2.9
+   Compiling async-compression v0.4.51
+   Compiling fs4 v0.13.1
+   Compiling rand_xoshiro v0.7.0
+   Compiling figment v0.10.19
+   Compiling thread_local v1.1.9
+   Compiling protoc-bin-vendored-linux-x86_64 v3.2.0
+   Compiling strsim v0.11.1
+   Compiling protoc-bin-vendored-linux-aarch_64 v3.2.0
+   Compiling datafusion-physical-expr v55.2.0
+   Compiling datafusion-execution v55.2.0
+   Compiling vcpkg v0.2.15
+   Compiling foyer v0.22.3
+   Compiling protoc-bin-vendored-win32 v3.2.0
+   Compiling protoc-bin-vendored-linux-x86_32 v3.2.0
+   Compiling ident_case v1.0.1
+   Compiling protoc-bin-vendored-macos-x86_64 v3.2.0
+   Compiling inlinable_string v0.1.15
+   Compiling unsafe-libyaml v0.2.11
+   Compiling protoc-bin-vendored-linux-s390_64 v3.2.0
+   Compiling protoc-bin-vendored-macos-aarch_64 v3.2.0
+   Compiling protoc-bin-vendored-linux-ppcle_64 v3.2.0
+   Compiling portable-atomic v1.13.1
+   Compiling protoc-bin-vendored v3.2.0
+   Compiling libz-sys v1.1.33
+   Compiling datafusion-functions v55.2.0
+   Compiling toml v0.8.23
+   Compiling lz4 v1.28.1
+   Compiling serde_yaml v0.9.34+deprecated
+   Compiling foyer-storage v0.22.3
+   Compiling pear v0.2.9
+   Compiling toml_edit v0.25.12+spec-1.1.0
+   Compiling darling_core v0.23.0
+   Compiling tonic-build v0.12.3
+   Compiling ouroboros_macro v0.18.5
+   Compiling objc2-io-kit v0.3.2
+   Compiling hyper-timeout v0.5.2
+   Compiling concurrent-queue v2.5.0
+   Compiling indexmap v1.9.3
+   Compiling static_assertions v1.1.0
+   Compiling winnow v0.6.26
+   Compiling aliasable v0.1.3
+   Compiling bytemuck v1.25.0
+   Compiling atomic v0.6.1
+   Compiling ouroboros v0.18.5
+   Compiling async-channel v2.5.0
+   Compiling sysinfo v0.35.2
+   Compiling proc-macro-crate v3.5.0
+   Compiling darling_macro v0.23.0
+   Compiling duration-str v0.11.3
+   Compiling crossbeam-skiplist v0.1.3
+   Compiling async-lock v3.4.2
+   Compiling fail-parallel v0.6.0
+   Compiling backon v1.6.0
+   Compiling ulid v1.2.1
+   Compiling crossbeam-channel v0.5.16
+   Compiling hashbrown v0.12.3
+   Compiling dotenvy v0.15.7
+   Compiling tagptr v0.2.0
+   Compiling num_enum_derive v0.7.6
+   Compiling darling v0.23.0
+   Compiling moka v0.12.16
+   Compiling axum-core v0.4.5
+   Compiling objc2-system-configuration v0.3.2
+   Compiling async-stream-impl v0.3.6
+   Compiling phf_shared v0.13.1
+   Compiling rdkafka-sys v4.10.0+2.12.1
+   Compiling bigdecimal v0.4.10
+   Compiling matchit v0.7.3
+   Compiling async-stream v0.3.6
+   Compiling num_enum v0.7.6
+   Compiling phf v0.13.1
+   Compiling tower v0.4.13
+   Compiling serde_with_macros v3.21.0
+   Compiling datafusion-physical-plan v55.2.0
+   Compiling datafusion-physical-expr-adapter v55.2.0
+   Compiling whoami v2.1.2
+   Compiling axum v0.7.9
+   Compiling datafusion-functions-aggregate v55.2.0
+   Compiling structmeta-derive v0.3.0
+   Compiling serde_with v3.21.0
+   Compiling tokio-postgres v0.7.18
+   Compiling structmeta v0.3.0
+   Compiling rockstream-management-proto v0.72.0 (/private/tmp/rockstream-v073-ledger-refresh/crates/rockstream-management-proto)
+   Compiling axum-core v0.5.6
+   Compiling prost-derive v0.14.4
+   Compiling serde_repr v0.1.20
+   Compiling home v0.5.12
+   Compiling matchit v0.8.4
+   Compiling bollard-stubs v1.47.1-rc.27.3.1
+   Compiling parse-display-derive v0.9.1
+   Compiling datafusion-functions-window v55.2.0
+   Compiling axum v0.8.9
+   Compiling prost v0.14.4
+   Compiling datafusion-optimizer v55.2.0
+   Compiling hyperlocal v0.9.1
+   Compiling xattr v1.6.1
+   Compiling datafusion-functions-nested v55.2.0
+   Compiling filetime v0.2.29
+   Compiling tokio-tar v0.3.1
+   Compiling parse-display v0.9.1
+   Compiling etcetera v0.8.0
+   Compiling docker_credential v1.4.0
+   Compiling der_derive v0.7.3
+   Compiling const-oid v0.9.6
+   Compiling tonic v0.14.6
+   Compiling flagset v0.4.7
+   Compiling prost-types v0.14.4
+   Compiling der v0.7.10
+   Compiling datafusion-sql v55.2.0
+   Compiling rockstream-runtime v0.72.0 (/private/tmp/rockstream-v073-ledger-refresh/crates/rockstream-runtime)
+   Compiling datafusion-session v55.2.0
+   Compiling tonic-prost v0.14.6
+   Compiling lazy-regex-proc_macros v3.6.0
+   Compiling yasna v0.5.2
+   Compiling pem v3.0.6
+   Compiling hmac v0.12.1
+   Compiling regex-lite v0.1.9
+   Compiling rcgen v0.13.2
+   Compiling lazy-regex v3.6.0
+   Compiling arrow-flight v59.3.2
+   Compiling spki v0.7.3
+   Compiling derive-new v0.7.0
+   Compiling wait-timeout v0.2.1
+   Compiling bit-vec v0.8.0
+   Compiling quick-error v1.2.3
+   Compiling md5 v0.7.0
+   Compiling bit-set v0.8.0
+   Compiling rusty-fork v0.3.1
+   Compiling x509-cert v0.2.5
+   Compiling rand_xorshift v0.4.0
+   Compiling unarray v0.1.4
+   Compiling proptest v1.11.0
+   Compiling datafusion-datasource v55.2.0
+   Compiling datafusion-catalog v55.2.0
+   Compiling datafusion-pruning v55.2.0
+   Compiling datafusion-datasource-json v55.2.0
+   Compiling datafusion-datasource-csv v55.2.0
+   Compiling datafusion-datasource-arrow v55.2.0
+   Compiling datafusion-datasource-parquet v55.2.0
+   Compiling datafusion-physical-optimizer v55.2.0
+   Compiling rustls-webpki v0.103.16
+   Compiling rdkafka v0.39.0
+   Compiling tokio-rustls v0.26.4
+   Compiling rustls-platform-verifier v0.7.0
+   Compiling hyper-rustls v0.27.9
+   Compiling rockstream-types v0.72.0 (/private/tmp/rockstream-v073-ledger-refresh/crates/rockstream-types)
+   Compiling tonic v0.12.3
+   Compiling pgwire v0.28.0 (/private/tmp/rockstream-v073-ledger-refresh/vendor/pgwire-0.28.0)
+   Compiling tokio-postgres-rustls v0.13.0
+   Compiling reqwest v0.13.5
+   Compiling reqwest v0.12.28
+   Compiling bollard v0.18.1
+   Compiling object_store v0.14.2
+   Compiling testcontainers v0.23.3
+   Compiling testcontainers-modules v0.11.6
+   Compiling slatedb-common v0.16.0
+   Compiling slatedb-txn-obj v0.16.0
+   Compiling slatedb v0.16.0
+   Compiling rockstream-sim v0.72.0 (/private/tmp/rockstream-v073-ledger-refresh/crates/rockstream-sim)
+   Compiling rockstream-plan v0.72.0 (/private/tmp/rockstream-v073-ledger-refresh/crates/rockstream-plan)
+   Compiling rockstream-diff v0.72.0 (/private/tmp/rockstream-v073-ledger-refresh/crates/rockstream-diff)
+   Compiling rockstream-storage v0.72.0 (/private/tmp/rockstream-v073-ledger-refresh/crates/rockstream-storage)
+   Compiling rockstream-connectors v0.72.0 (/private/tmp/rockstream-v073-ledger-refresh/crates/rockstream-connectors)
+   Compiling rockstream-control v0.72.0 (/private/tmp/rockstream-v073-ledger-refresh/crates/rockstream-control)
+   Compiling rockstream-ops v0.72.0 (/private/tmp/rockstream-v073-ledger-refresh/crates/rockstream-ops)
+   Compiling datafusion-catalog-listing v55.2.0
+   Compiling datafusion-functions-table v55.2.0
+   Compiling datafusion v55.2.0
+   Compiling rockstream-sql v0.72.0 (/private/tmp/rockstream-v073-ledger-refresh/crates/rockstream-sql)
+   Compiling rockstream-test-support v0.72.0 (/private/tmp/rockstream-v073-ledger-refresh/crates/rockstream-test-support)
+   Compiling rockstream-gateway v0.72.0 (/private/tmp/rockstream-v073-ledger-refresh/crates/rockstream-gateway)
+   Compiling rockstream-oracle v0.72.0 (/private/tmp/rockstream-v073-ledger-refresh/crates/rockstream-oracle)
+warning: linker stderr: ld: __eh_frame section too large (max 16MB) to encode dwarf unwind offsets in compact unwind table, performance of exception handling might be affected
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `rockstream-gateway` (test "auth_scram_tests") generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3m 07s
+     Running tests/auth_scram_tests.rs (target/debug/build/rockstream-gateway/81cc3181b92be04f/out/auth_scram_tests-81cc3181b92be04f)
+
+running 9 tests
+test test_bootstrap_function_shapes ... ok
+test test_md5_mode_fails_before_listener ... ok
+test test_scram_invalid_proof_is_rejected_and_audited_without_session ... ok
+test test_scram_startup_rejects_missing_or_empty_durable_credentials ... ok
+test test_scram_tokio_postgres_connects ... ok
+test test_scram_wrong_password ... ok
+test test_search_path_unqualified_view ... ok
+test test_set_show_search_path ... ok
+test test_version_banner ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.82s
+
+     Running tests/live_secret_rotation_tests.rs (target/debug/build/rockstream-gateway/f18d8fe59dce03bf/out/live_secret_rotation_tests-f18d8fe59dce03bf)
+
+running 1 test
+test alter_secret_resolution_updates_pgoutput_credential_version ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

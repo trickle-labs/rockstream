@@ -36,6 +36,49 @@ pub fn explain_incremental(plan: &PlanNode) -> String {
     )
 }
 
+/// Render a [`crate::distribution::DistributedPlan`] as an `EXPLAIN INCREMENTAL`
+/// block showing the real deployed graph: partition keys, network exchanges,
+/// worker placement, estimated state, and expected shuffle.
+pub fn explain_incremental_distributed(
+    distributed: &crate::distribution::DistributedPlan,
+) -> String {
+    let lines = collect_plan_lines(&distributed.plan);
+    let mut rendered = Vec::with_capacity(lines.len() + 6);
+    rendered.push(format!(
+        "distributed_plan: shards={} output_partition_key={:?} partial_aggregations={} estimated_state_bytes={} expected_shuffle_bytes={}",
+        distributed.shard_count,
+        distributed.output_annotation.partition_key,
+        distributed.partial_aggregation_count,
+        distributed.estimated_state_bytes,
+        distributed.expected_shuffle_bytes,
+    ));
+    if !distributed.worker_placements.is_empty() {
+        let placement_summary = distributed
+            .worker_placements
+            .iter()
+            .map(|p| {
+                let shards = p
+                    .shard_ids
+                    .iter()
+                    .map(|id| format!("shard-{id}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("worker-{}@{}[{}]", p.worker_id, p.address, shards)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        rendered.push(format!("worker_placement: {placement_summary}"));
+    }
+    for (idx, ex) in distributed.exchanges.iter().enumerate() {
+        rendered.push(format!(
+            "exchange[{idx}]: kind={:?} partition_key={:?} expected_shuffle_bytes={} reason={}",
+            ex.kind, ex.partition_key, ex.expected_shuffle_bytes, ex.reason
+        ));
+    }
+    rendered.extend(lines.into_iter().map(|line| line.base_line));
+    format_explain_block(&rendered)
+}
+
 pub fn explain_incremental_verbose(
     plan: &PlanNode,
     shard_info: &[ShardInfo],
@@ -329,10 +372,25 @@ fn render_node(plan: &PlanNode, depth: usize, lines: &mut Vec<PlanExplainLine>) 
             }
         }
 
-        PlanNode::Exchange { child, kind } => {
+        PlanNode::Exchange {
+            child,
+            kind,
+            partition_key,
+        } => {
             render_node(child, depth + 1, lines);
+            let detail = match kind {
+                rockstream_plan::ExchangeKind::Loopback => "loopback (single-shard)".to_owned(),
+                rockstream_plan::ExchangeKind::Hash => {
+                    format!("network_hash partition_key={partition_key:?}")
+                }
+                rockstream_plan::ExchangeKind::Broadcast => "network_broadcast".to_owned(),
+                rockstream_plan::ExchangeKind::Single => "network_gather (single)".to_owned(),
+                rockstream_plan::ExchangeKind::Range => {
+                    format!("network_range partition_key={partition_key:?}")
+                }
+            };
             lines.push(PlanExplainLine {
-                base_line: format!("{indent}  Exchange[{kind:?}]  loopback (single-shard)"),
+                base_line: format!("{indent}  Exchange[{kind:?}]  {detail}"),
                 metric_key: None,
                 combiner_enabled: false,
             });
@@ -826,6 +884,7 @@ mod tests {
             k: 10,
             rank_col: 2,
             partition_by: vec![0],
+            order_by: vec![],
         };
         let text = explain_incremental(&plan);
         assert!(text.contains("TopK"), "text: {text}");
@@ -840,6 +899,7 @@ mod tests {
 
         let plan = PlanNode::Exchange {
             kind: ExchangeKind::Hash,
+            partition_key: vec![0],
             child: Box::new(PlanNode::Aggregate {
                 input: Box::new(PlanNode::InnerJoin {
                     left: Box::new(PlanNode::Source {
@@ -917,6 +977,7 @@ mod tests {
     fn explain_exchange_shows_loopback() {
         let plan = PlanNode::Exchange {
             kind: ExchangeKind::Loopback,
+            partition_key: vec![],
             child: Box::new(PlanNode::Source {
                 name: "t".to_string(),
             }),

@@ -1,0 +1,246 @@
+warning: unused field `repository` in `workspace.package`
+  --> Cargo.toml:36:1
+   |
+36 | repository = "https://github.com/trickle-labs/rockstream"
+   | ^^^^^^^^^^
+   |
+   = note: `cargo::unused_workspace_package_fields` is set to `warn` by default
+help: consider removing the field `workspace.package.repository`
+warning: workspace (manifest) generated 1 warning
+warning: missing `[lints]` to inherit `[workspace.lints]`
+  --> crates/rockstream-types/Cargo.toml
+   = note: `cargo::missing_lints_inheritance` is set to `warn` by default
+help: to inherit `workspace.lints, add:
+   |
+34 ~ tempfile = "3"
+35 + [lints]
+36 + workspace = true
+   |
+help: to clarify your intent to not inherit, add:
+   |
+34 ~ tempfile = "3"
+35 + [lints]
+   |
+warning: `rockstream-types` (manifest) generated 1 warning
+warning: missing `[lints]` to inherit `[workspace.lints]`
+  --> crates/rockstream-plan/Cargo.toml
+   = note: `cargo::missing_lints_inheritance` is set to `warn` by default
+help: to inherit `workspace.lints, add:
+   |
+15 ~ serde_json = { workspace = true }
+16 + [lints]
+17 + workspace = true
+   |
+help: to clarify your intent to not inherit, add:
+   |
+15 ~ serde_json = { workspace = true }
+16 + [lints]
+   |
+warning: `rockstream-plan` (manifest) generated 1 warning
+warning: missing `[lints]` to inherit `[workspace.lints]`
+  --> crates/rockstream-storage/Cargo.toml
+   = note: `cargo::missing_lints_inheritance` is set to `warn` by default
+help: to inherit `workspace.lints, add:
+   |
+48 ~ criterion = { workspace = true, features = ["async_tokio"] }
+49 + [lints]
+50 + workspace = true
+   |
+help: to clarify your intent to not inherit, add:
+   |
+48 ~ criterion = { workspace = true, features = ["async_tokio"] }
+49 + [lints]
+   |
+warning: `rockstream-storage` (manifest) generated 1 warning
+warning: missing `[lints]` to inherit `[workspace.lints]`
+  --> crates/rockstream-test-support/Cargo.toml
+   = note: `cargo::missing_lints_inheritance` is set to `warn` by default
+help: to inherit `workspace.lints, add:
+   |
+23 ~ sha2 = { workspace = true }
+24 + [lints]
+25 + workspace = true
+   |
+help: to clarify your intent to not inherit, add:
+   |
+23 ~ sha2 = { workspace = true }
+24 + [lints]
+   |
+warning: `rockstream-test-support` (manifest) generated 1 warning
+warning: missing `[lints]` to inherit `[workspace.lints]`
+  --> crates/rockstream-management-proto/Cargo.toml
+   = note: `cargo::missing_lints_inheritance` is set to `warn` by default
+help: to inherit `workspace.lints, add:
+   |
+19 ~ tokio = { workspace = true }
+20 + [lints]
+21 + workspace = true
+   |
+help: to clarify your intent to not inherit, add:
+   |
+19 ~ tokio = { workspace = true }
+20 + [lints]
+   |
+warning: `rockstream-management-proto` (manifest) generated 1 warning
+warning: missing `[lints]` to inherit `[workspace.lints]`
+  --> crates/rockstream-ops/Cargo.toml
+   = note: `cargo::missing_lints_inheritance` is set to `warn` by default
+help: to inherit `workspace.lints, add:
+   |
+93 ~ workspace = true
+94 + [lints]
+95 + workspace = true
+   |
+help: to clarify your intent to not inherit, add:
+   |
+93 ~ workspace = true
+94 + [lints]
+   |
+warning: `rockstream-ops` (manifest) generated 1 warning
+warning: missing `[lints]` to inherit `[workspace.lints]`
+  --> crates/rockstream-diff/Cargo.toml
+   = note: `cargo::missing_lints_inheritance` is set to `warn` by default
+help: to inherit `workspace.lints, add:
+   |
+13 ~ tracing = { workspace = true }
+14 + [lints]
+15 + workspace = true
+   |
+help: to clarify your intent to not inherit, add:
+   |
+13 ~ tracing = { workspace = true }
+14 + [lints]
+   |
+warning: `rockstream-diff` (manifest) generated 1 warning
+warning: missing `[lints]` to inherit `[workspace.lints]`
+  --> crates/rockstream-runtime/Cargo.toml
+   = note: `cargo::missing_lints_inheritance` is set to `warn` by default
+help: to inherit `workspace.lints, add:
+   |
+69 ~ criterion = { workspace = true, features = ["async_tokio"] }
+70 + [lints]
+71 + workspace = true
+   |
+help: to clarify your intent to not inherit, add:
+   |
+69 ~ criterion = { workspace = true, features = ["async_tokio"] }
+70 + [lints]
+   |
+warning: `rockstream-runtime` (manifest) generated 1 warning
+warning: missing `[lints]` to inherit `[workspace.lints]`
+  --> fuzz/Cargo.toml
+   = note: `cargo::missing_lints_inheritance` is set to `warn` by default
+help: to inherit `workspace.lints, add:
+   |
+64 ~ doc = false
+65 + [lints]
+66 + workspace = true
+   |
+help: to clarify your intent to not inherit, add:
+   |
+64 ~ doc = false
+65 + [lints]
+   |
+warning: `rockstream-fuzz` (manifest) generated 1 warning
+warning: missing `[lints]` to inherit `[workspace.lints]`
+  --> crates/rockstream-sql/Cargo.toml
+   = note: `cargo::missing_lints_inheritance` is set to `warn` by default
+help: to inherit `workspace.lints, add:
+   |
+47 ~ bytes = { workspace = true }
+48 + [lints]
+49 + workspace = true
+   |
+help: to clarify your intent to not inherit, add:
+   |
+47 ~ bytes = { workspace = true }
+48 + [lints]
+   |
+warning: `rockstream-sql` (manifest) generated 1 warning
+warning: missing `[lints]` to inherit `[workspace.lints]`
+  --> crates/rockstream-sim/Cargo.toml
+   = note: `cargo::missing_lints_inheritance` is set to `warn` by default
+help: to inherit `workspace.lints, add:
+   |
+59 ~ rockstream-docgen = { workspace = true }
+60 + [lints]
+61 + workspace = true
+   |
+help: to clarify your intent to not inherit, add:
+   |
+59 ~ rockstream-docgen = { workspace = true }
+60 + [lints]
+   |
+warning: `rockstream-sim` (manifest) generated 1 warning
+warning: missing `[lints]` to inherit `[workspace.lints]`
+  --> crates/rockstream-control/Cargo.toml
+   = note: `cargo::missing_lints_inheritance` is set to `warn` by default
+help: to inherit `workspace.lints, add:
+   |
+65 ~ serde_json = { workspace = true }
+66 + [lints]
+67 + workspace = true
+   |
+help: to clarify your intent to not inherit, add:
+   |
+65 ~ serde_json = { workspace = true }
+66 + [lints]
+   |
+warning: `rockstream-control` (manifest) generated 1 warning
+warning: missing `[lints]` to inherit `[workspace.lints]`
+  --> crates/rockstream-connectors/Cargo.toml
+   = note: `cargo::missing_lints_inheritance` is set to `warn` by default
+help: to inherit `workspace.lints, add:
+   |
+49 ~ rand = { version = "0.8", features = ["small_rng"] }
+50 + [lints]
+51 + workspace = true
+   |
+help: to clarify your intent to not inherit, add:
+   |
+49 ~ rand = { version = "0.8", features = ["small_rng"] }
+50 + [lints]
+   |
+warning: `rockstream-connectors` (manifest) generated 1 warning
+warning: missing `[lints]` to inherit `[workspace.lints]`
+  --> crates/rockstream-oracle/Cargo.toml
+   = note: `cargo::missing_lints_inheritance` is set to `warn` by default
+help: to inherit `workspace.lints, add:
+   |
+43 ~ toml = { workspace = true }
+44 + [lints]
+45 + workspace = true
+   |
+help: to clarify your intent to not inherit, add:
+   |
+43 ~ toml = { workspace = true }
+44 + [lints]
+   |
+warning: `rockstream-oracle` (manifest) generated 1 warning
+warning: missing `[lints]` to inherit `[workspace.lints]`
+  --> crates/rockstream-docgen/Cargo.toml
+   = note: `cargo::missing_lints_inheritance` is set to `warn` by default
+help: to inherit `workspace.lints, add:
+   |
+34 ~ tokio = { workspace = true }
+35 + [lints]
+36 + workspace = true
+   |
+help: to clarify your intent to not inherit, add:
+   |
+34 ~ tokio = { workspace = true }
+35 + [lints]
+   |
+warning: `rockstream-docgen` (manifest) generated 1 warning
+warning: linker stderr: ld: __eh_frame section too large (max 16MB) to encode dwarf unwind offsets in compact unwind table, performance of exception handling might be affected
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `rockstream-cli` (bin "rockstream") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.32s
+     Running tests/management_tls_transport_tests.rs (target/release/build/rockstream-cli/9921d5aae15acde9/out/management_tls_transport_tests-9921d5aae15acde9)
+
+running 1 test
+test management_release_process_authenticates_and_authorizes_real_cli_requests ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 2.93s

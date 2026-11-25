@@ -1,0 +1,38 @@
+# Frozen Canonical Scale Qualification Ladder Profile (Issue #405)
+schema_version = 1
+profile_id = "scale-qualification-v1"
+canonical_cloud_instance_class = "c7i.4xlarge"
+canonical_region = "us-east-1"
+canonical_object_store = "s3-compatible"
+canonical_dataset = "nexmark-tpch-streaming-v1"
+freshness_slo_ms = 1000.0
+read_p99_slo_ms = 25.0
+
+[worker_ladder]
+counts = [1, 2, 4, 8, 16, 32, 64]
+modes = ["fixed_size_speedup", "proportional_scale_out"]
+baseline_immediate_counts = [1, 2, 4]
+fleet_gated_counts = [8, 16, 32, 64]
+
+[retained_state]
+ram_multipliers = ["1x", "4x", "10x"]
+
+[distributions_and_shapes]
+distributions = ["uniform", "skewed_50x_hot_key"]
+shapes = [
+  "aggregation",
+  "co_partitioned_join",
+  "repartitioned_join",
+  "dependent_views_1",
+  "dependent_views_20_shared_arrangements",
+  "bounded_window",
+  "concurrent_high_qps_reads_and_subscribe",
+]
+
+[durations]
+diagnostic_seconds = 300
+soak_seconds = 259200 # 72 hours
+
+[gate_sequence]
+correctness_blockers = ["#347", "#348", "#351", "#352"]
+architecture_milestones = ["#400", "#402", "#406", "#401", "#403", "#407"]

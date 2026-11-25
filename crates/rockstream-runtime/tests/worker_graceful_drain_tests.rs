@@ -60,6 +60,7 @@ async fn register_worker(addr: std::net::SocketAddr, worker_id: u64) -> TcpStrea
     match serde_json::from_str::<ControlMessage>(response.trim()).unwrap() {
         ControlMessage::Registered {
             worker_id: registered,
+            protocol_version: rockstream_types::compatibility::ProtocolVersion::V4,
         } => {
             assert_eq!(registered, WorkerId(worker_id));
         }

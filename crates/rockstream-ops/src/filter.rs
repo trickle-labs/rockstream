@@ -27,6 +27,11 @@ impl FilterOp {
         FilterOp { predicate }
     }
 
+    /// Borrow the underlying filter predicate (used by stateless operator fusion).
+    pub fn predicate(&self) -> &Expr {
+        &self.predicate
+    }
+
     /// Apply the filter to a single delta batch.
     pub fn apply(&self, input: ArrowZSet) -> Result<ArrowZSet, OpError> {
         if input.is_empty() {

@@ -28,7 +28,6 @@ use arrow::record_batch::RecordBatch;
 use rockstream_plan::OuterJoinKind;
 use rockstream_storage::{JoinSide, ShardDb, ShardKeyEncoder, WriteBatch};
 use rockstream_types::ids::OperatorId;
-use rockstream_types::KeyCapsule;
 
 use crate::error::OpError;
 use crate::join::{concat_zsets, stable_row_id};
@@ -232,24 +231,1065 @@ impl OuterJoinState {
     }
 }
 
-// ─── OuterJoinOp ─────────────────────────────────────────────────────────────
+// ─── OuterJoinStateCore (Single-Owner, Zero-Mutex) ───────────────────────────
 
-/// Incremental outer / semi / anti equi-join operator (v0.9 — IVM-5).
-pub struct OuterJoinOp {
+/// Lock-free single-owner state core for [`OuterJoinOp`] (Issue #402 R3).
+///
+/// Consolidates arrangement state, staged deltas, and dirty-key tracking into
+/// one owned struct so shard actors can drive outer/semi/anti joins via
+/// `&mut self` with zero hot-path `Mutex` locking, while [`OuterJoinOp`] wraps
+/// this core in a single `Mutex` for `Operator` / shared-reference callers.
+pub struct OuterJoinStateCore {
     op_id: OperatorId,
     kind: OuterJoinKind,
     left_key_cols: Vec<usize>,
     right_key_cols: Vec<usize>,
     left_n_cols: usize,
     right_n_cols: usize,
-    state: Mutex<OuterJoinState>,
-    left_staged: Mutex<StagedDelta>,
-    right_staged: Mutex<StagedDelta>,
-    dirty_left: Mutex<HashSet<(Vec<u8>, u128)>>,
-    dirty_right: Mutex<HashSet<(Vec<u8>, u128)>>,
-    dirty_rw: Mutex<HashSet<Vec<u8>>>,
-    dirty_lw: Mutex<HashSet<Vec<u8>>>,
-    dirty_null_weight: Mutex<bool>,
+    state: OuterJoinState,
+    left_staged: StagedDelta,
+    right_staged: StagedDelta,
+    dirty_left: HashSet<(Vec<u8>, u128)>,
+    dirty_right: HashSet<(Vec<u8>, u128)>,
+    dirty_rw: HashSet<Vec<u8>>,
+    dirty_lw: HashSet<Vec<u8>>,
+    dirty_null_weight: bool,
+}
+
+impl OuterJoinStateCore {
+    pub fn new(
+        op_id: OperatorId,
+        kind: OuterJoinKind,
+        left_key_cols: Vec<usize>,
+        right_key_cols: Vec<usize>,
+    ) -> Self {
+        Self::with_schema(op_id, kind, left_key_cols, right_key_cols, 2, 2)
+    }
+
+    pub fn with_schema(
+        op_id: OperatorId,
+        kind: OuterJoinKind,
+        left_key_cols: Vec<usize>,
+        right_key_cols: Vec<usize>,
+        left_n_cols: usize,
+        right_n_cols: usize,
+    ) -> Self {
+        Self {
+            op_id,
+            kind,
+            left_key_cols,
+            right_key_cols,
+            left_n_cols,
+            right_n_cols,
+            state: OuterJoinState::new(),
+            left_staged: StagedDelta::default(),
+            right_staged: StagedDelta::default(),
+            dirty_left: HashSet::new(),
+            dirty_right: HashSet::new(),
+            dirty_rw: HashSet::new(),
+            dirty_lw: HashSet::new(),
+            dirty_null_weight: false,
+        }
+    }
+
+    pub fn kind(&self) -> OuterJoinKind {
+        self.kind
+    }
+
+    pub fn op_id(&self) -> OperatorId {
+        self.op_id
+    }
+
+    pub fn left_entry_count(&self) -> usize {
+        self.state.left_entry_count()
+    }
+
+    pub fn right_entry_count(&self) -> usize {
+        self.state.right_entry_count()
+    }
+
+    pub fn state_bytes(&self) -> u64 {
+        self.state.state_bytes() + self.left_staged.staged_bytes + self.right_staged.staged_bytes
+    }
+
+    pub fn unmatched_key_count(&self) -> usize {
+        self.state.unmatched_key_count()
+    }
+
+    /// Run a full epoch directly on `&mut self` with zero `Mutex` locks.
+    pub fn process_epoch(
+        &mut self,
+        left: ArrowZSet,
+        right: ArrowZSet,
+    ) -> Result<ArrowZSet, OpError> {
+        match self.kind {
+            OuterJoinKind::Left => self.process_epoch_left(left, right),
+            OuterJoinKind::Right => self.process_epoch_right(left, right),
+            OuterJoinKind::Full => self.process_epoch_full(left, right),
+            OuterJoinKind::Semi => self.process_epoch_semi(left, right),
+            OuterJoinKind::Anti => self.process_epoch_anti(left, right),
+            OuterJoinKind::NullAwareAnti => self.process_epoch_null_aware_anti(left, right),
+        }
+    }
+
+    fn stage_left(&mut self, delta: &ArrowZSet) -> Result<(), OpError> {
+        if delta.is_empty() {
+            return Ok(());
+        }
+        let capsule = delta.get_or_build_key_capsule(&self.left_key_cols)?;
+        for row_idx in 0..delta.num_rows() {
+            let w = delta.weights[row_idx];
+            let capsule_key = capsule.row_bytes(row_idx).to_vec();
+            let is_null = capsule.row_contains_null(row_idx);
+            let row_bytes = OuterJoinOp::serialize_row(&delta.data, row_idx);
+            let row_id = stable_row_id(self.op_id.0, &capsule_key, &row_bytes);
+            let join_key = if is_null {
+                // Opposite sides must never share a NULL-key bucket.
+                [capsule_key, row_id.to_be_bytes().to_vec(), vec![0]].concat()
+            } else {
+                capsule_key
+            };
+            self.left_staged.push(join_key, row_id, row_bytes, w);
+        }
+        Ok(())
+    }
+
+    fn stage_right(&mut self, delta: &ArrowZSet) -> Result<(), OpError> {
+        if delta.is_empty() {
+            return Ok(());
+        }
+        let capsule = delta.get_or_build_key_capsule(&self.right_key_cols)?;
+        for row_idx in 0..delta.num_rows() {
+            let w = delta.weights[row_idx];
+            let capsule_key = capsule.row_bytes(row_idx).to_vec();
+            let is_null = capsule.row_contains_null(row_idx);
+            let row_bytes = OuterJoinOp::serialize_row(&delta.data, row_idx);
+            let row_id = stable_row_id(self.op_id.0, &capsule_key, &row_bytes);
+            let join_key = if is_null {
+                [capsule_key, row_id.to_be_bytes().to_vec(), vec![1]].concat()
+            } else {
+                capsule_key
+            };
+            self.right_staged.push(join_key, row_id, row_bytes, w);
+            if is_null {
+                self.right_staged.null_weight += w;
+            }
+        }
+        Ok(())
+    }
+
+    fn process_epoch_left(
+        &mut self,
+        left: ArrowZSet,
+        right: ArrowZSet,
+    ) -> Result<ArrowZSet, OpError> {
+        self.stage_left(&left)?;
+        self.stage_right(&right)?;
+
+        let out_schema = output_schema(
+            self.kind,
+            left.data.schema().as_ref(),
+            right.data.schema().as_ref(),
+        );
+        let mut outputs: Vec<ArrowZSet> = Vec::new();
+
+        let mut delta_rw: HashMap<Vec<u8>, i64> = HashMap::new();
+        let mut right_staged_rows: HashMap<Vec<u8>, Vec<(Vec<u8>, i64)>> = HashMap::new();
+        for (join_key, _row_id, row_bytes, w) in &self.right_staged.rows {
+            *delta_rw.entry(join_key.clone()).or_insert(0) += w;
+            right_staged_rows
+                .entry(join_key.clone())
+                .or_default()
+                .push((row_bytes.clone(), *w));
+        }
+
+        // 1. Inner join output: ΔL⋈R₀ + L₀⋈ΔR + ΔL⋈ΔR
+        let inner = self.compute_inner_join_output(&right_staged_rows, &out_schema)?;
+        if !inner.is_empty() {
+            outputs.push(inner);
+        }
+
+        // 2. NULL-pad transitions due to right side changing.
+        let mut null_pad_rows: OuterJoinRows = (
+            vec![Vec::new(); self.left_n_cols],
+            vec![Vec::new(); self.right_n_cols],
+            Vec::new(),
+        );
+        for (key, delta) in &delta_rw {
+            let old_rw = self.state.right_key_weight.get(key).copied().unwrap_or(0);
+            let new_rw = old_rw + delta;
+            if old_rw == new_rw {
+                continue;
+            }
+            if (old_rw == 0) != (new_rw == 0) {
+                let retract = old_rw == 0;
+                for (l_row_bytes, l_weight) in self.state.probe_left(key) {
+                    let left_vals = OuterJoinOp::deserialize_row(l_row_bytes, self.left_n_cols)?;
+                    let right_nulls = vec![None; self.right_n_cols];
+                    for (i, v) in left_vals.iter().enumerate() {
+                        null_pad_rows.0[i].push(*v);
+                    }
+                    for (i, v) in right_nulls.iter().enumerate() {
+                        null_pad_rows.1[i].push(*v);
+                    }
+                    null_pad_rows
+                        .2
+                        .push(if retract { -l_weight } else { l_weight });
+                }
+            }
+        }
+        if !null_pad_rows.2.is_empty() {
+            let batch = OuterJoinOp::make_output_batch(
+                &null_pad_rows.0,
+                &null_pad_rows.1,
+                &out_schema,
+                false,
+                true,
+            )?;
+            outputs.push(ArrowZSet::new(batch, null_pad_rows.2));
+        }
+
+        // 3. For each ΔL row: if effective_rw == 0, emit (row, NULL_right, w).
+        let mut null_new_rows: OuterJoinRows = (
+            vec![Vec::new(); self.left_n_cols],
+            vec![Vec::new(); self.right_n_cols],
+            Vec::new(),
+        );
+        for (join_key, _row_id, row_bytes, w) in &self.left_staged.rows {
+            let old_rw = self
+                .state
+                .right_key_weight
+                .get(join_key)
+                .copied()
+                .unwrap_or(0);
+            let delta = delta_rw.get(join_key).copied().unwrap_or(0);
+            let effective_rw = old_rw + delta;
+            if effective_rw == 0 {
+                let left_vals = OuterJoinOp::deserialize_row(row_bytes, self.left_n_cols)?;
+                let right_nulls = vec![None; self.right_n_cols];
+                for (i, v) in left_vals.iter().enumerate() {
+                    null_new_rows.0[i].push(*v);
+                }
+                for (i, v) in right_nulls.iter().enumerate() {
+                    null_new_rows.1[i].push(*v);
+                }
+                null_new_rows.2.push(*w);
+            }
+        }
+        if !null_new_rows.2.is_empty() {
+            let batch = OuterJoinOp::make_output_batch(
+                &null_new_rows.0,
+                &null_new_rows.1,
+                &out_schema,
+                false,
+                true,
+            )?;
+            outputs.push(ArrowZSet::new(batch, null_new_rows.2));
+        }
+
+        self.commit_staged(&delta_rw, None);
+        concat_zsets(outputs, out_schema)
+    }
+
+    fn process_epoch_right(
+        &mut self,
+        left: ArrowZSet,
+        right: ArrowZSet,
+    ) -> Result<ArrowZSet, OpError> {
+        self.stage_left(&left)?;
+        self.stage_right(&right)?;
+
+        let out_schema = output_schema(
+            self.kind,
+            left.data.schema().as_ref(),
+            right.data.schema().as_ref(),
+        );
+        let mut outputs: Vec<ArrowZSet> = Vec::new();
+
+        let mut delta_lw: HashMap<Vec<u8>, i64> = HashMap::new();
+        for (join_key, _, _, w) in &self.left_staged.rows {
+            *delta_lw.entry(join_key.clone()).or_insert(0) += w;
+        }
+
+        let mut right_staged_rows: HashMap<Vec<u8>, Vec<(Vec<u8>, i64)>> = HashMap::new();
+        for (join_key, _, row_bytes, w) in &self.right_staged.rows {
+            right_staged_rows
+                .entry(join_key.clone())
+                .or_default()
+                .push((row_bytes.clone(), *w));
+        }
+
+        let inner = self.compute_inner_join_output(&right_staged_rows, &out_schema)?;
+        if !inner.is_empty() {
+            outputs.push(inner);
+        }
+
+        let mut null_pad_rows: OuterJoinRows = (
+            vec![Vec::new(); self.left_n_cols],
+            vec![Vec::new(); self.right_n_cols],
+            Vec::new(),
+        );
+        for (key, delta) in &delta_lw {
+            let old_lw = self.state.left_key_weight.get(key).copied().unwrap_or(0);
+            let new_lw = old_lw + delta;
+            if (old_lw == 0) != (new_lw == 0) {
+                let retract = old_lw == 0;
+                for (r_row_bytes, r_weight) in self.state.probe_right(key) {
+                    let left_nulls = vec![None; self.left_n_cols];
+                    let right_vals = OuterJoinOp::deserialize_row(r_row_bytes, self.right_n_cols)?;
+                    for (i, v) in left_nulls.iter().enumerate() {
+                        null_pad_rows.0[i].push(*v);
+                    }
+                    for (i, v) in right_vals.iter().enumerate() {
+                        null_pad_rows.1[i].push(*v);
+                    }
+                    null_pad_rows
+                        .2
+                        .push(if retract { -r_weight } else { r_weight });
+                }
+            }
+        }
+        if !null_pad_rows.2.is_empty() {
+            let batch = OuterJoinOp::make_output_batch(
+                &null_pad_rows.0,
+                &null_pad_rows.1,
+                &out_schema,
+                true,
+                false,
+            )?;
+            outputs.push(ArrowZSet::new(batch, null_pad_rows.2));
+        }
+
+        let mut null_new_rows: OuterJoinRows = (
+            vec![Vec::new(); self.left_n_cols],
+            vec![Vec::new(); self.right_n_cols],
+            Vec::new(),
+        );
+        for (join_key, _, row_bytes, w) in &self.right_staged.rows {
+            let old_lw = self
+                .state
+                .left_key_weight
+                .get(join_key)
+                .copied()
+                .unwrap_or(0);
+            let delta = delta_lw.get(join_key).copied().unwrap_or(0);
+            let effective_lw = old_lw + delta;
+            if effective_lw == 0 {
+                let left_nulls = vec![None; self.left_n_cols];
+                let right_vals = OuterJoinOp::deserialize_row(row_bytes, self.right_n_cols)?;
+                for (i, v) in left_nulls.iter().enumerate() {
+                    null_new_rows.0[i].push(*v);
+                }
+                for (i, v) in right_vals.iter().enumerate() {
+                    null_new_rows.1[i].push(*v);
+                }
+                null_new_rows.2.push(*w);
+            }
+        }
+        if !null_new_rows.2.is_empty() {
+            let batch = OuterJoinOp::make_output_batch(
+                &null_new_rows.0,
+                &null_new_rows.1,
+                &out_schema,
+                true,
+                false,
+            )?;
+            outputs.push(ArrowZSet::new(batch, null_new_rows.2));
+        }
+
+        self.commit_staged(&HashMap::new(), Some(&delta_lw));
+        concat_zsets(outputs, out_schema)
+    }
+
+    fn process_epoch_full(
+        &mut self,
+        left: ArrowZSet,
+        right: ArrowZSet,
+    ) -> Result<ArrowZSet, OpError> {
+        self.stage_left(&left)?;
+        self.stage_right(&right)?;
+
+        let out_schema = output_schema(
+            self.kind,
+            left.data.schema().as_ref(),
+            right.data.schema().as_ref(),
+        );
+        let mut outputs: Vec<ArrowZSet> = Vec::new();
+
+        let mut delta_rw: HashMap<Vec<u8>, i64> = HashMap::new();
+        let mut right_staged_rows: HashMap<Vec<u8>, Vec<(Vec<u8>, i64)>> = HashMap::new();
+        for (join_key, _, row_bytes, w) in &self.right_staged.rows {
+            *delta_rw.entry(join_key.clone()).or_insert(0) += w;
+            right_staged_rows
+                .entry(join_key.clone())
+                .or_default()
+                .push((row_bytes.clone(), *w));
+        }
+
+        let mut delta_lw: HashMap<Vec<u8>, i64> = HashMap::new();
+        for (join_key, _, _, w) in &self.left_staged.rows {
+            *delta_lw.entry(join_key.clone()).or_insert(0) += w;
+        }
+
+        let inner = self.compute_inner_join_output(&right_staged_rows, &out_schema)?;
+        if !inner.is_empty() {
+            outputs.push(inner);
+        }
+
+        let mut null_pad_left: OuterJoinRows = (
+            vec![Vec::new(); self.left_n_cols],
+            vec![Vec::new(); self.right_n_cols],
+            Vec::new(),
+        );
+        for (key, delta) in &delta_rw {
+            let old_rw = self.state.right_key_weight.get(key).copied().unwrap_or(0);
+            let new_rw = old_rw + delta;
+            if (old_rw == 0) != (new_rw == 0) {
+                let retract = old_rw == 0;
+                for (l_row_bytes, l_weight) in self.state.probe_left(key) {
+                    let left_vals = OuterJoinOp::deserialize_row(l_row_bytes, self.left_n_cols)?;
+                    let right_nulls = vec![None; self.right_n_cols];
+                    for (i, v) in left_vals.iter().enumerate() {
+                        null_pad_left.0[i].push(*v);
+                    }
+                    for (i, v) in right_nulls.iter().enumerate() {
+                        null_pad_left.1[i].push(*v);
+                    }
+                    null_pad_left
+                        .2
+                        .push(if retract { -l_weight } else { l_weight });
+                }
+            }
+        }
+        if !null_pad_left.2.is_empty() {
+            let batch = OuterJoinOp::make_output_batch(
+                &null_pad_left.0,
+                &null_pad_left.1,
+                &out_schema,
+                false,
+                true,
+            )?;
+            outputs.push(ArrowZSet::new(batch, null_pad_left.2));
+        }
+
+        let mut null_pad_right: OuterJoinRows = (
+            vec![Vec::new(); self.left_n_cols],
+            vec![Vec::new(); self.right_n_cols],
+            Vec::new(),
+        );
+        for (key, delta) in &delta_lw {
+            let old_lw = self.state.left_key_weight.get(key).copied().unwrap_or(0);
+            let new_lw = old_lw + delta;
+            if (old_lw == 0) != (new_lw == 0) {
+                let retract = old_lw == 0;
+                for (r_row_bytes, r_weight) in self.state.probe_right(key) {
+                    let left_nulls = vec![None; self.left_n_cols];
+                    let right_vals = OuterJoinOp::deserialize_row(r_row_bytes, self.right_n_cols)?;
+                    for (i, v) in left_nulls.iter().enumerate() {
+                        null_pad_right.0[i].push(*v);
+                    }
+                    for (i, v) in right_vals.iter().enumerate() {
+                        null_pad_right.1[i].push(*v);
+                    }
+                    null_pad_right
+                        .2
+                        .push(if retract { -r_weight } else { r_weight });
+                }
+            }
+        }
+        if !null_pad_right.2.is_empty() {
+            let batch = OuterJoinOp::make_output_batch(
+                &null_pad_right.0,
+                &null_pad_right.1,
+                &out_schema,
+                true,
+                false,
+            )?;
+            outputs.push(ArrowZSet::new(batch, null_pad_right.2));
+        }
+
+        let mut null_new_left: OuterJoinRows = (
+            vec![Vec::new(); self.left_n_cols],
+            vec![Vec::new(); self.right_n_cols],
+            Vec::new(),
+        );
+        for (join_key, _, row_bytes, w) in &self.left_staged.rows {
+            let old_rw = self
+                .state
+                .right_key_weight
+                .get(join_key)
+                .copied()
+                .unwrap_or(0);
+            let delta = delta_rw.get(join_key).copied().unwrap_or(0);
+            let effective_rw = old_rw + delta;
+            if effective_rw == 0 {
+                let left_vals = OuterJoinOp::deserialize_row(row_bytes, self.left_n_cols)?;
+                let right_nulls = vec![None; self.right_n_cols];
+                for (i, v) in left_vals.iter().enumerate() {
+                    null_new_left.0[i].push(*v);
+                }
+                for (i, v) in right_nulls.iter().enumerate() {
+                    null_new_left.1[i].push(*v);
+                }
+                null_new_left.2.push(*w);
+            }
+        }
+        if !null_new_left.2.is_empty() {
+            let batch = OuterJoinOp::make_output_batch(
+                &null_new_left.0,
+                &null_new_left.1,
+                &out_schema,
+                false,
+                true,
+            )?;
+            outputs.push(ArrowZSet::new(batch, null_new_left.2));
+        }
+
+        let mut null_new_right: OuterJoinRows = (
+            vec![Vec::new(); self.left_n_cols],
+            vec![Vec::new(); self.right_n_cols],
+            Vec::new(),
+        );
+        for (join_key, _, row_bytes, w) in &self.right_staged.rows {
+            let old_lw = self
+                .state
+                .left_key_weight
+                .get(join_key)
+                .copied()
+                .unwrap_or(0);
+            let delta = delta_lw.get(join_key).copied().unwrap_or(0);
+            let effective_lw = old_lw + delta;
+            if effective_lw == 0 {
+                let left_nulls = vec![None; self.left_n_cols];
+                let right_vals = OuterJoinOp::deserialize_row(row_bytes, self.right_n_cols)?;
+                for (i, v) in left_nulls.iter().enumerate() {
+                    null_new_right.0[i].push(*v);
+                }
+                for (i, v) in right_vals.iter().enumerate() {
+                    null_new_right.1[i].push(*v);
+                }
+                null_new_right.2.push(*w);
+            }
+        }
+        if !null_new_right.2.is_empty() {
+            let batch = OuterJoinOp::make_output_batch(
+                &null_new_right.0,
+                &null_new_right.1,
+                &out_schema,
+                true,
+                false,
+            )?;
+            outputs.push(ArrowZSet::new(batch, null_new_right.2));
+        }
+
+        self.commit_staged(&delta_rw, Some(&delta_lw));
+        concat_zsets(outputs, out_schema)
+    }
+
+    fn process_epoch_semi(
+        &mut self,
+        left: ArrowZSet,
+        right: ArrowZSet,
+    ) -> Result<ArrowZSet, OpError> {
+        self.stage_left(&left)?;
+        self.stage_right(&right)?;
+
+        let out_schema = output_schema(
+            self.kind,
+            left.data.schema().as_ref(),
+            right.data.schema().as_ref(),
+        );
+        let mut outputs: Vec<ArrowZSet> = Vec::new();
+
+        let mut delta_rw: HashMap<Vec<u8>, i64> = HashMap::new();
+        for (join_key, _, _, w) in &self.right_staged.rows {
+            *delta_rw.entry(join_key.clone()).or_insert(0) += w;
+        }
+
+        let mut semi_rows: (Vec<Vec<Option<i64>>>, Vec<i64>) =
+            (vec![Vec::new(); self.left_n_cols], Vec::new());
+        for (key, delta) in &delta_rw {
+            let old_rw = self.state.right_key_weight.get(key).copied().unwrap_or(0);
+            let new_rw = old_rw + delta;
+            if (old_rw == 0) != (new_rw == 0) {
+                let sign: i64 = if old_rw == 0 { 1 } else { -1 };
+                for (l_row_bytes, l_weight) in self.state.probe_left(key) {
+                    let left_vals = OuterJoinOp::deserialize_row(l_row_bytes, self.left_n_cols)?;
+                    for (i, v) in left_vals.iter().enumerate() {
+                        semi_rows.0[i].push(*v);
+                    }
+                    semi_rows.1.push(sign * l_weight);
+                }
+            }
+        }
+        if !semi_rows.1.is_empty() {
+            let batch = OuterJoinOp::make_semi_batch(&semi_rows.0, &out_schema)?;
+            outputs.push(ArrowZSet::new(batch, semi_rows.1));
+        }
+
+        let mut new_left_rows: (Vec<Vec<Option<i64>>>, Vec<i64>) =
+            (vec![Vec::new(); self.left_n_cols], Vec::new());
+        for (join_key, _, row_bytes, w) in &self.left_staged.rows {
+            let old_rw = self
+                .state
+                .right_key_weight
+                .get(join_key)
+                .copied()
+                .unwrap_or(0);
+            let delta = delta_rw.get(join_key).copied().unwrap_or(0);
+            let effective_rw = old_rw + delta;
+            if effective_rw != 0 {
+                let left_vals = OuterJoinOp::deserialize_row(row_bytes, self.left_n_cols)?;
+                for (i, v) in left_vals.iter().enumerate() {
+                    new_left_rows.0[i].push(*v);
+                }
+                new_left_rows.1.push(*w);
+            }
+        }
+        if !new_left_rows.1.is_empty() {
+            let batch = OuterJoinOp::make_semi_batch(&new_left_rows.0, &out_schema)?;
+            outputs.push(ArrowZSet::new(batch, new_left_rows.1));
+        }
+
+        self.commit_staged(&delta_rw, None);
+        concat_zsets(outputs, out_schema)
+    }
+
+    fn process_epoch_anti(
+        &mut self,
+        left: ArrowZSet,
+        right: ArrowZSet,
+    ) -> Result<ArrowZSet, OpError> {
+        self.stage_left(&left)?;
+        self.stage_right(&right)?;
+
+        let out_schema = output_schema(
+            self.kind,
+            left.data.schema().as_ref(),
+            right.data.schema().as_ref(),
+        );
+        let mut outputs: Vec<ArrowZSet> = Vec::new();
+
+        let mut delta_rw: HashMap<Vec<u8>, i64> = HashMap::new();
+        for (join_key, _, _, w) in &self.right_staged.rows {
+            *delta_rw.entry(join_key.clone()).or_insert(0) += w;
+        }
+
+        let mut anti_rows: (Vec<Vec<Option<i64>>>, Vec<i64>) =
+            (vec![Vec::new(); self.left_n_cols], Vec::new());
+        for (key, delta) in &delta_rw {
+            let old_rw = self.state.right_key_weight.get(key).copied().unwrap_or(0);
+            let new_rw = old_rw + delta;
+            if (old_rw == 0) != (new_rw == 0) {
+                let sign: i64 = if old_rw == 0 { -1 } else { 1 };
+                for (l_row_bytes, l_weight) in self.state.probe_left(key) {
+                    let left_vals = OuterJoinOp::deserialize_row(l_row_bytes, self.left_n_cols)?;
+                    for (i, v) in left_vals.iter().enumerate() {
+                        anti_rows.0[i].push(*v);
+                    }
+                    anti_rows.1.push(sign * l_weight);
+                }
+            }
+        }
+        if !anti_rows.1.is_empty() {
+            let batch = OuterJoinOp::make_semi_batch(&anti_rows.0, &out_schema)?;
+            outputs.push(ArrowZSet::new(batch, anti_rows.1));
+        }
+
+        let mut new_left_rows: (Vec<Vec<Option<i64>>>, Vec<i64>) =
+            (vec![Vec::new(); self.left_n_cols], Vec::new());
+        for (join_key, _, row_bytes, w) in &self.left_staged.rows {
+            let old_rw = self
+                .state
+                .right_key_weight
+                .get(join_key)
+                .copied()
+                .unwrap_or(0);
+            let delta = delta_rw.get(join_key).copied().unwrap_or(0);
+            let effective_rw = old_rw + delta;
+            if effective_rw == 0 {
+                let left_vals = OuterJoinOp::deserialize_row(row_bytes, self.left_n_cols)?;
+                for (i, v) in left_vals.iter().enumerate() {
+                    new_left_rows.0[i].push(*v);
+                }
+                new_left_rows.1.push(*w);
+            }
+        }
+        if !new_left_rows.1.is_empty() {
+            let batch = OuterJoinOp::make_semi_batch(&new_left_rows.0, &out_schema)?;
+            outputs.push(ArrowZSet::new(batch, new_left_rows.1));
+        }
+
+        self.commit_staged(&delta_rw, None);
+        concat_zsets(outputs, out_schema)
+    }
+
+    fn process_epoch_null_aware_anti(
+        &mut self,
+        left: ArrowZSet,
+        right: ArrowZSet,
+    ) -> Result<ArrowZSet, OpError> {
+        self.stage_left(&left)?;
+        self.stage_right(&right)?;
+
+        let out_schema = output_schema(
+            self.kind,
+            left.data.schema().as_ref(),
+            right.data.schema().as_ref(),
+        );
+        let mut delta_rw: HashMap<Vec<u8>, i64> = HashMap::new();
+        for (join_key, _, _, weight) in &self.right_staged.rows {
+            *delta_rw.entry(join_key.clone()).or_insert(0) += weight;
+        }
+        let null_delta = self.right_staged.null_weight;
+        let total_delta: i64 = delta_rw.values().sum();
+        let mut output_rows = vec![Vec::new(); self.left_n_cols];
+        let mut output_weights = Vec::new();
+
+        let old_null = self.state.right_null_weight > 0;
+        let new_null = self.state.right_null_weight + null_delta > 0;
+        let old_empty = self.state.right_total_weight == 0;
+        let new_empty = self.state.right_total_weight + total_delta == 0;
+
+        if old_null != new_null || old_empty != new_empty {
+            for (key, rows) in &self.state.left_arr {
+                let old_matches = self.state.right_key_weight.get(key).copied().unwrap_or(0);
+                let new_matches = old_matches + delta_rw.get(key).copied().unwrap_or(0);
+                for row in rows.values() {
+                    let values = OuterJoinOp::deserialize_row(&row.row_bytes, self.left_n_cols)?;
+                    let has_null_key = self
+                        .left_key_cols
+                        .iter()
+                        .any(|column| values[*column].is_none());
+                    let was_visible = if has_null_key {
+                        old_empty
+                    } else {
+                        !old_null && old_matches == 0
+                    };
+                    let now_visible = if has_null_key {
+                        new_empty
+                    } else {
+                        !new_null && new_matches == 0
+                    };
+                    if was_visible != now_visible {
+                        for (column, value) in values.iter().enumerate() {
+                            output_rows[column].push(*value);
+                        }
+                        output_weights
+                            .push(row.weight * (i64::from(now_visible) - i64::from(was_visible)));
+                    }
+                }
+            }
+        } else if !old_null {
+            for (key, delta) in &delta_rw {
+                let old_matches = self.state.right_key_weight.get(key).copied().unwrap_or(0);
+                let new_matches = old_matches + delta;
+                if (old_matches == 0) != (new_matches == 0) {
+                    let sign = if old_matches == 0 { -1 } else { 1 };
+                    for (row_bytes, weight) in self.state.probe_left(key) {
+                        let values = OuterJoinOp::deserialize_row(row_bytes, self.left_n_cols)?;
+                        let has_null_key = self
+                            .left_key_cols
+                            .iter()
+                            .any(|column| values[*column].is_none());
+                        if has_null_key {
+                            continue;
+                        }
+                        for (column, value) in values.iter().enumerate() {
+                            output_rows[column].push(*value);
+                        }
+                        output_weights.push(sign * weight);
+                    }
+                }
+            }
+        }
+
+        if !new_null {
+            for (key, _, row_bytes, weight) in &self.left_staged.rows {
+                let values = OuterJoinOp::deserialize_row(row_bytes, self.left_n_cols)?;
+                let has_null_key = self
+                    .left_key_cols
+                    .iter()
+                    .any(|column| values[*column].is_none());
+                if has_null_key && !new_empty {
+                    continue;
+                }
+                let matches = self.state.right_key_weight.get(key).copied().unwrap_or(0)
+                    + delta_rw.get(key).copied().unwrap_or(0);
+                if has_null_key || (!new_null && matches == 0) {
+                    for (column, value) in values.iter().enumerate() {
+                        output_rows[column].push(*value);
+                    }
+                    output_weights.push(*weight);
+                }
+            }
+        }
+
+        let outputs = if output_weights.is_empty() {
+            Vec::new()
+        } else {
+            vec![ArrowZSet::new(
+                OuterJoinOp::make_semi_batch(&output_rows, &out_schema)?,
+                output_weights,
+            )]
+        };
+        self.commit_staged(&delta_rw, None);
+        concat_zsets(outputs, out_schema)
+    }
+
+    fn compute_inner_join_output(
+        &self,
+        right_staged_rows: &HashMap<Vec<u8>, Vec<(Vec<u8>, i64)>>,
+        out_schema: &SchemaRef,
+    ) -> Result<ArrowZSet, OpError> {
+        let mut left_cols: Vec<Vec<Option<i64>>> = vec![Vec::new(); self.left_n_cols];
+        let mut right_cols: Vec<Vec<Option<i64>>> = vec![Vec::new(); self.right_n_cols];
+        let mut out_weights: Vec<i64> = Vec::new();
+
+        // ΔL ⋈ R₀
+        for (join_key, _, row_bytes, w) in &self.left_staged.rows {
+            for (right_row_bytes, r_weight) in self.state.probe_right(join_key) {
+                let left_vals = OuterJoinOp::deserialize_row(row_bytes, self.left_n_cols)?;
+                let right_vals = OuterJoinOp::deserialize_row(right_row_bytes, self.right_n_cols)?;
+                for (i, v) in left_vals.iter().enumerate() {
+                    left_cols[i].push(*v);
+                }
+                for (i, v) in right_vals.iter().enumerate() {
+                    right_cols[i].push(*v);
+                }
+                out_weights.push(w * r_weight);
+            }
+        }
+
+        // L₀ ⋈ ΔR
+        for (join_key, _, row_bytes, w) in &self.right_staged.rows {
+            for (left_row_bytes, l_weight) in self.state.probe_left(join_key) {
+                let left_vals = OuterJoinOp::deserialize_row(left_row_bytes, self.left_n_cols)?;
+                let right_vals = OuterJoinOp::deserialize_row(row_bytes, self.right_n_cols)?;
+                for (i, v) in left_vals.iter().enumerate() {
+                    left_cols[i].push(*v);
+                }
+                for (i, v) in right_vals.iter().enumerate() {
+                    right_cols[i].push(*v);
+                }
+                out_weights.push(l_weight * w);
+            }
+        }
+
+        // ΔL ⋈ ΔR
+        for (join_key, _, left_bytes, l_w) in &self.left_staged.rows {
+            if let Some(right_rows) = right_staged_rows.get(join_key) {
+                for (right_bytes, r_w) in right_rows {
+                    let left_vals = OuterJoinOp::deserialize_row(left_bytes, self.left_n_cols)?;
+                    let right_vals = OuterJoinOp::deserialize_row(right_bytes, self.right_n_cols)?;
+                    for (i, v) in left_vals.iter().enumerate() {
+                        left_cols[i].push(*v);
+                    }
+                    for (i, v) in right_vals.iter().enumerate() {
+                        right_cols[i].push(*v);
+                    }
+                    out_weights.push(l_w * r_w);
+                }
+            }
+        }
+
+        let batch =
+            OuterJoinOp::make_output_batch(&left_cols, &right_cols, out_schema, false, false)?;
+        Ok(ArrowZSet::new(batch, out_weights))
+    }
+
+    fn commit_staged(
+        &mut self,
+        delta_rw: &HashMap<Vec<u8>, i64>,
+        delta_lw: Option<&HashMap<Vec<u8>, i64>>,
+    ) {
+        for (join_key, row_id, row_bytes, w) in self.left_staged.rows.drain(..) {
+            self.dirty_left.insert((join_key.clone(), row_id));
+            self.state.update_left(join_key, row_id, row_bytes, w);
+        }
+
+        for (join_key, row_id, row_bytes, w) in self.right_staged.rows.drain(..) {
+            self.dirty_right.insert((join_key.clone(), row_id));
+            self.state.update_right(join_key, row_id, row_bytes, w);
+        }
+
+        self.left_staged.staged_bytes = 0;
+        let null_delta = self.right_staged.null_weight;
+        self.right_staged.null_weight = 0;
+        self.right_staged.staged_bytes = 0;
+
+        if self.kind == OuterJoinKind::NullAwareAnti {
+            let total_delta: i64 = delta_rw.values().sum();
+            let old_bytes = u64::from(self.state.right_total_weight > 0) * 16;
+            self.state.right_total_weight += total_delta;
+            self.state.right_null_weight += null_delta;
+            let new_bytes = u64::from(self.state.right_total_weight > 0) * 16;
+            self.state.state_bytes = self
+                .state
+                .state_bytes
+                .saturating_sub(old_bytes)
+                .saturating_add(new_bytes);
+            if total_delta != 0 || null_delta != 0 {
+                self.dirty_null_weight = true;
+            }
+        }
+
+        for (key, delta) in delta_rw {
+            self.dirty_rw.insert(key.clone());
+            let is_new = !self.state.right_key_weight.contains_key(key);
+            let key_len = key.len() as u64;
+            if is_new {
+                self.state.state_bytes += key_len + 8;
+            }
+            let entry = self.state.right_key_weight.entry(key.clone()).or_insert(0);
+            *entry += delta;
+            if *entry == 0 {
+                self.state.right_key_weight.remove(key);
+                self.state.state_bytes = self.state.state_bytes.saturating_sub(key_len + 8);
+            }
+        }
+
+        if let Some(dlw) = delta_lw {
+            for (key, delta) in dlw {
+                self.dirty_lw.insert(key.clone());
+                let is_new = !self.state.left_key_weight.contains_key(key);
+                let key_len = key.len() as u64;
+                if is_new {
+                    self.state.state_bytes += key_len + 8;
+                }
+                let entry = self.state.left_key_weight.entry(key.clone()).or_insert(0);
+                *entry += delta;
+                if *entry == 0 {
+                    self.state.left_key_weight.remove(key);
+                    self.state.state_bytes = self.state.state_bytes.saturating_sub(key_len + 8);
+                }
+            }
+        }
+    }
+
+    pub fn append_state(&mut self, target: &mut WriteBatch) -> Result<(), OpError> {
+        let mut batch = WriteBatch::new();
+
+        for (join_key, row_id) in self.dirty_left.drain() {
+            let key =
+                ShardKeyEncoder::join_arr_key(JoinSide::Left, self.op_id.0, &join_key, row_id);
+            if let Some(arr_row) = self
+                .state
+                .left_arr
+                .get(&join_key)
+                .and_then(|b| b.get(&row_id))
+            {
+                if arr_row.weight > 0 {
+                    batch.put(&key, &arr_row.row_bytes);
+                } else {
+                    batch.delete(&key);
+                }
+            } else {
+                batch.delete(&key);
+            }
+        }
+
+        for (join_key, row_id) in self.dirty_right.drain() {
+            let key =
+                ShardKeyEncoder::join_arr_key(JoinSide::Right, self.op_id.0, &join_key, row_id);
+            if let Some(arr_row) = self
+                .state
+                .right_arr
+                .get(&join_key)
+                .and_then(|b| b.get(&row_id))
+            {
+                if arr_row.weight > 0 {
+                    batch.put(&key, &arr_row.row_bytes);
+                } else {
+                    batch.delete(&key);
+                }
+            } else {
+                batch.delete(&key);
+            }
+        }
+
+        let rw_prefix: &[u8] = &[0x01, 0x4F, 0x52];
+        for key_bytes in self.dirty_rw.drain() {
+            let mut storage_key = Vec::with_capacity(3 + 8 + key_bytes.len());
+            storage_key.extend_from_slice(rw_prefix);
+            storage_key.extend_from_slice(&self.op_id.0.to_be_bytes());
+            storage_key.extend_from_slice(&key_bytes);
+            if let Some(&weight) = self.state.right_key_weight.get(&key_bytes) {
+                if weight != 0 {
+                    batch.put(&storage_key, &weight.to_be_bytes());
+                } else {
+                    batch.delete(&storage_key);
+                }
+            } else {
+                batch.delete(&storage_key);
+            }
+        }
+
+        let lw_prefix: &[u8] = &[0x01, 0x4F, 0x4C];
+        for key_bytes in self.dirty_lw.drain() {
+            let mut storage_key = Vec::with_capacity(3 + 8 + key_bytes.len());
+            storage_key.extend_from_slice(lw_prefix);
+            storage_key.extend_from_slice(&self.op_id.0.to_be_bytes());
+            storage_key.extend_from_slice(&key_bytes);
+            if let Some(&weight) = self.state.left_key_weight.get(&key_bytes) {
+                if weight != 0 {
+                    batch.put(&storage_key, &weight.to_be_bytes());
+                } else {
+                    batch.delete(&storage_key);
+                }
+            } else {
+                batch.delete(&storage_key);
+            }
+        }
+
+        if std::mem::take(&mut self.dirty_null_weight) {
+            let mut storage_key = vec![0x01, 0x4F, 0x4E];
+            storage_key.extend_from_slice(&self.op_id.0.to_be_bytes());
+            if self.state.right_total_weight > 0 {
+                let mut value = self.state.right_total_weight.to_be_bytes().to_vec();
+                value.extend_from_slice(&self.state.right_null_weight.to_be_bytes());
+                batch.put(&storage_key, &value);
+            } else {
+                batch.delete(&storage_key);
+            }
+        }
+
+        target.merge_from(batch);
+        Ok(())
+    }
+
+    pub async fn persist_state(&mut self, db: &ShardDb) -> Result<(), OpError> {
+        let mut batch = WriteBatch::new();
+        self.append_state(&mut batch)?;
+        if !batch.is_empty() {
+            db.write_batch(batch).await.map_err(OpError::storage)?;
+        }
+        Ok(())
+    }
+
+    pub async fn restore_in_place(&mut self, db: &ShardDb) -> Result<(), OpError> {
+        let loaded = OuterJoinOp::load_from_storage(db, self.op_id, self.kind).await?;
+        let loaded_core = loaded.into_core();
+        self.state = loaded_core.state;
+        self.left_staged = StagedDelta::default();
+        self.right_staged = StagedDelta::default();
+        self.dirty_left.clear();
+        self.dirty_right.clear();
+        self.dirty_rw.clear();
+        self.dirty_lw.clear();
+        self.dirty_null_weight = false;
+        Ok(())
+    }
+}
+
+// ─── OuterJoinOp ─────────────────────────────────────────────────────────────
+
+/// Incremental outer / semi / anti equi-join operator (v0.9 — IVM-5).
+pub struct OuterJoinOp {
+    op_id: OperatorId,
+    kind: OuterJoinKind,
+    right_n_cols: usize,
+    core: Mutex<OuterJoinStateCore>,
 }
 
 impl OuterJoinOp {
@@ -272,40 +1312,34 @@ impl OuterJoinOp {
         left_n_cols: usize,
         right_n_cols: usize,
     ) -> Self {
-        OuterJoinOp {
+        Self::from_core(OuterJoinStateCore::with_schema(
             op_id,
             kind,
             left_key_cols,
             right_key_cols,
             left_n_cols,
             right_n_cols,
-            state: Mutex::new(OuterJoinState::new()),
-            left_staged: Mutex::new(StagedDelta::default()),
-            right_staged: Mutex::new(StagedDelta::default()),
-            dirty_left: Mutex::new(HashSet::new()),
-            dirty_right: Mutex::new(HashSet::new()),
-            dirty_rw: Mutex::new(HashSet::new()),
-            dirty_lw: Mutex::new(HashSet::new()),
-            dirty_null_weight: Mutex::new(false),
+        ))
+    }
+
+    pub fn from_core(core: OuterJoinStateCore) -> Self {
+        let op_id = core.op_id;
+        let kind = core.kind;
+        let right_n_cols = core.right_n_cols;
+        OuterJoinOp {
+            op_id,
+            kind,
+            right_n_cols,
+            core: Mutex::new(core),
         }
+    }
+
+    pub fn into_core(self) -> OuterJoinStateCore {
+        self.core.into_inner().unwrap()
     }
 
     pub fn kind(&self) -> OuterJoinKind {
         self.kind
-    }
-
-    fn extract_key(
-        row: &RecordBatch,
-        row_idx: usize,
-        key_cols: &[usize],
-    ) -> Result<(Vec<u8>, bool), OpError> {
-        let arrays: Vec<&dyn arrow::array::Array> = key_cols
-            .iter()
-            .map(|column| row.column(*column).as_ref())
-            .collect();
-        let capsule = KeyCapsule::from_arrays(&arrays, row_idx)
-            .map_err(|error| OpError::unsupported_plan_node(error.to_string()))?;
-        Ok((capsule.typed_bytes().to_vec(), capsule.contains_null()))
     }
 
     fn serialize_row(batch: &RecordBatch, row_idx: usize) -> Vec<u8> {
@@ -393,966 +1427,38 @@ impl OuterJoinOp {
 
     /// Run a full epoch: process left and right deltas, then commit.
     pub fn process_epoch(&self, left: ArrowZSet, right: ArrowZSet) -> Result<ArrowZSet, OpError> {
-        match self.kind {
-            OuterJoinKind::Left => self.process_epoch_left(left, right),
-            OuterJoinKind::Right => self.process_epoch_right(left, right),
-            OuterJoinKind::Full => self.process_epoch_full(left, right),
-            OuterJoinKind::Semi => self.process_epoch_semi(left, right),
-            OuterJoinKind::Anti => self.process_epoch_anti(left, right),
-            OuterJoinKind::NullAwareAnti => self.process_epoch_null_aware_anti(left, right),
-        }
+        self.core.lock().unwrap().process_epoch(left, right)
     }
 
-    /// Stage a left delta into left_staged (no probing yet).
-    fn stage_left(&self, delta: &ArrowZSet) -> Result<(), OpError> {
-        let mut staged = self.left_staged.lock().unwrap();
-        for row_idx in 0..delta.num_rows() {
-            let w = delta.weights[row_idx];
-            let (capsule_key, is_null) =
-                Self::extract_key(&delta.data, row_idx, &self.left_key_cols)?;
-            let row_bytes = Self::serialize_row(&delta.data, row_idx);
-            let row_id = stable_row_id(self.op_id.0, &capsule_key, &row_bytes);
-            let join_key = if is_null {
-                // Opposite sides must never share a NULL-key bucket.
-                [capsule_key, row_id.to_be_bytes().to_vec(), vec![0]].concat()
-            } else {
-                capsule_key
-            };
-            staged.push(join_key, row_id, row_bytes, w);
-        }
-        Ok(())
-    }
-
-    /// Stage a right delta into right_staged (no probing yet).
-    fn stage_right(&self, delta: &ArrowZSet) -> Result<(), OpError> {
-        let mut staged = self.right_staged.lock().unwrap();
-        for row_idx in 0..delta.num_rows() {
-            let w = delta.weights[row_idx];
-            let (capsule_key, is_null) =
-                Self::extract_key(&delta.data, row_idx, &self.right_key_cols)?;
-            let row_bytes = Self::serialize_row(&delta.data, row_idx);
-            let row_id = stable_row_id(self.op_id.0, &capsule_key, &row_bytes);
-            let join_key = if is_null {
-                [capsule_key, row_id.to_be_bytes().to_vec(), vec![1]].concat()
-            } else {
-                capsule_key
-            };
-            staged.push(join_key, row_id, row_bytes, w);
-            if is_null {
-                staged.null_weight += w;
-            }
-        }
-        Ok(())
-    }
-
-    // ─── LEFT JOIN ────────────────────────────────────────────────────────────
-
-    fn process_epoch_left(&self, left: ArrowZSet, right: ArrowZSet) -> Result<ArrowZSet, OpError> {
-        self.stage_left(&left)?;
-        self.stage_right(&right)?;
-
-        let out_schema = output_schema(
-            self.kind,
-            left.data.schema().as_ref(),
-            right.data.schema().as_ref(),
-        );
-        let mut outputs: Vec<ArrowZSet> = Vec::new();
-
-        // Compute staged right delta per key.
-        let delta_rw: HashMap<Vec<u8>, i64> = {
-            let staged = self.right_staged.lock().unwrap();
-            let mut map: HashMap<Vec<u8>, i64> = HashMap::new();
-            for (join_key, _row_id, _row_bytes, w) in &staged.rows {
-                *map.entry(join_key.clone()).or_insert(0) += w;
-            }
-            map
-        };
-
-        // Compute staged right delta rows by key (for ΔL ⋈ ΔR).
-        let right_staged_rows: HashMap<Vec<u8>, Vec<(Vec<u8>, i64)>> = {
-            let staged = self.right_staged.lock().unwrap();
-            let mut map: HashMap<Vec<u8>, Vec<(Vec<u8>, i64)>> = HashMap::new();
-            for (join_key, _row_id, row_bytes, w) in &staged.rows {
-                map.entry(join_key.clone())
-                    .or_default()
-                    .push((row_bytes.clone(), *w));
-            }
-            map
-        };
-
-        {
-            let state = self.state.lock().unwrap();
-
-            // 1. Inner join output: ΔL⋈R₀ + L₀⋈ΔR + ΔL⋈ΔR
-            let inner = self.compute_inner_join_output(&state, &right_staged_rows, &out_schema)?;
-            if !inner.is_empty() {
-                outputs.push(inner);
-            }
-
-            // 2. NULL-pad transitions due to right side changing.
-            //    For each key in delta_rw:
-            //      old_rw = right_key_weight[k], new_rw = old_rw + delta_rw[k]
-            //      If old_rw == 0 && new_rw != 0: retract NULL-pads for L₀[k]
-            //      If old_rw != 0 && new_rw == 0: add NULL-pads for L₀[k]
-            let mut null_pad_rows: OuterJoinRows = (
-                vec![Vec::new(); self.left_n_cols],
-                vec![Vec::new(); self.right_n_cols],
-                Vec::new(),
-            );
-            for (key, delta) in &delta_rw {
-                let old_rw = state.right_key_weight.get(key).copied().unwrap_or(0);
-                let new_rw = old_rw + delta;
-                if old_rw == new_rw {
-                    continue;
-                }
-                if (old_rw == 0) != (new_rw == 0) {
-                    // Transition: either match gained or match lost for L₀ rows.
-                    let retract = old_rw == 0; // was unmatched, now matched → retract NULL-pad
-                    for (l_row_bytes, l_weight) in state.probe_left(key) {
-                        let left_vals = Self::deserialize_row(l_row_bytes, self.left_n_cols)?;
-                        let right_nulls = vec![None; self.right_n_cols];
-                        for (i, v) in left_vals.iter().enumerate() {
-                            null_pad_rows.0[i].push(*v);
-                        }
-                        for (i, v) in right_nulls.iter().enumerate() {
-                            null_pad_rows.1[i].push(*v);
-                        }
-                        // retract → negative weight; add → positive weight
-                        null_pad_rows
-                            .2
-                            .push(if retract { -l_weight } else { l_weight });
-                    }
-                }
-            }
-            if !null_pad_rows.2.is_empty() {
-                let batch = Self::make_output_batch(
-                    &null_pad_rows.0,
-                    &null_pad_rows.1,
-                    &out_schema,
-                    false,
-                    true,
-                )?;
-                outputs.push(ArrowZSet::new(batch, null_pad_rows.2));
-            }
-
-            // 3. For each ΔL row: if effective_rw == 0, emit (row, NULL_right, w).
-            {
-                let staged_left = self.left_staged.lock().unwrap();
-                let mut null_new_rows: OuterJoinRows = (
-                    vec![Vec::new(); self.left_n_cols],
-                    vec![Vec::new(); self.right_n_cols],
-                    Vec::new(),
-                );
-                for (join_key, _row_id, row_bytes, w) in &staged_left.rows {
-                    let old_rw = state.right_key_weight.get(join_key).copied().unwrap_or(0);
-                    let delta = delta_rw.get(join_key).copied().unwrap_or(0);
-                    let effective_rw = old_rw + delta;
-                    if effective_rw == 0 {
-                        let left_vals = Self::deserialize_row(row_bytes, self.left_n_cols)?;
-                        let right_nulls = vec![None; self.right_n_cols];
-                        for (i, v) in left_vals.iter().enumerate() {
-                            null_new_rows.0[i].push(*v);
-                        }
-                        for (i, v) in right_nulls.iter().enumerate() {
-                            null_new_rows.1[i].push(*v);
-                        }
-                        null_new_rows.2.push(*w);
-                    }
-                }
-                if !null_new_rows.2.is_empty() {
-                    let batch = Self::make_output_batch(
-                        &null_new_rows.0,
-                        &null_new_rows.1,
-                        &out_schema,
-                        false,
-                        true,
-                    )?;
-                    outputs.push(ArrowZSet::new(batch, null_new_rows.2));
-                }
-            }
-        }
-
-        // Apply staged deltas to state.
-        self.commit_staged(&delta_rw, None);
-
-        concat_zsets(outputs, out_schema)
-    }
-
-    // ─── RIGHT JOIN ───────────────────────────────────────────────────────────
-
-    fn process_epoch_right(&self, left: ArrowZSet, right: ArrowZSet) -> Result<ArrowZSet, OpError> {
-        self.stage_left(&left)?;
-        self.stage_right(&right)?;
-
-        let out_schema = output_schema(
-            self.kind,
-            left.data.schema().as_ref(),
-            right.data.schema().as_ref(),
-        );
-        let mut outputs: Vec<ArrowZSet> = Vec::new();
-
-        let delta_lw: HashMap<Vec<u8>, i64> = {
-            let staged = self.left_staged.lock().unwrap();
-            let mut map: HashMap<Vec<u8>, i64> = HashMap::new();
-            for (join_key, _, _, w) in &staged.rows {
-                *map.entry(join_key.clone()).or_insert(0) += w;
-            }
-            map
-        };
-
-        let right_staged_rows: HashMap<Vec<u8>, Vec<(Vec<u8>, i64)>> = {
-            let staged = self.right_staged.lock().unwrap();
-            let mut map: HashMap<Vec<u8>, Vec<(Vec<u8>, i64)>> = HashMap::new();
-            for (join_key, _, row_bytes, w) in &staged.rows {
-                map.entry(join_key.clone())
-                    .or_default()
-                    .push((row_bytes.clone(), *w));
-            }
-            map
-        };
-
-        {
-            let state = self.state.lock().unwrap();
-
-            // 1. Inner join output.
-            let inner = self.compute_inner_join_output(&state, &right_staged_rows, &out_schema)?;
-            if !inner.is_empty() {
-                outputs.push(inner);
-            }
-
-            // 2. NULL-pad transitions for right rows (symmetric to left).
-            let mut null_pad_rows: OuterJoinRows = (
-                vec![Vec::new(); self.left_n_cols],
-                vec![Vec::new(); self.right_n_cols],
-                Vec::new(),
-            );
-            for (key, delta) in &delta_lw {
-                let old_lw = state.left_key_weight.get(key).copied().unwrap_or(0);
-                let new_lw = old_lw + delta;
-                if (old_lw == 0) != (new_lw == 0) {
-                    let retract = old_lw == 0;
-                    for (r_row_bytes, r_weight) in state.probe_right(key) {
-                        let left_nulls = vec![None; self.left_n_cols];
-                        let right_vals = Self::deserialize_row(r_row_bytes, self.right_n_cols)?;
-                        for (i, v) in left_nulls.iter().enumerate() {
-                            null_pad_rows.0[i].push(*v);
-                        }
-                        for (i, v) in right_vals.iter().enumerate() {
-                            null_pad_rows.1[i].push(*v);
-                        }
-                        null_pad_rows
-                            .2
-                            .push(if retract { -r_weight } else { r_weight });
-                    }
-                }
-            }
-            if !null_pad_rows.2.is_empty() {
-                let batch = Self::make_output_batch(
-                    &null_pad_rows.0,
-                    &null_pad_rows.1,
-                    &out_schema,
-                    true,
-                    false,
-                )?;
-                outputs.push(ArrowZSet::new(batch, null_pad_rows.2));
-            }
-
-            // 3. For each ΔR row: if effective_lw == 0, emit (NULL_left, row, w).
-            {
-                let staged_right = self.right_staged.lock().unwrap();
-                let mut null_new_rows: OuterJoinRows = (
-                    vec![Vec::new(); self.left_n_cols],
-                    vec![Vec::new(); self.right_n_cols],
-                    Vec::new(),
-                );
-                for (join_key, _, row_bytes, w) in &staged_right.rows {
-                    let old_lw = state.left_key_weight.get(join_key).copied().unwrap_or(0);
-                    let delta = delta_lw.get(join_key).copied().unwrap_or(0);
-                    let effective_lw = old_lw + delta;
-                    if effective_lw == 0 {
-                        let left_nulls = vec![None; self.left_n_cols];
-                        let right_vals = Self::deserialize_row(row_bytes, self.right_n_cols)?;
-                        for (i, v) in left_nulls.iter().enumerate() {
-                            null_new_rows.0[i].push(*v);
-                        }
-                        for (i, v) in right_vals.iter().enumerate() {
-                            null_new_rows.1[i].push(*v);
-                        }
-                        null_new_rows.2.push(*w);
-                    }
-                }
-                if !null_new_rows.2.is_empty() {
-                    let batch = Self::make_output_batch(
-                        &null_new_rows.0,
-                        &null_new_rows.1,
-                        &out_schema,
-                        true,
-                        false,
-                    )?;
-                    outputs.push(ArrowZSet::new(batch, null_new_rows.2));
-                }
-            }
-        }
-
-        self.commit_staged(&HashMap::new(), Some(&delta_lw));
-
-        concat_zsets(outputs, out_schema)
-    }
-
-    // ─── FULL OUTER JOIN ──────────────────────────────────────────────────────
-
-    fn process_epoch_full(&self, left: ArrowZSet, right: ArrowZSet) -> Result<ArrowZSet, OpError> {
-        self.stage_left(&left)?;
-        self.stage_right(&right)?;
-
-        let out_schema = output_schema(
-            self.kind,
-            left.data.schema().as_ref(),
-            right.data.schema().as_ref(),
-        );
-        let mut outputs: Vec<ArrowZSet> = Vec::new();
-
-        let delta_rw: HashMap<Vec<u8>, i64> = {
-            let staged = self.right_staged.lock().unwrap();
-            let mut map: HashMap<Vec<u8>, i64> = HashMap::new();
-            for (join_key, _, _, w) in &staged.rows {
-                *map.entry(join_key.clone()).or_insert(0) += w;
-            }
-            map
-        };
-
-        let delta_lw: HashMap<Vec<u8>, i64> = {
-            let staged = self.left_staged.lock().unwrap();
-            let mut map: HashMap<Vec<u8>, i64> = HashMap::new();
-            for (join_key, _, _, w) in &staged.rows {
-                *map.entry(join_key.clone()).or_insert(0) += w;
-            }
-            map
-        };
-
-        let right_staged_rows: HashMap<Vec<u8>, Vec<(Vec<u8>, i64)>> = {
-            let staged = self.right_staged.lock().unwrap();
-            let mut map: HashMap<Vec<u8>, Vec<(Vec<u8>, i64)>> = HashMap::new();
-            for (join_key, _, row_bytes, w) in &staged.rows {
-                map.entry(join_key.clone())
-                    .or_default()
-                    .push((row_bytes.clone(), *w));
-            }
-            map
-        };
-
-        {
-            let state = self.state.lock().unwrap();
-
-            // 1. Inner join output.
-            let inner = self.compute_inner_join_output(&state, &right_staged_rows, &out_schema)?;
-            if !inner.is_empty() {
-                outputs.push(inner);
-            }
-
-            // 2. Left-side NULL-pad transitions (same as LEFT JOIN).
-            let mut null_pad_left: OuterJoinRows = (
-                vec![Vec::new(); self.left_n_cols],
-                vec![Vec::new(); self.right_n_cols],
-                Vec::new(),
-            );
-            for (key, delta) in &delta_rw {
-                let old_rw = state.right_key_weight.get(key).copied().unwrap_or(0);
-                let new_rw = old_rw + delta;
-                if (old_rw == 0) != (new_rw == 0) {
-                    let retract = old_rw == 0;
-                    for (l_row_bytes, l_weight) in state.probe_left(key) {
-                        let left_vals = Self::deserialize_row(l_row_bytes, self.left_n_cols)?;
-                        let right_nulls = vec![None; self.right_n_cols];
-                        for (i, v) in left_vals.iter().enumerate() {
-                            null_pad_left.0[i].push(*v);
-                        }
-                        for (i, v) in right_nulls.iter().enumerate() {
-                            null_pad_left.1[i].push(*v);
-                        }
-                        null_pad_left
-                            .2
-                            .push(if retract { -l_weight } else { l_weight });
-                    }
-                }
-            }
-            if !null_pad_left.2.is_empty() {
-                let batch = Self::make_output_batch(
-                    &null_pad_left.0,
-                    &null_pad_left.1,
-                    &out_schema,
-                    false,
-                    true,
-                )?;
-                outputs.push(ArrowZSet::new(batch, null_pad_left.2));
-            }
-
-            // 3. Right-side NULL-pad transitions (same as RIGHT JOIN).
-            let mut null_pad_right: OuterJoinRows = (
-                vec![Vec::new(); self.left_n_cols],
-                vec![Vec::new(); self.right_n_cols],
-                Vec::new(),
-            );
-            for (key, delta) in &delta_lw {
-                let old_lw = state.left_key_weight.get(key).copied().unwrap_or(0);
-                let new_lw = old_lw + delta;
-                if (old_lw == 0) != (new_lw == 0) {
-                    let retract = old_lw == 0;
-                    for (r_row_bytes, r_weight) in state.probe_right(key) {
-                        let left_nulls = vec![None; self.left_n_cols];
-                        let right_vals = Self::deserialize_row(r_row_bytes, self.right_n_cols)?;
-                        for (i, v) in left_nulls.iter().enumerate() {
-                            null_pad_right.0[i].push(*v);
-                        }
-                        for (i, v) in right_vals.iter().enumerate() {
-                            null_pad_right.1[i].push(*v);
-                        }
-                        null_pad_right
-                            .2
-                            .push(if retract { -r_weight } else { r_weight });
-                    }
-                }
-            }
-            if !null_pad_right.2.is_empty() {
-                let batch = Self::make_output_batch(
-                    &null_pad_right.0,
-                    &null_pad_right.1,
-                    &out_schema,
-                    true,
-                    false,
-                )?;
-                outputs.push(ArrowZSet::new(batch, null_pad_right.2));
-            }
-
-            // 4. New ΔL rows with no effective right match → NULL-pad right.
-            {
-                let staged_left = self.left_staged.lock().unwrap();
-                let mut null_new_left: OuterJoinRows = (
-                    vec![Vec::new(); self.left_n_cols],
-                    vec![Vec::new(); self.right_n_cols],
-                    Vec::new(),
-                );
-                for (join_key, _, row_bytes, w) in &staged_left.rows {
-                    let old_rw = state.right_key_weight.get(join_key).copied().unwrap_or(0);
-                    let delta = delta_rw.get(join_key).copied().unwrap_or(0);
-                    let effective_rw = old_rw + delta;
-                    if effective_rw == 0 {
-                        let left_vals = Self::deserialize_row(row_bytes, self.left_n_cols)?;
-                        let right_nulls = vec![None; self.right_n_cols];
-                        for (i, v) in left_vals.iter().enumerate() {
-                            null_new_left.0[i].push(*v);
-                        }
-                        for (i, v) in right_nulls.iter().enumerate() {
-                            null_new_left.1[i].push(*v);
-                        }
-                        null_new_left.2.push(*w);
-                    }
-                }
-                if !null_new_left.2.is_empty() {
-                    let batch = Self::make_output_batch(
-                        &null_new_left.0,
-                        &null_new_left.1,
-                        &out_schema,
-                        false,
-                        true,
-                    )?;
-                    outputs.push(ArrowZSet::new(batch, null_new_left.2));
-                }
-            }
-
-            // 5. New ΔR rows with no effective left match → NULL-pad left.
-            {
-                let staged_right = self.right_staged.lock().unwrap();
-                let mut null_new_right: OuterJoinRows = (
-                    vec![Vec::new(); self.left_n_cols],
-                    vec![Vec::new(); self.right_n_cols],
-                    Vec::new(),
-                );
-                for (join_key, _, row_bytes, w) in &staged_right.rows {
-                    let old_lw = state.left_key_weight.get(join_key).copied().unwrap_or(0);
-                    let delta = delta_lw.get(join_key).copied().unwrap_or(0);
-                    let effective_lw = old_lw + delta;
-                    if effective_lw == 0 {
-                        let left_nulls = vec![None; self.left_n_cols];
-                        let right_vals = Self::deserialize_row(row_bytes, self.right_n_cols)?;
-                        for (i, v) in left_nulls.iter().enumerate() {
-                            null_new_right.0[i].push(*v);
-                        }
-                        for (i, v) in right_vals.iter().enumerate() {
-                            null_new_right.1[i].push(*v);
-                        }
-                        null_new_right.2.push(*w);
-                    }
-                }
-                if !null_new_right.2.is_empty() {
-                    let batch = Self::make_output_batch(
-                        &null_new_right.0,
-                        &null_new_right.1,
-                        &out_schema,
-                        true,
-                        false,
-                    )?;
-                    outputs.push(ArrowZSet::new(batch, null_new_right.2));
-                }
-            }
-        }
-
-        self.commit_staged(&delta_rw, Some(&delta_lw));
-
-        concat_zsets(outputs, out_schema)
-    }
-
-    // ─── SEMI JOIN ────────────────────────────────────────────────────────────
-
-    fn process_epoch_semi(&self, left: ArrowZSet, right: ArrowZSet) -> Result<ArrowZSet, OpError> {
-        self.stage_left(&left)?;
-        self.stage_right(&right)?;
-
-        let out_schema = output_schema(
-            self.kind,
-            left.data.schema().as_ref(),
-            right.data.schema().as_ref(),
-        );
-        let mut outputs: Vec<ArrowZSet> = Vec::new();
-
-        let delta_rw: HashMap<Vec<u8>, i64> = {
-            let staged = self.right_staged.lock().unwrap();
-            let mut map: HashMap<Vec<u8>, i64> = HashMap::new();
-            for (join_key, _, _, w) in &staged.rows {
-                *map.entry(join_key.clone()).or_insert(0) += w;
-            }
-            map
-        };
-
-        {
-            let state = self.state.lock().unwrap();
-
-            // Emit from L₀ when right-side match status changes for a key.
-            let mut semi_rows: (Vec<Vec<Option<i64>>>, Vec<i64>) =
-                (vec![Vec::new(); self.left_n_cols], Vec::new());
-            for (key, delta) in &delta_rw {
-                let old_rw = state.right_key_weight.get(key).copied().unwrap_or(0);
-                let new_rw = old_rw + delta;
-                if (old_rw == 0) != (new_rw == 0) {
-                    // Status changed: was unmatched → now matched (emit +), or vice versa (emit -).
-                    let sign: i64 = if old_rw == 0 { 1 } else { -1 };
-                    for (l_row_bytes, l_weight) in state.probe_left(key) {
-                        let left_vals = Self::deserialize_row(l_row_bytes, self.left_n_cols)?;
-                        for (i, v) in left_vals.iter().enumerate() {
-                            semi_rows.0[i].push(*v);
-                        }
-                        semi_rows.1.push(sign * l_weight);
-                    }
-                }
-            }
-            if !semi_rows.1.is_empty() {
-                let batch = Self::make_semi_batch(&semi_rows.0, &out_schema)?;
-                outputs.push(ArrowZSet::new(batch, semi_rows.1));
-            }
-
-            // For each ΔL row: if effective_rw != 0, emit (row, w).
-            {
-                let staged_left = self.left_staged.lock().unwrap();
-                let mut new_left_rows: (Vec<Vec<Option<i64>>>, Vec<i64>) =
-                    (vec![Vec::new(); self.left_n_cols], Vec::new());
-                for (join_key, _, row_bytes, w) in &staged_left.rows {
-                    let old_rw = state.right_key_weight.get(join_key).copied().unwrap_or(0);
-                    let delta = delta_rw.get(join_key).copied().unwrap_or(0);
-                    let effective_rw = old_rw + delta;
-                    if effective_rw != 0 {
-                        let left_vals = Self::deserialize_row(row_bytes, self.left_n_cols)?;
-                        for (i, v) in left_vals.iter().enumerate() {
-                            new_left_rows.0[i].push(*v);
-                        }
-                        new_left_rows.1.push(*w);
-                    }
-                }
-                if !new_left_rows.1.is_empty() {
-                    let batch = Self::make_semi_batch(&new_left_rows.0, &out_schema)?;
-                    outputs.push(ArrowZSet::new(batch, new_left_rows.1));
-                }
-            }
-        }
-
-        self.commit_staged(&delta_rw, None);
-
-        concat_zsets(outputs, out_schema)
-    }
-
-    // ─── ANTI JOIN ────────────────────────────────────────────────────────────
-
-    fn process_epoch_anti(&self, left: ArrowZSet, right: ArrowZSet) -> Result<ArrowZSet, OpError> {
-        self.stage_left(&left)?;
-        self.stage_right(&right)?;
-
-        let out_schema = output_schema(
-            self.kind,
-            left.data.schema().as_ref(),
-            right.data.schema().as_ref(),
-        );
-        let mut outputs: Vec<ArrowZSet> = Vec::new();
-
-        let delta_rw: HashMap<Vec<u8>, i64> = {
-            let staged = self.right_staged.lock().unwrap();
-            let mut map: HashMap<Vec<u8>, i64> = HashMap::new();
-            for (join_key, _, _, w) in &staged.rows {
-                *map.entry(join_key.clone()).or_insert(0) += w;
-            }
-            map
-        };
-
-        {
-            let state = self.state.lock().unwrap();
-
-            // Emit from L₀ when right-side match status changes for a key.
-            let mut anti_rows: (Vec<Vec<Option<i64>>>, Vec<i64>) =
-                (vec![Vec::new(); self.left_n_cols], Vec::new());
-            for (key, delta) in &delta_rw {
-                let old_rw = state.right_key_weight.get(key).copied().unwrap_or(0);
-                let new_rw = old_rw + delta;
-                if (old_rw == 0) != (new_rw == 0) {
-                    // Anti: was unmatched → emit −; now matched → retract from anti output.
-                    // old_rw==0 means was in anti output → now matched, must retract.
-                    let sign: i64 = if old_rw == 0 { -1 } else { 1 };
-                    for (l_row_bytes, l_weight) in state.probe_left(key) {
-                        let left_vals = Self::deserialize_row(l_row_bytes, self.left_n_cols)?;
-                        for (i, v) in left_vals.iter().enumerate() {
-                            anti_rows.0[i].push(*v);
-                        }
-                        anti_rows.1.push(sign * l_weight);
-                    }
-                }
-            }
-            if !anti_rows.1.is_empty() {
-                let batch = Self::make_semi_batch(&anti_rows.0, &out_schema)?;
-                outputs.push(ArrowZSet::new(batch, anti_rows.1));
-            }
-
-            // For each ΔL row: if effective_rw == 0, emit (row, w).
-            {
-                let staged_left = self.left_staged.lock().unwrap();
-                let mut new_left_rows: (Vec<Vec<Option<i64>>>, Vec<i64>) =
-                    (vec![Vec::new(); self.left_n_cols], Vec::new());
-                for (join_key, _, row_bytes, w) in &staged_left.rows {
-                    let old_rw = state.right_key_weight.get(join_key).copied().unwrap_or(0);
-                    let delta = delta_rw.get(join_key).copied().unwrap_or(0);
-                    let effective_rw = old_rw + delta;
-                    if effective_rw == 0 {
-                        let left_vals = Self::deserialize_row(row_bytes, self.left_n_cols)?;
-                        for (i, v) in left_vals.iter().enumerate() {
-                            new_left_rows.0[i].push(*v);
-                        }
-                        new_left_rows.1.push(*w);
-                    }
-                }
-                if !new_left_rows.1.is_empty() {
-                    let batch = Self::make_semi_batch(&new_left_rows.0, &out_schema)?;
-                    outputs.push(ArrowZSet::new(batch, new_left_rows.1));
-                }
-            }
-        }
-
-        self.commit_staged(&delta_rw, None);
-
-        concat_zsets(outputs, out_schema)
-    }
-
-    fn process_epoch_null_aware_anti(
-        &self,
+    /// Single-owner zero-lock epoch execution path (`&mut self`).
+    pub fn process_epoch_mut(
+        &mut self,
         left: ArrowZSet,
         right: ArrowZSet,
     ) -> Result<ArrowZSet, OpError> {
-        self.stage_left(&left)?;
-        self.stage_right(&right)?;
-
-        let out_schema = output_schema(
-            self.kind,
-            left.data.schema().as_ref(),
-            right.data.schema().as_ref(),
-        );
-        let delta_rw: HashMap<Vec<u8>, i64> = {
-            let staged = self.right_staged.lock().unwrap();
-            let mut map = HashMap::new();
-            for (join_key, _, _, weight) in &staged.rows {
-                *map.entry(join_key.clone()).or_insert(0) += weight;
-            }
-            map
-        };
-        let null_delta = self.right_staged.lock().unwrap().null_weight;
-        let total_delta: i64 = delta_rw.values().sum();
-        let mut output_rows = vec![Vec::new(); self.left_n_cols];
-        let mut output_weights = Vec::new();
-
-        {
-            let state = self.state.lock().unwrap();
-            let old_null = state.right_null_weight > 0;
-            let new_null = state.right_null_weight + null_delta > 0;
-            let old_empty = state.right_total_weight == 0;
-            let new_empty = state.right_total_weight + total_delta == 0;
-
-            if old_null != new_null || old_empty != new_empty {
-                for (key, rows) in &state.left_arr {
-                    let old_matches = state.right_key_weight.get(key).copied().unwrap_or(0);
-                    let new_matches = old_matches + delta_rw.get(key).copied().unwrap_or(0);
-                    for row in rows.values() {
-                        let values = Self::deserialize_row(&row.row_bytes, self.left_n_cols)?;
-                        let has_null_key = self
-                            .left_key_cols
-                            .iter()
-                            .any(|column| values[*column].is_none());
-                        let was_visible = if has_null_key {
-                            old_empty
-                        } else {
-                            !old_null && old_matches == 0
-                        };
-                        let now_visible = if has_null_key {
-                            new_empty
-                        } else {
-                            !new_null && new_matches == 0
-                        };
-                        if was_visible != now_visible {
-                            for (column, value) in values.iter().enumerate() {
-                                output_rows[column].push(*value);
-                            }
-                            output_weights.push(
-                                row.weight * (i64::from(now_visible) - i64::from(was_visible)),
-                            );
-                        }
-                    }
-                }
-            } else if !old_null {
-                for (key, delta) in &delta_rw {
-                    let old_matches = state.right_key_weight.get(key).copied().unwrap_or(0);
-                    let new_matches = old_matches + delta;
-                    if (old_matches == 0) != (new_matches == 0) {
-                        let sign = if old_matches == 0 { -1 } else { 1 };
-                        for (row_bytes, weight) in state.probe_left(key) {
-                            let values = Self::deserialize_row(row_bytes, self.left_n_cols)?;
-                            let has_null_key = self
-                                .left_key_cols
-                                .iter()
-                                .any(|column| values[*column].is_none());
-                            if has_null_key {
-                                continue;
-                            }
-                            for (column, value) in values.iter().enumerate() {
-                                output_rows[column].push(*value);
-                            }
-                            output_weights.push(sign * weight);
-                        }
-                    }
-                }
-            }
-
-            if !new_null {
-                let staged_left = self.left_staged.lock().unwrap();
-                for (key, _, row_bytes, weight) in &staged_left.rows {
-                    let values = Self::deserialize_row(row_bytes, self.left_n_cols)?;
-                    let has_null_key = self
-                        .left_key_cols
-                        .iter()
-                        .any(|column| values[*column].is_none());
-                    if has_null_key && !new_empty {
-                        continue;
-                    }
-                    let matches = state.right_key_weight.get(key).copied().unwrap_or(0)
-                        + delta_rw.get(key).copied().unwrap_or(0);
-                    if has_null_key || (!new_null && matches == 0) {
-                        for (column, value) in values.iter().enumerate() {
-                            output_rows[column].push(*value);
-                        }
-                        output_weights.push(*weight);
-                    }
-                }
-            }
-        }
-
-        let outputs = if output_weights.is_empty() {
-            Vec::new()
-        } else {
-            vec![ArrowZSet::new(
-                Self::make_semi_batch(&output_rows, &out_schema)?,
-                output_weights,
-            )]
-        };
-        self.commit_staged(&delta_rw, None);
-        concat_zsets(outputs, out_schema)
-    }
-
-    // ─── Inner join helper ────────────────────────────────────────────────────
-
-    /// Compute the inner join contribution: ΔL⋈R₀ + L₀⋈ΔR + ΔL⋈ΔR.
-    fn compute_inner_join_output(
-        &self,
-        state: &OuterJoinState,
-        right_staged_rows: &HashMap<Vec<u8>, Vec<(Vec<u8>, i64)>>,
-        out_schema: &SchemaRef,
-    ) -> Result<ArrowZSet, OpError> {
-        let mut left_cols: Vec<Vec<Option<i64>>> = vec![Vec::new(); self.left_n_cols];
-        let mut right_cols: Vec<Vec<Option<i64>>> = vec![Vec::new(); self.right_n_cols];
-        let mut out_weights: Vec<i64> = Vec::new();
-
-        let staged_left = self.left_staged.lock().unwrap();
-        let staged_right = self.right_staged.lock().unwrap();
-
-        // ΔL ⋈ R₀
-        for (join_key, _, row_bytes, w) in &staged_left.rows {
-            for (right_row_bytes, r_weight) in state.probe_right(join_key) {
-                let left_vals = Self::deserialize_row(row_bytes, self.left_n_cols)?;
-                let right_vals = Self::deserialize_row(right_row_bytes, self.right_n_cols)?;
-                for (i, v) in left_vals.iter().enumerate() {
-                    left_cols[i].push(*v);
-                }
-                for (i, v) in right_vals.iter().enumerate() {
-                    right_cols[i].push(*v);
-                }
-                out_weights.push(w * r_weight);
-            }
-        }
-
-        // L₀ ⋈ ΔR
-        for (join_key, _, row_bytes, w) in &staged_right.rows {
-            for (left_row_bytes, l_weight) in state.probe_left(join_key) {
-                let left_vals = Self::deserialize_row(left_row_bytes, self.left_n_cols)?;
-                let right_vals = Self::deserialize_row(row_bytes, self.right_n_cols)?;
-                for (i, v) in left_vals.iter().enumerate() {
-                    left_cols[i].push(*v);
-                }
-                for (i, v) in right_vals.iter().enumerate() {
-                    right_cols[i].push(*v);
-                }
-                out_weights.push(l_weight * w);
-            }
-        }
-
-        // ΔL ⋈ ΔR
-        for (join_key, _, left_bytes, l_w) in &staged_left.rows {
-            if let Some(right_rows) = right_staged_rows.get(join_key) {
-                for (right_bytes, r_w) in right_rows {
-                    let left_vals = Self::deserialize_row(left_bytes, self.left_n_cols)?;
-                    let right_vals = Self::deserialize_row(right_bytes, self.right_n_cols)?;
-                    for (i, v) in left_vals.iter().enumerate() {
-                        left_cols[i].push(*v);
-                    }
-                    for (i, v) in right_vals.iter().enumerate() {
-                        right_cols[i].push(*v);
-                    }
-                    out_weights.push(l_w * r_w);
-                }
-            }
-        }
-
-        let batch = Self::make_output_batch(&left_cols, &right_cols, out_schema, false, false)?;
-        Ok(ArrowZSet::new(batch, out_weights))
-    }
-
-    // ─── Commit staged ────────────────────────────────────────────────────────
-
-    /// Apply staged deltas to arrangements and key-weight maps, then clear staged.
-    fn commit_staged(
-        &self,
-        delta_rw: &HashMap<Vec<u8>, i64>,
-        delta_lw: Option<&HashMap<Vec<u8>, i64>>,
-    ) {
-        let mut state = self.state.lock().unwrap();
-        let mut left_s = self.left_staged.lock().unwrap();
-        let mut right_s = self.right_staged.lock().unwrap();
-
-        let mut dirty_left = self.dirty_left.lock().unwrap();
-        let mut dirty_right = self.dirty_right.lock().unwrap();
-        let mut dirty_rw = self.dirty_rw.lock().unwrap();
-        let mut dirty_lw = self.dirty_lw.lock().unwrap();
-
-        // Apply staged left rows.
-        for (join_key, row_id, row_bytes, w) in left_s.rows.drain(..) {
-            dirty_left.insert((join_key.clone(), row_id));
-            state.update_left(join_key, row_id, row_bytes, w);
-        }
-
-        // Apply staged right rows.
-        for (join_key, row_id, row_bytes, w) in right_s.rows.drain(..) {
-            dirty_right.insert((join_key.clone(), row_id));
-            state.update_right(join_key, row_id, row_bytes, w);
-        }
-
-        left_s.staged_bytes = 0;
-        let null_delta = right_s.null_weight;
-        right_s.null_weight = 0;
-        right_s.staged_bytes = 0;
-
-        if self.kind == OuterJoinKind::NullAwareAnti {
-            let total_delta: i64 = delta_rw.values().sum();
-            let old_bytes = u64::from(state.right_total_weight > 0) * 16;
-            state.right_total_weight += total_delta;
-            state.right_null_weight += null_delta;
-            let new_bytes = u64::from(state.right_total_weight > 0) * 16;
-            state.state_bytes = state
-                .state_bytes
-                .saturating_sub(old_bytes)
-                .saturating_add(new_bytes);
-            if total_delta != 0 || null_delta != 0 {
-                *self.dirty_null_weight.lock().unwrap() = true;
-            }
-        }
-
-        // Update right_key_weight.
-        for (key, delta) in delta_rw {
-            dirty_rw.insert(key.clone());
-            let is_new = !state.right_key_weight.contains_key(key);
-            let key_len = key.len() as u64;
-            if is_new {
-                state.state_bytes += key_len + 8;
-            }
-            let entry = state.right_key_weight.entry(key.clone()).or_insert(0);
-            *entry += delta;
-            if *entry == 0 {
-                state.right_key_weight.remove(key);
-                state.state_bytes = state.state_bytes.saturating_sub(key_len + 8);
-            }
-        }
-
-        // Update left_key_weight (for RIGHT and FULL joins).
-        if let Some(dlw) = delta_lw {
-            for (key, delta) in dlw {
-                dirty_lw.insert(key.clone());
-                let is_new = !state.left_key_weight.contains_key(key);
-                let key_len = key.len() as u64;
-                if is_new {
-                    state.state_bytes += key_len + 8;
-                }
-                let entry = state.left_key_weight.entry(key.clone()).or_insert(0);
-                *entry += delta;
-                if *entry == 0 {
-                    state.left_key_weight.remove(key);
-                    state.state_bytes = state.state_bytes.saturating_sub(key_len + 8);
-                }
-            }
-        }
+        self.core.get_mut().unwrap().process_epoch(left, right)
     }
 
     // ─── Metrics ─────────────────────────────────────────────────────────────
 
     /// Fill-level metric for the left arrangement.
     pub fn left_entry_count(&self) -> usize {
-        self.state.lock().unwrap().left_entry_count()
+        self.core.lock().unwrap().left_entry_count()
     }
 
     /// Fill-level metric for the right arrangement.
     pub fn right_entry_count(&self) -> usize {
-        self.state.lock().unwrap().right_entry_count()
+        self.core.lock().unwrap().right_entry_count()
     }
 
     /// State bytes metric.
     pub fn state_bytes(&self) -> u64 {
-        let state = self.state.lock().unwrap();
-        let left_s = self.left_staged.lock().unwrap();
-        let right_s = self.right_staged.lock().unwrap();
-        state.state_bytes() + left_s.staged_bytes + right_s.staged_bytes
+        self.core.lock().unwrap().state_bytes()
     }
 
     /// Number of keys with nonzero match-count tracking (unmatched tracking).
     pub fn unmatched_key_count(&self) -> usize {
-        self.state.lock().unwrap().unmatched_key_count()
+        self.core.lock().unwrap().unmatched_key_count()
     }
 
     /// Operator ID.
@@ -1368,97 +1474,7 @@ impl OuterJoinOp {
     /// O(|Δ|) write amplification instead of O(|state|).
     /// Uses only point puts/deletes — no range deletion.
     pub fn append_state(&self, target: &mut WriteBatch) -> Result<(), OpError> {
-        let mut batch = WriteBatch::new();
-
-        {
-            let state = self.state.lock().unwrap();
-            let mut dirty_left = self.dirty_left.lock().unwrap();
-            let mut dirty_right = self.dirty_right.lock().unwrap();
-            let mut dirty_rw = self.dirty_rw.lock().unwrap();
-            let mut dirty_lw = self.dirty_lw.lock().unwrap();
-            let mut dirty_null_weight = self.dirty_null_weight.lock().unwrap();
-
-            // Left arrangement (same key format as JoinOp).
-            for (join_key, row_id) in dirty_left.drain() {
-                let key =
-                    ShardKeyEncoder::join_arr_key(JoinSide::Left, self.op_id.0, &join_key, row_id);
-                if let Some(arr_row) = state.left_arr.get(&join_key).and_then(|b| b.get(&row_id)) {
-                    if arr_row.weight > 0 {
-                        batch.put(&key, &arr_row.row_bytes);
-                    } else {
-                        batch.delete(&key);
-                    }
-                } else {
-                    batch.delete(&key);
-                }
-            }
-
-            // Right arrangement.
-            for (join_key, row_id) in dirty_right.drain() {
-                let key =
-                    ShardKeyEncoder::join_arr_key(JoinSide::Right, self.op_id.0, &join_key, row_id);
-                if let Some(arr_row) = state.right_arr.get(&join_key).and_then(|b| b.get(&row_id)) {
-                    if arr_row.weight > 0 {
-                        batch.put(&key, &arr_row.row_bytes);
-                    } else {
-                        batch.delete(&key);
-                    }
-                } else {
-                    batch.delete(&key);
-                }
-            }
-
-            // right_key_weight: prefix [0x01, 0x4F, 0x52] + op_id:8 + key_bytes → weight:8
-            let rw_prefix: &[u8] = &[0x01, 0x4F, 0x52];
-            for key_bytes in dirty_rw.drain() {
-                let mut storage_key = Vec::with_capacity(3 + 8 + key_bytes.len());
-                storage_key.extend_from_slice(rw_prefix);
-                storage_key.extend_from_slice(&self.op_id.0.to_be_bytes());
-                storage_key.extend_from_slice(&key_bytes);
-                if let Some(&weight) = state.right_key_weight.get(&key_bytes) {
-                    if weight != 0 {
-                        batch.put(&storage_key, &weight.to_be_bytes());
-                    } else {
-                        batch.delete(&storage_key);
-                    }
-                } else {
-                    batch.delete(&storage_key);
-                }
-            }
-
-            // left_key_weight: prefix [0x01, 0x4F, 0x4C] + op_id:8 + key_bytes → weight:8
-            let lw_prefix: &[u8] = &[0x01, 0x4F, 0x4C];
-            for key_bytes in dirty_lw.drain() {
-                let mut storage_key = Vec::with_capacity(3 + 8 + key_bytes.len());
-                storage_key.extend_from_slice(lw_prefix);
-                storage_key.extend_from_slice(&self.op_id.0.to_be_bytes());
-                storage_key.extend_from_slice(&key_bytes);
-                if let Some(&weight) = state.left_key_weight.get(&key_bytes) {
-                    if weight != 0 {
-                        batch.put(&storage_key, &weight.to_be_bytes());
-                    } else {
-                        batch.delete(&storage_key);
-                    }
-                } else {
-                    batch.delete(&storage_key);
-                }
-            }
-
-            if std::mem::take(&mut *dirty_null_weight) {
-                let mut storage_key = vec![0x01, 0x4F, 0x4E];
-                storage_key.extend_from_slice(&self.op_id.0.to_be_bytes());
-                if state.right_total_weight > 0 {
-                    let mut value = state.right_total_weight.to_be_bytes().to_vec();
-                    value.extend_from_slice(&state.right_null_weight.to_be_bytes());
-                    batch.put(&storage_key, &value);
-                } else {
-                    batch.delete(&storage_key);
-                }
-            }
-        }
-
-        target.merge_from(batch);
-        Ok(())
+        self.core.lock().unwrap().append_state(target)
     }
 
     pub async fn persist_state(&self, db: &ShardDb) -> Result<(), OpError> {
@@ -1561,29 +1577,24 @@ impl OuterJoinOp {
             }
         }
 
-        Ok(OuterJoinOp {
-            op_id,
-            kind,
-            left_key_cols: vec![0],
-            right_key_cols: vec![0],
-            left_n_cols: 2,
-            right_n_cols: 2,
-            state: Mutex::new(st),
-            left_staged: Mutex::new(StagedDelta::default()),
-            right_staged: Mutex::new(StagedDelta::default()),
-            dirty_left: Mutex::new(HashSet::new()),
-            dirty_right: Mutex::new(HashSet::new()),
-            dirty_rw: Mutex::new(HashSet::new()),
-            dirty_lw: Mutex::new(HashSet::new()),
-            dirty_null_weight: Mutex::new(false),
-        })
+        let mut core = OuterJoinStateCore::with_schema(op_id, kind, vec![0], vec![0], 2, 2);
+        core.state = st;
+        Ok(OuterJoinOp::from_core(core))
     }
 
     /// Restore OuterJoinOp state from `db` into this instance in place.
     pub async fn restore_in_place(&self, db: &ShardDb) -> Result<(), OpError> {
         let loaded = Self::load_from_storage(db, self.op_id, self.kind).await?;
-        let loaded_st = loaded.state.into_inner().unwrap();
-        *self.state.lock().unwrap() = loaded_st;
+        let loaded_core = loaded.into_core();
+        let mut core = self.core.lock().unwrap();
+        core.state = loaded_core.state;
+        core.left_staged = StagedDelta::default();
+        core.right_staged = StagedDelta::default();
+        core.dirty_left.clear();
+        core.dirty_right.clear();
+        core.dirty_rw.clear();
+        core.dirty_lw.clear();
+        core.dirty_null_weight = false;
         Ok(())
     }
 }

@@ -186,7 +186,9 @@ pub fn next_stateful_op_id() -> OperatorId {
 
 /// One stage of a `StatefulPipeline`.
 pub enum Stage {
-    /// A stateless operator (`FilterOp`/`ProjectOp`/`MapOp`) — no persisted
+    /// A fused stateless kernel (`Filter -> Project -> Map`) compiled by Issue #402 R3.
+    FusedStateless(Arc<crate::fused::FusedStatelessKernel>),
+    /// A stateless operator (`FilterOp`/`ProjectOp`/`MapOp` or custom stateless op) — no persisted
     /// identity, nothing to load/persist.
     Stateless(Arc<dyn Operator>),
     Aggregate(Arc<AggregateOp>),
@@ -233,6 +235,7 @@ pub enum Stage {
 impl Stage {
     fn process(&self, delta: ArrowZSet, epoch: u64) -> Result<ArrowZSet, OpError> {
         match self {
+            Stage::FusedStateless(op) => op.apply(delta),
             Stage::Stateless(op) => op.process_delta(delta),
             Stage::Aggregate(op) => op.process_delta(delta),
             Stage::MinMax(op, _) => op.process_delta(delta),
@@ -254,6 +257,7 @@ impl Stage {
 
     pub fn state_bytes(&self) -> u64 {
         match self {
+            Stage::FusedStateless(_) => 0,
             Stage::Stateless(op) => op.state_bytes(),
             Stage::Aggregate(op) => op.state_bytes(),
             Stage::MinMax(op, _) => op.state_bytes(),
@@ -273,7 +277,7 @@ impl Stage {
     /// OperatorId for this stage, if stateful.
     pub fn op_id(&self) -> Option<OperatorId> {
         match self {
-            Stage::Stateless(_) => None,
+            Stage::FusedStateless(_) | Stage::Stateless(_) => None,
             Stage::Aggregate(op) => Some(op.op_id),
             Stage::MinMax(_, id) => Some(*id),
             Stage::Distinct(_, id) => Some(*id),
@@ -295,6 +299,7 @@ impl Stage {
     /// Name of this stage's operator kind.
     pub fn kind_name(&self) -> &'static str {
         match self {
+            Stage::FusedStateless(_) => "FusedStateless",
             Stage::Stateless(_) => "Stateless",
             Stage::Aggregate(_) => "Aggregate",
             Stage::MinMax(_, _) => "MinMax",
@@ -316,7 +321,7 @@ impl Stage {
 
     async fn persist(&self, db: &ShardDb) -> Result<(), OpError> {
         match self {
-            Stage::Stateless(_) => Ok(()),
+            Stage::FusedStateless(_) | Stage::Stateless(_) => Ok(()),
             Stage::Aggregate(op) => persist_agg_state(db, op).await,
             Stage::MinMax(op, _) => crate::minmax::persist_minmax_state(db, op).await,
             Stage::Distinct(op, id) => persist_distinct_state(db, op, *id).await,
@@ -353,7 +358,7 @@ impl Stage {
 
     async fn append_state(&self, db: &ShardDb, target: &mut WriteBatch) -> Result<(), OpError> {
         match self {
-            Stage::Stateless(_) => Ok(()),
+            Stage::FusedStateless(_) | Stage::Stateless(_) => Ok(()),
             Stage::Aggregate(op) => append_agg_state(db, op, target).await,
             Stage::MinMax(op, _) => crate::minmax::append_minmax_state(db, op, target).await,
             Stage::Distinct(op, id) => crate::distinct::append_distinct_state(op, *id, target),
@@ -1386,6 +1391,11 @@ impl StatefulPipeline {
         self.stages.is_empty()
     }
 
+    /// Inspect stages currently compiled into this pipeline.
+    pub fn stages(&self) -> &[Stage] {
+        &self.stages
+    }
+
     /// Thread `delta` through every stage in order, returning the final
     /// output delta.
     pub fn process(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
@@ -1742,6 +1752,13 @@ impl JoinKind {
         }
     }
 
+    /// Acknowledge that the last appended state batch committed durably.
+    fn ack_persisted_state(&self) {
+        if let JoinKind::Factorized(op) = self {
+            op.ack_persisted_state();
+        }
+    }
+
     /// Load the join's persisted arrangement(s) from `db` in place.
     async fn restore(&self, db: &ShardDb) -> Result<(), OpError> {
         match self {
@@ -1797,6 +1814,26 @@ impl JoinPipeline {
             JoinKind::Factorized(_) => "factorized",
             JoinKind::Inner(_) | JoinKind::Outer(_) => "classic",
         }
+    }
+
+    /// Inspect pre-join stages for the left input.
+    pub fn left_pre(&self) -> &[Stage] {
+        &self.left_pre
+    }
+
+    /// Inspect pre-join stages for the right input.
+    pub fn right_pre(&self) -> &[Stage] {
+        &self.right_pre
+    }
+
+    /// Inspect post-join stages.
+    pub fn post(&self) -> &[Stage] {
+        &self.post
+    }
+
+    /// Inspect the underlying join operator variant.
+    pub fn join(&self) -> &JoinKind {
+        &self.join
     }
 
     pub fn set_db(&self, db: Arc<ShardDb>) {
@@ -1933,6 +1970,7 @@ impl JoinPipeline {
     }
 
     pub fn ack_persisted_state(&self) {
+        self.join.ack_persisted_state();
         for stage in self
             .left_pre
             .iter()
@@ -1957,6 +1995,296 @@ impl JoinPipeline {
             stage.restore(db).await?;
         }
         Ok(())
+    }
+}
+
+// ─── Single-Owner, Zero-Mutex Owned Pipelines (Issue #402 R3) ────────────────
+
+/// A single-owner pipeline stage executed exclusively via `&mut self` inside a
+/// shard actor, acquiring **zero** `Mutex` locks on the hot execution loop.
+pub enum OwnedStage {
+    /// Fused stateless kernel (`Filter -> Project -> Map`).
+    FusedStateless(crate::fused::FusedStatelessKernel),
+    /// Arbitrary stateless operator.
+    Stateless(Box<dyn Operator>),
+    /// Lock-free aggregate state core (`&mut self`).
+    Aggregate(crate::aggregate::AggregateStateCore),
+    /// Distinct operator executed via `process_delta_mut` (zero locking).
+    Distinct(DistinctOp, OperatorId),
+}
+
+impl OwnedStage {
+    pub fn process(&mut self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
+        match self {
+            OwnedStage::FusedStateless(op) => op.apply(delta),
+            OwnedStage::Stateless(op) => op.process_delta(delta),
+            OwnedStage::Aggregate(core) => core
+                .process_delta_with_result_mut(delta)
+                .map(|r| r.output_delta),
+            OwnedStage::Distinct(op, _) => op.process_delta_mut(delta),
+        }
+    }
+
+    pub fn state_bytes(&self) -> u64 {
+        match self {
+            OwnedStage::FusedStateless(_) => 0,
+            OwnedStage::Stateless(op) => op.state_bytes(),
+            OwnedStage::Aggregate(core) => core.state_bytes(),
+            OwnedStage::Distinct(op, _) => op.state_bytes(),
+        }
+    }
+
+    pub fn append_state(&self, target: &mut WriteBatch) -> Result<(), OpError> {
+        match self {
+            OwnedStage::FusedStateless(_) | OwnedStage::Stateless(_) => Ok(()),
+            OwnedStage::Aggregate(core) => {
+                core.append_state_to_batch(target);
+                Ok(())
+            }
+            OwnedStage::Distinct(op, id) => crate::distinct::append_distinct_state(op, *id, target),
+        }
+    }
+
+    pub fn ack_persisted_state(&mut self) {
+        match self {
+            OwnedStage::Aggregate(core) => core.clear_dirty_keys(),
+            OwnedStage::Distinct(op, _) => op.ack_persisted_state(),
+            OwnedStage::FusedStateless(_) | OwnedStage::Stateless(_) => {}
+        }
+    }
+
+    pub fn rollback_uncommitted(&mut self) {
+        if let OwnedStage::Aggregate(core) = self {
+            core.rollback_uncommitted();
+        }
+    }
+
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            OwnedStage::FusedStateless(_) => "FusedStateless",
+            OwnedStage::Stateless(_) => "Stateless",
+            OwnedStage::Aggregate(_) => "Aggregate",
+            OwnedStage::Distinct(_, _) => "Distinct",
+        }
+    }
+}
+
+/// Single-owner, zero-Mutex stateful pipeline for shard actors (Issue #402 R3).
+#[derive(Default)]
+pub struct OwnedStatefulPipeline {
+    stages: Vec<OwnedStage>,
+}
+
+impl OwnedStatefulPipeline {
+    pub fn new() -> Self {
+        Self { stages: Vec::new() }
+    }
+
+    pub fn push(mut self, stage: OwnedStage) -> Self {
+        self.stages.push(stage);
+        self
+    }
+
+    pub fn stages(&self) -> &[OwnedStage] {
+        &self.stages
+    }
+
+    pub fn stages_mut(&mut self) -> &mut [OwnedStage] {
+        &mut self.stages
+    }
+
+    pub fn process(&mut self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
+        let mut current = delta;
+        for stage in &mut self.stages {
+            current = stage.process(current)?;
+        }
+        Ok(current)
+    }
+
+    pub fn append_state(&self, target: &mut WriteBatch) -> Result<(), OpError> {
+        for stage in &self.stages {
+            stage.append_state(target)?;
+        }
+        Ok(())
+    }
+
+    pub async fn persist(&mut self, db: &ShardDb) -> Result<(), OpError> {
+        let mut batch = WriteBatch::new();
+        self.append_state(&mut batch)?;
+        if !batch.is_empty() {
+            db.write_batch(batch).await.map_err(OpError::storage)?;
+        }
+        self.ack_persisted_state();
+        Ok(())
+    }
+
+    pub fn ack_persisted_state(&mut self) {
+        for stage in &mut self.stages {
+            stage.ack_persisted_state();
+        }
+    }
+
+    pub fn rollback_uncommitted(&mut self) {
+        for stage in &mut self.stages {
+            stage.rollback_uncommitted();
+        }
+    }
+
+    pub fn state_bytes(&self) -> u64 {
+        self.stages.iter().map(OwnedStage::state_bytes).sum()
+    }
+}
+
+/// Single-owner, zero-Mutex join operator variant for shard actors (Issue #402 R3).
+pub enum OwnedJoinKind {
+    Inner(crate::join::JoinStateCore),
+    Outer(crate::outer_join::OuterJoinStateCore),
+    Factorized(crate::factorized::FactorizedJoinCore),
+}
+
+impl OwnedJoinKind {
+    pub fn process_epoch(
+        &mut self,
+        left: ArrowZSet,
+        right: ArrowZSet,
+    ) -> Result<ArrowZSet, OpError> {
+        match self {
+            OwnedJoinKind::Inner(core) => core.process_epoch_mut(left, right),
+            OwnedJoinKind::Outer(core) => core.process_epoch(left, right),
+            OwnedJoinKind::Factorized(core) => core.process_epoch_mut(left, right),
+        }
+    }
+
+    pub fn append_state(&mut self, target: &mut WriteBatch) -> Result<(), OpError> {
+        match self {
+            OwnedJoinKind::Inner(core) => core.append_state_mut(target),
+            OwnedJoinKind::Outer(core) => core.append_state(target),
+            OwnedJoinKind::Factorized(core) => core.append_state(target),
+        }
+    }
+
+    pub fn ack_persisted_state(&mut self) {
+        if let OwnedJoinKind::Factorized(core) = self {
+            core.ack_persisted_state();
+        }
+    }
+
+    pub fn state_bytes(&self) -> u64 {
+        match self {
+            OwnedJoinKind::Inner(core) => core.state_bytes(),
+            OwnedJoinKind::Outer(core) => core.state_bytes(),
+            OwnedJoinKind::Factorized(core) => core.state_bytes(),
+        }
+    }
+}
+
+/// Single-owner, zero-Mutex two-input join pipeline (Issue #402 R3).
+pub struct OwnedJoinPipeline {
+    left_pre: Vec<OwnedStage>,
+    right_pre: Vec<OwnedStage>,
+    join: OwnedJoinKind,
+    post: Vec<OwnedStage>,
+}
+
+impl OwnedJoinPipeline {
+    pub fn new(
+        left_pre: Vec<OwnedStage>,
+        right_pre: Vec<OwnedStage>,
+        join: OwnedJoinKind,
+        post: Vec<OwnedStage>,
+    ) -> Self {
+        Self {
+            left_pre,
+            right_pre,
+            join,
+            post,
+        }
+    }
+
+    pub fn left_pre(&self) -> &[OwnedStage] {
+        &self.left_pre
+    }
+
+    pub fn right_pre(&self) -> &[OwnedStage] {
+        &self.right_pre
+    }
+
+    pub fn post(&self) -> &[OwnedStage] {
+        &self.post
+    }
+
+    pub fn join(&self) -> &OwnedJoinKind {
+        &self.join
+    }
+
+    pub fn join_mut(&mut self) -> &mut OwnedJoinKind {
+        &mut self.join
+    }
+
+    pub fn process(
+        &mut self,
+        left_delta: ArrowZSet,
+        right_delta: ArrowZSet,
+    ) -> Result<ArrowZSet, OpError> {
+        let mut left = left_delta;
+        for stage in &mut self.left_pre {
+            left = stage.process(left)?;
+        }
+        let mut right = right_delta;
+        for stage in &mut self.right_pre {
+            right = stage.process(right)?;
+        }
+        let mut out = self.join.process_epoch(left, right)?;
+        for stage in &mut self.post {
+            out = stage.process(out)?;
+        }
+        Ok(out)
+    }
+
+    pub fn append_state(&mut self, target: &mut WriteBatch) -> Result<(), OpError> {
+        self.join.append_state(target)?;
+        for stage in self
+            .left_pre
+            .iter()
+            .chain(&self.right_pre)
+            .chain(&self.post)
+        {
+            stage.append_state(target)?;
+        }
+        Ok(())
+    }
+
+    pub async fn persist(&mut self, db: &ShardDb) -> Result<(), OpError> {
+        let mut batch = WriteBatch::new();
+        self.append_state(&mut batch)?;
+        if !batch.is_empty() {
+            db.write_batch(batch).await.map_err(OpError::storage)?;
+        }
+        self.ack_persisted_state();
+        Ok(())
+    }
+
+    pub fn ack_persisted_state(&mut self) {
+        self.join.ack_persisted_state();
+        for stage in self
+            .left_pre
+            .iter_mut()
+            .chain(&mut self.right_pre)
+            .chain(&mut self.post)
+        {
+            stage.ack_persisted_state();
+        }
+    }
+
+    pub fn state_bytes(&self) -> u64 {
+        self.join.state_bytes()
+            + self
+                .left_pre
+                .iter()
+                .chain(&self.right_pre)
+                .chain(&self.post)
+                .map(OwnedStage::state_bytes)
+                .sum::<u64>()
     }
 }
 
@@ -2429,6 +2757,8 @@ mod tests {
         use std::collections::HashMap;
         let mut net: HashMap<(i64, i64), i64> = HashMap::new();
         for out in [&out1, &out2] {
+            out.validate()
+                .expect("pipeline output must have aligned row weights");
             let k0 = out
                 .data
                 .column(0)
@@ -2441,8 +2771,8 @@ mod tests {
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .unwrap();
-            for i in 0..out.num_rows() {
-                *net.entry((k0.value(i), k1.value(i))).or_insert(0) += out.weights[i];
+            for (i, &weight) in out.weights.iter().enumerate() {
+                *net.entry((k0.value(i), k1.value(i))).or_insert(0) += weight;
             }
         }
         let mut live: Vec<(i64, i64)> = net

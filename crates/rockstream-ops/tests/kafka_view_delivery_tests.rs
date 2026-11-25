@@ -294,7 +294,7 @@ async fn view_snapshot_changes_and_recovery_match_exact_consumer_stream() {
     append(db.clone(), &[(1, &huge, 1)]).await;
     assert_eq!(
         export.deliver_next().await.unwrap_err().to_string(),
-        "RS-4002: sink I/O error: Kafka row envelope exceeds the 900 KiB delivery limit"
+        "RS-4002: sink I/O error: single Kafka row exceeds the 921600 byte envelope limit"
     );
     assert_eq!(db.get(b"\x06kafka-view/122").await.unwrap(), checkpoint);
     assert_eq!(consume(&bootstrap, topic), empty);

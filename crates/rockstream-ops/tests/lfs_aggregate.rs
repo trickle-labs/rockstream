@@ -72,7 +72,7 @@ async fn restore_discards_dirty_keys_from_abandoned_attempt() {
                     id.0,
                     &key.to_be_bytes(),
                 ),
-                [sum.to_be_bytes(), 1_i64.to_be_bytes()].concat(),
+                rockstream_storage::MergeOperatorRegistry::encode_sum_count(sum, 1),
             )
         })
         .collect::<Vec<_>>();

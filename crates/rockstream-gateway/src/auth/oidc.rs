@@ -104,6 +104,7 @@ pub struct OidcVerifier {
     client: Client,
     cache: RwLock<Option<CachedJwks>>,
     refresh: Mutex<()>,
+    cache_metric: rockstream_types::metrics::JwksCacheSizeMetric,
 }
 
 impl OidcVerifier {
@@ -118,6 +119,7 @@ impl OidcVerifier {
             client,
             cache: RwLock::new(None),
             refresh: Mutex::new(()),
+            cache_metric: rockstream_types::metrics::JwksCacheSizeMetric::register(),
         };
         let fetched = verifier.fetch_jwks().await?;
         verifier.store_jwks(fetched);
@@ -280,14 +282,19 @@ impl OidcVerifier {
     }
 
     fn store_jwks(&self, fetched: FetchedJwks) {
-        if fetched.ttl.is_zero() {
+        let ttl = fetched.ttl.min(JWKS_CACHE_TTL);
+        if ttl.is_zero() {
             *self.cache.write() = None;
+            self.cache_metric.set(0, None);
             return;
         }
+        let expires_at = Instant::now() + ttl;
+        let cache_size = fetched.keys.len() as u64;
         *self.cache.write() = Some(CachedJwks {
             keys: fetched.keys,
-            expires_at: Instant::now() + fetched.ttl.min(JWKS_CACHE_TTL),
+            expires_at,
         });
+        self.cache_metric.set(cache_size, Some(expires_at));
     }
 
     async fn fetch_jwks(&self) -> Result<FetchedJwks, AuthError> {
@@ -568,6 +575,11 @@ pub(crate) const VALID_TOKEN: &str = "eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3QtcnNhIi
 
 #[cfg(test)]
 pub(crate) async fn verifier_with_local_jwks() -> OidcVerifier {
+    verifier_with_local_jwks_for("https://issuer.example", "rockstream").await
+}
+
+#[cfg(test)]
+pub(crate) async fn verifier_with_local_jwks_for(issuer: &str, audience: &str) -> OidcVerifier {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -587,12 +599,7 @@ pub(crate) async fn verifier_with_local_jwks() -> OidcVerifier {
         stream.write_all(response.as_bytes()).await.unwrap();
         stream.write_all(body).await.unwrap();
     });
-    let config = OidcConfig::new(
-        "https://issuer.example",
-        "rockstream",
-        format!("http://{address}/jwks"),
-    )
-    .unwrap();
+    let config = OidcConfig::new(issuer, audience, format!("http://{address}/jwks")).unwrap();
     let verifier = OidcVerifier::new(config).await.unwrap();
     server.await.unwrap();
     verifier
@@ -648,6 +655,57 @@ mod tests {
         let verifier = OidcVerifier::new(config).await.unwrap();
         server.await.unwrap();
         assert_eq!(verifier.cache_size(), 1);
+    }
+
+    #[tokio::test]
+    async fn accepts_exact_jwks_body_limit_and_rejects_chunked_limit_plus_one() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut exact, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let _ = exact.read(&mut request).await.unwrap();
+            let mut exact_body = TEST_JWKS.as_bytes().to_vec();
+            exact_body.resize(MAX_JWKS_RESPONSE_BYTES, b' ');
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: max-age=60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                exact_body.len()
+            );
+            exact.write_all(header.as_bytes()).await.unwrap();
+            exact.write_all(&exact_body).await.unwrap();
+
+            let (mut oversized, _) = listener.accept().await.unwrap();
+            let _ = oversized.read(&mut request).await.unwrap();
+            oversized
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: max-age=60\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let oversized_body = vec![b' '; MAX_JWKS_RESPONSE_BYTES + 1];
+            oversized
+                .write_all(format!("{:X}\r\n", oversized_body.len()).as_bytes())
+                .await
+                .unwrap();
+            oversized.write_all(&oversized_body).await.unwrap();
+            oversized.write_all(b"\r\n0\r\n\r\n").await.unwrap();
+        });
+
+        let config = OidcConfig::new(
+            "https://issuer.example",
+            "rockstream",
+            format!("http://{address}/jwks"),
+        )
+        .unwrap();
+        let verifier = OidcVerifier::new(config.clone()).await.unwrap();
+        assert_eq!(verifier.cache_size(), 1);
+        let error = match OidcVerifier::new(config).await {
+            Err(error) => error,
+            Ok(_) => panic!("the verifier accepted a JWKS body over the byte limit"),
+        };
+        assert_eq!(
+            error.to_string(),
+            "[RS-2400] auth.unauthenticated: OIDC JWKS response exceeds the 1 MiB limit"
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]

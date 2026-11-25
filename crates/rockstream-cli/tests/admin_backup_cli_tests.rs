@@ -1,8 +1,57 @@
 use std::fs;
-use std::process::Command;
+use std::path::Path;
+use std::process::{Command, Output};
 use tempfile::tempdir;
 
-use rockstream_control::{BackupManifest, BACKUP_MANIFEST_FILENAME};
+use rockstream_cli::transport::StorageClient;
+use rockstream_control::BACKUP_MANIFEST_FILENAME;
+
+fn normalize_correlation_id(stderr: Vec<u8>) -> String {
+    let stderr = String::from_utf8(stderr).unwrap();
+    let marker = "(correlation_id=";
+    let start = stderr.find(marker).unwrap() + marker.len();
+    let end = start + stderr[start..].find(' ').unwrap();
+    uuid::Uuid::parse_str(&stderr[start..end]).unwrap();
+    stderr.replacen(&stderr[start..end], "<correlation_id>", 1)
+}
+
+fn assert_local_backup_creation_unavailable(output: Output) {
+    assert!(!output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
+    assert_eq!(
+        normalize_correlation_id(output.stderr),
+        "[RS-2400] auth.unauthenticated: Unauthenticated: request missing or carrying invalid credentials (detail=local backup creation is unavailable without an authenticated endpoint) (correlation_id=<correlation_id> context=detail=local backup creation is unavailable without an authenticated endpoint) next_steps: Provide valid credentials (Bearer token or mTLS certificate)\n  next steps: Configure an authenticated --management endpoint; do not use --identity-role as authorization.\n"
+    );
+}
+
+fn create_backup_fixture(storage_dir: &Path, destination: &Path) {
+    StorageClient::new()
+        .create_backup(storage_dir, destination.to_str().unwrap())
+        .expect("create backup fixture through the storage adapter");
+}
+
+fn run_local_backup_create(
+    storage_dir: &Path,
+    destination: &Path,
+    user: &str,
+    role: &str,
+) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_rockstream"))
+        .args([
+            "--storage-dir",
+            storage_dir.to_str().unwrap(),
+            "--identity-user",
+            user,
+            "--identity-role",
+            role,
+            "admin",
+            "backup",
+            "create",
+            destination.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap()
+}
 
 #[test]
 fn test_backup_create_empty_destination() {
@@ -14,46 +63,13 @@ fn test_backup_create_empty_destination() {
     fs::create_dir_all(storage_dir.join("catalog")).unwrap();
     fs::write(storage_dir.join("catalog/schema.json"), b"{\"tables\":[]}").unwrap();
 
-    let binary = env!("CARGO_BIN_EXE_rockstream");
-    let output = Command::new(binary)
-        .args([
-            "--storage-dir",
-            storage_dir.to_str().unwrap(),
-            "--identity-user",
-            "admin-user",
-            "--identity-role",
-            "admin",
-            "admin",
-            "backup",
-            "create",
-            dest_dir.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-
-    assert!(
-        output.status.success(),
-        "backup create failed: stdout={}, stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Backup created at"));
-    assert!(stdout.contains("status: SUCCESS"));
-
-    let manifest_path = dest_dir.join(BACKUP_MANIFEST_FILENAME);
-    assert!(manifest_path.exists());
-    let manifest_str = fs::read_to_string(&manifest_path).unwrap();
-    let manifest = BackupManifest::from_json(&manifest_str).unwrap();
-    assert_eq!(manifest.format_version, 1);
-    assert_eq!(manifest.storage_format, 3);
-    assert!(!manifest.files.is_empty());
-    assert!(manifest.validate().is_ok());
-
-    // Verify files copied to destination
-    assert!(dest_dir.join("shards/0/data.sst").exists());
-    assert!(dest_dir.join("catalog/schema.json").exists());
+    assert_local_backup_creation_unavailable(run_local_backup_create(
+        &storage_dir,
+        &dest_dir,
+        "admin-user",
+        "admin",
+    ));
+    assert!(!dest_dir.exists());
 }
 
 #[test]
@@ -66,26 +82,12 @@ fn test_backup_create_occupied_refusal() {
     fs::create_dir_all(&dest_dir).unwrap();
     fs::write(dest_dir.join("existing_file.txt"), b"donotoverwrite").unwrap();
 
-    let binary = env!("CARGO_BIN_EXE_rockstream");
-    let output = Command::new(binary)
-        .args([
-            "--storage-dir",
-            storage_dir.to_str().unwrap(),
-            "--identity-user",
-            "admin-user",
-            "--identity-role",
-            "admin",
-            "admin",
-            "backup",
-            "create",
-            dest_dir.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("RS-2401"));
+    assert_local_backup_creation_unavailable(run_local_backup_create(
+        &storage_dir,
+        &dest_dir,
+        "admin-user",
+        "admin",
+    ));
 
     // Ensure existing file was not modified or deleted
     assert_eq!(
@@ -103,26 +105,13 @@ fn test_backup_create_permission_denied() {
     fs::create_dir_all(&storage_dir).unwrap();
     fs::write(storage_dir.join("data.sst"), b"sample-data").unwrap();
 
-    let binary = env!("CARGO_BIN_EXE_rockstream");
-    let output = Command::new(binary)
-        .args([
-            "--storage-dir",
-            storage_dir.to_str().unwrap(),
-            "--identity-user",
-            "viewer-user",
-            "--identity-role",
-            "viewer",
-            "admin",
-            "backup",
-            "create",
-            dest_dir.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("RS-2401"));
+    assert_local_backup_creation_unavailable(run_local_backup_create(
+        &storage_dir,
+        &dest_dir,
+        "viewer-user",
+        "viewer",
+    ));
+    assert!(!dest_dir.exists());
 }
 
 #[test]
@@ -133,24 +122,9 @@ fn test_backup_inspect_valid() {
     fs::create_dir_all(&storage_dir).unwrap();
     fs::write(storage_dir.join("payload.bin"), b"hello-world").unwrap();
 
-    let binary = env!("CARGO_BIN_EXE_rockstream");
-    let create_out = Command::new(binary)
-        .args([
-            "--storage-dir",
-            storage_dir.to_str().unwrap(),
-            "--identity-user",
-            "admin-user",
-            "--identity-role",
-            "admin",
-            "admin",
-            "backup",
-            "create",
-            dest_dir.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert!(create_out.status.success());
+    create_backup_fixture(&storage_dir, &dest_dir);
 
+    let binary = env!("CARGO_BIN_EXE_rockstream");
     let inspect_out = Command::new(binary)
         .args([
             "--json",
@@ -210,24 +184,9 @@ fn test_backup_verify_valid() {
     fs::create_dir_all(&storage_dir).unwrap();
     fs::write(storage_dir.join("item.dat"), b"verified-bytes").unwrap();
 
-    let binary = env!("CARGO_BIN_EXE_rockstream");
-    let create_out = Command::new(binary)
-        .args([
-            "--storage-dir",
-            storage_dir.to_str().unwrap(),
-            "--identity-user",
-            "admin-user",
-            "--identity-role",
-            "admin",
-            "admin",
-            "backup",
-            "create",
-            dest_dir.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert!(create_out.status.success());
+    create_backup_fixture(&storage_dir, &dest_dir);
 
+    let binary = env!("CARGO_BIN_EXE_rockstream");
     let verify_out = Command::new(binary)
         .args([
             "--json",
@@ -252,24 +211,9 @@ fn test_backup_verify_tampered_file_failure() {
     fs::create_dir_all(&storage_dir).unwrap();
     fs::write(storage_dir.join("item.dat"), b"pristine-bytes").unwrap();
 
-    let binary = env!("CARGO_BIN_EXE_rockstream");
-    let create_out = Command::new(binary)
-        .args([
-            "--storage-dir",
-            storage_dir.to_str().unwrap(),
-            "--identity-user",
-            "admin-user",
-            "--identity-role",
-            "admin",
-            "admin",
-            "backup",
-            "create",
-            dest_dir.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert!(create_out.status.success());
+    create_backup_fixture(&storage_dir, &dest_dir);
 
+    let binary = env!("CARGO_BIN_EXE_rockstream");
     // Tamper with the payload file
     fs::write(dest_dir.join("item.dat"), b"tampered-bytes!").unwrap();
 

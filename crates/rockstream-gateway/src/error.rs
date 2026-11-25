@@ -34,11 +34,8 @@ pub enum GatewayError {
 
     /// [RS-2007] write.idempotency_key_required.
     ///
-    /// As of v0.51.1, a COMMIT with neither `SET rockstream.idempotency_key`
-    /// nor `SET rockstream.source_epoch` no longer fails: the server mints a
-    /// fresh CSPRNG-derived idempotency key for that commit instead. This
-    /// variant is retained for protocol/documentation stability but is no
-    /// longer reachable from the normal write-commit path.
+    /// COMMIT generates its own key when neither setting is provided. ALTER
+    /// SECRET still requires a client UUID so a lost response can be retried.
     IdempotencyKeyRequired,
 
     /// [RS-2500] copy.table_not_found — COPY target table does not exist in the catalog.
@@ -121,6 +118,20 @@ pub enum GatewayError {
     /// relation cannot safely fall back to the gateway-local shard.
     QueryTimeScatterTopologyUnavailable,
 
+    /// [RS-2031] query.freshness_timeout — requested freshness epoch was not
+    /// reached on this stateless serving replica before timeout.
+    FreshnessTimeout {
+        required_epoch: u64,
+        serving_frontier: Option<u64>,
+        timeout_ms: u64,
+    },
+
+    /// [RS-2032] query.read_overloaded — stateless serving admission rejected
+    /// or timed out waiting for read concurrency/queue capacity.
+    ReadOverloaded {
+        reason: String,
+    },
+
     /// [RS-2030] query.query_time_scatter_frontier_mismatch — configured
     /// query-time shards do not expose one common durable frontier.
     QueryTimeScatterFrontierMismatch {
@@ -177,6 +188,23 @@ impl std::fmt::Display for GatewayError {
                     .unwrap_or("Retry after simplifying the query."),
             );
         }
+        if let Self::FreshnessTimeout {
+            required_epoch,
+            serving_frontier,
+            timeout_ms,
+        } = self
+        {
+            return write!(
+                f,
+                "[RS-2031] query.freshness_timeout: requested freshness epoch {required_epoch} was not reached within {timeout_ms}ms (serving_frontier={serving_frontier:?}). next_steps: Retry after the writer commits or increase freshness timeout."
+            );
+        }
+        if let Self::ReadOverloaded { reason } = self {
+            return write!(
+                f,
+                "[RS-2032] query.read_overloaded: {reason}. next_steps: Reduce concurrent read load or scale out stateless gateway replicas."
+            );
+        }
         f.write_str(&self.diagnostic_occurrence().render_text())
     }
 }
@@ -231,6 +259,8 @@ impl GatewayError {
             Self::NotifyChannelLimitExceeded { .. } => ErrorCode::new(2564),
             Self::QueryTimeResultSetTooLarge { .. } => ErrorCode::new(2025),
             Self::QueryTimeScatterTopologyUnavailable => ErrorCode::new(2028),
+            Self::FreshnessTimeout { .. } => ErrorCode::new(2031),
+            Self::ReadOverloaded { .. } => ErrorCode::new(2032),
             Self::QueryTimeScatterFrontierMismatch { .. } => ErrorCode::new(2030),
             Self::QueryTimeScatterBudgetExceeded { .. } => ErrorCode::new(2029),
             Self::QueryTimeExecutionFailed { .. } => ErrorCode::new(2026),
@@ -301,6 +331,7 @@ impl GatewayError {
                 ("byte_limit".to_string(), byte_limit.to_string()),
             ],
             Self::QueryTimeExecutionFailed { detail }
+            | Self::ReadOverloaded { reason: detail }
             | Self::NotSupported(detail)
             | Self::ParseError(detail)
             | Self::PgWire(detail) => vec![("detail".to_string(), detail.clone())],
