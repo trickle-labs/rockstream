@@ -1538,7 +1538,11 @@ impl ManagementMigrationRuntime {
             self.release_migration_pin(operation_id).await;
             return;
         }
-        if self.shard_manager.get(shard_id) != Some(lease.clone()) {
+        if !self
+            .shard_manager
+            .get(shard_id)
+            .is_some_and(|current| current.same_owner(&lease))
+        {
             end_shard_handoff(&self.data_plane, shard_id).await;
             self.release_migration_pin(operation_id).await;
             self.fail(

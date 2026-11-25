@@ -1859,27 +1859,22 @@ impl BucketedAggregateOp {
             }
         }
 
-        for (&(group_key, _bucket), &(sum, count)) in local_partials.iter() {
-            if let Some((combined_sum, combined_count)) = local_combined.get_mut(&group_key) {
-                if *combined_count == 0 {
-                    *combined_sum = checked_add_i64(*combined_sum, sum)
-                        .map_err(|_| OpError::aggregate_overflow(group_key))?;
-                    *combined_count = checked_add_i64(*combined_count, count)
-                        .map_err(|_| OpError::aggregate_overflow(group_key))?;
-                    if *combined_count < 0 {
-                        return Err(OpError::invalid_multiplicity(group_key, *combined_count));
-                    }
-                }
-            } else {
-                let entry = local_combined.entry(group_key).or_insert((0, 0));
-                entry.0 = checked_add_i64(entry.0, sum)
-                    .map_err(|_| OpError::aggregate_overflow(group_key))?;
-                entry.1 = checked_add_i64(entry.1, count)
-                    .map_err(|_| OpError::aggregate_overflow(group_key))?;
-                if entry.1 < 0 {
-                    return Err(OpError::invalid_multiplicity(group_key, entry.1));
-                }
+        // Combined records are authoritative. Legacy partial-only records
+        // must reconstruct the sum of ALL buckets, independent of hash order.
+        let mut reconstructed: HashMap<i64, (i128, i128)> = HashMap::new();
+        for (&(group_key, _bucket), &(sum, count)) in &local_partials {
+            if !local_combined.contains_key(&group_key) {
+                let entry = reconstructed.entry(group_key).or_default();
+                entry.0 += i128::from(sum);
+                entry.1 += i128::from(count);
             }
+        }
+        for (group_key, (sum, count)) in reconstructed {
+            let sum =
+                checked_i128_to_i64(sum).map_err(|_| OpError::aggregate_overflow(group_key))?;
+            let count =
+                checked_i128_to_i64(count).map_err(|_| OpError::aggregate_overflow(group_key))?;
+            local_combined.insert(group_key, (sum, count));
         }
 
         let mut combined = self
@@ -1949,24 +1944,35 @@ impl Operator for BucketedAggregateOp {
             .downcast_ref::<Int64Array>()
             .ok_or_else(|| OpError::column_type_mismatch("Int64", "other"))?;
 
-        let mut consolidated: std::collections::HashMap<(i64, i64), i64> =
-            std::collections::HashMap::new();
-        let mut order: Vec<(i64, i64)> = Vec::new();
+        // Stage the full epoch before taking the state locks. Use the same
+        // checked single-owner kernel as AggregateOp for the authoritative result.
+        let mut staged = StagedEpochAggregator::new();
+        let mut bucket_deltas: HashMap<u16, (i128, i128)> = HashMap::new();
+        let mut sum_budget = 0u128;
+        let mut count_budget = 0u128;
         for (row, &w) in delta.weights.iter().enumerate() {
+            if w == 0 || k_col.is_null(row) || v_col.is_null(row) {
+                continue;
+            }
             let k = k_col.value(row);
             let v = v_col.value(row);
-            let entry = consolidated.entry((k, v)).or_insert_with(|| {
-                order.push((k, v));
-                0
-            });
-            *entry += w;
+            staged.ingest_delta(k, v, w)?;
+            if k == self.hot_key && self.bucket_count > 1 {
+                let contribution =
+                    checked_mul_i64(v, w).map_err(|_| OpError::aggregate_overflow(k))?;
+                sum_budget = sum_budget.saturating_add(u128::from(contribution.unsigned_abs()));
+                count_budget = count_budget.saturating_add(u128::from(w.unsigned_abs()));
+                let entry = bucket_deltas.entry(self.bucket_for(k, v)).or_default();
+                entry.0 += i128::from(contribution);
+                entry.1 += i128::from(w);
+            }
         }
 
-        let mut out_k: Vec<i64> = Vec::with_capacity(order.len() * 2);
-        let mut out_sum: Vec<i64> = Vec::with_capacity(order.len() * 2);
-        let mut out_count: Vec<i64> = Vec::with_capacity(order.len() * 2);
-        let mut out_avg: Vec<f64> = Vec::with_capacity(order.len() * 2);
-        let mut out_weights: Vec<i64> = Vec::with_capacity(order.len() * 2);
+        let mut out_k = Vec::with_capacity(staged.order.len() * 2);
+        let mut out_sum = Vec::with_capacity(staged.order.len() * 2);
+        let mut out_count = Vec::with_capacity(staged.order.len() * 2);
+        let mut out_avg = Vec::with_capacity(staged.order.len() * 2);
+        let mut out_weights = Vec::with_capacity(staged.order.len() * 2);
 
         let mut combined = self
             .combined
@@ -1976,49 +1982,38 @@ impl Operator for BucketedAggregateOp {
             .partials
             .lock()
             .expect("BucketedAggregateOp mutex poisoned");
+        let mut transitions = Vec::with_capacity(staged.order.len());
 
-        for (k, v) in order {
-            let w = consolidated[&(k, v)];
-            if w == 0 {
-                continue;
-            }
-
+        for &k in &staged.order {
+            let (delta_sum, delta_count) = staged.entries[&k];
             let (old_sum, old_count) = combined.get(&k).copied().unwrap_or((0, 0));
             let old_state = (old_count > 0).then_some((old_sum, old_count));
-
-            let contribution = checked_mul_i64(v, w).map_err(|_| OpError::aggregate_overflow(k))?;
-            let new_sum = checked_add_i64(old_sum, contribution)
+            let new_count = checked_add_i64(old_count, delta_count)
                 .map_err(|_| OpError::aggregate_overflow(k))?;
-            let new_count =
-                checked_add_i64(old_count, w).map_err(|_| OpError::aggregate_overflow(k))?;
             if new_count < 0 {
                 return Err(OpError::invalid_multiplicity(k, new_count));
             }
-
-            if k == self.hot_key && self.bucket_count > 1 {
-                let bucket = self.bucket_for(k, v);
-                let partial_key = (k, bucket);
-                let (partial_sum, partial_count) =
-                    partials.get(&partial_key).copied().unwrap_or((0, 0));
-                let next_partial_sum = checked_add_i64(partial_sum, contribution)
-                    .map_err(|_| OpError::aggregate_overflow(k))?;
-                let next_partial_count = checked_add_i64(partial_count, w)
-                    .map_err(|_| OpError::aggregate_overflow(k))?;
-                if next_partial_count != 0 {
-                    partials.insert(partial_key, (next_partial_sum, next_partial_count));
+            let next = rockstream_verified::aggregate::transition(
+                old_sum,
+                old_count,
+                delta_sum,
+                delta_count,
+            )
+            .ok_or_else(|| {
+                if new_count == 0 {
+                    OpError::invalid_literal(format!(
+                        "aggregate group {k} has zero count with nonzero sum"
+                    ))
                 } else {
-                    partials.remove(&partial_key);
+                    OpError::aggregate_overflow(k)
                 }
+            })?;
+            let new_state = (new_count > 0).then_some(next);
+            transitions.push((k, new_state));
+
+            if old_state == new_state {
+                continue;
             }
-
-            let new_state = if new_count > 0 {
-                combined.insert(k, (new_sum, new_count));
-                Some((new_sum, new_count))
-            } else {
-                combined.remove(&k);
-                None
-            };
-
             if let Some((old_sum, old_count)) = old_state {
                 out_k.push(k);
                 out_sum.push(old_sum);
@@ -2035,13 +2030,78 @@ impl Operator for BucketedAggregateOp {
             }
         }
 
+        // ADR 0004: include all existing partial operands and every input
+        // operand in the absolute-sum budget, not just the net epoch delta.
+        // If the budget fails, retain the single-owner result and discard the
+        // partial state. An existing unsplit group cannot be salted again
+        // without redistributing its input history; wait until it is empty.
+        let mut next_partials = HashMap::new();
+        if !bucket_deltas.is_empty() {
+            let mut previous = (0i128, 0i128);
+            for (&(key, bucket), &(sum, count)) in partials.iter() {
+                if key != self.hot_key {
+                    continue;
+                }
+                sum_budget = sum_budget.saturating_add(u128::from(sum.unsigned_abs()));
+                count_budget = count_budget.saturating_add(u128::from(count.unsigned_abs()));
+                previous.0 += i128::from(sum);
+                previous.1 += i128::from(count);
+                next_partials.insert(bucket, (i128::from(sum), i128::from(count)));
+            }
+            let (old_sum, old_count) = combined.get(&self.hot_key).copied().unwrap_or((0, 0));
+            let complete = previous == (i128::from(old_sum), i128::from(old_count));
+            let limit = i64::MAX as u128;
+            if complete && sum_budget <= limit && count_budget <= limit {
+                for (&bucket, &(sum, count)) in &bucket_deltas {
+                    let entry = next_partials.entry(bucket).or_default();
+                    entry.0 += sum;
+                    entry.1 += count;
+                }
+                if next_partials
+                    .values()
+                    .any(|&(sum, count)| count < 0 || (count == 0 && sum != 0))
+                {
+                    next_partials.clear();
+                }
+                next_partials.retain(|_, &mut (_, count)| count != 0);
+            } else {
+                next_partials.clear();
+            }
+        }
+
+        // Construct output before publishing any state, including on errors.
+        let data = RecordBatch::try_new(
+            output_schema(),
+            vec![
+                Arc::new(Int64Array::from(out_k)) as ArrayRef,
+                Arc::new(Int64Array::from(out_sum)) as ArrayRef,
+                Arc::new(Int64Array::from(out_count)) as ArrayRef,
+                Arc::new(Float64Array::from(out_avg)) as ArrayRef,
+            ],
+        )
+        .map_err(OpError::arrow)?;
+        let output_rows = data.num_rows();
+        for (k, state) in transitions {
+            if let Some(state) = state {
+                combined.insert(k, state);
+            } else {
+                combined.remove(&k);
+            }
+        }
+        if !bucket_deltas.is_empty() {
+            partials.retain(|&(key, _), _| key != self.hot_key);
+            for (bucket, (sum, count)) in next_partials {
+                // The absolute-sum admission above proves these casts exact.
+                partials.insert((self.hot_key, bucket), (sum as i64, count as i64));
+            }
+        }
         drop(partials);
         drop(combined);
 
         debug!(
             op_id = self.op_id.0,
             input_rows = delta.num_rows(),
-            output_rows = out_k.len(),
+            output_rows,
             hot_key = self.hot_key,
             bucket_count = self.bucket_count,
             "BucketedAggregateOp: processed delta"
@@ -2054,20 +2114,6 @@ impl Operator for BucketedAggregateOp {
             0,
         );
 
-        if out_k.is_empty() {
-            return Ok(ArrowZSet::empty(output_schema()));
-        }
-
-        let data = RecordBatch::try_new(
-            output_schema(),
-            vec![
-                Arc::new(Int64Array::from(out_k)) as ArrayRef,
-                Arc::new(Int64Array::from(out_sum)) as ArrayRef,
-                Arc::new(Int64Array::from(out_count)) as ArrayRef,
-                Arc::new(Float64Array::from(out_avg)) as ArrayRef,
-            ],
-        )
-        .map_err(OpError::arrow)?;
         Ok(ArrowZSet::new(data, out_weights))
     }
 }
@@ -2551,6 +2597,77 @@ mod tests {
         op2.restore(&entries).unwrap();
         assert_eq!(op2.live_groups(), 2);
         assert_eq!(op2.live_partials(), 1);
+    }
+
+    #[test]
+    fn bucketed_restore_reconstructs_every_legacy_partial() {
+        let op_id = OperatorId(10);
+        let entries = vec![
+            (
+                bytes::Bytes::from(bucketed_partial_key(op_id, 1, 0)),
+                encode_bucketed_value(10, 1),
+            ),
+            (
+                bytes::Bytes::from(bucketed_partial_key(op_id, 1, 1)),
+                encode_bucketed_value(30, 2),
+            ),
+        ];
+        let op = BucketedAggregateOp::new(op_id, 1, 4);
+        op.restore_from_entries(&entries).unwrap();
+        let output = op.process_delta(make_batch(&[(1, 5, 1)])).unwrap();
+        assert_eq!(
+            extract_rows(&output),
+            vec![(1, 40, 3, 40.0 / 3.0, -1), (1, 45, 4, 11.25, 1)]
+        );
+    }
+
+    #[test]
+    fn bucketed_aggregate_recombines_once_per_epoch() {
+        let op = BucketedAggregateOp::new(OperatorId(10), 1, 4);
+        let output = op
+            .process_delta(make_batch(&[(1, 10, 1), (1, 20, 1), (1, 30, 1)]))
+            .unwrap();
+        assert_eq!(extract_rows(&output), vec![(1, 60, 3, 20.0, 1)]);
+        let output = op
+            .process_delta(make_batch(&[(1, 10, -1), (1, 40, 1)]))
+            .unwrap();
+        assert_eq!(
+            extract_rows(&output),
+            vec![(1, 60, 3, 20.0, -1), (1, 90, 3, 30.0, 1)]
+        );
+    }
+
+    #[test]
+    fn bucketed_aggregate_nonadmitted_epoch_falls_back_to_single_owner() {
+        let op = BucketedAggregateOp::new(OperatorId(10), 1, 4);
+        let output = op
+            .process_delta(make_batch(&[(1, i64::MAX, 1), (1, -i64::MAX, 1)]))
+            .unwrap();
+        assert_eq!(extract_rows(&output), vec![(1, 0, 2, 0.0, 1)]);
+        assert_eq!(op.live_partials(), 0);
+        let output = op.process_delta(make_batch(&[(1, 3, 1)])).unwrap();
+        assert_eq!(
+            extract_rows(&output),
+            vec![(1, 0, 2, 0.0, -1), (1, 3, 3, 1.0, 1)]
+        );
+        assert_eq!(op.live_partials(), 0);
+    }
+
+    #[test]
+    fn bucketed_aggregate_failed_epoch_does_not_install_any_transition() {
+        let op = BucketedAggregateOp::new(OperatorId(10), 1, 4);
+        op.process_delta(make_batch(&[(1, 2, 1), (2, i64::MAX, 1)]))
+            .unwrap();
+        assert!(matches!(
+            op.process_delta(make_batch(&[(1, 4, 1), (2, 1, 1)])),
+            Err(OpError::AggregateOverflow { group_key: 2, .. })
+        ));
+        assert_eq!(op.live_partials(), 1);
+        let output = op.process_delta(make_batch(&[(1, 4, 1)])).unwrap();
+        assert_eq!(
+            extract_rows(&output),
+            vec![(1, 2, 1, 2.0, -1), (1, 6, 2, 3.0, 1)]
+        );
     }
 
     #[test]
