@@ -17,7 +17,7 @@ Try to be extremely conservative with the input tokens. Use adaptive polling int
 After any test run, extract only the summary — do not paste full passing test output into the conversation:
 
 ```
-rtk cargo test ... 2>&1 | grep -E "^test .* (ok|FAILED|ignored)|^test result:|^FAILED$|^error"
+cargo test ... 2>&1 | grep -E "^test .* (ok|FAILED|ignored)|^test result:|^FAILED$|^error"
 ```
 
 Show full output **only for FAILED tests**. Passing test noise balloons the cache and gets re-read on every subsequent turn, multiplying token costs 10–30×.
@@ -25,23 +25,6 @@ Show full output **only for FAILED tests**. Passing test noise balloons the cach
 ## Writing tests
 
 All tests must test and verify the exact, and ideally, full output instead of counts and other simplifications. This is important so that the tests can cover more ground.
-
-## RTK Wrapper
-
-Always use rtk wrapper for all commands. Examples:
-
-- `rtk grep "pattern"` instead of `grep -r "pattern"`
-- `rtk read <file>` instead of `cat <file>`
-- `rtk ls` instead of `ls`
-- `rtk find "*.md" .` instead of `find . -name "*.md"`
-- `rtk cargo test` instead of `cargo test`
-- `rtk cargo build` instead of `cargo build`
-- `rtk cargo clippy` instead of `cargo clippy`
-- `rtk git log` instead of `git log`
-- `rtk git status` instead of `git status`
-- `rtk git diff` instead of `git diff`
-- `rtk gh pr view <num>` instead of `gh pr view <num>`
-- `rtk gh pr checks <num>` instead of `gh pr checks <num>`
 
 ## Code Exploration Protocol
 
