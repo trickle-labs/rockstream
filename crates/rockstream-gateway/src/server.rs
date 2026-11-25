@@ -25560,7 +25560,11 @@ mod s4_tests {
         Arc::new(GatewayHandler::new(catalog, reader))
     }
 
-    pub(super) async fn make_handler_with_admin() -> (Arc<GatewayHandler>, String) {
+    pub(super) async fn make_handler_with_admin() -> (
+        Arc<GatewayHandler>,
+        String,
+        Arc<dyn object_store::ObjectStore>,
+    ) {
         use rockstream_storage::catalog::{
             CatalogMutation, CatalogNamespace, CatalogStore, CatalogTxn, DurableCatalogStore,
         };
@@ -25611,8 +25615,10 @@ mod s4_tests {
                 },
             }],
         };
+        let object_store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
         let durable = Arc::new(DurableCatalogStore::new(
-            Arc::new(object_store::memory::InMemory::new()),
+            object_store.clone(),
             "gateway-unit-admin".to_string(),
         ));
         durable
@@ -25652,7 +25658,7 @@ mod s4_tests {
             username: "unit-admin".to_string(),
         };
         handler.sessions.insert(conn_id.clone(), session);
-        (handler, conn_id)
+        (handler, conn_id, object_store)
     }
 
     fn assert_authentication_event(
@@ -26169,7 +26175,7 @@ mod s4_tests {
 
     #[tokio::test]
     async fn sink_secret_reference_blocks_secret_drop_until_sink_drop() {
-        let (handler, conn_id) = make_handler_with_admin().await;
+        let (handler, conn_id, _) = make_handler_with_admin().await;
         handler.catalog.add_view_in_namespace(CatalogView {
             name: "orders_view".to_string(),
             sql: "SELECT 1".to_string(),
@@ -27165,10 +27171,13 @@ mod v073_subscription_policy_tests {
     use super::*;
 
     #[tokio::test]
-    async fn live_subscriptions_reauthorize_and_keep_other_principals_streaming() {
+    async fn live_subscriptions_reauthorize_across_catalog_instances_and_keep_other_principals_streaming(
+    ) {
         use crate::catalog_stubs::CatalogView;
         use crate::change_log::ChangeEntry;
-        use rockstream_storage::catalog::{CatalogMutation, CatalogStore, CatalogTxn};
+        use rockstream_storage::catalog::{
+            CatalogMutation, CatalogStore, CatalogTxn, DurableCatalogStore,
+        };
         use rockstream_types::authorization::{PermissionPreset, ScopedPresetGrant};
         use rockstream_types::ids::PrincipalId;
 
@@ -27191,7 +27200,8 @@ mod v073_subscription_policy_tests {
             }
         }
 
-        let (handler, admin_conn_id) = super::s4_tests::make_handler_with_admin().await;
+        let (handler, admin_conn_id, object_store) =
+            super::s4_tests::make_handler_with_admin().await;
         handler.bind_server(&handler);
         handler.catalog.add_view_in_namespace(CatalogView {
             name: "v072_live_auth".to_string(),
@@ -27265,6 +27275,9 @@ mod v073_subscription_policy_tests {
             )
             .await
             .unwrap();
+        let independent_catalog =
+            Arc::new(DurableCatalogStore::new(object_store, "gateway-unit-admin"));
+        independent_catalog.refresh().await.unwrap();
 
         let reader_conn_id = "subscription-reader-session";
         handler
@@ -27298,7 +27311,8 @@ mod v073_subscription_policy_tests {
             before_state: AuditField::Known(format!("revision=1;policy={reader_policy}")),
             after_state: AuditField::Known(format!("revision=2;policy={revoked_policy}")),
         };
-        durable
+        let revocation_started = std::time::Instant::now();
+        independent_catalog
             .commit_txn(
                 CatalogTxn::new(
                     4,
@@ -27341,6 +27355,11 @@ mod v073_subscription_policy_tests {
             .unwrap()
             .unwrap()
             .unwrap_err();
+        let reauthorization_elapsed = revocation_started.elapsed();
+        assert!(
+            reauthorization_elapsed <= Duration::from_secs(60),
+            "authorization revocation took {reauthorization_elapsed:?}"
+        );
         match error {
             PgWireError::UserError(error) => {
                 assert_eq!(error.severity, "ERROR");

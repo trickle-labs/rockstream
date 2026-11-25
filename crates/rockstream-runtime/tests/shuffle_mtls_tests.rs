@@ -432,6 +432,91 @@ async fn test_worker_shuffle_grpc_mtls_rejects_unregistered_worker_identity() {
 }
 
 #[tokio::test]
+async fn worker_shuffle_rejects_frames_from_unregistered_worker_identity() {
+    let pki = TestPki::generate();
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let target_db = rockstream_storage::shard_db::ShardDb::builder("target", store)
+        .build()
+        .await
+        .unwrap();
+    let target_shard = ShardId(20);
+    let active_shards = HashMap::from([(
+        target_shard,
+        ShardState {
+            lease: ShardLease::new(target_shard, WorkerId(1), LeaseToken(2)),
+            db: Some(target_db),
+        },
+    )]);
+    let shard_leases = Arc::new(RwLock::new(HashMap::from([
+        (
+            ShardId(10),
+            ShardLease::new(ShardId(10), WorkerId(1), LeaseToken(1)),
+        ),
+        (
+            target_shard,
+            ShardLease::new(target_shard, WorkerId(1), LeaseToken(2)),
+        ),
+    ])));
+    let registry = ExchangeRegistry::with_worker_state(
+        Arc::new(RwLock::new(active_shards)),
+        Arc::new(RwLock::new(worker_infos(&[1]))),
+    )
+    .with_shard_leases(shard_leases);
+    let (inlet_tx, mut inlet_rx) = mpsc::channel(2);
+    let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("a", arrow::datatypes::DataType::Int64, false),
+        arrow::datatypes::Field::new("b", arrow::datatypes::DataType::Int64, false),
+    ]));
+    registry.register(100, target_shard.0 as u32, inlet_tx, schema);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let service = ExchangeService::new(with_auto_ack_audit(registry))
+        .with_internal_tls(pki.worker_tls_config(1));
+    service.start(addr).await.unwrap();
+    let peers = Arc::new(RwLock::new(HashMap::from([(
+        WorkerId(1),
+        addr.to_string(),
+    )])));
+    let pool = ShuffleClientPool::new(peers).with_internal_tls(pki.mismatched_worker_tls_config());
+    let mut client = pool.get_client(WorkerId(1)).await.unwrap();
+    let payload = rockstream_runtime::exchange::serialization::serialize_zset(
+        &ArrowZSet::from_ab_rows(&[(1, 10), (2, 20)], 1),
+    )
+    .unwrap();
+
+    let mut request = tonic::Request::new(futures::stream::iter(vec![ShuffleFrame {
+        exchange_id: 100,
+        src_shard: 10,
+        target_shard: target_shard.0 as u32,
+        epoch: 1,
+        seq: 1,
+        payload: payload.to_vec(),
+        row_count: 2,
+    }]));
+    request.metadata_mut().insert(
+        "protocol_version",
+        tonic::metadata::MetadataValue::from_static("3"),
+    );
+
+    let status = match client.shuffle_stream(request).await {
+        Err(status) => status,
+        Ok(_) => panic!("unregistered worker identity must not submit frames"),
+    };
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        status.message(),
+        "RS-2401: worker node identity is not currently registered"
+    );
+    assert!(matches!(
+        inlet_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    service.shutdown().await;
+}
+
+#[tokio::test]
 async fn exchange_stream_rejects_and_audits_unregistered_worker_identity() {
     let pki = TestPki::generate();
     let (audit_sender, mut audit_receiver, waiters) = audit_transport();
