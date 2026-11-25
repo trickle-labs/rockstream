@@ -939,6 +939,20 @@ The `sink_secret_reference_blocks_secret_drop_until_sink_drop` regression in
 `crates/rockstream-gateway/src/server.rs` verifies that a sink binding blocks
 deletion until `DROP SINK` removes it.
 
+PR #450 adds a 1 MiB serialized worker-secret payload cap and a per-worker cache
+cap of 1,024 entries and 64 MiB across active and pending generations.
+`secrets_lifecycle_tests.rs::worker_secret_payload_limit_accepts_exact_bound_and_rejects_overflow`
+and `worker_secret_resolution_tests.rs::worker_accepts_maximum_payload_and_rejects_one_byte_over`
+check exact-bound and overflow rejection without changing the stored secret or
+retained-byte metric. `worker_secret_resolution_tests.rs::worker_resolves_exact_payload_in_memory_and_rejects_wrong_identity`
+checks active/pending promotion, and
+`runtime/src/secrets.rs::cache_byte_admission_counts_active_and_pending_generations`
+checks cache byte-accounting arithmetic. These worker-local resource bounds add
+no M1–M7 coordination transition; the formal models still do not represent
+cache bytes or token admission. This is partial #304 resource-bound evidence,
+not release-process cache-pressure, cancellation/expiry recovery, or complete
+secret-rotation qualification.
+
 Issue #306 keeps release support artifacts sanitized and addresses downloads by
 opaque artifact ID bound to the authenticated principal and scope. The release
 tests compare the complete generated JSON, verify operator-only artifact access
