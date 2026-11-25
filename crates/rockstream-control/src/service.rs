@@ -7017,16 +7017,14 @@ async fn handle_connection_stream<R, W>(
                         (members, revoke)
                     })
                 };
-                if let Some((members, completed_metadata)) = completion {
-                    if let Some(metadata) = completed_metadata {
-                        let targets = members
-                            .keys()
-                            .filter_map(|id| shard_manager.get(*id).map(|lease| lease.worker_id))
-                            .collect();
-                        revoke_direct_grants(&metadata, None, &targets, &worker_senders).await;
-                        let mut state = data_plane.lock().await;
-                        release_completed_direct_reservation(&mut state, &metadata);
-                    }
+                if let Some((members, Some(metadata))) = completion {
+                    let targets = members
+                        .keys()
+                        .filter_map(|id| shard_manager.get(*id).map(|lease| lease.worker_id))
+                        .collect();
+                    revoke_direct_grants(&metadata, None, &targets, &worker_senders).await;
+                    let mut state = data_plane.lock().await;
+                    release_completed_direct_reservation(&mut state, &metadata);
                 }
             }
             WorkerMessage::ShardLoadReport { worker_id, samples } => {
