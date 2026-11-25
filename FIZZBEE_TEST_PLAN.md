@@ -822,6 +822,17 @@ authorization rule. `security_audit_metrics_tests.rs::durable_audit_metrics_foll
 and `security_audit_health_tests.rs::audit_storage_degradation_is_visible_without_failing_ready_health`
 check the metric and health surfaces.
 
+PR #445 (issue #305) adds the management `ListSecurityAuditRecords` endpoint
+over the existing durable audit catalog. The handler authorizes
+`SecurityAuditRead` for the requested `AuditRange` and policy revision, binds
+page tokens to that range, and returns bounded versioned-JSON pages. Its
+authorization-denial audit append changes no M1–M7 coordination transition.
+`management.rs::security_audit_history_is_range_authorized_and_paginated`
+checks exact page records, range-bound token rejection, denial status, and the
+normalized denial audit record. This management-query evidence does not
+qualify audit retention, storage-full recovery, or the complete v0.73 audit
+contract.
+
 Issue #304 wires `sasl_plain` references into SQL Kafka sinks. Resolution checks
 the durable consumer grant and secret version; a replacement transactional
 producer is initialized only between sink transactions, before the next view

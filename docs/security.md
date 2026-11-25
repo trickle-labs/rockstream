@@ -1,5 +1,31 @@
 # RockStream Security Architecture & Internal mTLS (v0.55)
 
+## Durable security audit history (v0.73)
+
+The authenticated management gRPC method `ListSecurityAuditRecords` reads the
+authoritative security audit catalog. It requires `security.audit.read`; the
+Administrator preset grants cluster-wide history access. A grant can restrict
+that permission to an `AuditRange` with inclusive `from_timestamp_ms` and
+`to_timestamp_ms` bounds. Requests outside the caller's range are denied and
+audited. The Operator preset does not grant audit or principal-management
+access.
+
+Set `page_size` to 1–100 (0 selects 50). Optional timestamp bounds filter the
+90-day retained history. Each returned `records_json` entry is one
+versioned `SecurityAuditRecord` JSON value. Use the opaque `next_page_token`
+unchanged with the same timestamp bounds to continue; it follows the stable
+`(timestamp_ms, event_id)` order. A changed range requires a new first-page
+request. Pages also fit within the 1 MiB management response limit, so a page
+can contain fewer records than requested. If a single record exceeds that
+limit, the method returns `RESOURCE_EXHAUSTED` for that page.
+
+The durable catalog retains at most 1 GiB of encoded audit records. When that
+budget is full, required security writes fail instead of discarding events.
+Monitor `security_audit_retained_records`, `security_audit_retained_bytes`,
+`security_audit_capacity_bytes`, and `security_audit_degraded` on the metrics
+endpoint. History reads use the shared bounded management request gate and cap
+each page at 100 records.
+
 ## Secrets and envelope encryption (v0.55.1)
 
 `CREATE SECRET`, `ALTER SECRET`, `DROP SECRET`, and `SHOW SECRETS` store only

@@ -8,8 +8,11 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use chrono::{SecondsFormat, Utc};
 use futures::Stream;
+use prost::Message;
 use rockstream_management_proto::{ensure_protocol_version, v1};
 use rockstream_storage::catalog::{CatalogMutation, CatalogStore, CatalogTxn};
 use rockstream_types::authorization::{
@@ -48,6 +51,32 @@ use crate::topology::TopologyCatalog;
 const DEFAULT_PAGE_SIZE: usize = 50;
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_MANAGEMENT_REQUESTS: usize = 64;
+
+struct BoundedJsonBuffer {
+    bytes: Vec<u8>,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl io::Write for BoundedJsonBuffer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let remaining = self.limit.saturating_sub(self.bytes.len());
+        if bytes.len() > remaining {
+            self.bytes.extend_from_slice(&bytes[..remaining]);
+            self.exceeded = true;
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "security audit record exceeds response limit",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 pub fn security_deployment_fingerprint(config: &NodeConfig, catalog_namespace: &str) -> String {
     let context = format!(
@@ -1752,6 +1781,59 @@ fn page_size(requested: u32) -> Result<usize, Status> {
     Ok(size)
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SecurityAuditPageToken {
+    version: u8,
+    from_timestamp_ms: Option<u64>,
+    to_timestamp_ms: Option<u64>,
+    after_timestamp_ms: u64,
+    after_event_id: String,
+}
+
+fn security_audit_page_cursor(
+    token: &str,
+    from_timestamp_ms: Option<u64>,
+    to_timestamp_ms: Option<u64>,
+) -> Result<Option<(u64, String)>, Status> {
+    if token.is_empty() {
+        return Ok(None);
+    }
+    let decoded = URL_SAFE_NO_PAD
+        .decode(token)
+        .map_err(|_| Status::invalid_argument("invalid page token"))?;
+    let cursor: SecurityAuditPageToken = serde_json::from_slice(&decoded)
+        .map_err(|_| Status::invalid_argument("invalid page token"))?;
+    if cursor.version != 1
+        || cursor.from_timestamp_ms != from_timestamp_ms
+        || cursor.to_timestamp_ms != to_timestamp_ms
+        || cursor.after_timestamp_ms == 0
+        || cursor.after_event_id.trim().is_empty()
+        || from_timestamp_ms.is_some_and(|from| cursor.after_timestamp_ms < from)
+        || to_timestamp_ms.is_some_and(|to| cursor.after_timestamp_ms > to)
+    {
+        return Err(Status::invalid_argument("invalid page token"));
+    }
+    Ok(Some((cursor.after_timestamp_ms, cursor.after_event_id)))
+}
+
+fn security_audit_page_token(
+    record: &SecurityAuditRecord,
+    from_timestamp_ms: Option<u64>,
+    to_timestamp_ms: Option<u64>,
+) -> Result<String, Status> {
+    let cursor = SecurityAuditPageToken {
+        version: 1,
+        from_timestamp_ms,
+        to_timestamp_ms,
+        after_timestamp_ms: record.timestamp_ms,
+        after_event_id: record.event_id.clone(),
+    };
+    serde_json::to_vec(&cursor)
+        .map(|cursor| URL_SAFE_NO_PAD.encode(cursor))
+        .map_err(|_| Status::internal("security audit page token could not be encoded"))
+}
+
 fn page<T>(items: Vec<T>, size: usize, token: &str) -> Result<(Vec<T>, String), Status> {
     let offset = if token.is_empty() {
         0
@@ -2208,6 +2290,102 @@ impl v1::management_service_server::ManagementService for ManagementService {
                 key_range_known: false,
             }),
         }))
+    }
+
+    async fn list_security_audit_records(
+        &self,
+        request: Request<v1::ListSecurityAuditRecordsRequest>,
+    ) -> Result<Response<v1::ListSecurityAuditRecordsResponse>, Status> {
+        let _permit = self.acquire_request()?;
+        Self::ensure_version(request.get_ref().protocol_version)?;
+        let from_timestamp_ms = request.get_ref().from_timestamp_ms;
+        let to_timestamp_ms = request.get_ref().to_timestamp_ms;
+        if from_timestamp_ms
+            .zip(to_timestamp_ms)
+            .is_some_and(|(from, to)| from > to)
+        {
+            return Err(Status::invalid_argument(
+                "from_timestamp_ms must not exceed to_timestamp_ms",
+            ));
+        }
+        let (principal_id, policy_revision) = self
+            .authorize(
+                &request,
+                SecurityAction::SecurityAuditRead,
+                PolicyScope::AuditRange {
+                    from_ms: from_timestamp_ms,
+                    to_ms: to_timestamp_ms,
+                },
+            )
+            .await?;
+        let request = request.into_inner();
+        let size = page_size(request.page_size)?;
+        let after =
+            security_audit_page_cursor(&request.page_token, from_timestamp_ms, to_timestamp_ms)?;
+        let catalog = self
+            .security_catalog
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("management security catalog is unavailable"))?;
+        let records = catalog
+            .list_security_audit_page(
+                (principal_id, policy_revision),
+                from_timestamp_ms,
+                to_timestamp_ms,
+                after,
+                size + 1,
+            )
+            .await
+            .map_err(|_| Status::unavailable("management security audit history is unavailable"))?;
+        let record_count = records.len();
+        let mut response = v1::ListSecurityAuditRecordsResponse {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            observed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            source_version: format!("security-audit-records:v{SECURITY_AUDIT_FORMAT_VERSION}"),
+            records_json: Vec::new(),
+            next_page_token: String::new(),
+        };
+        for (index, record) in records.into_iter().take(size).enumerate() {
+            let mut json = BoundedJsonBuffer {
+                bytes: Vec::new(),
+                limit: MAX_MESSAGE_BYTES,
+                exceeded: false,
+            };
+            if serde_json::to_writer(&mut json, &record).is_err() {
+                if json.exceeded {
+                    if response.records_json.is_empty() {
+                        return Err(Status::resource_exhausted(
+                            "security audit record exceeds the management response size limit",
+                        ));
+                    }
+                    break;
+                }
+                return Err(Status::internal(
+                    "security audit record could not be encoded",
+                ));
+            }
+            let record_json = String::from_utf8(json.bytes)
+                .map_err(|_| Status::internal("security audit record could not be encoded"))?;
+            response.records_json.push(record_json);
+            let previous_page_token = std::mem::replace(
+                &mut response.next_page_token,
+                if index + 1 < record_count {
+                    security_audit_page_token(&record, from_timestamp_ms, to_timestamp_ms)?
+                } else {
+                    String::new()
+                },
+            );
+            if response.encoded_len() > MAX_MESSAGE_BYTES {
+                response.records_json.pop();
+                response.next_page_token = previous_page_token;
+                if response.records_json.is_empty() {
+                    return Err(Status::resource_exhausted(
+                        "security audit record exceeds the management response size limit",
+                    ));
+                }
+                break;
+            }
+        }
+        Ok(Response::new(response))
     }
 
     async fn list_operations(
@@ -4050,6 +4228,311 @@ mod tests {
         assert_eq!(denied.operation_id, AuditField::NotApplicable);
         assert_eq!(denied.before_state, AuditField::NotApplicable);
         assert_eq!(denied.after_state, AuditField::NotApplicable);
+    }
+
+    #[tokio::test]
+    async fn security_audit_history_is_range_authorized_and_paginated() {
+        let security_catalog = test_security_catalog().await;
+        let from_timestamp_ms = Utc::now().timestamp_millis().max(1) as u64 + 60_000;
+        let events = (0..4)
+            .map(|index| SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: format!("audit-history-{index}"),
+                timestamp_ms: from_timestamp_ms + index,
+                actor: AuditIdentity::Verified("principal:1".to_owned()),
+                target: AuditField::Known(if index == 3 {
+                    "x".repeat(MAX_MESSAGE_BYTES)
+                } else {
+                    "audit-history-test".to_owned()
+                }),
+                scope: AuditField::Known("cluster".to_owned()),
+                action: SecurityAuditClass::AuthenticationSuccess,
+                outcome: SecurityAuditOutcome::Success,
+                correlation: AuditCorrelation::NotApplicable,
+                operation_id: AuditField::NotApplicable,
+                policy_revision: AuditField::Known(1),
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::NotApplicable,
+            })
+            .collect::<Vec<_>>();
+        let revision = security_catalog.get_revision().await;
+        security_catalog
+            .commit_txn(
+                CatalogTxn::new(
+                    revision + 1,
+                    revision + 1,
+                    events
+                        .iter()
+                        .cloned()
+                        .map(CatalogMutation::AppendSecurityAudit)
+                        .collect(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let operations = ManagementOperationStore::new(Arc::new(InMemory::new()));
+        let service = ManagementService::new(
+            TopologyCatalog::new(),
+            ShardManager::new(),
+            operations,
+            NodeConfig::default(),
+        )
+        .with_security_catalog(security_catalog.clone());
+        let granted_range = PolicyScope::AuditRange {
+            from_ms: Some(from_timestamp_ms + 1),
+            to_ms: Some(from_timestamp_ms + 3),
+        };
+        let grant_operation_id = uuid::Uuid::new_v4().to_string();
+        let grant_response = <ManagementService as v1::management_service_server::ManagementService>::set_security_principal_grants(
+            &service,
+            authenticated_request(v1::SetSecurityPrincipalGrantsRequest {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                principal_id: 2,
+                expected_revision: 1,
+                expected_grantor_revision: 1,
+                idempotency_key: grant_operation_id,
+                preset_grants: vec![v1::SecurityPresetGrant {
+                    preset: "operator".to_owned(),
+                    scope_json: serde_json::to_string(&PolicyScope::Cluster).unwrap(),
+                }],
+                scoped_grants: vec![v1::SecurityActionGrant {
+                    action: "security_audit_read".to_owned(),
+                    scope_json: serde_json::to_string(&granted_range).unwrap(),
+                }],
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(grant_response.operation.unwrap().state, "succeeded");
+
+        let audit_request = |principal_id,
+                             certificate_sha256,
+                             from_timestamp_ms,
+                             to_timestamp_ms,
+                             page_size,
+                             page_token| {
+            let mut request = Request::new(v1::ListSecurityAuditRecordsRequest {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                from_timestamp_ms,
+                to_timestamp_ms,
+                page_size,
+                page_token,
+            });
+            request.extensions_mut().insert(ManagementConnectionInfo {
+                certificate_sha256,
+                principal_id,
+                closed: Arc::new(AtomicBool::new(false)),
+            });
+            request
+        };
+        let mut first_page = <ManagementService as v1::management_service_server::ManagementService>::list_security_audit_records(
+            &service,
+            audit_request(
+                PrincipalId(2),
+                [8; 32],
+                Some(from_timestamp_ms + 1),
+                Some(from_timestamp_ms + 2),
+                1,
+                String::new(),
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            first_page.protocol_version,
+            rockstream_management_proto::PROTOCOL_VERSION
+        );
+        assert_eq!(
+            first_page.source_version,
+            format!("security-audit-records:v{SECURITY_AUDIT_FORMAT_VERSION}")
+        );
+        assert!(chrono::DateTime::parse_from_rfc3339(&first_page.observed_at).is_ok());
+        assert_eq!(
+            first_page.records_json,
+            vec![serde_json::to_string(&events[1]).unwrap()]
+        );
+        assert!(!first_page.next_page_token.is_empty());
+
+        let next_page_token = std::mem::take(&mut first_page.next_page_token);
+        let second_page = <ManagementService as v1::management_service_server::ManagementService>::list_security_audit_records(
+            &service,
+            audit_request(
+                PrincipalId(2),
+                [8; 32],
+                Some(from_timestamp_ms + 1),
+                Some(from_timestamp_ms + 2),
+                1,
+                next_page_token.clone(),
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            second_page.records_json,
+            vec![serde_json::to_string(&events[2]).unwrap()]
+        );
+        assert!(second_page.next_page_token.is_empty());
+
+        let bounded_page = <ManagementService as v1::management_service_server::ManagementService>::list_security_audit_records(
+            &service,
+            audit_request(
+                PrincipalId(2),
+                [8; 32],
+                Some(from_timestamp_ms + 1),
+                Some(from_timestamp_ms + 3),
+                3,
+                String::new(),
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            bounded_page.records_json,
+            vec![
+                serde_json::to_string(&events[1]).unwrap(),
+                serde_json::to_string(&events[2]).unwrap(),
+            ]
+        );
+        let bounded_page_token = security_audit_page_token(
+            &events[2],
+            Some(from_timestamp_ms + 1),
+            Some(from_timestamp_ms + 3),
+        )
+        .unwrap();
+        assert_eq!(bounded_page.next_page_token, bounded_page_token);
+        let oversized_record = <ManagementService as v1::management_service_server::ManagementService>::list_security_audit_records(
+            &service,
+            audit_request(
+                PrincipalId(2),
+                [8; 32],
+                Some(from_timestamp_ms + 1),
+                Some(from_timestamp_ms + 3),
+                3,
+                bounded_page_token,
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(oversized_record.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(
+            oversized_record.message(),
+            "security audit record exceeds the management response size limit"
+        );
+
+        let changed_range = <ManagementService as v1::management_service_server::ManagementService>::list_security_audit_records(
+            &service,
+            audit_request(
+                PrincipalId(1),
+                [7; 32],
+                Some(from_timestamp_ms),
+                Some(from_timestamp_ms + 2),
+                1,
+                next_page_token,
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(changed_range.code(), tonic::Code::InvalidArgument);
+        assert_eq!(changed_range.message(), "invalid page token");
+
+        let denied_peer = ManagementConnectionInfo {
+            certificate_sha256: [8; 32],
+            principal_id: PrincipalId(2),
+            closed: Arc::new(AtomicBool::new(false)),
+        };
+        let mut denied_request = audit_request(
+            PrincipalId(2),
+            [8; 32],
+            Some(from_timestamp_ms),
+            Some(from_timestamp_ms + 2),
+            1,
+            String::new(),
+        );
+        denied_request.extensions_mut().insert(denied_peer.clone());
+        let denied = <ManagementService as v1::management_service_server::ManagementService>::list_security_audit_records(
+            &service,
+            denied_request,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        assert_eq!(denied.message(), "management action is not authorized");
+        assert!(!denied_peer.is_closed());
+
+        let mut forbidden_grants_request = Request::new(v1::ListSecurityPrincipalsRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            page_size: 0,
+            page_token: String::new(),
+        });
+        forbidden_grants_request
+            .extensions_mut()
+            .insert(ManagementConnectionInfo {
+                certificate_sha256: [8; 32],
+                principal_id: PrincipalId(2),
+                closed: Arc::new(AtomicBool::new(false)),
+            });
+        let forbidden_grants = <ManagementService as v1::management_service_server::ManagementService>::list_security_principals(
+            &service,
+            forbidden_grants_request,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(forbidden_grants.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            forbidden_grants.message(),
+            "management action is not authorized"
+        );
+
+        let audit = security_catalog
+            .list_security_audit_records()
+            .await
+            .unwrap();
+        let denial = audit
+            .iter()
+            .find(|record| {
+                record.action == SecurityAuditClass::AuthorizationDenial
+                    && record.target == AuditField::Known("SecurityAuditRead".to_owned())
+            })
+            .unwrap();
+        let event_id = denial
+            .event_id
+            .strip_prefix("management-denial-")
+            .expect("range denial audit event");
+        assert!(uuid::Uuid::parse_str(event_id).is_ok());
+        assert!(denial.timestamp_ms > 0);
+        let mut normalized_denial = denial.clone();
+        normalized_denial.event_id = "<event_id>".to_owned();
+        normalized_denial.timestamp_ms = 0;
+        assert_eq!(
+            normalized_denial,
+            SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: "<event_id>".to_owned(),
+                timestamp_ms: 0,
+                actor: AuditIdentity::Verified("principal:2".to_owned()),
+                target: AuditField::Known("SecurityAuditRead".to_owned()),
+                scope: AuditField::Known(
+                    serde_json::to_string(&PolicyScope::AuditRange {
+                        from_ms: Some(from_timestamp_ms),
+                        to_ms: Some(from_timestamp_ms + 2),
+                    })
+                    .unwrap()
+                ),
+                action: SecurityAuditClass::AuthorizationDenial,
+                outcome: SecurityAuditOutcome::Denied,
+                correlation: AuditCorrelation::Unknown,
+                operation_id: AuditField::NotApplicable,
+                policy_revision: AuditField::Known(2),
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::NotApplicable,
+            }
+        );
     }
 
     #[tokio::test]
