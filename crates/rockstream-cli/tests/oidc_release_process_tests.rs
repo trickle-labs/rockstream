@@ -795,6 +795,28 @@ async fn start_delegated_control_process(
     seed_worker_secret: bool,
     minio: Option<(u16, &str)>,
 ) -> RunningGateway {
+    let management_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    start_delegated_control_process_with_management_address(
+        working_dir,
+        storage,
+        (address, management_address),
+        pki,
+        additional_principal,
+        seed_worker_secret,
+        minio,
+    )
+    .await
+}
+
+async fn start_delegated_control_process_with_management_address(
+    working_dir: &Path,
+    storage: &Path,
+    (address, management_address): (std::net::SocketAddr, std::net::SocketAddr),
+    pki: &rockstream_test_support::pki::TestPki,
+    additional_principal: Option<SecurityPrincipal>,
+    seed_worker_secret: bool,
+    minio: Option<(u16, &str)>,
+) -> RunningGateway {
     let certs = rustls_pemfile::certs(&mut BufReader::new(
         std::fs::File::open(&pki.cli_cert_path).unwrap(),
     ))
@@ -988,7 +1010,6 @@ async fn start_delegated_control_process(
         drop(secret_store);
     }
 
-    let management_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
     start_control_process_with_operator(
         working_dir,
         storage,
@@ -2547,7 +2568,7 @@ async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
 }
 
 #[tokio::test]
-async fn delegated_worker_secret_uses_durable_store_in_release_control_process() {
+async fn delegated_worker_secret_rechecks_actor_scope_in_release_control_process() {
     let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let temp = tempfile::tempdir().unwrap();
@@ -2577,10 +2598,7 @@ async fn delegated_worker_secret_uses_durable_store_in_release_control_process()
                 name: "delegated_view".to_owned(),
             },
         }],
-        scoped_grants: vec![ScopedActionGrant {
-            action: SecurityAction::SecretUse,
-            scope: secret_scope.clone(),
-        }],
+        scoped_grants: Vec::new(),
     };
     let mut config = rockstream_types::config::NodeConfig::default();
     config.node.deployment_id = Some("release-deployment".to_owned());
@@ -2593,10 +2611,12 @@ async fn delegated_worker_secret_uses_durable_store_in_release_control_process()
     .unwrap();
 
     let address: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-    let mut process = start_delegated_control_process(
+    let management_address: std::net::SocketAddr =
+        format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut process = start_delegated_control_process_with_management_address(
         temp.path(),
         &storage,
-        address,
+        (address, management_address),
         &pki,
         Some(actor.clone()),
         true,
@@ -2683,20 +2703,22 @@ async fn delegated_worker_secret_uses_durable_store_in_release_control_process()
         kind: ResourceKind::View,
         name: "delegated_view".to_owned(),
     };
-    let assertion = rockstream_control::delegation::ActorAssertionSigner::from_pkcs8_pem(
+    let signer = rockstream_control::delegation::ActorAssertionSigner::from_pkcs8_pem(
         &fixtures.join("actor-assertion-test-key.pem"),
         "release-deployment",
     )
-    .unwrap()
-    .issue(
-        actor.id,
-        actor.revision,
-        action,
-        view_scope,
-        vec![secret_scope.clone()],
-        rockstream_control::delegation::request_digest(&message).unwrap(),
-    )
     .unwrap();
+    let request_digest = rockstream_control::delegation::request_digest(&message).unwrap();
+    let assertion = signer
+        .issue(
+            actor.id,
+            actor.revision,
+            action,
+            view_scope.clone(),
+            vec![secret_scope.clone()],
+            request_digest,
+        )
+        .unwrap();
     let gateway = rockstream_runtime::data_plane::DataPlaneClient::new(address.to_string())
         .with_internal_tls(&pki.gateway_tls_config())
         .unwrap();
@@ -2708,6 +2730,192 @@ async fn delegated_worker_secret_uses_durable_store_in_release_control_process()
         .get_deployment(request.workload_id, lease.shard_id)
         .is_some()));
 
+    let denial_record = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            catalog.refresh().await.unwrap();
+            let records = catalog.list_security_audit_records().await.unwrap();
+            if let Some(record) = records.iter().find(|record| {
+                record.action == SecurityAuditClass::AuthorizationDenial
+                    && record.actor == AuditIdentity::Verified(actor.id.to_string())
+                    && record.target == AuditField::Known("kafka".to_owned())
+            }) {
+                break record.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("release control process must deny delegated secret use without actor scope");
+    assert!(worker
+        .secret(
+            request.workload_id,
+            "kafka",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .is_none());
+    assert_eq!(
+        catalog
+            .get_security_principal(actor.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        actor
+    );
+    let event_id = denial_record
+        .event_id
+        .strip_prefix("gateway-delegation:")
+        .expect("delegated secret denial audit ID");
+    assert!(uuid::Uuid::parse_str(event_id).is_ok());
+    let mut normalized_denial = denial_record.clone();
+    normalized_denial.event_id = "gateway-delegation:<uuid>".to_owned();
+    assert!(normalized_denial.timestamp_ms > 0);
+    normalized_denial.timestamp_ms = 0;
+    assert_eq!(
+        normalized_denial,
+        SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: "gateway-delegation:<uuid>".to_owned(),
+            timestamp_ms: 0,
+            actor: AuditIdentity::Verified(actor.id.to_string()),
+            target: AuditField::Known("kafka".to_owned()),
+            scope: AuditField::Known(format!("{secret_scope:?}")),
+            action: SecurityAuditClass::AuthorizationDenial,
+            outcome: SecurityAuditOutcome::Denied,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::Known(actor.revision),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
+    );
+
+    let mut management = wait_for_management_client(management_address, &pki).await;
+    let grant_operation_id = uuid::Uuid::new_v4().to_string();
+    let grant_operation = management
+        .set_security_principal_grants(SetSecurityPrincipalGrantsRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            principal_id: actor.id.0,
+            expected_revision: actor.revision,
+            expected_grantor_revision: 1,
+            idempotency_key: grant_operation_id.clone(),
+            preset_grants: vec![SecurityPresetGrant {
+                preset: "builder".to_owned(),
+                scope_json: serde_json::to_string(&view_scope).unwrap(),
+            }],
+            scoped_grants: vec![SecurityActionGrant {
+                action: "secret_use".to_owned(),
+                scope_json: serde_json::to_string(&secret_scope).unwrap(),
+            }],
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .operation
+        .unwrap();
+    assert_eq!(grant_operation.operation_id, grant_operation_id);
+    assert_eq!(grant_operation.kind, "security_principal_grants");
+    assert_eq!(grant_operation.state, "succeeded");
+    assert_eq!(grant_operation.phase, "security_policy_committed");
+    let mut authorized_actor = actor.clone();
+    authorized_actor.revision += 1;
+    authorized_actor.scoped_grants.push(ScopedActionGrant {
+        action: SecurityAction::SecretUse,
+        scope: secret_scope.clone(),
+    });
+    drop(management);
+    worker_handle.abort();
+    gateway_process.0.kill().unwrap();
+    gateway_process.0.wait().unwrap();
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+    catalog.refresh().await.unwrap();
+    let audit_before_restart = catalog.list_security_audit_records().await.unwrap();
+    std::fs::write(
+        temp.path().join("rockstream.toml"),
+        toml::to_string(&config).unwrap(),
+    )
+    .unwrap();
+    let mut process = start_control_process_with_operator(
+        temp.path(),
+        &storage,
+        address,
+        management_address,
+        &pki,
+        None,
+        false,
+        None,
+        false,
+        true,
+    )
+    .await;
+    wait_for_gateway(&mut process.0, address).await;
+    let gateway_address: std::net::SocketAddr =
+        format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut gateway_process = start_gateway_process(
+        temp.path(),
+        &storage,
+        gateway_address,
+        &pki.gateway_cert_path,
+        &pki.gateway_key_path,
+        "off",
+        None,
+        "",
+        "",
+        "",
+    );
+    wait_for_gateway(&mut gateway_process.0, gateway_address).await;
+    let (worker, worker_handle) = rockstream_runtime::client::start_worker_client_with_tls(
+        1,
+        &address.to_string(),
+        &worker_storage,
+        pki.worker_tls_config(1),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while worker.worker_id().is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let gateway = rockstream_runtime::data_plane::DataPlaneClient::new(address.to_string())
+        .with_internal_tls(&pki.gateway_tls_config())
+        .unwrap();
+    let authorized_assertion = signer
+        .issue(
+            authorized_actor.id,
+            authorized_actor.revision,
+            action,
+            view_scope,
+            vec![secret_scope.clone()],
+            request_digest,
+        )
+        .unwrap();
+    gateway
+        .deploy_delegated(request.clone(), &authorized_assertion)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            catalog.refresh().await.unwrap();
+            let records = catalog.list_security_audit_records().await.unwrap();
+            if records.iter().any(|record| {
+                record.action == SecurityAuditClass::AuthenticationSuccess
+                    && record.actor == AuditIdentity::Verified(actor.id.to_string())
+                    && record.target == AuditField::Known("ViewAuthor".to_owned())
+                    && record.policy_revision == AuditField::Known(authorized_actor.revision)
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("release control process must accept the updated actor revision");
     let resolved = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let Some(secret) = worker.secret(
@@ -2768,7 +2976,23 @@ async fn delegated_worker_secret_uses_durable_store_in_release_control_process()
         .await
         .unwrap();
     let records = recovered.list_security_audit_records().await.unwrap();
-    let secret_audits: Vec<_> = records[audit_before.len()..]
+    assert_eq!(
+        recovered
+            .get_security_principal(authorized_actor.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        authorized_actor
+    );
+    assert_eq!(
+        recovered
+            .get_security_audit_record(&denial_record.event_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        denial_record
+    );
+    let secret_audits: Vec<_> = records[audit_before_restart.len()..]
         .iter()
         .filter(|record| {
             record.action == SecurityAuditClass::AuthenticationSuccess
@@ -2776,18 +3000,32 @@ async fn delegated_worker_secret_uses_durable_store_in_release_control_process()
         })
         .collect();
     assert_eq!(secret_audits.len(), 1);
+    let mut normalized_success = (*secret_audits[0]).clone();
+    let success_event_id = normalized_success
+        .event_id
+        .strip_prefix("gateway-delegation:")
+        .expect("delegated secret success audit ID");
+    assert!(uuid::Uuid::parse_str(success_event_id).is_ok());
+    normalized_success.event_id = "gateway-delegation:<uuid>".to_owned();
+    assert!(normalized_success.timestamp_ms > 0);
+    normalized_success.timestamp_ms = 0;
     assert_eq!(
-        secret_audits[0].actor,
-        AuditIdentity::Verified(actor.id.to_string())
-    );
-    assert_eq!(
-        secret_audits[0].scope,
-        AuditField::Known(format!("{secret_scope:?}"))
-    );
-    assert_eq!(secret_audits[0].outcome, SecurityAuditOutcome::Success);
-    assert_eq!(
-        secret_audits[0].policy_revision,
-        AuditField::Known(actor.revision)
+        normalized_success,
+        SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: "gateway-delegation:<uuid>".to_owned(),
+            timestamp_ms: 0,
+            actor: AuditIdentity::Verified(actor.id.to_string()),
+            target: AuditField::Known("kafka".to_owned()),
+            scope: AuditField::Known(format!("{secret_scope:?}")),
+            action: SecurityAuditClass::AuthenticationSuccess,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::Known(authorized_actor.revision),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
     );
 }
 
