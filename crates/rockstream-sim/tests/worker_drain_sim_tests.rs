@@ -32,7 +32,9 @@ async fn register(
         .unwrap()
         .unwrap();
     match serde_json::from_str::<ControlMessage>(response.trim()).unwrap() {
-        ControlMessage::Registered { worker_id } => assert_eq!(worker_id, registration.worker_id),
+        ControlMessage::Registered { worker_id, .. } => {
+            assert_eq!(worker_id, registration.worker_id)
+        }
         other => panic!("expected registration response, got {other:?}"),
     }
     reader

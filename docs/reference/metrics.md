@@ -20,5 +20,11 @@
 | pgwire_errors_total | counter | count | sqlstate, error_code | stable | Total pgwire errors returned to clients |
 | pgwire_queries_total | counter | count | command | stable | Total pgwire queries processed |
 | pgwire_query_duration_ms | histogram | ms | command | stable | Duration of pgwire queries in milliseconds |
+| security_audit_capacity_bytes | gauge | bytes |  | stable | Configured deployment-wide security audit retention limit |
+| security_audit_degraded | gauge | boolean |  | stable | Whether required security audit writes are failing |
+| security_audit_retained_bytes | gauge | bytes |  | stable | JSON-encoded size of retained security audit records |
+| security_audit_retained_records | gauge | count |  | stable | Number of retained security audit records |
+| security_audit_transport_capacity | gauge | count |  | stable | Maximum in-flight worker security audit acknowledgements |
+| security_audit_transport_pending | gauge | count |  | stable | Worker security audit requests awaiting durable acknowledgement |
 | storage_flush_latency_ms | histogram | ms | tier | stable | Storage flush duration latency in milliseconds |
 

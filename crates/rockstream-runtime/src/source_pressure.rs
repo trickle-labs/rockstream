@@ -75,8 +75,11 @@ impl SourcePressureController {
     }
 
     fn gross_reserved_bytes(&self) -> u128 {
-        let allocated = u128::from(self.ledger.total_allocated_bytes());
-        allocated * u128::from(100 + self.ledger.allocator_overhead_pct()) / 100
+        let accounted = u128::from(self.ledger.total_allocated_bytes())
+            * u128::from(100 + self.ledger.allocator_overhead_pct())
+            / 100;
+        let calibrated = u128::from(self.ledger.calibrated_pressure_bytes());
+        accounted.max(calibrated)
     }
 
     pub fn base_credits(&self) -> u32 {

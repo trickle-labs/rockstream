@@ -1,7 +1,7 @@
 use rockstream_management_proto::{ensure_protocol_version, v1, PROTOCOL_VERSION};
 
 #[test]
-fn management_v1_contract_has_all_fourteen_methods() {
+fn management_v1_contract_has_all_nineteen_methods() {
     let proto = include_str!("../proto/management/v1/management.proto");
     let service = proto
         .split("service ManagementService {")
@@ -25,6 +25,9 @@ fn management_v1_contract_has_all_fourteen_methods() {
             "rpc ListShards(ListShardsRequest) returns (ListShardsResponse);",
             "rpc GetShard(GetShardRequest) returns (GetShardResponse);",
             "rpc ListOperations(ListOperationsRequest) returns (ListOperationsResponse);",
+            "rpc ListSecurityAuditRecords(ListSecurityAuditRecordsRequest) returns (ListSecurityAuditRecordsResponse);",
+            "rpc ListSecurityPrincipals(ListSecurityPrincipalsRequest) returns (ListSecurityPrincipalsResponse);",
+            "rpc SetSecurityPrincipalGrants(SetSecurityPrincipalGrantsRequest) returns (SetSecurityPrincipalGrantsResponse);",
             "rpc GetOperation(GetOperationRequest) returns (GetOperationResponse);",
             "rpc GetConfigSummary(GetConfigSummaryRequest) returns (GetConfigSummaryResponse);",
             "rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);",
@@ -33,6 +36,8 @@ fn management_v1_contract_has_all_fourteen_methods() {
             "rpc MigrateShard(MigrateShardRequest) returns (MigrateShardResponse);",
             "rpc CreateBackup(CreateBackupRequest) returns (CreateBackupResponse);",
             "rpc CancelOperation(CancelOperationRequest) returns (CancelOperationResponse);",
+            "rpc GenerateSupportArtifact(GenerateSupportArtifactRequest) returns (GenerateSupportArtifactResponse);",
+            "rpc DownloadSupportArtifact(DownloadSupportArtifactRequest) returns (stream DownloadSupportArtifactChunk);",
         ]
     );
 
@@ -71,6 +76,10 @@ fn every_request_and_response_carries_protocol_version() {
         v1::GetShardResponse,
         v1::ListOperationsRequest,
         v1::ListOperationsResponse,
+        v1::ListSecurityPrincipalsRequest,
+        v1::ListSecurityPrincipalsResponse,
+        v1::SetSecurityPrincipalGrantsRequest,
+        v1::SetSecurityPrincipalGrantsResponse,
         v1::GetOperationRequest,
         v1::GetOperationResponse,
         v1::GetConfigSummaryRequest,
@@ -87,6 +96,9 @@ fn every_request_and_response_carries_protocol_version() {
         v1::CreateBackupResponse,
         v1::CancelOperationRequest,
         v1::CancelOperationResponse,
+        v1::GenerateSupportArtifactRequest,
+        v1::GenerateSupportArtifactResponse,
+        v1::DownloadSupportArtifactRequest,
     );
 }
 
@@ -112,6 +124,9 @@ struct TestService;
 
 #[tonic::async_trait]
 impl v1::management_service_server::ManagementService for TestService {
+    type DownloadSupportArtifactStream =
+        futures::stream::Empty<Result<v1::DownloadSupportArtifactChunk, tonic::Status>>;
+
     async fn get_cluster_status(
         &self,
         _: tonic::Request<v1::GetClusterStatusRequest>,
@@ -146,6 +161,24 @@ impl v1::management_service_server::ManagementService for TestService {
         &self,
         _: tonic::Request<v1::ListOperationsRequest>,
     ) -> Result<tonic::Response<v1::ListOperationsResponse>, tonic::Status> {
+        Err(rockstream_management_proto::unavailable_status())
+    }
+    async fn list_security_audit_records(
+        &self,
+        _: tonic::Request<v1::ListSecurityAuditRecordsRequest>,
+    ) -> Result<tonic::Response<v1::ListSecurityAuditRecordsResponse>, tonic::Status> {
+        Err(rockstream_management_proto::unavailable_status())
+    }
+    async fn list_security_principals(
+        &self,
+        _: tonic::Request<v1::ListSecurityPrincipalsRequest>,
+    ) -> Result<tonic::Response<v1::ListSecurityPrincipalsResponse>, tonic::Status> {
+        Err(rockstream_management_proto::unavailable_status())
+    }
+    async fn set_security_principal_grants(
+        &self,
+        _: tonic::Request<v1::SetSecurityPrincipalGrantsRequest>,
+    ) -> Result<tonic::Response<v1::SetSecurityPrincipalGrantsResponse>, tonic::Status> {
         Err(rockstream_management_proto::unavailable_status())
     }
     async fn get_operation(
@@ -194,6 +227,18 @@ impl v1::management_service_server::ManagementService for TestService {
         &self,
         _: tonic::Request<v1::CancelOperationRequest>,
     ) -> Result<tonic::Response<v1::CancelOperationResponse>, tonic::Status> {
+        Err(rockstream_management_proto::unavailable_status())
+    }
+    async fn generate_support_artifact(
+        &self,
+        _: tonic::Request<v1::GenerateSupportArtifactRequest>,
+    ) -> Result<tonic::Response<v1::GenerateSupportArtifactResponse>, tonic::Status> {
+        Err(rockstream_management_proto::unavailable_status())
+    }
+    async fn download_support_artifact(
+        &self,
+        _: tonic::Request<v1::DownloadSupportArtifactRequest>,
+    ) -> Result<tonic::Response<Self::DownloadSupportArtifactStream>, tonic::Status> {
         Err(rockstream_management_proto::unavailable_status())
     }
 }

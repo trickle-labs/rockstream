@@ -83,12 +83,16 @@ async fn start_test_gateway_inner(authenticated: bool) -> (tokio_postgres::Clien
         Arc::new(
             SecretStore::open_durable(
                 "unscoped-reachability-secrets",
-                store,
+                store.clone(),
                 Arc::new(EnvKekProvider::from_passphrase("test-passphrase")),
             )
             .await
             .unwrap()
-            .with_security_audit_catalog(durable_catalog),
+            .with_security_audit_catalog(durable_catalog)
+            .with_management_operation_store(
+                rockstream_control::ManagementOperationStore::new(store.clone()),
+                "unscoped-reachability".to_string(),
+            ),
         )
     } else {
         Arc::new(SecretStore::new(
@@ -375,15 +379,30 @@ async fn test_reachability_secret_ddl() {
     let (client, _gw) = start_test_gateway_with_admin().await;
     assert_command_ok(
         &client,
+        "SET rockstream.idempotency_key = 'reachability-secret-create';",
+    )
+    .await;
+    assert_command_ok(
+        &client,
         "CREATE SECRET s_kfk (TYPE = 'sasl_plain', username = 'u', password = 'p');",
     )
     .await;
 
+    assert_command_ok(
+        &client,
+        "SET rockstream.idempotency_key = '00000000-0000-4000-8000-000000000361';",
+    )
+    .await;
     assert_command_ok(&client, "ALTER SECRET s_kfk SET (password = 'p2');").await;
 
     let rows_secrets = query_rows(&client, "SHOW SECRETS;").await;
     assert!(!rows_secrets.is_empty());
 
+    assert_command_ok(
+        &client,
+        "SET rockstream.idempotency_key = 'reachability-secret-drop';",
+    )
+    .await;
     assert_command_ok(&client, "DROP SECRET s_kfk;").await;
 }
 

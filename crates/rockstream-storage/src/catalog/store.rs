@@ -12,7 +12,7 @@
 use async_trait::async_trait;
 use futures::StreamExt;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, ObjectStoreExt};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -36,15 +36,21 @@ use rockstream_types::ids::{
     CompiledPlanId, DatabaseId, IndexId, NamespaceId, PrincipalId, SinkId, SourceId, TableId,
     ViewId, WorkloadId,
 };
+use rockstream_types::metrics;
 use rockstream_types::workload::WorkloadDef;
 
 const SECURITY_AUDIT_RETENTION_MS: u64 = 90 * 24 * 60 * 60 * 1000;
 const MAX_SECURITY_AUDIT_BYTES: u64 = 1024 * 1024 * 1024;
+pub const SECURITY_AUDIT_APPEND_ATTEMPTS: usize = 8;
 
 /// Abstract interface for catalog operations.
 #[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait CatalogStore: Send + Sync {
+    fn deployment_namespace(&self) -> String;
+    async fn refresh(&self) -> Result<(), CatalogError> {
+        Ok(())
+    }
     async fn commit_txn(&self, txn: CatalogTxn) -> Result<u64, CatalogError>;
     async fn get_revision(&self) -> u64;
     async fn allocate_id(&self) -> Result<u64, CatalogError>;
@@ -91,6 +97,10 @@ pub trait CatalogStore: Send + Sync {
         id: PrincipalId,
     ) -> Result<Option<SecurityPrincipal>, CatalogError>;
     async fn list_security_principals(&self) -> Result<Vec<SecurityPrincipal>, CatalogError>;
+    async fn get_security_audit_record(
+        &self,
+        event_id: &str,
+    ) -> Result<Option<SecurityAuditRecord>, CatalogError>;
     async fn list_security_audit_records(&self) -> Result<Vec<SecurityAuditRecord>, CatalogError>;
     async fn list_security_audit_page(
         &self,
@@ -128,10 +138,54 @@ struct CatalogInnerState {
     roles: HashMap<PrincipalId, CatalogRoleEntry>,
     security_principals: HashMap<PrincipalId, SecurityPrincipal>,
     security_audit_records: Vec<SecurityAuditRecord>,
+    security_audit_by_id: HashMap<String, usize>,
     security_audit_order: Vec<usize>,
     security_audit_bytes: u64,
     security_audit_oldest_timestamp_ms: Option<u64>,
     compiled_plans: HashMap<CompiledPlanId, CompiledPlanRecord>,
+}
+
+async fn persist_catalog_log(
+    store: &dyn ObjectStore,
+    path: &ObjectPath,
+    bytes: &[u8],
+) -> Result<(), CatalogError> {
+    match store
+        .put_opts(path, bytes.to_vec().into(), PutMode::Create.into())
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(object_store::Error::AlreadyExists { .. }) => {
+            let existing = store
+                .get(path)
+                .await
+                .map_err(|error| {
+                    CatalogError::Storage(format!(
+                        "[RS-0003] failed to read catalog log {}: {error}",
+                        path.as_ref()
+                    ))
+                })?
+                .bytes()
+                .await
+                .map_err(|error| {
+                    CatalogError::Storage(format!(
+                        "[RS-0003] failed to read catalog log {}: {error}",
+                        path.as_ref()
+                    ))
+                })?;
+            if existing.as_ref() == bytes {
+                Ok(())
+            } else {
+                Err(CatalogError::OptimisticConflict(format!(
+                    "catalog log {} already contains a different transaction",
+                    path.as_ref()
+                )))
+            }
+        }
+        Err(error) => Err(CatalogError::Storage(format!(
+            "[RS-0003] failed to write catalog log: {error}"
+        ))),
+    }
 }
 
 /// Durable catalog store backed by an `ObjectStore`.
@@ -175,6 +229,11 @@ impl DurableCatalogStore {
             "{}/catalog/snapshots/{:020}.snap.tmp",
             self.prefix, revision
         );
+        ObjectPath::from(p.trim_start_matches('/'))
+    }
+
+    fn revision_log_path(&self, revision: u64) -> ObjectPath {
+        let p = format!("{}/catalog/log/{:020}.log", self.prefix, revision);
         ObjectPath::from(p.trim_start_matches('/'))
     }
 
@@ -465,7 +524,7 @@ impl DurableCatalogStore {
         let log_prefix = format!("{}/catalog/log/", prefix);
         let log_prefix_path = ObjectPath::from(log_prefix.trim_start_matches('/'));
 
-        let mut log_files: Vec<(u64, u64, ObjectPath)> = Vec::new();
+        let mut log_files: Vec<(u64, Option<u64>, ObjectPath)> = Vec::new();
         let mut log_stream = store.list(Some(&log_prefix_path));
         while let Some(item) = log_stream.next().await {
             let meta =
@@ -474,30 +533,44 @@ impl DurableCatalogStore {
             let filename = location.as_ref().split('/').next_back().unwrap_or_default();
             if filename.ends_with(".log") {
                 let parts: Vec<&str> = filename.trim_end_matches(".log").split('_').collect();
-                if parts.len() == 2 {
-                    if let (Ok(rev), Ok(op_id)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>())
-                    {
-                        if rev > start_revision {
-                            log_files.push((rev, op_id, location));
-                        }
+                let entry = match parts.as_slice() {
+                    [revision] => revision
+                        .parse::<u64>()
+                        .ok()
+                        .map(|revision| (revision, None)),
+                    [revision, operation_id] => revision
+                        .parse::<u64>()
+                        .ok()
+                        .zip(operation_id.parse::<u64>().ok())
+                        .map(|(revision, operation_id)| (revision, Some(operation_id))),
+                    _ => None,
+                };
+                if let Some((revision, operation_id)) = entry {
+                    if revision > start_revision {
+                        log_files.push((revision, operation_id, location));
                     }
                 }
             }
         }
 
-        log_files.sort_by_key(|(rev, op_id, _)| (*rev, *op_id));
+        log_files.sort_by_key(|(revision, operation_id, _)| {
+            (
+                *revision,
+                operation_id.is_some(),
+                operation_id.unwrap_or_default(),
+            )
+        });
+        let operation_logs = log_files
+            .iter()
+            .filter_map(|(revision, operation_id, _)| {
+                operation_id.map(|operation_id| (*revision, operation_id))
+            })
+            .collect::<HashSet<_>>();
 
-        let mut total_buffer_bytes = 0;
+        let mut total_buffer_bytes = 0usize;
         let mut expected_revision = start_revision;
-        for (rev, op_id, path) in log_files {
-            if rev != expected_revision.saturating_add(1) {
-                return Err(CatalogError::DecodeError(format!(
-                    "[RS-1003] incomplete catalog log history: expected revision {}, found {}; next_steps: inspect catalog log files",
-                    expected_revision.saturating_add(1),
-                    rev
-                )));
-            }
-
+        let mut last_replayed_log: Option<(u64, u64, Vec<u8>)> = None;
+        for (revision, operation_id, path) in log_files {
             let res = store.get(&path).await.map_err(|e| {
                 CatalogError::Storage(format!(
                     "[RS-0003] failed to read log file {}: {e}",
@@ -508,7 +581,20 @@ impl DurableCatalogStore {
                 CatalogError::Storage(format!("[RS-0003] failed to load log bytes: {e}"))
             })?;
 
-            total_buffer_bytes += bytes.len();
+            if revision == expected_revision
+                && operation_id.is_some_and(|operation_id| {
+                    last_replayed_log.as_ref().is_some_and(
+                        |(last_revision, last_operation_id, last_bytes)| {
+                            *last_revision == revision
+                                && *last_operation_id == operation_id
+                                && last_bytes.as_slice() == bytes.as_ref()
+                        },
+                    )
+                })
+            {
+                continue;
+            }
+            total_buffer_bytes = total_buffer_bytes.saturating_add(bytes.len());
             if total_buffer_bytes > MAX_REPLAY_BUFFER_BYTES {
                 return Err(CatalogError::ReplayBufferExceeded(format!(
                     "[RS-1003] uncommitted txn replay buffer exceeded maximum size of {} bytes; next_steps: compact catalog log files",
@@ -519,22 +605,54 @@ impl DurableCatalogStore {
             // A bad record must not turn a complete listing into a partial
             // catalog. Preserve the original error and every stored object.
             let txn = CatalogTxn::decode(&bytes)?;
-            if txn.revision != rev || txn.operation_id != op_id {
+            if txn.revision != revision
+                || operation_id.is_some_and(|operation_id| txn.operation_id != operation_id)
+            {
                 return Err(CatalogError::DecodeError(format!(
                     "[RS-1003] catalog log {} has mismatched revision or operation ID; next_steps: inspect catalog log files",
                     path.as_ref()
                 )));
             }
-            expected_revision = rev;
-
+            if revision == expected_revision
+                && last_replayed_log.as_ref().is_some_and(
+                    |(last_revision, last_operation_id, last_bytes)| {
+                        *last_revision == revision
+                            && *last_operation_id == txn.operation_id
+                            && last_bytes.as_slice() == bytes.as_ref()
+                    },
+                )
+            {
+                continue;
+            }
+            if revision != expected_revision.saturating_add(1) {
+                return Err(CatalogError::DecodeError(format!(
+                    "[RS-1003] incomplete catalog log history: expected revision {}, found {}; next_steps: inspect catalog log files",
+                    expected_revision.saturating_add(1),
+                    revision
+                )));
+            }
             if recovered_state
                 .committed_operations
                 .contains(&txn.operation_id)
             {
-                continue;
+                return Err(CatalogError::DecodeError(format!(
+                    "[RS-1003] duplicate catalog operation {} at revision {}; next_steps: inspect catalog log files",
+                    txn.operation_id, revision
+                )));
             }
 
             validate_security_mutations(&recovered_state, &txn)?;
+
+            if operation_id.is_none() && !operation_logs.contains(&(revision, txn.operation_id)) {
+                let legacy_path = ObjectPath::from(
+                    format!(
+                        "{}/catalog/log/{:020}_{:020}.log",
+                        prefix, revision, txn.operation_id
+                    )
+                    .trim_start_matches('/'),
+                );
+                persist_catalog_log(store.as_ref(), &legacy_path, &bytes).await?;
+            }
 
             for mutation in &txn.mutations {
                 apply_mutation_to_state(&mut recovered_state, &catalog.id_allocator, mutation)?;
@@ -544,6 +662,8 @@ impl DurableCatalogStore {
                 .committed_operations
                 .insert(txn.operation_id);
             recovered_state.revision = txn.revision;
+            expected_revision = revision;
+            last_replayed_log = Some((revision, txn.operation_id, bytes.to_vec()));
         }
 
         // An unreadable newer snapshot cannot be ignored if the remaining
@@ -556,15 +676,12 @@ impl DurableCatalogStore {
             }
         }
 
-        *catalog.state.write().await = recovered_state;
-        {
-            let mut state = catalog.state.write().await;
-            prune_expired_security_audit_records(&mut state, audit_cutoff_ms)?;
-            ensure_security_audit_budget_bytes(
-                state.security_audit_bytes,
-                MAX_SECURITY_AUDIT_BYTES,
-            )?;
-        }
+        let mut state = catalog.state.write().await;
+        *state = recovered_state;
+        prune_expired_security_audit_records(&mut state, audit_cutoff_ms)?;
+        update_security_audit_storage_metrics(&state);
+        ensure_security_audit_budget_bytes(state.security_audit_bytes, MAX_SECURITY_AUDIT_BYTES)?;
+        drop(state);
         Ok(catalog)
     }
 
@@ -631,6 +748,115 @@ impl DurableCatalogStore {
         }
         Ok(self.get_revision().await)
     }
+
+    /// Replace the login methods for an existing administrator during offline recovery.
+    ///
+    /// Call only from trusted tooling with direct durable-state access while listeners are closed.
+    /// This preserves the stored principal and grants; it cannot create or promote a principal.
+    pub async fn recover_administrator_credentials(
+        &self,
+        principal_id: PrincipalId,
+        login_methods: Vec<rockstream_types::authorization::LoginMethod>,
+        operation_id: u64,
+    ) -> Result<u64, CatalogError> {
+        let event_id = format!("offline-admin-recovery:{operation_id}");
+        let current = self
+            .get_security_principal(principal_id)
+            .await?
+            .ok_or_else(|| {
+                invalid_security_policy("administrator recovery requires an existing principal")
+            })?;
+        let audit_records = self.list_security_audit_records().await?;
+        if let Some(existing_audit) = audit_records
+            .iter()
+            .find(|record| record.event_id == event_id)
+        {
+            if current.login_methods == login_methods
+                && has_administrator_preset(&current)
+                && existing_audit.actor == AuditIdentity::Unknown
+                && existing_audit.target
+                    == AuditField::Known(format!("principal:{}", principal_id.0))
+                && existing_audit.action == SecurityAuditClass::AdminOperationCompletion
+                && existing_audit.outcome == SecurityAuditOutcome::Success
+                && existing_audit.correlation == AuditCorrelation::NotApplicable
+                && existing_audit.operation_id == AuditField::Known(operation_id.to_string())
+                && existing_audit.scope == AuditField::Known("cluster".into())
+                && existing_audit.policy_revision == AuditField::Known(current.revision)
+                && existing_audit.after_state == AuditField::Known(principal_audit_state(&current))
+            {
+                return Ok(self.get_revision().await);
+            }
+            return Err(invalid_security_policy(
+                "offline recovery operation ID is already committed to a different change",
+            ));
+        }
+
+        if !is_active_administrator(&current) {
+            return Err(invalid_security_policy(
+                "offline credential recovery requires an existing active administrator principal",
+            ));
+        }
+        if current.login_methods == login_methods {
+            return Err(invalid_security_policy(
+                "offline credential recovery requires replacement login methods",
+            ));
+        }
+        let revision = current.revision.checked_add(1).ok_or_else(|| {
+            invalid_security_policy("administrator revision is exhausted during recovery")
+        })?;
+        let mut recovered = current.clone();
+        recovered.revision = revision;
+        recovered.login_methods = login_methods;
+        recovered.validate().map_err(|error| {
+            invalid_security_policy(&format!("invalid recovered administrator: {error}"))
+        })?;
+        if !is_active_administrator(&recovered) {
+            return Err(invalid_security_policy(
+                "recovered principal must retain an interactive cluster administrator grant",
+            ));
+        }
+        let audit = SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: event_id.clone(),
+            timestamp_ms: current_time_ms()?,
+            actor: AuditIdentity::Unknown,
+            target: AuditField::Known(format!("principal:{}", principal_id.0)),
+            scope: AuditField::Known("cluster".into()),
+            action: SecurityAuditClass::AdminOperationCompletion,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::NotApplicable,
+            operation_id: AuditField::Known(operation_id.to_string()),
+            policy_revision: AuditField::Known(recovered.revision),
+            before_state: AuditField::Known(principal_audit_state(&current)),
+            after_state: AuditField::Known(principal_audit_state(&recovered)),
+        };
+        let catalog_revision = self.get_revision().await.checked_add(1).ok_or_else(|| {
+            invalid_security_policy("catalog revision is exhausted during administrator recovery")
+        })?;
+        let txn = CatalogTxn::new(
+            catalog_revision,
+            operation_id,
+            vec![CatalogMutation::RecoverAdministratorCredentials {
+                principal: recovered.clone(),
+                expected_revision: current.revision,
+                audit: audit.clone(),
+            }],
+        )?;
+        self.commit_txn(txn).await?;
+
+        let persisted_principal = self.get_security_principal(principal_id).await?;
+        let audit_committed = self
+            .list_security_audit_records()
+            .await?
+            .into_iter()
+            .any(|record| record == audit);
+        if persisted_principal.as_ref() != Some(&recovered) || !audit_committed {
+            return Err(invalid_security_policy(
+                "offline recovery operation ID is already committed to a different change",
+            ));
+        }
+        Ok(self.get_revision().await)
+    }
 }
 
 fn current_time_ms() -> Result<u64, CatalogError> {
@@ -683,8 +909,17 @@ fn encoded_security_audit_record_bytes(record: &SecurityAuditRecord) -> Result<u
     Ok(counter.0)
 }
 
+fn update_security_audit_storage_metrics(state: &CatalogInnerState) {
+    metrics::set_security_audit_storage_metrics(
+        state.security_audit_records.len() as u64,
+        state.security_audit_bytes,
+        MAX_SECURITY_AUDIT_BYTES,
+    );
+}
+
 fn ensure_security_audit_budget_bytes(bytes: u64, max_bytes: u64) -> Result<(), CatalogError> {
     if bytes > max_bytes {
+        metrics::set_security_audit_degraded(true);
         return Err(CatalogError::Storage(
             "security audit retention budget is full (1 GiB); required security operation was not committed".into(),
         ));
@@ -694,6 +929,12 @@ fn ensure_security_audit_budget_bytes(bytes: u64, max_bytes: u64) -> Result<(), 
 
 fn rebuild_security_audit_index(state: &mut CatalogInnerState) -> Result<(), CatalogError> {
     state.security_audit_bytes = encoded_security_audit_bytes(&state.security_audit_records)?;
+    state.security_audit_by_id = state
+        .security_audit_records
+        .iter()
+        .enumerate()
+        .map(|(index, record)| (record.event_id.clone(), index))
+        .collect();
     state.security_audit_order = (0..state.security_audit_records.len()).collect();
     state.security_audit_order.sort_unstable_by(|left, right| {
         let left = &state.security_audit_records[*left];
@@ -730,9 +971,9 @@ fn append_security_audit_record_to_state(
     record: &SecurityAuditRecord,
 ) -> Result<(), CatalogError> {
     if let Some(existing) = state
-        .security_audit_records
-        .iter()
-        .find(|existing| existing.event_id == record.event_id)
+        .security_audit_by_id
+        .get(&record.event_id)
+        .and_then(|index| state.security_audit_records.get(*index))
     {
         return if existing == record {
             Ok(())
@@ -749,6 +990,11 @@ fn append_security_audit_record_to_state(
     };
     state.security_audit_bytes = state
         .security_audit_bytes
+        .saturating_sub(if state.security_audit_records.is_empty() {
+            2
+        } else {
+            0
+        })
         .saturating_add(separator_bytes)
         .saturating_add(encoded_security_audit_record_bytes(record)?);
     state.security_audit_oldest_timestamp_ms = Some(
@@ -766,6 +1012,9 @@ fn append_security_audit_record_to_state(
     });
     state.security_audit_records.push(record.clone());
     state
+        .security_audit_by_id
+        .insert(record.event_id.clone(), record_index);
+    state
         .security_audit_order
         .insert(insert_at.unwrap_or_else(|index| index), record_index);
     Ok(())
@@ -774,6 +1023,8 @@ fn append_security_audit_record_to_state(
 fn security_audit_record(mutation: &CatalogMutation) -> Option<&SecurityAuditRecord> {
     match mutation {
         CatalogMutation::PutSecurityPrincipal { audit, .. }
+        | CatalogMutation::PutSecurityPrincipalForOperation { audit, .. }
+        | CatalogMutation::RecoverAdministratorCredentials { audit, .. }
         | CatalogMutation::DeleteSecurityPrincipal { audit, .. } => Some(audit),
         CatalogMutation::AppendSecurityAudit(record) => Some(record),
         _ => None,
@@ -790,12 +1041,7 @@ fn ensure_txn_security_audit_budget(
         .mutations
         .iter()
         .filter_map(security_audit_record)
-        .filter(|record| {
-            !state
-                .security_audit_records
-                .iter()
-                .any(|existing| existing.event_id == record.event_id)
-        })
+        .filter(|record| !state.security_audit_by_id.contains_key(&record.event_id))
         .collect::<Vec<_>>();
     if new_records
         .iter()
@@ -847,11 +1093,7 @@ fn validate_security_mutations(
 ) -> Result<(), CatalogError> {
     let mut principals = state.security_principals.clone();
     let mut changed_principals = HashSet::new();
-    let mut audit_ids: HashSet<&str> = state
-        .security_audit_records
-        .iter()
-        .map(|record| record.event_id.as_str())
-        .collect();
+    let mut audit_ids = HashSet::new();
     let mut has_principal_change = false;
     let mut has_bootstrap = false;
 
@@ -862,7 +1104,25 @@ fn validate_security_mutations(
                 expected_revision,
                 grantor_revision,
                 audit,
+            }
+            | CatalogMutation::PutSecurityPrincipalForOperation {
+                principal,
+                expected_revision,
+                grantor_revision,
+                audit,
+                ..
             } => {
+                let audit_operation_id = match mutation {
+                    CatalogMutation::PutSecurityPrincipalForOperation { operation_id, .. } => {
+                        if audit.correlation != AuditCorrelation::Observed(operation_id.clone()) {
+                            return Err(invalid_security_policy(
+                                "operation-correlated grant audit must retain the observed client UUID",
+                            ));
+                        }
+                        operation_id.clone()
+                    }
+                    _ => txn.operation_id.to_string(),
+                };
                 has_principal_change = true;
                 let is_first_administrator =
                     state.security_principals.is_empty() && expected_revision.is_none();
@@ -915,6 +1175,15 @@ fn validate_security_mutations(
                             ));
                         }
                         validate_grantor(state, *grantor_revision, audit)?;
+                        if grantor_revision
+                            .as_ref()
+                            .is_some_and(|(grantor_id, _)| *grantor_id == principal.id)
+                            && !self_update_adds_no_grants(old, principal)
+                        {
+                            return Err(invalid_security_policy(
+                                "grantor cannot increase its own authority",
+                            ));
+                        }
                     }
                     (Some(old), None) => {
                         return Err(security_revision_conflict(principal.id, 0, old.revision));
@@ -926,14 +1195,16 @@ fn validate_security_mutations(
 
                 validate_grant_audit(
                     audit,
-                    txn.operation_id,
+                    &audit_operation_id,
                     principal.id,
                     principal.revision,
                     old.map(principal_audit_state),
                     Some(principal_audit_state(principal)),
                     is_first_administrator,
                 )?;
-                if !audit_ids.insert(audit.event_id.as_str()) {
+                if state.security_audit_by_id.contains_key(&audit.event_id)
+                    || !audit_ids.insert(audit.event_id.as_str())
+                {
                     return Err(invalid_security_policy(
                         "audit event identity is already present",
                     ));
@@ -965,19 +1236,82 @@ fn validate_security_mutations(
                 validate_grantor(state, *grantor_revision, audit)?;
                 validate_grant_audit(
                     audit,
-                    txn.operation_id,
+                    &txn.operation_id.to_string(),
                     *principal_id,
                     expected_revision.saturating_add(1),
                     Some(principal_audit_state(old)),
                     None,
                     false,
                 )?;
-                if !audit_ids.insert(audit.event_id.as_str()) {
+                if state.security_audit_by_id.contains_key(&audit.event_id)
+                    || !audit_ids.insert(audit.event_id.as_str())
+                {
                     return Err(invalid_security_policy(
                         "audit event identity is already present",
                     ));
                 }
                 principals.remove(principal_id);
+            }
+            CatalogMutation::RecoverAdministratorCredentials {
+                principal,
+                expected_revision,
+                audit,
+            } => {
+                has_principal_change = true;
+                if txn.mutations.len() != 1 {
+                    return Err(invalid_security_policy(
+                        "offline administrator recovery must be a single-mutation transaction",
+                    ));
+                }
+                if !changed_principals.insert(principal.id) {
+                    return Err(invalid_security_policy(
+                        "transaction changes the same principal more than once",
+                    ));
+                }
+                principal.validate().map_err(|error| {
+                    invalid_security_policy(&format!("invalid recovered administrator: {error}"))
+                })?;
+                let old = state
+                    .security_principals
+                    .get(&principal.id)
+                    .ok_or_else(|| invalid_security_policy("recovery principal does not exist"))?;
+                if old.revision != *expected_revision {
+                    return Err(security_revision_conflict(
+                        principal.id,
+                        *expected_revision,
+                        old.revision,
+                    ));
+                }
+                if !is_active_administrator(old)
+                    || principal.format_version != old.format_version
+                    || principal.display_name != old.display_name
+                    || principal.enabled != old.enabled
+                    || principal.preset_grants != old.preset_grants
+                    || principal.scoped_grants != old.scoped_grants
+                    || principal.login_methods == old.login_methods
+                    || expected_revision.checked_add(1) != Some(principal.revision)
+                    || !is_active_administrator(principal)
+                {
+                    return Err(invalid_security_policy(
+                        "offline recovery may only replace login methods for an existing active administrator",
+                    ));
+                }
+                validate_admin_recovery_audit(
+                    audit,
+                    txn.operation_id,
+                    principal.id,
+                    principal.revision,
+                    old,
+                    principal,
+                )?;
+                if state.security_audit_by_id.contains_key(&audit.event_id)
+                    || !audit_ids.insert(audit.event_id.as_str())
+                {
+                    return Err(invalid_security_policy(
+                        "audit event identity is already present",
+                    ));
+                }
+                principals.insert(principal.id, principal.clone());
             }
             CatalogMutation::AppendSecurityAudit(record) => {
                 record.validate().map_err(|error| {
@@ -985,11 +1319,12 @@ fn validate_security_mutations(
                         "invalid security audit record: {error}"
                     ))
                 })?;
-                if !audit_ids.insert(record.event_id.as_str())
-                    && !state
-                        .security_audit_records
-                        .iter()
-                        .any(|existing| existing == record)
+                let existing = state
+                    .security_audit_by_id
+                    .get(&record.event_id)
+                    .and_then(|index| state.security_audit_records.get(*index));
+                if existing.is_some_and(|existing| existing != record)
+                    || (!audit_ids.insert(record.event_id.as_str()) && existing.is_none())
                 {
                     return Err(invalid_security_policy(
                         "audit event identity is already present",
@@ -1059,13 +1394,28 @@ fn validate_grantor(
     Ok(())
 }
 
+fn self_update_adds_no_grants(current: &SecurityPrincipal, updated: &SecurityPrincipal) -> bool {
+    updated
+        .preset_grants
+        .iter()
+        .all(|grant| current.preset_grants.contains(grant))
+        && updated
+            .scoped_grants
+            .iter()
+            .all(|grant| current.scoped_grants.contains(grant))
+}
+
 fn is_active_administrator(principal: &SecurityPrincipal) -> bool {
     principal.enabled
         && principal.validate().is_ok()
         && principal.has_interactive_login()
-        && principal.preset_grants.iter().any(|grant| {
-            grant.preset == PermissionPreset::Administrator && grant.scope == PolicyScope::Cluster
-        })
+        && has_administrator_preset(principal)
+}
+
+fn has_administrator_preset(principal: &SecurityPrincipal) -> bool {
+    principal.preset_grants.iter().any(|grant| {
+        grant.preset == PermissionPreset::Administrator && grant.scope == PolicyScope::Cluster
+    })
 }
 
 fn principal_audit_state(principal: &SecurityPrincipal) -> String {
@@ -1080,7 +1430,7 @@ fn principal_audit_state(principal: &SecurityPrincipal) -> String {
 
 fn validate_grant_audit(
     audit: &SecurityAuditRecord,
-    operation_id: u64,
+    operation_id: &str,
     principal_id: PrincipalId,
     policy_revision: u64,
     before_state: Option<String>,
@@ -1100,7 +1450,7 @@ fn validate_grant_audit(
         || audit.outcome != SecurityAuditOutcome::Success
         || !matches!(&audit.target, AuditField::Known(value) if value == &target)
         || audit.scope != AuditField::Known("cluster".to_string())
-        || audit.operation_id != AuditField::Known(operation_id.to_string())
+        || audit.operation_id != AuditField::Known(operation_id.to_owned())
         || audit.policy_revision != AuditField::Known(policy_revision)
         || audit.before_state != before_state.map_or(AuditField::NotApplicable, AuditField::Known)
         || audit.after_state != after_state.map_or(AuditField::NotApplicable, AuditField::Known)
@@ -1108,6 +1458,36 @@ fn validate_grant_audit(
     {
         return Err(invalid_security_policy(
             "grant audit must record the permitted actor identity, target, operation, policy revision, and exact before/after state",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_admin_recovery_audit(
+    audit: &SecurityAuditRecord,
+    operation_id: u64,
+    principal_id: PrincipalId,
+    policy_revision: u64,
+    before: &SecurityPrincipal,
+    after: &SecurityPrincipal,
+) -> Result<(), CatalogError> {
+    audit.validate().map_err(|error| {
+        CatalogError::InvalidSecurityPolicy(format!("invalid recovery audit record: {error}"))
+    })?;
+    if audit.event_id != format!("offline-admin-recovery:{operation_id}")
+        || audit.actor != AuditIdentity::Unknown
+        || audit.target != AuditField::Known(format!("principal:{}", principal_id.0))
+        || audit.scope != AuditField::Known("cluster".into())
+        || audit.action != SecurityAuditClass::AdminOperationCompletion
+        || audit.outcome != SecurityAuditOutcome::Success
+        || audit.correlation != AuditCorrelation::NotApplicable
+        || audit.operation_id != AuditField::Known(operation_id.to_string())
+        || audit.policy_revision != AuditField::Known(policy_revision)
+        || audit.before_state != AuditField::Known(principal_audit_state(before))
+        || audit.after_state != AuditField::Known(principal_audit_state(after))
+    {
+        return Err(invalid_security_policy(
+            "offline administrator recovery audit must record unknown actor, operation, target, scope, revision, and exact before/after policy",
         ));
     }
     Ok(())
@@ -1215,6 +1595,18 @@ fn apply_mutation_to_state(
         }
         CatalogMutation::PutSecurityPrincipal {
             principal, audit, ..
+        }
+        | CatalogMutation::PutSecurityPrincipalForOperation {
+            principal, audit, ..
+        } => {
+            allocator.observe(principal.id.0);
+            state
+                .security_principals
+                .insert(principal.id, principal.clone());
+            append_security_audit_record_to_state(state, audit)?;
+        }
+        CatalogMutation::RecoverAdministratorCredentials {
+            principal, audit, ..
         } => {
             allocator.observe(principal.id.0);
             state
@@ -1246,12 +1638,44 @@ fn apply_mutation_to_state(
 
 #[async_trait]
 impl CatalogStore for DurableCatalogStore {
+    fn deployment_namespace(&self) -> String {
+        self.prefix.clone()
+    }
+
+    async fn refresh(&self) -> Result<(), CatalogError> {
+        let recovered = match Self::recover(self.store.clone(), self.prefix.clone()).await {
+            Ok(recovered) => recovered,
+            Err(error) => {
+                metrics::set_security_audit_degraded(true);
+                return Err(error);
+            }
+        };
+        let recovered_state = recovered.state.read().await.clone();
+        self.id_allocator
+            .observe(recovered.id_allocator.high_water_mark());
+        let mut state = self.state.write().await;
+        if recovered_state.revision >= state.revision {
+            *state = recovered_state;
+        }
+        update_security_audit_storage_metrics(&state);
+        Ok(())
+    }
+
     async fn commit_txn(&self, txn: CatalogTxn) -> Result<u64, CatalogError> {
         let mut state = self.state.write().await;
 
         // 1. Replay deduplication: if operation_id already committed, return current revision as idempotent no-op
         if state.committed_operations.contains(&txn.operation_id) {
             return Ok(state.revision);
+        }
+        let next_revision = state.revision.checked_add(1).ok_or_else(|| {
+            CatalogError::OptimisticConflict("catalog revision is exhausted".to_owned())
+        })?;
+        if txn.revision != next_revision {
+            return Err(CatalogError::OptimisticConflict(format!(
+                "catalog revision {} is stale; current revision is {}",
+                txn.revision, state.revision
+            )));
         }
 
         validate_security_mutations(&state, &txn)?;
@@ -1387,22 +1811,48 @@ impl CatalogStore for DurableCatalogStore {
         let txn = CatalogTxn::new(txn.revision, txn.operation_id, resolved)?;
 
         // 3. Durably persist transaction log
-        let bytes = txn.encode()?;
-        let path = self.log_path(txn.revision, txn.operation_id);
-        self.store.put(&path, bytes.into()).await.map_err(|e| {
-            CatalogError::Storage(format!("[RS-0003] failed to write catalog log: {e}"))
+        let bytes = txn.encode().inspect_err(|_| {
+            if audit_cutoff_ms > 0 {
+                metrics::set_security_audit_degraded(true);
+            }
         })?;
+        let revision_path = self.revision_log_path(txn.revision);
+        if let Err(error) = persist_catalog_log(self.store.as_ref(), &revision_path, &bytes).await {
+            if audit_cutoff_ms > 0 {
+                metrics::set_security_audit_degraded(true);
+            }
+            return Err(error);
+        }
+        let path = self.log_path(txn.revision, txn.operation_id);
+        if let Err(error) = persist_catalog_log(self.store.as_ref(), &path, &bytes).await {
+            if audit_cutoff_ms > 0 {
+                metrics::set_security_audit_degraded(true);
+            }
+            return Err(error);
+        }
 
         // 4. Apply all mutations to in-memory state
         if audit_cutoff_ms > 0 {
-            prune_expired_security_audit_records(&mut state, audit_cutoff_ms)?;
+            if let Err(error) = prune_expired_security_audit_records(&mut state, audit_cutoff_ms) {
+                metrics::set_security_audit_degraded(true);
+                return Err(error);
+            }
         }
         for m in &txn.mutations {
-            apply_mutation_to_state(&mut state, &self.id_allocator, m)?;
+            if let Err(error) = apply_mutation_to_state(&mut state, &self.id_allocator, m) {
+                if audit_cutoff_ms > 0 {
+                    metrics::set_security_audit_degraded(true);
+                }
+                return Err(error);
+            }
         }
 
         state.committed_operations.insert(txn.operation_id);
         state.revision = txn.revision;
+        if audit_cutoff_ms > 0 {
+            update_security_audit_storage_metrics(&state);
+            metrics::set_security_audit_degraded(false);
+        }
 
         Ok(state.revision)
     }
@@ -1564,6 +2014,20 @@ impl CatalogStore for DurableCatalogStore {
             .collect())
     }
 
+    async fn get_security_audit_record(
+        &self,
+        event_id: &str,
+    ) -> Result<Option<SecurityAuditRecord>, CatalogError> {
+        let cutoff_ms = security_audit_cutoff_ms(current_time_ms()?);
+        let state = self.state.read().await;
+        Ok(state
+            .security_audit_by_id
+            .get(event_id)
+            .and_then(|index| state.security_audit_records.get(*index))
+            .filter(|record| record.timestamp_ms >= cutoff_ms)
+            .cloned())
+    }
+
     async fn list_security_audit_records(&self) -> Result<Vec<SecurityAuditRecord>, CatalogError> {
         let cutoff_ms = security_audit_cutoff_ms(current_time_ms()?);
         Ok(self
@@ -1722,6 +2186,57 @@ mod security_audit_budget_tests {
     }
 
     #[test]
+    fn audit_event_id_index_preserves_replay_and_duplicate_validation() {
+        let existing = audit_record("existing", 1);
+        let mut state = CatalogInnerState {
+            security_audit_records: vec![existing.clone()],
+            ..CatalogInnerState::default()
+        };
+        rebuild_security_audit_index(&mut state).unwrap();
+
+        let replay = CatalogTxn::new(
+            1,
+            1,
+            vec![CatalogMutation::AppendSecurityAudit(existing.clone())],
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_security_mutations(&state, &replay),
+            Ok(())
+        ));
+
+        let mut conflicting = existing;
+        conflicting.timestamp_ms = 2;
+        let conflict = CatalogTxn::new(
+            1,
+            2,
+            vec![CatalogMutation::AppendSecurityAudit(conflicting)],
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_security_mutations(&state, &conflict),
+            Err(CatalogError::InvalidSecurityPolicy(message))
+                if message == "audit event identity is already present"
+        ));
+
+        let duplicate = audit_record("new", 3);
+        let repeated = CatalogTxn::new(
+            1,
+            3,
+            vec![
+                CatalogMutation::AppendSecurityAudit(duplicate.clone()),
+                CatalogMutation::AppendSecurityAudit(duplicate),
+            ],
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_security_mutations(&CatalogInnerState::default(), &repeated),
+            Err(CatalogError::InvalidSecurityPolicy(message))
+                if message == "audit event identity is already present"
+        ));
+    }
+
+    #[test]
     fn retained_audit_budget_uses_exact_json_array_size_and_rejects_overflow() {
         let event = audit_record("event-1", 1);
         let encoded = encoded_security_audit_bytes([&event]).unwrap();
@@ -1740,6 +2255,80 @@ mod security_audit_budget_tests {
             Err(CatalogError::Storage(message))
                 if message == "security audit retention budget is full (1 GiB); required security operation was not committed"
         ));
+    }
+
+    #[tokio::test]
+    async fn full_audit_budget_rejects_first_admin_without_catalog_effects() {
+        let object_store = Arc::new(object_store::memory::InMemory::new());
+        let catalog = DurableCatalogStore::new(object_store.clone(), "audit-budget-full");
+        let existing = audit_record("existing", current_time_ms().unwrap());
+        catalog
+            .commit_txn(
+                CatalogTxn::new(
+                    1,
+                    1,
+                    vec![CatalogMutation::AppendSecurityAudit(existing.clone())],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        catalog.state.write().await.security_audit_bytes = MAX_SECURITY_AUDIT_BYTES;
+
+        let administrator = SecurityPrincipal {
+            format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+            id: PrincipalId(77),
+            display_name: "bootstrap-admin".to_string(),
+            enabled: true,
+            revision: 1,
+            login_methods: vec![LoginMethod::Oidc {
+                issuer: "https://issuer.example".to_string(),
+                subject: "bootstrap-admin".to_string(),
+            }],
+            preset_grants: vec![ScopedPresetGrant {
+                preset: PermissionPreset::Administrator,
+                scope: PolicyScope::Cluster,
+            }],
+            scoped_grants: vec![],
+        };
+        let error = catalog
+            .preprovision_first_administrator(administrator.clone(), 2)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CatalogError::Storage(message)
+                if message == "security audit retention budget is full (1 GiB); required security operation was not committed"
+        ));
+        assert_eq!(catalog.get_revision().await, 1);
+        assert_eq!(
+            catalog.list_security_audit_records().await.unwrap(),
+            vec![existing.clone()]
+        );
+        assert_eq!(
+            catalog
+                .get_security_principal(administrator.id)
+                .await
+                .unwrap(),
+            None
+        );
+
+        let recovered = DurableCatalogStore::recover(object_store, "audit-budget-full")
+            .await
+            .unwrap();
+        assert_eq!(recovered.get_revision().await, 1);
+        assert_eq!(
+            recovered.list_security_audit_records().await.unwrap(),
+            vec![existing]
+        );
+        assert_eq!(
+            recovered
+                .get_security_principal(administrator.id)
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

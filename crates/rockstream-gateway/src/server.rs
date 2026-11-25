@@ -15,7 +15,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
+use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::streaming::StreamingTable;
@@ -489,6 +490,7 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> PgWireResul
 
     let ctx = SessionContext::new();
     rockstream_sql::frontend::register_session_sql_udf(&ctx);
+    rockstream_sql::frontend::register_hop_sql_udf(&ctx);
     for view in catalog.list_views() {
         let mut fields = Vec::new();
         for col in &view.columns {
@@ -1201,6 +1203,7 @@ const FALLBACK_QUERY_MAX_ROWS: usize = 10_000;
 const FALLBACK_QUERY_MAX_ARRAY_BYTES: usize = 8 * 1024 * 1024;
 const FALLBACK_QUERY_MAX_WALL_MS: u64 = 5_000;
 const FALLBACK_QUERY_MAX_CONCURRENT: usize = 16;
+const SECURITY_POLICY_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 static FALLBACK_QUERY_PERMITS: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(FALLBACK_QUERY_MAX_CONCURRENT);
 static NEXT_DISTRIBUTED_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -2133,6 +2136,7 @@ pub struct GatewayHandler {
     query_time_shard_topology_provider: Option<Arc<QueryTimeShardTopologyProvider>>,
     /// Authentication mode for this gateway instance.
     auth_mode: AuthMode,
+    security_policy_refreshed_at: tokio::sync::Mutex<Option<std::time::Instant>>,
     /// Configured RS256 verifier for OIDC-authenticated public connections.
     oidc_verifier: Option<Arc<crate::auth::OidcVerifier>>,
     /// Legacy RoleCatalog for MD5 compatibility; SCRAM credentials come from durable principals.
@@ -2165,13 +2169,22 @@ pub struct GatewayHandler {
     /// outright (`RS-1019`) when compilation fails — there is no
     /// materializer fallback left (v0.51.4 Slice 8).
     compiled_views: Arc<DashMap<String, Arc<rockstream_ops::CompiledView>>>,
+    /// Shared time-slice fabric for correlated HOP/TUMBLE windowed views over
+    /// the same source table and timestamp column (issue #404 R2).
+    shared_windows: Arc<Mutex<rockstream_ops::SharedWindowFabric>>,
+    /// Live SQL-wired Kafka view sinks keyed by sink name (issue #404 R4).
+    kafka_sinks:
+        Arc<DashMap<String, Arc<tokio::sync::Mutex<rockstream_ops::kafka_sink::KafkaViewSink>>>>,
     distributed_data_plane: Option<DataPlaneClient>,
+    actor_assertion_signer: Option<Arc<rockstream_control::delegation::ActorAssertionSigner>>,
     distributed_storage_root: Option<String>,
+    stateless_read_router: Option<Arc<crate::stateless_serving::StatelessReadRouter>>,
+    read_admission: Arc<crate::stateless_serving::ReadAdmissionController>,
     backfill_admission: Arc<crate::admission::BackfillAdmissionController>,
     /// Bound only by `GatewayServer`; source tasks upgrade it per poll and
     /// exit when the server releases its handler.
     self_ref: Arc<Mutex<Weak<GatewayHandler>>>,
-    source_workers: Arc<DashMap<String, ()>>,
+    source_workers: Arc<DashMap<String, futures::future::AbortHandle>>,
     pgoutput_coordinators:
         Arc<DashMap<ConnectorId, Arc<tokio::sync::Mutex<SharedPgOutputCoordinator>>>>,
     /// ponytail: source creation is rare; replace this global lock with
@@ -2187,6 +2200,102 @@ pub struct GatewayHandler {
     pub in_flight_queries: Arc<AtomicUsize>,
     /// Bound concurrent eager cursor producers across all connections.
     cursor_producer_slots: Arc<tokio::sync::Semaphore>,
+    /// Test-only barrier awaited before acquiring `shard_commit_lock` on explicit-key commits.
+    commit_lock_barrier_for_test: Option<Arc<tokio::sync::Barrier>>,
+    /// Tables whose persisted primary keys in `shard_db` have been verified/reconciled
+    /// to the canonical typed tuple encoding (`__pk1:`).
+    reconciled_pk_tables: Arc<DashSet<String>>,
+}
+
+fn secret_use_scopes_for_deployment(
+    principal: &rockstream_types::authorization::SecurityPrincipal,
+    schemas: &[rockstream_types::data_plane::DeploymentSchema],
+    sources: impl IntoIterator<Item = CatalogSourceEntry>,
+) -> Vec<rockstream_types::authorization::PolicyScope> {
+    use rockstream_types::authorization::{PolicyScope, SecurityAction};
+
+    sources
+        .into_iter()
+        .filter_map(|source| {
+            let table = source.table_name.as_deref()?;
+            if !schemas
+                .iter()
+                .any(|schema| schema.relation.eq_ignore_ascii_case(table))
+            {
+                return None;
+            }
+            let name = rockstream_types::secret::secret_name_from_reference(
+                source.options.get("secret")?,
+            )?;
+            Some(PolicyScope::Secret {
+                namespace: source.secret_namespace?,
+                name: name.to_owned(),
+                consumer: Some(source.secret_consumer?),
+            })
+        })
+        .filter(|scope| {
+            rockstream_control::authorization::allows(principal, SecurityAction::SecretUse, scope)
+        })
+        .fold(Vec::new(), |mut scopes, scope| {
+            if !scopes.contains(&scope) {
+                scopes.push(scope);
+            }
+            scopes
+        })
+}
+
+#[cfg(test)]
+#[test]
+fn delegated_secret_allowance_matches_the_authorized_source_scope() {
+    use rockstream_types::authorization::{
+        LoginMethod, PolicyScope, ScopedActionGrant, SecurityAction, SecurityPrincipal,
+        SECURITY_PRINCIPAL_FORMAT_VERSION,
+    };
+
+    let scope = PolicyScope::Secret {
+        namespace: "public".to_owned(),
+        name: "kafka".to_owned(),
+        consumer: Some(PrincipalId(3)),
+    };
+    let source = CatalogSourceEntry {
+        name: "orders_source".to_owned(),
+        table_name: Some("orders".to_owned()),
+        source_type: "kafka".to_owned(),
+        options: HashMap::from([("secret".to_owned(), "secret://kafka".to_owned())]),
+        format: "json".to_owned(),
+        status: "RUNNING".to_owned(),
+        live_offset: "0".to_owned(),
+        live_lag: 0,
+        secret_consumer: Some(PrincipalId(3)),
+        secret_namespace: Some("public".to_owned()),
+    };
+    let mut principal = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(2),
+        display_name: "view author".to_owned(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::Service {
+            service_id: "view-author".to_owned(),
+        }],
+        preset_grants: Vec::new(),
+        scoped_grants: vec![ScopedActionGrant {
+            action: SecurityAction::SecretUse,
+            scope: scope.clone(),
+        }],
+    };
+    let schemas = [rockstream_types::data_plane::DeploymentSchema {
+        relation: "ORDERS".to_owned(),
+        columns: Vec::new(),
+    }];
+
+    assert_eq!(
+        secret_use_scopes_for_deployment(&principal, &schemas, [source.clone()],),
+        vec![scope]
+    );
+
+    principal.scoped_grants.clear();
+    assert!(secret_use_scopes_for_deployment(&principal, &schemas, [source]).is_empty());
 }
 
 impl GatewayHandler {
@@ -2496,7 +2605,8 @@ impl GatewayHandler {
             after_state: AuditField::NotApplicable,
         };
         let operation_id = rand::random::<u64>().max(1);
-        for attempt in 0..2 {
+        for attempt in 0..rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS {
+            store.refresh().await.map_err(|error| error.to_string())?;
             let revision = store
                 .get_revision()
                 .await
@@ -2511,8 +2621,10 @@ impl GatewayHandler {
             match store.commit_txn(transaction).await {
                 Ok(_) => return Ok(()),
                 Err(rockstream_storage::catalog::CatalogError::OptimisticConflict(_))
-                    if attempt == 0 =>
+                    if attempt + 1
+                        < rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS =>
                 {
+                    store.refresh().await.map_err(|error| error.to_string())?;
                     continue;
                 }
                 Err(error) => return Err(error.to_string()),
@@ -2594,6 +2706,23 @@ impl GatewayHandler {
         }
     }
 
+    async fn refresh_security_policy_if_stale(
+        &self,
+        store: &rockstream_storage::catalog::DurableCatalogStore,
+    ) -> Result<(), String> {
+        use rockstream_storage::catalog::CatalogStore;
+
+        let mut refreshed_at = self.security_policy_refreshed_at.lock().await;
+        if refreshed_at
+            .as_ref()
+            .is_none_or(|last| last.elapsed() >= SECURITY_POLICY_REFRESH_INTERVAL)
+        {
+            store.refresh().await.map_err(|error| error.to_string())?;
+            *refreshed_at = Some(std::time::Instant::now());
+        }
+        Ok(())
+    }
+
     async fn security_principal_for_login(
         &self,
         authenticated: &Principal,
@@ -2604,6 +2733,7 @@ impl GatewayHandler {
             .catalog
             .get_durable_store()
             .ok_or_else(|| "durable security catalog is unavailable".to_string())?;
+        self.refresh_security_policy_if_stale(&store).await?;
         let principals = store
             .list_security_principals()
             .await
@@ -2643,6 +2773,78 @@ impl GatewayHandler {
             );
         }
         Ok(found)
+    }
+
+    async fn actor_assertion_for_request(
+        &self,
+        conn_id: Option<&str>,
+        action: SecurityAction,
+        scope: PolicyScope,
+        request: &rockstream_types::topology::WorkerMessage,
+    ) -> Result<Option<String>, String> {
+        use rockstream_types::topology::WorkerMessage;
+
+        if !matches!(
+            request,
+            WorkerMessage::DeployWorkload(_)
+                | WorkerMessage::SubmitSourceDelta(_)
+                | WorkerMessage::ReadWorkload { .. }
+                | WorkerMessage::ReadOperatorStats { .. }
+        ) {
+            return Err("[RS-2401] actor assertion may only authorize a data-plane request".into());
+        }
+        if self
+            .distributed_data_plane
+            .as_ref()
+            .is_some_and(DataPlaneClient::uses_insecure_internal_dev)
+        {
+            return Ok(None);
+        }
+        let conn_id = conn_id.ok_or_else(|| {
+            "[RS-2401] delegated data-plane operation has no authenticated client session"
+                .to_owned()
+        })?;
+        let (authenticated, namespace) = self
+            .sessions
+            .get(conn_id)
+            .map(|session| (session.principal.clone(), session.current_namespace.clone()))
+            .ok_or_else(|| "[RS-2401] delegated data-plane session is unavailable".to_owned())?;
+        if authenticated.is_system() {
+            return Err("[RS-2401] system service identity cannot assert a user actor".into());
+        }
+        let principal = self
+            .security_principal_for_login(&authenticated)
+            .await?
+            .ok_or_else(|| "[RS-2401] authenticated actor has no durable principal".to_owned())?;
+        if !principal.enabled
+            || !rockstream_control::authorization::allows(&principal, action, &scope)
+        {
+            return Err(format!(
+                "[RS-2401] actor is not currently authorized for {action:?} on {scope:?} in namespace {namespace}"
+            ));
+        }
+        let signer = self.actor_assertion_signer.as_ref().ok_or_else(|| {
+            "[RS-2401] dedicated actor assertion signing key is not configured".to_owned()
+        })?;
+        let digest = rockstream_control::delegation::request_digest(request)?;
+        let secret_use_scopes = match request {
+            WorkerMessage::DeployWorkload(deployment) => secret_use_scopes_for_deployment(
+                &principal,
+                &deployment.schemas,
+                self.catalog.list_sources(),
+            ),
+            _ => Vec::new(),
+        };
+        signer
+            .issue(
+                principal.id,
+                principal.revision,
+                action,
+                scope,
+                secret_use_scopes,
+                digest,
+            )
+            .map(Some)
     }
 
     async fn authorize_secret_use_for_connection(
@@ -2802,16 +3004,27 @@ impl GatewayHandler {
         let Some(authorized_principal) = matching_principal.as_ref() else {
             return Ok(vec![security_audit_policy_changed_response()]);
         };
-        let records = match store
-            .list_security_audit_page(
+        let mut cancel_token = CANCEL_TOKEN
+            .try_with(|token| token.clone())
+            .unwrap_or_else(|_| CancelToken::new());
+        let page = tokio::select! {
+            biased;
+            _ = cancel_token.cancelled() => {
+                return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "57014".to_string(),
+                    "[RS-2050] query.cancelled: query was cancelled by a client CancelRequest. next_steps: Retry the query or await client timeout settings.".to_string(),
+                )))]);
+            }
+            page = store.list_security_audit_page(
                 (authorized_principal.id, authorized_principal.revision),
                 query.from_ms,
                 query.to_ms,
                 query.after,
                 query.limit,
-            )
-            .await
-        {
+            ) => page,
+        };
+        let records = match page {
             Ok(records) => records,
             Err(rockstream_storage::catalog::CatalogError::OptimisticConflict(_)) => {
                 return Ok(vec![security_audit_policy_changed_response()]);
@@ -2936,6 +3149,9 @@ impl GatewayHandler {
             .get_durable_store()
             .ok_or_else(|| "durable secret authorization state is unavailable".to_string())?;
         use rockstream_storage::catalog::CatalogStore;
+        self.refresh_security_policy_if_stale(&store)
+            .await
+            .map_err(|_| "durable secret authorization state is unavailable".to_string())?;
         let consumers = store
             .list_security_principals()
             .await
@@ -2971,6 +3187,267 @@ impl GatewayHandler {
             .get_secret(namespace_id, &secret_name)
             .await
             .map_err(|error| error.to_string())
+    }
+
+    async fn authorize_sink_secret_use(
+        &self,
+        sink: &CatalogSinkEntry,
+        reference: &str,
+    ) -> Result<String, String> {
+        let secret_name = rockstream_types::secret::secret_name_from_reference(reference)
+            .ok_or_else(|| "sink has an unsupported secret reference".to_string())?;
+        let consumer_id = sink
+            .secret_consumer
+            .ok_or_else(|| "sink secret reference has no durable consumer identity".to_string())?;
+        let namespace = sink
+            .secret_namespace
+            .as_deref()
+            .ok_or_else(|| "sink secret reference has no durable namespace".to_string())?;
+        let store = self
+            .catalog
+            .get_durable_store()
+            .ok_or_else(|| "durable secret authorization state is unavailable".to_string())?;
+        use rockstream_storage::catalog::CatalogStore;
+        let consumers = store
+            .list_security_principals()
+            .await
+            .map_err(|_| "durable secret authorization state is unavailable".to_string())?;
+        let consumer = consumers
+            .into_iter()
+            .find(|principal| principal.id == consumer_id && principal.enabled)
+            .ok_or_else(|| "sink secret consumer is no longer enabled".to_string())?;
+        let scope = PolicyScope::Secret {
+            namespace: namespace.to_string(),
+            name: secret_name.to_string(),
+            consumer: Some(consumer_id),
+        };
+        if !rockstream_control::authorization::allows(&consumer, SecurityAction::SecretUse, &scope)
+        {
+            return Err("[RS-2401] sink secret consumer is no longer authorized".to_string());
+        }
+        Ok(secret_name.to_string())
+    }
+
+    async fn resolve_sink_secret(
+        &self,
+        sink: &CatalogSinkEntry,
+        reference: &str,
+    ) -> Result<rockstream_types::secret::Secret, String> {
+        let secret_name = self.authorize_sink_secret_use(sink, reference).await?;
+        let namespace = sink
+            .secret_namespace
+            .as_deref()
+            .ok_or_else(|| "sink secret reference has no durable namespace".to_string())?;
+        let namespace_id = self.secret_namespace_id(namespace).await?;
+        self.secret_store
+            .get_secret(namespace_id, &secret_name)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn kafka_sink_credentials(
+        &self,
+        sink: &CatalogSinkEntry,
+    ) -> Result<Option<(String, String, u64, String, String)>, String> {
+        let Some(reference) = sink.secret_name.as_deref() else {
+            if sink.security_protocol.is_some() {
+                return Err(
+                    "Kafka SASL security.protocol requires a bound sasl_plain secret".into(),
+                );
+            }
+            return Ok(None);
+        };
+        let protocol = match sink
+            .security_protocol
+            .as_deref()
+            .map(str::to_ascii_uppercase)
+            .as_deref()
+        {
+            Some("SASL_SSL") => "SASL_SSL",
+            Some("SASL_PLAINTEXT") => "SASL_PLAINTEXT",
+            _ => {
+                return Err(
+                    "Kafka secret sinks require security.protocol SASL_SSL or SASL_PLAINTEXT"
+                        .into(),
+                )
+            }
+        };
+        let secret = self.resolve_sink_secret(sink, reference).await?;
+        if secret.secret_type != rockstream_types::secret::SecretType::SaslPlain {
+            return Err("[RS-2424] Kafka sink secret must use type sasl_plain".into());
+        }
+        let username = secret
+            .payload
+            .get("username")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "Kafka sink secret has no username".to_string())?
+            .clone();
+        let password = secret
+            .payload
+            .get("password")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "Kafka sink secret has no password".to_string())?
+            .clone();
+        Ok(Some((
+            protocol.to_string(),
+            secret.name,
+            secret.metadata.version,
+            username,
+            password,
+        )))
+    }
+
+    async fn refresh_kafka_sink_secret(
+        &self,
+        entry: &CatalogSinkEntry,
+        sink: &mut rockstream_ops::kafka_sink::KafkaViewSink,
+    ) -> Result<bool, String> {
+        let (bound_name, active_version) = sink.secret_binding();
+        let Some(bound_name) = bound_name.map(str::to_string) else {
+            if entry.secret_name.is_some() {
+                return Err("[RS-2425] Kafka sink secret binding is unavailable".into());
+            }
+            if entry.security_protocol.is_some() {
+                return Err(
+                    "Kafka SASL security.protocol requires a bound sasl_plain secret".into(),
+                );
+            }
+            return Ok(false);
+        };
+        let reference = entry
+            .secret_name
+            .as_deref()
+            .ok_or_else(|| "Kafka sink secret reference is unavailable".to_string())?;
+        let secret_name = self.authorize_sink_secret_use(entry, reference).await?;
+        if secret_name != bound_name {
+            return Err("[RS-2425] Kafka sink secret binding changed".into());
+        }
+        let namespace = entry
+            .secret_namespace
+            .as_deref()
+            .ok_or_else(|| "sink secret reference has no durable namespace".to_string())?;
+        let namespace_id = self.secret_namespace_id(namespace).await?;
+        let metadata = self
+            .secret_store
+            .get_secret_metadata(namespace_id, &secret_name)
+            .await
+            .map_err(|error| error.to_string())?;
+        if metadata.version < active_version {
+            return Err("[RS-2425] Kafka sink secret version moved backwards".into());
+        }
+        if metadata.version == active_version {
+            return Ok(false);
+        }
+        let credentials = self
+            .kafka_sink_credentials(entry)
+            .await?
+            .ok_or_else(|| "Kafka sink secret credentials are unavailable".to_string())?;
+        if credentials.2 < metadata.version {
+            return Err("[RS-2425] Kafka sink secret changed during credential resolution".into());
+        }
+        sink.rotate_sasl_plain_credentials(
+            &credentials.1,
+            credentials.2,
+            &credentials.3,
+            &credentials.4,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    async fn refresh_kafka_secret_at_epoch(
+        &self,
+        runtime: &mut SourceRuntimeCoordinator<KafkaSource>,
+        lease: &SourceOwnerLease,
+        source: &CatalogSourceEntry,
+    ) -> Result<bool, GatewayError> {
+        let (bound_name, active_version) = runtime
+            .kafka_secret_binding(lease)
+            .map_err(source_backfill_error)?;
+        let Some(bound_name) = bound_name.map(str::to_string) else {
+            if source.options.contains_key("secret") {
+                return Err(GatewayError::QueryTimeExecutionFailed {
+                    detail: "Kafka source secret binding is unavailable".to_string(),
+                });
+            }
+            return Ok(false);
+        };
+        let reference =
+            source
+                .options
+                .get("secret")
+                .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                    detail: "Kafka source secret reference is unavailable".to_string(),
+                })?;
+        let secret_name = self
+            .authorize_source_secret_use(source, reference)
+            .await
+            .map_err(|detail| GatewayError::QueryTimeExecutionFailed { detail })?;
+        if secret_name != bound_name {
+            return Err(GatewayError::QueryTimeExecutionFailed {
+                detail: "Kafka source secret binding changed".to_string(),
+            });
+        }
+        let namespace = source.secret_namespace.as_deref().ok_or_else(|| {
+            GatewayError::QueryTimeExecutionFailed {
+                detail: "source secret reference has no durable namespace".to_string(),
+            }
+        })?;
+        let namespace_id = self
+            .secret_namespace_id(namespace)
+            .await
+            .map_err(|detail| GatewayError::QueryTimeExecutionFailed { detail })?;
+        let metadata = self
+            .secret_store
+            .get_secret_metadata(namespace_id, &secret_name)
+            .await
+            .map_err(|error| GatewayError::QueryTimeExecutionFailed {
+                detail: error.to_string(),
+            })?;
+        if metadata.version < active_version {
+            return Err(GatewayError::QueryTimeExecutionFailed {
+                detail: "Kafka source secret version moved backwards".to_string(),
+            });
+        }
+        if metadata.version == active_version {
+            return Ok(false);
+        }
+        let secret = self
+            .resolve_source_secret(source, reference)
+            .await
+            .map_err(|detail| GatewayError::QueryTimeExecutionFailed { detail })?;
+        if secret.metadata.version < metadata.version {
+            return Err(GatewayError::QueryTimeExecutionFailed {
+                detail: "Kafka source secret changed during credential resolution".to_string(),
+            });
+        }
+        if secret.secret_type != rockstream_types::secret::SecretType::SaslPlain {
+            return Err(GatewayError::QueryTimeExecutionFailed {
+                detail: "Kafka source secret must use type sasl_plain".to_string(),
+            });
+        }
+        let username = secret
+            .payload
+            .get("username")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                detail: "Kafka source secret has no username".to_string(),
+            })?;
+        let password = secret
+            .payload
+            .get("password")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                detail: "Kafka source secret has no password".to_string(),
+            })?;
+        runtime
+            .rotate_kafka_secret_at_epoch(
+                lease,
+                &secret_name,
+                secret.metadata.version,
+                username,
+                password,
+            )
+            .map_err(source_backfill_error)
     }
 
     async fn refresh_pgoutput_secret_at_epoch(
@@ -3112,7 +3589,8 @@ impl GatewayHandler {
             after_state: AuditField::NotApplicable,
         };
         let operation_id = rand::random::<u64>().max(1);
-        for attempt in 0..2 {
+        for attempt in 0..rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS {
+            store.refresh().await.map_err(|error| error.to_string())?;
             let revision = store
                 .get_revision()
                 .await
@@ -3127,8 +3605,10 @@ impl GatewayHandler {
             match store.commit_txn(transaction).await {
                 Ok(_) => return Ok(()),
                 Err(rockstream_storage::catalog::CatalogError::OptimisticConflict(_))
-                    if attempt == 0 =>
+                    if attempt + 1
+                        < rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS =>
                 {
+                    store.refresh().await.map_err(|error| error.to_string())?;
                     continue;
                 }
                 Err(error) => return Err(error.to_string()),
@@ -3325,6 +3805,7 @@ impl GatewayHandler {
             query_time_shard_topology: None,
             query_time_shard_topology_provider: None,
             auth_mode: AuthMode::Off,
+            security_policy_refreshed_at: tokio::sync::Mutex::new(None),
             oidc_verifier: None,
             role_catalog: Arc::new(RoleCatalog::new()),
             acl_store: Arc::new(rockstream_control::AclStore::new()),
@@ -3337,8 +3818,13 @@ impl GatewayHandler {
             table_insert_metadata: Arc::new(DashMap::new()),
             frontier_published_at_ms: Arc::new(AtomicU64::new(current_time_ms())),
             compiled_views: Arc::new(DashMap::new()),
+            shared_windows: Arc::new(Mutex::new(rockstream_ops::SharedWindowFabric::new())),
+            kafka_sinks: Arc::new(DashMap::new()),
             distributed_data_plane: None,
+            actor_assertion_signer: None,
             distributed_storage_root: None,
+            stateless_read_router: None,
+            read_admission: Arc::new(crate::stateless_serving::ReadAdmissionController::default()),
             backfill_admission: Arc::new(crate::admission::BackfillAdmissionController::default()),
             self_ref: Arc::new(Mutex::new(Weak::new())),
             source_workers: Arc::new(DashMap::new()),
@@ -3351,6 +3837,8 @@ impl GatewayHandler {
             is_draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             in_flight_queries: Arc::new(AtomicUsize::new(0)),
             cursor_producer_slots: Arc::new(tokio::sync::Semaphore::new(4)),
+            commit_lock_barrier_for_test: None,
+            reconciled_pk_tables: Arc::new(DashSet::new()),
         }
     }
 
@@ -3375,6 +3863,7 @@ impl GatewayHandler {
             query_time_shard_topology: None,
             query_time_shard_topology_provider: None,
             auth_mode: AuthMode::Off,
+            security_policy_refreshed_at: tokio::sync::Mutex::new(None),
             oidc_verifier: None,
             role_catalog: Arc::new(RoleCatalog::new()),
             acl_store: Arc::new(rockstream_control::AclStore::new()),
@@ -3387,8 +3876,13 @@ impl GatewayHandler {
             table_insert_metadata: Arc::new(DashMap::new()),
             frontier_published_at_ms: Arc::new(AtomicU64::new(current_time_ms())),
             compiled_views: Arc::new(DashMap::new()),
+            shared_windows: Arc::new(Mutex::new(rockstream_ops::SharedWindowFabric::new())),
+            kafka_sinks: Arc::new(DashMap::new()),
             distributed_data_plane: None,
+            actor_assertion_signer: None,
             distributed_storage_root: None,
+            stateless_read_router: None,
+            read_admission: Arc::new(crate::stateless_serving::ReadAdmissionController::default()),
             backfill_admission: Arc::new(crate::admission::BackfillAdmissionController::default()),
             self_ref: Arc::new(Mutex::new(Weak::new())),
             source_workers: Arc::new(DashMap::new()),
@@ -3401,6 +3895,8 @@ impl GatewayHandler {
             is_draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             in_flight_queries: Arc::new(AtomicUsize::new(0)),
             cursor_producer_slots: Arc::new(tokio::sync::Semaphore::new(4)),
+            commit_lock_barrier_for_test: None,
+            reconciled_pk_tables: Arc::new(DashSet::new()),
         }
     }
 
@@ -3508,6 +4004,7 @@ impl GatewayHandler {
                         },
                     );
                 }
+                self.attach_shared_window_if_applicable(view_name, &view_plan, table_schemas);
                 Ok(compiled)
             }
             Err(compile_err) => {
@@ -3526,6 +4023,216 @@ impl GatewayHandler {
                 Err(format!("[RS-1019] compile_plan: {compile_err}; next_steps: simplify the view query or verify its source schemas"))
             }
         }
+    }
+
+    /// Access the shared time-slice window fabric (for telemetry and verification).
+    pub fn shared_window_consumer_count(
+        &self,
+        spec: &rockstream_types::SharedWindowSpec,
+    ) -> Option<usize> {
+        self.shared_windows.lock().consumer_count(spec)
+    }
+
+    fn attach_shared_window_if_applicable(
+        &self,
+        view_name: &str,
+        plan: &rockstream_plan::PlanNode,
+        table_schemas: &HashMap<String, SchemaRef>,
+    ) {
+        fn resolve_source_col(
+            node: &rockstream_plan::PlanNode,
+            col_idx: usize,
+        ) -> Option<(String, usize)> {
+            match node {
+                rockstream_plan::PlanNode::Source { name } => Some((name.clone(), col_idx)),
+                rockstream_plan::PlanNode::Filter { input, .. } => {
+                    resolve_source_col(input, col_idx)
+                }
+                rockstream_plan::PlanNode::Project { input, columns } => {
+                    let mapped = match columns.get(col_idx) {
+                        Some(rockstream_plan::Expr::Column(orig)) => *orig,
+                        _ => col_idx,
+                    };
+                    resolve_source_col(input, mapped)
+                }
+                _ => None,
+            }
+        }
+        fn find_window_info(node: &rockstream_plan::PlanNode) -> Option<(String, usize, i64, i64)> {
+            match node {
+                rockstream_plan::PlanNode::HopWindow {
+                    input,
+                    time_col,
+                    window_size_ms,
+                    slide_ms,
+                    ..
+                } => {
+                    let (src, orig_col) = resolve_source_col(input, *time_col)?;
+                    Some((src, orig_col, *slide_ms, *window_size_ms))
+                }
+                rockstream_plan::PlanNode::TumbleWindow {
+                    input,
+                    time_col,
+                    window_size_ms,
+                    ..
+                } => {
+                    let (src, orig_col) = resolve_source_col(input, *time_col)?;
+                    Some((src, orig_col, *window_size_ms, *window_size_ms))
+                }
+                rockstream_plan::PlanNode::ViewSink { child, .. }
+                | rockstream_plan::PlanNode::Exchange { child, .. } => find_window_info(child),
+                rockstream_plan::PlanNode::Aggregate { input, .. }
+                | rockstream_plan::PlanNode::Project { input, .. }
+                | rockstream_plan::PlanNode::Filter { input, .. }
+                | rockstream_plan::PlanNode::TopK { input, .. }
+                | rockstream_plan::PlanNode::Distinct { input, .. }
+                | rockstream_plan::PlanNode::Window { input, .. }
+                | rockstream_plan::PlanNode::IndexArrange { input, .. } => find_window_info(input),
+                _ => None,
+            }
+        }
+
+        let Some((source_table, time_col_idx, slice_ms, window_width_ms)) = find_window_info(plan)
+        else {
+            return;
+        };
+        if slice_ms <= 0 || window_width_ms <= 0 || window_width_ms % slice_ms != 0 {
+            return;
+        }
+        let time_col_name = table_schemas
+            .get(&source_table)
+            .and_then(|schema| schema.fields().get(time_col_idx))
+            .map(|f| f.name().clone())
+            .unwrap_or_else(|| format!("col_{time_col_idx}"));
+        let Ok(spec) = rockstream_types::SharedWindowSpec::new(
+            source_table,
+            "default",
+            time_col_name,
+            slice_ms as u64,
+            None,
+            rockstream_types::merge_law::MergeLawId(2),
+            rockstream_types::merge_law::MergeLawVersion(1),
+        ) else {
+            return;
+        };
+        let mut fabric = self.shared_windows.lock();
+        let _ = fabric.register(spec.clone());
+        let _ = fabric.attach(&spec, view_name, window_width_ms as u64);
+    }
+
+    /// Deliver committed view epochs to any live SQL-wired Kafka sinks attached
+    /// to `views`.
+    async fn deliver_kafka_sinks_for_views(&self, views: &[String]) {
+        if self.kafka_sinks.is_empty() {
+            return;
+        }
+        let matching_sinks: Vec<(
+            CatalogSinkEntry,
+            String,
+            Arc<tokio::sync::Mutex<rockstream_ops::kafka_sink::KafkaViewSink>>,
+        )> = self
+            .catalog
+            .list_sinks()
+            .into_iter()
+            .filter(|entry| {
+                entry.format.eq_ignore_ascii_case("KAFKA") && views.contains(&entry.view)
+            })
+            .filter_map(|entry| {
+                self.kafka_sinks
+                    .get(&entry.name)
+                    .map(|sink| (entry.clone(), entry.name, Arc::clone(sink.value())))
+            })
+            .collect();
+        for (entry, sink_name, sink_arc) in matching_sinks {
+            let mut sink = sink_arc.lock().await;
+            if let Err(error) = self.refresh_kafka_sink_secret(&entry, &mut sink).await {
+                tracing::warn!(
+                    sink = %sink_name,
+                    error = %error,
+                    "deliver_kafka_sinks_for_views: failed to refresh Kafka sink credentials"
+                );
+                continue;
+            }
+            if let Err(err) = sink.drain_all().await {
+                tracing::warn!(
+                    sink = %sink_name,
+                    error = %err,
+                    "deliver_kafka_sinks_for_views: failed to deliver committed view epochs to Kafka"
+                );
+            }
+        }
+    }
+
+    /// Reattach and recover persisted SQL-wired Kafka sinks after restart.
+    async fn recover_kafka_sinks(
+        &self,
+        shard_db: &Arc<rockstream_storage::ShardDb>,
+    ) -> Result<(), GatewayError> {
+        for entry in self.catalog.list_sinks() {
+            if !entry.format.eq_ignore_ascii_case("KAFKA") {
+                continue;
+            }
+            if self.kafka_sinks.contains_key(&entry.name) {
+                continue;
+            }
+            let Some(view) = self.catalog.get_view(&entry.view) else {
+                continue;
+            };
+            let Some(op_id) = view.op_id else {
+                continue;
+            };
+            let connector_id = ConnectorId(
+                entry
+                    .format_version
+                    .unwrap_or_else(|| stable_name_id("kafka-sink", &entry.name)),
+            );
+            let topic = &entry.catalog;
+            let brokers = &entry.path;
+            let kafka_sink = match self
+                .kafka_sink_credentials(&entry)
+                .await
+                .map_err(|detail| GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("recover Kafka sink '{}': {detail}", entry.name),
+                })? {
+                Some((protocol, secret_name, version, username, password)) => {
+                    rockstream_connectors::KafkaSink::connect_with_sasl_plain(
+                        connector_id,
+                        brokers,
+                        topic,
+                        &protocol,
+                        &secret_name,
+                        version,
+                        &username,
+                        &password,
+                    )
+                }
+                None => rockstream_connectors::KafkaSink::connect(connector_id, brokers, topic),
+            }
+            .map_err(|error| GatewayError::QueryTimeExecutionFailed {
+                detail: format!("recover Kafka sink '{}': {error}", entry.name),
+            })?;
+            let mut view_sink = rockstream_ops::kafka_sink::KafkaViewSink::new(
+                kafka_sink,
+                Arc::clone(shard_db),
+                OperatorId(op_id),
+                view.columns.len(),
+            );
+            if let Some(max_bytes) = entry.parquet_row_group_bytes {
+                view_sink = view_sink.with_max_envelope_bytes(max_bytes as usize);
+            }
+            if let Err(err) = view_sink.drain_all().await {
+                tracing::warn!(
+                    sink = %entry.name,
+                    error = %err,
+                    "recover_kafka_sinks: recovery delivery returned error"
+                );
+            }
+            self.kafka_sinks.insert(
+                entry.name.clone(),
+                Arc::new(tokio::sync::Mutex::new(view_sink)),
+            );
+        }
+        Ok(())
     }
 
     /// Same as `try_compile_view`, but reuses `sink_op_id` instead of
@@ -3599,6 +4306,11 @@ impl GatewayHandler {
         let Some(shard_db) = self.shard_db.clone() else {
             return Ok(());
         };
+        for table in self.catalog.list_tables() {
+            if !table.pk_cols.is_empty() {
+                self.ensure_table_pk_keys_reconciled(&table.name).await?;
+            }
+        }
         for view in self.catalog.list_views() {
             let Some(op_id) = view.op_id else {
                 continue;
@@ -3725,6 +4437,7 @@ impl GatewayHandler {
                 }
             }
         }
+        self.recover_kafka_sinks(&shard_db).await?;
         Ok(())
     }
 
@@ -4036,11 +4749,41 @@ impl GatewayHandler {
     }
 
     async fn ensure_local_view_consistency(&self) -> PgWireResult<()> {
-        if !self.pending_view_recovery.lock().is_empty() {
+        let pending = if let Some(db) = &self.shard_db {
+            db.get(&rockstream_storage::ShardKeyEncoder::meta_key(
+                b"distributed-source-pending",
+            ))
+            .await
+            .map_err(|e| PgWireError::ApiError(Box::new(GatewayError::Storage(e))))?
+            .is_some()
+        } else {
+            false
+        };
+        if pending || !self.pending_view_recovery.lock().is_empty() {
             let _guard = self.shard_commit_lock.lock().await;
             self.recover_pending_views_locked()
                 .await
                 .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+            self.ensure_no_pending_distributed_locked()
+                .await
+                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_no_pending_distributed_locked(&self) -> Result<(), GatewayError> {
+        if let Some(db) = &self.shard_db {
+            if db
+                .get(&rockstream_storage::ShardKeyEncoder::meta_key(
+                    b"distributed-source-pending",
+                ))
+                .await?
+                .is_some()
+            {
+                return Err(GatewayError::QueryTimeExecutionFailed {
+                    detail: "distributed source requires recovery; preserve source input and shard storage and contact the operator before retrying".to_string(),
+                });
+            }
         }
         Ok(())
     }
@@ -4060,13 +4803,37 @@ impl GatewayHandler {
         view_name: &str,
         shard_db: &Arc<rockstream_storage::ShardDb>,
     ) -> Result<(), GatewayError> {
-        let Some(compiled) = self.compiled_views.get(view_name) else {
+        let Some(compiled) = self
+            .compiled_views
+            .get(view_name)
+            .map(|v| Arc::clone(v.value()))
+        else {
             return Ok(());
         };
+        let single_source = if compiled.join.is_none() {
+            self.compiled_single_source(view_name)?
+        } else {
+            None
+        };
+        self.populate_compiled_view_instance(
+            view_name,
+            &compiled,
+            single_source.as_deref(),
+            shard_db,
+        )
+        .await
+    }
 
-        // v0.51.4 Slice 3: a join-shaped view's initial backfill scans both
-        // source tables' current contents (weight 1 per row) and feeds them
-        // through the join in one shot.
+    /// Backfill a specific `CompiledView` instance (either the live view or a
+    /// staging replacement view prior to atomic cutover) from current base-table
+    /// contents in `shard_db`.
+    async fn populate_compiled_view_instance(
+        &self,
+        view_name: &str,
+        compiled: &rockstream_ops::CompiledView,
+        single_source: Option<&str>,
+        shard_db: &Arc<rockstream_storage::ShardDb>,
+    ) -> Result<(), GatewayError> {
         if let Some(join) = &compiled.join {
             let left = self
                 .full_table_zset(&join.left_source, shard_db.as_ref())
@@ -4098,12 +4865,10 @@ impl GatewayHandler {
             return Ok(());
         }
 
-        let Some(source_name) = self.compiled_single_source(view_name)? else {
+        let Some(source_name) = single_source else {
             return Ok(());
         };
-        let input = self
-            .full_table_zset(&source_name, shard_db.as_ref())
-            .await?;
+        let input = self.full_table_zset(source_name, shard_db.as_ref()).await?;
         if input.is_empty() {
             return Ok(());
         }
@@ -4154,6 +4919,15 @@ impl GatewayHandler {
             .backfill_lifecycle(view_name)
             .await
             .map_err(source_backfill_error)?;
+        // The recovered M3 checkpoint may have committed immediately before
+        // an ACK failure. Reconcile the broker first, even for a completed
+        // backfill; never replay a durable input batch during recovery.
+        if runtime.has_pending_ack() {
+            runtime
+                .acknowledge_recovered(&lease)
+                .await
+                .map_err(source_backfill_error)?;
+        }
         if recovered
             .as_ref()
             .is_some_and(|lifecycle| lifecycle.phase == BackfillPhase::Running)
@@ -4281,7 +5055,7 @@ impl GatewayHandler {
             let mut combined = Vec::new();
             for batch in &delta.batches {
                 combined.extend(
-                    source_batch_to_dml_ops(&table.name, &table.columns, batch)
+                    source_batch_to_dml_ops(&table.name, &table.columns, &table.pk_cols, batch)
                         .map_err(|detail| GatewayError::QueryTimeExecutionFailed { detail })?,
                 );
             }
@@ -4358,21 +5132,72 @@ impl GatewayHandler {
             .or_else(|| source.options.get("group_id"))
             .map(|configured| format!("{configured}-{connector_id}"))
             .unwrap_or_else(|| format!("rockstream-{connector_id}"));
-        let mut runtime = KafkaSource::connect(
-            connector_id,
-            catalog_columns_to_schema(&table.columns),
-            bootstrap,
-            topic,
-            &group_id,
-        )
-        .map_err(source_backfill_error)?;
-        if let Some(secret_reference) = source.options.get("secret") {
-            let secret_name = self
-                .authorize_source_secret_use(source, secret_reference)
+        let schema = catalog_columns_to_schema(&table.columns);
+        let runtime = if let Some(secret_reference) = source.options.get("secret") {
+            let secret = self
+                .resolve_source_secret(source, secret_reference)
                 .await
                 .map_err(|detail| GatewayError::QueryTimeExecutionFailed { detail })?;
-            runtime.bind_secret(secret_name);
+            if secret.secret_type != rockstream_types::secret::SecretType::SaslPlain {
+                return Err(GatewayError::QueryTimeExecutionFailed {
+                    detail: "Kafka source secret must use type sasl_plain".to_string(),
+                });
+            }
+            let security_protocol = match source
+                .options
+                .get("security.protocol")
+                .or_else(|| source.options.get("security_protocol"))
+                .map(String::as_str)
+            {
+                Some(protocol) if protocol.eq_ignore_ascii_case("SASL_SSL") => "SASL_SSL",
+                Some(protocol) if protocol.eq_ignore_ascii_case("SASL_PLAINTEXT") => {
+                    "SASL_PLAINTEXT"
+                }
+                _ => {
+                    return Err(GatewayError::QueryTimeExecutionFailed {
+                        detail: "Kafka secret sources require security.protocol SASL_SSL or SASL_PLAINTEXT"
+                            .to_string(),
+                    });
+                }
+            };
+            let username = secret
+                .payload
+                .get("username")
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                    detail: "Kafka source secret has no username".to_string(),
+                })?;
+            let password = secret
+                .payload
+                .get("password")
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                    detail: "Kafka source secret has no password".to_string(),
+                })?;
+            KafkaSource::connect_with_sasl_plain(
+                connector_id,
+                schema,
+                bootstrap,
+                topic,
+                &group_id,
+                security_protocol,
+                &secret.name,
+                secret.metadata.version,
+                username,
+                password,
+            )
+        } else {
+            if source.options.contains_key("security.protocol")
+                || source.options.contains_key("security_protocol")
+            {
+                return Err(GatewayError::QueryTimeExecutionFailed {
+                    detail: "Kafka SASL security.protocol requires a bound sasl_plain secret"
+                        .to_string(),
+                });
+            }
+            KafkaSource::connect(connector_id, schema, bootstrap, topic, &group_id)
         }
+        .map_err(source_backfill_error)?;
         Ok((table, connector_id, runtime))
     }
 
@@ -4740,6 +5565,29 @@ impl GatewayHandler {
         shard_db: &Arc<rockstream_storage::ShardDb>,
     ) -> Result<(), GatewayError> {
         let mut coordinator = coordinator.lock().await;
+        // A newly attached alias may point to a different PostgreSQL table
+        // than the first source using this shared slot. Check its partition
+        // publication before reading or publishing a view from it.
+        let imported = self.catalog.source_table(&source.name).ok_or_else(|| {
+            GatewayError::QueryTimeExecutionFailed {
+                detail: format!("source '{}' is not bound to a table", source.name),
+            }
+        })?;
+        let upstream_table = source
+            .options
+            .get("table")
+            .map(String::as_str)
+            .unwrap_or(&imported.name);
+        let lease = coordinator.owner_lease.clone().ok_or_else(|| {
+            GatewayError::QueryTimeExecutionFailed {
+                detail: "RS-4013: pgoutput coordinator owner is fenced".to_string(),
+            }
+        })?;
+        coordinator
+            .runtime
+            .validate_pgoutput_table(&lease, upstream_table)
+            .await
+            .map_err(source_backfill_error)?;
         let _guard = self.shard_commit_lock.lock().await;
         self.recover_pending_views_locked().await?;
         self.validate_pgoutput_lifecycles(&coordinator).await?;
@@ -4949,6 +5797,28 @@ impl GatewayHandler {
         );
     }
 
+    /// Cancel every live source worker, including one paused inside an M3
+    /// commit. The gateway process can then be retired without allowing an
+    /// old slot owner to race a newly recovered owner.
+    #[doc(hidden)]
+    pub fn abort_source_workers_for_test(&self) -> usize {
+        let handles = self
+            .source_workers
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect::<Vec<_>>();
+        for handle in &handles {
+            handle.abort();
+        }
+        handles.len()
+    }
+
+    /// Observe task cleanup after a simulated owner crash.
+    #[doc(hidden)]
+    pub fn active_source_worker_count_for_test(&self) -> usize {
+        self.source_workers.len()
+    }
+
     fn spawn_kafka_source_worker(
         &self,
         source: CatalogSourceEntry,
@@ -4956,7 +5826,11 @@ impl GatewayHandler {
         shard_db: Arc<rockstream_storage::ShardDb>,
     ) {
         let key = format!("{}:{view_name}", source.name);
-        if self.source_workers.insert(key.clone(), ()).is_some() {
+        let (abort, registration) = futures::future::AbortHandle::new_pair();
+        if let dashmap::mapref::entry::Entry::Vacant(entry) = self.source_workers.entry(key.clone())
+        {
+            entry.insert(abort);
+        } else {
             return;
         }
         let weak = self.self_ref.lock().clone();
@@ -4965,8 +5839,11 @@ impl GatewayHandler {
             return;
         }
         tokio::spawn(async move {
-            GatewayHandler::run_kafka_source_worker(weak.clone(), source, view_name, shard_db)
-                .await;
+            let _ = futures::future::Abortable::new(
+                GatewayHandler::run_kafka_source_worker(weak.clone(), source, view_name, shard_db),
+                registration,
+            )
+            .await;
             if let Some(handler) = weak.upgrade() {
                 handler.source_workers.remove(&key);
             }
@@ -4984,7 +5861,11 @@ impl GatewayHandler {
         };
         let connector_id = identity.connector_id();
         let key = format!("pgoutput:{}", connector_id.0);
-        if self.source_workers.insert(key.clone(), ()).is_some() {
+        let (abort, registration) = futures::future::AbortHandle::new_pair();
+        if let dashmap::mapref::entry::Entry::Vacant(entry) = self.source_workers.entry(key.clone())
+        {
+            entry.insert(abort);
+        } else {
             return;
         }
         let weak = self.self_ref.lock().clone();
@@ -4993,11 +5874,14 @@ impl GatewayHandler {
             return;
         }
         tokio::spawn(async move {
-            GatewayHandler::run_postgres_cdc_source_worker(
-                weak.clone(),
-                source,
-                view_name,
-                shard_db,
+            let _ = futures::future::Abortable::new(
+                GatewayHandler::run_postgres_cdc_source_worker(
+                    weak.clone(),
+                    source,
+                    view_name,
+                    shard_db,
+                ),
+                registration,
             )
             .await;
             if let Some(handler) = weak.upgrade() {
@@ -5125,6 +6009,32 @@ impl GatewayHandler {
                     .open_pgoutput(&lease)
                     .await
                     .map_err(|_| ())?;
+                // Revalidate all existing imported aliases on restart. One
+                // shared slot can contain multiple independently imported
+                // tables, including a partitioned root not used by the first
+                // alias that opened the physical connection.
+                let restored_aliases = handler.pgoutput_source_aliases(connector_id);
+                for alias in &restored_aliases {
+                    let upstream_table = alias.options.get("table").cloned().or_else(|| {
+                        handler
+                            .catalog
+                            .source_table(&alias.name)
+                            .map(|table| table.name)
+                    });
+                    if let Some(upstream_table) = upstream_table {
+                        if let Err(error) = coordinator
+                            .runtime
+                            .validate_pgoutput_table(&lease, &upstream_table)
+                            .await
+                        {
+                            handler.block_pgoutput_aliases(
+                                &restored_aliases,
+                                format!("pgoutput publication validation failed: {error}"),
+                            );
+                            return Err(());
+                        }
+                    }
+                }
                 let durable_lsn = rockstream_connectors::PgLsn::from_offset_token(
                     coordinator.runtime.committed_offset(),
                 )
@@ -5208,13 +6118,65 @@ impl GatewayHandler {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
+                Err(rockstream_connectors::SourceError::Io(reason))
+                    if reason.starts_with("RS-4017: pgoutput connection disconnected:") =>
+                {
+                    // Only transport loss is retryable: the slot still owns the
+                    // unacknowledged transaction. Discard partial relation
+                    // messages and spill, reopen under the same fenced owner,
+                    // and replay from the durable slot/checkpoint.
+                    tracing::warn!(%reason, "pgoutput transport lost; reopening shared slot");
+                    if let Err(error) = coordinator.discard_interrupted_envelope(&shard_db).await {
+                        handler.block_pgoutput_aliases(
+                            &aliases,
+                            format!("pgoutput disconnect cleanup failed: {error}"),
+                        );
+                        break;
+                    }
+                    let mut last_error = None;
+                    for _ in 0..20 {
+                        match coordinator
+                            .runtime
+                            .reopen_pgoutput_after_disconnect(&lease)
+                            .await
+                        {
+                            Ok(()) => {
+                                last_error = None;
+                                break;
+                            }
+                            Err(error) => {
+                                last_error = Some(error);
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                        }
+                    }
+                    if let Some(error) = last_error {
+                        handler.block_pgoutput_aliases(
+                            &aliases,
+                            format!("pgoutput reconnect failed: {error}"),
+                        );
+                        break;
+                    }
+                    handler.project_pgoutput_status(&coordinator);
+                    continue;
+                }
                 Err(error) => {
                     handler
                         .block_pgoutput_aliases(&aliases, format!("pgoutput poll failed: {error}"));
+                    // An oversized frame stops the COPY stream but must also
+                    // release the control socket and source-owner lease.
+                    let _ = coordinator.runtime.close_pgoutput(&lease);
+                    coordinator.owner_lease = None;
                     break;
                 }
             };
             let is_commit = matches!(&event, PgOutputEvent::Commit { .. });
+            let is_change = matches!(
+                &event,
+                PgOutputEvent::Insert { .. }
+                    | PgOutputEvent::Update { .. }
+                    | PgOutputEvent::Delete { .. }
+            );
             let mut result = match event {
                 PgOutputEvent::Begin { xid } if coordinator.active_envelope.is_none() => {
                     match handler
@@ -5282,6 +6244,9 @@ impl GatewayHandler {
                     Some(old_values),
                     None,
                 ),
+                PgOutputEvent::Truncate {
+                    xid, relation_ids, ..
+                } => coordinator.push_truncate(xid, &relation_ids),
                 PgOutputEvent::Commit { xid, commit_lsn } => {
                     match coordinator.finish_envelope(xid, commit_lsn) {
                         Ok(envelope) => {
@@ -5300,6 +6265,12 @@ impl GatewayHandler {
                 {
                     result = Err(error);
                 }
+            }
+            if is_change && result.is_ok() {
+                // The test barrier ensures a real partial envelope has been
+                // buffered before the PostgreSQL backend is disconnected.
+                // This is otherwise a no-op, including in production builds.
+                shard_db.await_pgoutput_change_cut_for_test().await;
             }
             if let Err(error) = result {
                 let reason = match &error {
@@ -5323,7 +6294,7 @@ impl GatewayHandler {
     fn pgoutput_source_aliases(&self, connector_id: ConnectorId) -> Vec<CatalogSourceEntry> {
         self.pgoutput_registered_aliases(connector_id)
             .into_iter()
-            .filter(|source| source.status == "OK")
+            .filter(|source| matches!(source.status.as_str(), "OK" | "RUNNING"))
             .collect()
     }
 
@@ -5663,28 +6634,19 @@ impl GatewayHandler {
                 )
             })
             .collect::<HashMap<_, _>>();
-        let mut ops = Vec::new();
-        for change in &envelope.changes {
-            let route = staged_routes
-                .get(&change.relation_id)
-                .copied()
-                .or_else(|| coordinator.relation_routes.get(&change.relation_id))
-                .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
-                    detail: format!(
-                        "RS-4013: pgoutput relation {} has no durable route",
-                        change.relation_id
-                    ),
-                })?;
-            if route.schema_version != change.schema_version {
-                return Err(GatewayError::QueryTimeExecutionFailed {
-                    detail: format!(
-                        "RS-1002: pgoutput relation {} change used schema version {}, expected {}",
-                        change.relation_id, change.schema_version, route.schema_version
-                    ),
-                });
-            }
-            ops.push(pgoutput_change_to_dml(route, change)?);
-        }
+        let mut resolved_routes = coordinator
+            .relation_routes
+            .iter()
+            .map(|(&id, route)| (id, route))
+            .collect::<HashMap<_, _>>();
+        resolved_routes.extend(staged_routes.iter().map(|(&id, &route)| (id, route)));
+        // Read the pre-TRUNCATE table images under the shard commit lock, then
+        // expand ordered markers into row retractions before the M3 write.
+        // A failed/incomplete scan must never advance the PostgreSQL LSN.
+        let truncate_images =
+            load_pgoutput_truncate_images(shard_db, &envelope.changes, &resolved_routes).await?;
+        let ops =
+            pgoutput_envelope_to_dml_ops(&envelope.changes, &resolved_routes, truncate_images)?;
         let changed_relations = ops
             .iter()
             .map(dml_table_name)
@@ -5817,9 +6779,7 @@ impl GatewayHandler {
                 .unwrap_or_else(|| SnapshotDeltaFence::new(offset.clone(), offset.clone()));
             let estimated_rows = previous
                 .as_ref()
-                .map_or(envelope.changes.len() as u64, |lifecycle| {
-                    lifecycle.estimated_rows
-                });
+                .map_or(ops.len() as u64, |lifecycle| lifecycle.estimated_rows);
             lifecycles.push(BackfillLifecycle::new(
                 BackfillPhase::Running,
                 BackfillCursor::new(view_name, 0, offset.as_bytes().to_vec(), fence, epoch),
@@ -5892,12 +6852,12 @@ impl GatewayHandler {
         Ok(())
     }
 
-    async fn run_live_source_worker<S: SourceConnector>(
+    async fn run_live_source_worker(
         weak: Weak<GatewayHandler>,
         source: CatalogSourceEntry,
         view_name: String,
         table: CatalogTable,
-        mut runtime: SourceRuntimeCoordinator<S>,
+        mut runtime: SourceRuntimeCoordinator<KafkaSource>,
         shard_db: Arc<rockstream_storage::ShardDb>,
     ) {
         if runtime.recover().await.is_err() {
@@ -5906,11 +6866,50 @@ impl GatewayHandler {
         let Ok(lease) = runtime.acquire_owner(format!("gateway:{view_name}:live")) else {
             return;
         };
+        let mut needs_pipeline_recovery = false;
         loop {
             let Some(handler) = weak.upgrade() else {
                 break;
             };
             if handler.catalog.get_source(&source.name).is_none() {
+                break;
+            }
+            // No new records are needed to make progress on a failed ACK.
+            // This branch runs *before* polling, including on a fresh worker
+            // that restored an M3 checkpoint from a previous process.
+            if runtime.has_pending_ack() {
+                if let Err(error) = handler
+                    .refresh_kafka_secret_at_epoch(&mut runtime, &lease, &source)
+                    .await
+                {
+                    tracing::warn!(view = %view_name, %error, "Kafka source credential refresh before ACK retry failed");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                if let Err(error) = runtime.acknowledge_recovered(&lease).await {
+                    tracing::warn!(view = %view_name, %error, "live source durable checkpoint ACK retry failed");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                needs_pipeline_recovery = true;
+            }
+            if needs_pipeline_recovery {
+                // The failed ACK happened after the atomic M3 write. Restore
+                // in-memory pipeline state from that write, not from a replay
+                // of the input, before allowing the next batch to execute.
+                // Retain this obligation across transient recovery failures,
+                // even if no further input ever arrives.
+                let _guard = handler.shard_commit_lock.lock().await;
+                if let Err(error) = handler.recover_pending_views_locked().await {
+                    tracing::warn!(view = %view_name, %error, "live source committed view state recovery failed");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                needs_pipeline_recovery = false;
+                handler.refresh_backfill_progress(&view_name).await;
+            }
+            if let Some(reason) = runtime.blocked_reason() {
+                tracing::error!(code = "RS-4016", view = %view_name, %reason, "live source remains blocked without a retryable ACK");
                 break;
             }
             drop(handler);
@@ -5935,6 +6934,17 @@ impl GatewayHandler {
                     continue;
                 }
             };
+            let Some(handler) = weak.upgrade() else {
+                break;
+            };
+            if let Err(error) = handler
+                .refresh_kafka_secret_at_epoch(&mut runtime, &lease, &source)
+                .await
+            {
+                tracing::warn!(view = %view_name, %error, "Kafka source credential refresh failed");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
             if delta.batches.is_empty() {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
@@ -5956,7 +6966,7 @@ impl GatewayHandler {
             let mut ops = Vec::new();
             let mut decode_failed = false;
             for batch in &delta.batches {
-                match source_batch_to_dml_ops(&table.name, &table.columns, batch) {
+                match source_batch_to_dml_ops(&table.name, &table.columns, &table.pk_cols, batch) {
                     Ok(batch_ops) => ops.extend(batch_ops),
                     Err(error) => {
                         tracing::warn!(view = %view_name, %error, "live source batch decode failed");
@@ -5970,9 +6980,6 @@ impl GatewayHandler {
                 continue;
             }
             let Ok(epoch) = runtime.next_epoch() else {
-                break;
-            };
-            let Some(handler) = weak.upgrade() else {
                 break;
             };
             if let Err(error) = handler
@@ -6016,7 +7023,7 @@ impl GatewayHandler {
         estimated_rows: u64,
         shard_db: &Arc<rockstream_storage::ShardDb>,
     ) -> Result<(), GatewayError> {
-        let ops = source_batch_to_dml_ops(&table.name, &table.columns, batch)
+        let ops = source_batch_to_dml_ops(&table.name, &table.columns, &table.pk_cols, batch)
             .map_err(|detail| GatewayError::QueryTimeExecutionFailed { detail })?;
         self.commit_bound_source_ops(
             runtime,
@@ -6432,6 +7439,7 @@ impl GatewayHandler {
         &'a self,
         query: &'a str,
         session_info: &crate::catalog_stubs::SessionInfo,
+        conn_id: Option<&str>,
     ) -> Option<PgWireResult<Vec<Response<'a>>>> {
         let q = query.trim();
         let ql = q.to_lowercase();
@@ -6570,7 +7578,7 @@ impl GatewayHandler {
             || ql.starts_with("create or replace view ")
             || ql.starts_with("create or replace materialized view ")
         {
-            return Some(self.handle_create_view(q).await);
+            return Some(self.handle_create_view(q, conn_id).await);
         }
 
         // REFRESH MATERIALIZED VIEW
@@ -6679,6 +7687,7 @@ impl GatewayHandler {
         {
             return Ok(denied);
         }
+        let authorization_check_at = tokio::time::Instant::now() + SECURITY_POLICY_REFRESH_INTERVAL;
 
         let catalog_columns = self
             .catalog
@@ -6821,20 +7830,98 @@ impl GatewayHandler {
         let schema = Arc::new(fields);
         let stream_schema = schema.clone();
         let registry = self.subscribe_registry.clone();
+        let authorization = (
+            self.self_ref.lock().clone(),
+            request.view_name.clone(),
+            conn_id.map(str::to_owned),
+            authorization_check_at,
+        );
         let data_stream = Box::pin(stream::unfold(
-            (registry, handle, pending, stream_schema, false, stream_slot),
-            |(registry, mut handle, mut pending, schema, failed, stream_slot)| async move {
+            (
+                registry,
+                handle,
+                pending,
+                stream_schema,
+                false,
+                stream_slot,
+                authorization,
+            ),
+            |(
+                registry,
+                mut handle,
+                mut pending,
+                schema,
+                failed,
+                stream_slot,
+                mut authorization,
+            )| async move {
                 if failed {
                     return None;
                 }
                 loop {
+                    if tokio::time::Instant::now() >= authorization.3 {
+                        authorization.3 =
+                            tokio::time::Instant::now() + SECURITY_POLICY_REFRESH_INTERVAL;
+                        let handler = authorization.0.upgrade()?;
+                        match handler
+                            .select_access_error_response(
+                                &authorization.1,
+                                authorization.2.as_deref(),
+                            )
+                            .await
+                        {
+                            Ok(None) => {}
+                            Ok(Some(denied)) => {
+                                let error = match denied.into_iter().next() {
+                                    Some(Response::Error(error)) => PgWireError::UserError(error),
+                                    _ => PgWireError::ApiError(Box::new(std::io::Error::other(
+                                        "subscription reauthorization returned no error response",
+                                    ))),
+                                };
+                                return Some((
+                                    Err(error),
+                                    (
+                                        registry,
+                                        handle,
+                                        pending,
+                                        schema,
+                                        true,
+                                        stream_slot,
+                                        authorization,
+                                    ),
+                                ));
+                            }
+                            Err(error) => {
+                                return Some((
+                                    Err(error),
+                                    (
+                                        registry,
+                                        handle,
+                                        pending,
+                                        schema,
+                                        true,
+                                        stream_slot,
+                                        authorization,
+                                    ),
+                                ));
+                            }
+                        }
+                    }
                     if let Some(row) = pending.pop_front() {
                         let mut encoder = DataRowEncoder::new(schema.clone());
                         for value in String::from_utf8_lossy(&row.encoded_row).split('\t') {
                             if let Err(error) = encoder.encode_field(&Some(value)) {
                                 return Some((
                                     Err(error),
-                                    (registry, handle, pending, schema, true, stream_slot),
+                                    (
+                                        registry,
+                                        handle,
+                                        pending,
+                                        schema,
+                                        true,
+                                        stream_slot,
+                                        authorization,
+                                    ),
                                 ));
                             }
                         }
@@ -6842,14 +7929,30 @@ impl GatewayHandler {
                         if let Err(error) = encoder.encode_field(&Some(timestamp.as_str())) {
                             return Some((
                                 Err(error),
-                                (registry, handle, pending, schema, true, stream_slot),
+                                (
+                                    registry,
+                                    handle,
+                                    pending,
+                                    schema,
+                                    true,
+                                    stream_slot,
+                                    authorization,
+                                ),
                             ));
                         }
                         let diff = row.mz_diff.to_string();
                         if let Err(error) = encoder.encode_field(&Some(diff.as_str())) {
                             return Some((
                                 Err(error),
-                                (registry, handle, pending, schema, true, stream_slot),
+                                (
+                                    registry,
+                                    handle,
+                                    pending,
+                                    schema,
+                                    true,
+                                    stream_slot,
+                                    authorization,
+                                ),
                             ));
                         }
                         let encoded = match encoder.finish() {
@@ -6857,13 +7960,29 @@ impl GatewayHandler {
                             Err(error) => {
                                 return Some((
                                     Err(error),
-                                    (registry, handle, pending, schema, true, stream_slot),
+                                    (
+                                        registry,
+                                        handle,
+                                        pending,
+                                        schema,
+                                        true,
+                                        stream_slot,
+                                        authorization,
+                                    ),
                                 ));
                             }
                         };
                         return Some((
                             Ok(encoded),
-                            (registry, handle, pending, schema, false, stream_slot),
+                            (
+                                registry,
+                                handle,
+                                pending,
+                                schema,
+                                false,
+                                stream_slot,
+                                authorization,
+                            ),
                         ));
                     }
                     match handle.poll(&registry) {
@@ -6872,7 +7991,15 @@ impl GatewayHandler {
                         Err(error) => {
                             return Some((
                                 Err(PgWireError::ApiError(Box::new(error))),
-                                (registry, handle, pending, schema, true, stream_slot),
+                                (
+                                    registry,
+                                    handle,
+                                    pending,
+                                    schema,
+                                    true,
+                                    stream_slot,
+                                    authorization,
+                                ),
                             ));
                         }
                     }
@@ -7200,7 +8327,7 @@ impl GatewayHandler {
         // ─────────────────────────────────────────────────────────────────────────
 
         // SET rockstream.* must be intercepted before catalog stubs handle generic SET commands.
-        if ql.starts_with("set rockstream.") || ql.starts_with("set local rockstream.") {
+        if parse_set_rockstream(q).is_some() {
             return self.handle_set_rockstream(q, &ql, conn_id);
         }
 
@@ -7377,14 +8504,66 @@ impl GatewayHandler {
                                 .filter_map(|operator| parse_operator_id(&operator.op_id))
                                 .collect();
                             let stats = if let Some(data_plane) = &self.distributed_data_plane {
-                                data_plane
-                                    .read_operator_stats(
-                                        WorkloadId(stable_name_id("workload", &view.name)),
-                                        operator_ids.clone(),
+                                let workload_id =
+                                    WorkloadId(stable_name_id("workload", &view.name));
+                                let request_id = uuid::Uuid::new_v4().to_string();
+                                let namespace = conn_id
+                                    .and_then(|id| {
+                                        self.sessions
+                                            .get(id)
+                                            .map(|session| session.current_namespace.clone())
+                                    })
+                                    .unwrap_or_else(|| "public".to_owned());
+                                let worker_request =
+                                    rockstream_types::topology::WorkerMessage::ReadOperatorStats {
+                                        request_id: request_id.clone(),
+                                        workload_id,
+                                        operator_ids: operator_ids.clone(),
+                                    };
+                                let assertion = self
+                                    .actor_assertion_for_request(
+                                        conn_id,
+                                        SecurityAction::DataRead,
+                                        PolicyScope::Resource {
+                                            namespace,
+                                            kind: ResourceKind::View,
+                                            name: view.name.clone(),
+                                        },
+                                        &worker_request,
                                     )
                                     .await
-                                    .ok()
-                                    .flatten()
+                                    .map_err(|detail| {
+                                        PgWireError::ApiError(Box::new(
+                                            GatewayError::QueryTimeExecutionFailed { detail },
+                                        ))
+                                    })?;
+                                let stats = match assertion {
+                                    Some(assertion) => {
+                                        data_plane
+                                            .read_operator_stats_delegated(
+                                                workload_id,
+                                                operator_ids.clone(),
+                                                request_id,
+                                                &assertion,
+                                            )
+                                            .await
+                                    }
+                                    None => {
+                                        data_plane
+                                            .read_operator_stats(workload_id, operator_ids.clone())
+                                            .await
+                                    }
+                                };
+                                stats.map_err(|error| {
+                                    PgWireError::ApiError(Box::new(
+                                        GatewayError::QueryTimeExecutionFailed {
+                                            detail: format!(
+                                                "read delegated operator stats for {}: {error}",
+                                                view.name
+                                            ),
+                                        },
+                                    ))
+                                })?
                             } else if self.compiled_views.contains_key(&view.name) {
                                 let local =
                                     rockstream_types::metrics::operator_runtime_stats_for_ids(
@@ -7891,11 +9070,16 @@ impl GatewayHandler {
                 self.catalog.backfill_status_response(view_name),
             ))]);
         }
+        if ql.trim_end_matches(';') == "show backfill status" {
+            return Ok(vec![promote_response(catalog_resp_to_response(
+                self.catalog.backfill_status_all_response(),
+            ))]);
+        }
         if ql.starts_with("show backfill status") {
             return Ok(vec![promote_response(Response::Error(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
                 "42601".to_owned(),
-                "[RS-2001] sql.invalid_syntax: expected SHOW BACKFILL STATUS FOR MATERIALIZED VIEW <name>. Next steps: provide a materialized view name.".to_owned(),
+                "[RS-2001] sql.invalid_syntax: expected SHOW BACKFILL STATUS or SHOW BACKFILL STATUS FOR MATERIALIZED VIEW <name>. Next steps: provide a materialized view name or omit the FOR clause to list all views.".to_owned(),
             ))))]);
         }
         if ql.trim_end_matches(';') == "show view status" {
@@ -8184,7 +9368,7 @@ impl GatewayHandler {
                 .collect());
         }
 
-        if let Some(result) = self.dispatch_sync(query, &session_info).await {
+        if let Some(result) = self.dispatch_sync(query, &session_info, conn_id).await {
             // Promote lifetime — responses from dispatch_sync hold no borrows
             // from `query`, only owned data.
             let result = result.map(|v| v.into_iter().map(promote_response).collect());
@@ -8546,6 +9730,7 @@ impl GatewayHandler {
         // so the planner can resolve any referenced names.
         let ctx = SessionContext::new();
         rockstream_sql::frontend::register_session_sql_udf(&ctx);
+        rockstream_sql::frontend::register_hop_sql_udf(&ctx);
         for view in self.catalog.list_views() {
             let mut fields = Vec::new();
             for col in &view.columns {
@@ -9128,9 +10313,18 @@ impl GatewayHandler {
         &self,
         view_name: &str,
         limit: Option<usize>,
-        order_by: Vec<(String, bool)>,
+        order_by: Vec<(String, bool, bool)>,
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<Response<'static>>> {
+        let _distributed_read_guard = if self.distributed_data_plane.is_some() {
+            let guard = self.shard_commit_lock.lock().await;
+            self.ensure_no_pending_distributed_locked()
+                .await
+                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+            Some(guard)
+        } else {
+            None
+        };
         if let Some(error_responses) = self
             .select_access_error_response(view_name, conn_id)
             .await?
@@ -9180,6 +10374,24 @@ impl GatewayHandler {
             )]
         };
 
+        let _read_admission_permit = self
+            .read_admission
+            .admit(limit, limit.unwrap_or(1024).saturating_mul(256))
+            .await
+            .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+
+        // Prefer reading directly from stateless ShardReader replicas over
+        // shared object storage when configured, bypassing control-routed reads.
+        let stateless_rows = if let Some(router) = &self.stateless_read_router {
+            if self.catalog.get_view(view_name).is_some() {
+                router.read_view(view_name, None, None, None).await.ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Prefer reading directly from ShardDb when available.  ShardDb reads
         // from its in-memory memtable (WAL + SSTs), which reflects the latest
         // committed writes immediately after the post-COMMIT flush.  The
@@ -9189,48 +10401,68 @@ impl GatewayHandler {
             .distributed_data_plane
             .as_ref()
             .filter(|_| self.catalog.get_view(view_name).is_some());
-        let batches: Vec<RecordBatch> = if let Some(distributed_data_plane) = distributed_data_plane
+        let batches: Vec<RecordBatch> = if let Some(mut rows) =
+            stateless_rows.filter(|r| !r.is_empty() || distributed_data_plane.is_none())
         {
-            let snapshot = distributed_data_plane
-                .read_workload(WorkloadId(stable_name_id("workload", view_name)))
+            sort_rows_by_order(&mut rows, &schema_fields, &order_by);
+            if let Some(n) = limit {
+                rows.truncate(n);
+            }
+            stored_rows_to_batches(&self.catalog, view_name, &rows)?
+        } else if let Some(distributed_data_plane) = distributed_data_plane {
+            let namespace = conn_id
+                .and_then(|id| {
+                    self.sessions
+                        .get(id)
+                        .map(|session| session.current_namespace.clone())
+                })
+                .unwrap_or_else(|| "public".to_owned());
+            let workload_id = WorkloadId(stable_name_id("workload", view_name));
+            let worker_request = rockstream_types::topology::WorkerMessage::ReadWorkload {
+                version: rockstream_types::data_plane::WORKLOAD_SNAPSHOT_VERSION,
+                workload_id,
+            };
+            let assertion = self
+                .actor_assertion_for_request(
+                    conn_id,
+                    SecurityAction::DataRead,
+                    PolicyScope::Resource {
+                        namespace,
+                        kind: ResourceKind::View,
+                        name: view_name.to_owned(),
+                    },
+                    &worker_request,
+                )
                 .await
-                .map_err(|error| {
+                .map_err(|detail| {
                     PgWireError::ApiError(Box::new(GatewayError::QueryTimeExecutionFailed {
-                        detail: format!("read distributed view {view_name}: {error}"),
+                        detail,
                     }))
                 })?;
+            let snapshot = match assertion {
+                Some(assertion) => {
+                    distributed_data_plane
+                        .read_workload_delegated(workload_id, &assertion)
+                        .await
+                }
+                None => distributed_data_plane.read_workload(workload_id).await,
+            }
+            .map_err(|error| {
+                PgWireError::ApiError(Box::new(GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("read distributed view {view_name}: {error}"),
+                }))
+            })?;
+            // shortcut: snapshots omit worker output, remove this gate when reads include it.
+            if snapshot.shards.iter().all(|shard| shard.deltas.is_empty()) {
+                return Err(PgWireError::ApiError(Box::new(
+                    GatewayError::QueryTimeExecutionFailed {
+                        detail: format!("distributed view {view_name} output is unavailable; contact the operator before relying on this result"),
+                    },
+                )));
+            }
             let mut rows = merge_workload_snapshot(&snapshot)
                 .map_err(|error| PgWireError::ApiError(Box::new(error)))?;
-            if !order_by.is_empty() {
-                let col_idx: std::collections::HashMap<String, usize> = schema_fields
-                    .iter()
-                    .enumerate()
-                    .map(|(i, f)| (f.name().to_lowercase(), i))
-                    .collect();
-                rows.sort_by(|a, b| {
-                    let a_fields: Vec<&str> =
-                        std::str::from_utf8(a).unwrap_or("").split('\t').collect();
-                    let b_fields: Vec<&str> =
-                        std::str::from_utf8(b).unwrap_or("").split('\t').collect();
-                    for (col, desc) in &order_by {
-                        let Some(&idx) = col_idx.get(col.as_str()) else {
-                            continue;
-                        };
-                        let av = a_fields.get(idx).copied().unwrap_or("");
-                        let bv = b_fields.get(idx).copied().unwrap_or("");
-                        let ord = if let (Ok(an), Ok(bn)) = (av.parse::<i64>(), bv.parse::<i64>()) {
-                            an.cmp(&bn)
-                        } else {
-                            av.cmp(bv)
-                        };
-                        let ord = if *desc { ord.reverse() } else { ord };
-                        if ord != std::cmp::Ordering::Equal {
-                            return ord;
-                        }
-                    }
-                    std::cmp::Ordering::Equal
-                });
-            }
+            sort_rows_by_order(&mut rows, &schema_fields, &order_by);
             if let Some(n) = limit {
                 rows.truncate(n);
             }
@@ -9251,41 +10483,7 @@ impl GatewayHandler {
                     .await
                     .map_err(|error| PgWireError::ApiError(Box::new(error)))?
             };
-            // Apply ORDER BY if specified
-            if !order_by.is_empty() {
-                // Build column-name → index map from schema_fields
-                let col_idx: std::collections::HashMap<String, usize> = schema_fields
-                    .iter()
-                    .enumerate()
-                    .map(|(i, f)| (f.name().to_lowercase(), i))
-                    .collect();
-                rows.sort_by(|a, b| {
-                    let a_fields: Vec<&str> =
-                        std::str::from_utf8(a).unwrap_or("").split('\t').collect();
-                    let b_fields: Vec<&str> =
-                        std::str::from_utf8(b).unwrap_or("").split('\t').collect();
-                    for (col, desc) in &order_by {
-                        let idx = match col_idx.get(col.as_str()) {
-                            Some(&i) => i,
-                            None => continue,
-                        };
-                        let av = a_fields.get(idx).copied().unwrap_or("");
-                        let bv = b_fields.get(idx).copied().unwrap_or("");
-                        let ord = if let (Ok(an), Ok(bn)) = (av.parse::<i64>(), bv.parse::<i64>()) {
-                            an.cmp(&bn)
-                        } else if let (Ok(af), Ok(bf)) = (av.parse::<f64>(), bv.parse::<f64>()) {
-                            af.partial_cmp(&bf).unwrap_or(std::cmp::Ordering::Equal)
-                        } else {
-                            av.cmp(bv)
-                        };
-                        let ord = if *desc { ord.reverse() } else { ord };
-                        if ord != std::cmp::Ordering::Equal {
-                            return ord;
-                        }
-                    }
-                    std::cmp::Ordering::Equal
-                });
-            }
+            sort_rows_by_order(&mut rows, &schema_fields, &order_by);
             if let Some(n) = limit {
                 rows.truncate(n);
             }
@@ -9345,7 +10543,11 @@ impl GatewayHandler {
         ))])
     }
 
-    async fn handle_create_view<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+    async fn handle_create_view<'a>(
+        &'a self,
+        q: &str,
+        conn_id: Option<&str>,
+    ) -> PgWireResult<Vec<Response<'a>>> {
         let ql = q.to_lowercase();
         let is_materialized = ql.contains("materialized view");
         let if_not_exists = ql.contains("if not exists");
@@ -9358,7 +10560,10 @@ impl GatewayHandler {
 
         // Extract view name and query SQL for cycle detection.
         if let Some(view_name) = parse_create_view_name(q) {
-            if self.catalog.get_view(&view_name).is_some() {
+            let existing_view = self.catalog.get_view(&view_name);
+            let is_replacement = or_replace && existing_view.is_some();
+            let is_async_replace = parse_create_view_async(q);
+            if existing_view.is_some() {
                 if if_not_exists {
                     return Ok(vec![Response::Execution(Tag::new(tag).with_rows(0))]);
                 }
@@ -9439,6 +10644,190 @@ impl GatewayHandler {
                 }
             }
 
+            // Zero-downtime view replacement (issue #404 R3): when replacing an
+            // existing view on a shard-backed gateway, compile and backfill the
+            // replacement under a fresh staging operator ID while keeping the
+            // live view continuously queryable, then atomically cut over under
+            // `shard_commit_lock` so zero committed epochs are missed.
+            if is_replacement && self.distributed_data_plane.is_none() {
+                if let Some(shard_db) = self.shard_db.clone() {
+                    let inlined_sql =
+                        inline_view_dependencies(&select_sql, &self.catalog, MAX_VIEW_INLINE_DEPTH);
+                    let compile_deps = extract_sql_refs(&inlined_sql);
+                    let deps_are_base_tables = compile_deps
+                        .iter()
+                        .all(|dep| self.catalog.get_table(dep).is_some());
+                    let compile_result = if deps_are_base_tables {
+                        let table_schemas: HashMap<String, SchemaRef> = compile_deps
+                            .iter()
+                            .map(|dep| {
+                                (dep.clone(), query_time_relation_schema(&self.catalog, dep))
+                            })
+                            .collect();
+                        self.try_compile_view(
+                            &view_name,
+                            &inlined_sql,
+                            initial_columns.len(),
+                            &table_schemas,
+                            shard_db.clone(),
+                        )
+                        .await
+                    } else {
+                        Err(format!(
+                            "[RS-1019] view.compile_failed: view depends on non-base-table \
+                             relation(s) {compile_deps:?} that could not be inlined to base tables"
+                        ))
+                    };
+                    let staging_compiled = match compile_result {
+                        Ok(compiled) => Arc::new(compiled),
+                        Err(e) => {
+                            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                                "ERROR".to_owned(),
+                                "42601".to_owned(),
+                                format!(
+                                    "[RS-1019] view.compile_failed: {tag} '{view_name}' could not be \
+                                     compiled into an executable operator pipeline: {e}. Next steps: \
+                                     simplify the query to a supported shape (see \
+                                     docs/language-features.md), or reference only base tables."
+                                ),
+                            )))]);
+                        }
+                    };
+                    let single_source =
+                        if staging_compiled.join.is_none() && compile_deps.len() == 1 {
+                            Some(compile_deps[0].clone())
+                        } else {
+                            None
+                        };
+                    self.catalog.begin_replacement_backfill(&view_name, 0);
+
+                    if is_async_replace {
+                        let weak_self = self.self_ref.lock().clone();
+                        let view_name_bg = view_name.clone();
+                        let select_sql_bg = select_sql.clone();
+                        let initial_columns_bg = initial_columns.clone();
+                        let deps_bg = deps.clone();
+                        let workload_bg = workload_name.clone();
+                        let shard_db_bg = shard_db.clone();
+                        tokio::spawn(async move {
+                            let Some(handler) = weak_self.upgrade() else {
+                                return;
+                            };
+                            let _commit_guard = handler.shard_commit_lock.lock().await;
+                            handler.catalog.catch_up_replacement_backfill(&view_name_bg);
+                            if let Err(err) = handler
+                                .populate_compiled_view_instance(
+                                    &view_name_bg,
+                                    &staging_compiled,
+                                    single_source.as_deref(),
+                                    &shard_db_bg,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    view = %view_name_bg,
+                                    error = %err,
+                                    "async CREATE OR REPLACE MATERIALIZED VIEW backfill failed; keeping existing live view"
+                                );
+                                handler.catalog.publish_backfill(&view_name_bg);
+                                return;
+                            }
+                            let op_id = staging_compiled.sink_op_id.0;
+                            let pk = staging_compiled.pk.clone();
+                            let _ = rockstream_ops::sink::write_view_directory_entry(
+                                &shard_db_bg,
+                                &view_name_bg,
+                                OperatorId(op_id),
+                                initial_columns_bg.len(),
+                                &pk,
+                            )
+                            .await;
+                            let _ = shard_db_bg.flush().await;
+                            handler
+                                .compiled_views
+                                .insert(view_name_bg.clone(), staging_compiled);
+                            use crate::catalog_stubs::CatalogView;
+                            handler.catalog.add_view_with_deps(
+                                CatalogView {
+                                    name: view_name_bg.clone(),
+                                    sql: select_sql_bg,
+                                    columns: initial_columns_bg,
+                                    namespace: "public".to_string(),
+                                    op_id: Some(op_id),
+                                },
+                                deps_bg,
+                            );
+                            if let Some(wl) = workload_bg {
+                                handler.catalog.assign_view_workload(&view_name_bg, &wl);
+                            }
+                            handler.catalog.publish_backfill(&view_name_bg);
+                        });
+                        return Ok(vec![Response::Execution(Tag::new(tag).with_rows(0))]);
+                    }
+
+                    // Synchronous inline atomic cutover: hold `shard_commit_lock`
+                    // across backfill + swap so zero committed epochs are missed
+                    // while concurrent readers continue reading the live view.
+                    let _commit_guard = self.shard_commit_lock.lock().await;
+                    self.catalog.catch_up_replacement_backfill(&view_name);
+                    if let Err(error) = self
+                        .populate_compiled_view_instance(
+                            &view_name,
+                            &staging_compiled,
+                            single_source.as_deref(),
+                            &shard_db,
+                        )
+                        .await
+                    {
+                        self.catalog.publish_backfill(&view_name);
+                        return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                            "ERROR".to_owned(),
+                            "55000".to_owned(),
+                            format!(
+                                "[RS-4022] backfill.not_published: replacement backfill for '{view_name}' failed (existing live view preserved): {error}"
+                            ),
+                        )))]);
+                    }
+                    let op_id = staging_compiled.sink_op_id.0;
+                    let pk = staging_compiled.pk.clone();
+                    let _ = rockstream_ops::sink::write_view_directory_entry(
+                        &shard_db,
+                        &view_name,
+                        OperatorId(op_id),
+                        initial_columns.len(),
+                        &pk,
+                    )
+                    .await;
+                    let _ = shard_db.flush().await;
+                    self.compiled_views
+                        .insert(view_name.clone(), staging_compiled);
+                    use crate::catalog_stubs::CatalogView;
+                    self.catalog.add_view_with_deps(
+                        CatalogView {
+                            name: view_name.clone(),
+                            sql: select_sql,
+                            columns: initial_columns,
+                            namespace: "public".to_string(),
+                            op_id: Some(op_id),
+                        },
+                        deps,
+                    );
+                    if let Some(workload_name) = workload_name {
+                        self.catalog
+                            .assign_view_workload(&view_name, &workload_name);
+                    }
+                    self.catalog.publish_backfill(&view_name);
+                    if let Some(log) = &self.audit_log {
+                        let _ = log.append(&rockstream_types::audit::AuditEvent::now(
+                            "system",
+                            "replace_view",
+                            &view_name,
+                        ));
+                    }
+                    return Ok(vec![Response::Execution(Tag::new(tag).with_rows(0))]);
+                }
+            }
+
             // v0.51.4 Slice 8: attempt to compile the view's SELECT into an
             // executable operator chain *before* registering it in the
             // catalog. There is no DataFusion-materializer fallback left
@@ -9491,9 +10880,18 @@ impl GatewayHandler {
                     )))]);
                 };
                 let sink_operator_id = OperatorId(stable_name_id("distributed-sink", &view_name));
+                let namespace = conn_id
+                    .and_then(|id| {
+                        self.sessions
+                            .get(id)
+                            .map(|session| session.current_namespace.clone())
+                    })
+                    .unwrap_or_else(|| "public".to_owned());
                 let request = DeploymentRequest {
                     version: DEPLOYMENT_DESCRIPTOR_VERSION,
                     workload_id: WorkloadId(stable_name_id("workload", &view_name)),
+                    namespace: namespace.clone(),
+                    workload_name: view_name.clone(),
                     plan_json: serde_json::to_string(&plan).map_err(|error| {
                         PgWireError::ApiError(Box::new(GatewayError::QueryTimeExecutionFailed {
                             detail: format!("serialize distributed plan {view_name}: {error}"),
@@ -9533,10 +10931,27 @@ impl GatewayHandler {
                     merge_key_columns,
                     routing_columns,
                 };
-                data_plane.deploy(request).await.map_err(|error| {
-                    PgWireError::ApiError(Box::new(GatewayError::QueryTimeExecutionFailed {
-                        detail: format!("deploy distributed view {view_name}: {error}"),
-                    }))
+                let worker_request =
+                    rockstream_types::topology::WorkerMessage::DeployWorkload(request.clone());
+                let assertion = self
+                    .actor_assertion_for_request(
+                        conn_id,
+                        SecurityAction::ViewAuthor,
+                        PolicyScope::Resource {
+                            namespace,
+                            kind: ResourceKind::View,
+                            name: view_name.clone(),
+                        },
+                        &worker_request,
+                    )
+                    .await
+                    .map_err(|detail| GatewayError::QueryTimeExecutionFailed { detail })?;
+                let deployment = match assertion {
+                    Some(assertion) => data_plane.deploy_delegated(request, &assertion).await,
+                    None => data_plane.deploy(request).await,
+                };
+                deployment.map_err(|error| GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("deploy distributed view {view_name}: {error}"),
                 })?;
                 Some(sink_operator_id.0)
             } else if let Some(shard_db) = self.shard_db.clone() {
@@ -10426,10 +11841,13 @@ impl GatewayHandler {
             ))]);
         }
 
-        if !matches!(
-            parsed.catalog.as_str(),
-            "filesystem" | "glue" | "rest" | "hive" | "ducklake"
-        ) {
+        let is_kafka_sink = parsed.format.eq_ignore_ascii_case("KAFKA");
+        if !is_kafka_sink
+            && !matches!(
+                parsed.catalog.as_str(),
+                "filesystem" | "glue" | "rest" | "hive" | "ducklake"
+            )
+        {
             return Ok(vec![create_sink_error_response(format!(
                 "[RS-4007] CREATE SINK catalog '{}' is invalid; expected filesystem|glue|rest|hive|ducklake. Next steps: {CREATE_SINK_NEXT_STEPS}",
                 parsed.catalog
@@ -10513,6 +11931,7 @@ impl GatewayHandler {
             partition_by: parsed.partition_by,
             catalog: parsed.catalog,
             secret_name: secret_reference.clone(),
+            security_protocol: parsed.security_protocol,
             secret_consumer: secret_scope.as_ref().map(|(consumer, _)| *consumer),
             secret_namespace: secret_scope
                 .as_ref()
@@ -10520,6 +11939,76 @@ impl GatewayHandler {
             last_snapshot_epoch: None,
             state: "OK".to_string(),
         };
+
+        if is_kafka_sink {
+            if let Some(shard_db) = self.shard_db.clone() {
+                if let Some(view) = self.catalog.get_view(&parsed.view) {
+                    if let Some(op_id) = view.op_id {
+                        let connector_id = ConnectorId(
+                            parsed
+                                .format_version
+                                .unwrap_or_else(|| stable_name_id("kafka-sink", &parsed.name)),
+                        );
+                        let credentials = match self.kafka_sink_credentials(&entry).await {
+                            Ok(credentials) => credentials,
+                            Err(error) => {
+                                return Ok(vec![create_sink_error_response(format!(
+                                    "[RS-4008] sink.kafka_connect_failed: failed to resolve credentials for Kafka sink '{}': {error}. Next steps: verify the secret type, scope, and SASL transport.",
+                                    parsed.name,
+                                ))]);
+                            }
+                        };
+                        let kafka_sink_result = match credentials {
+                            Some((protocol, secret_name, version, username, password)) => {
+                                rockstream_connectors::KafkaSink::connect_with_sasl_plain(
+                                    connector_id,
+                                    &entry.path,
+                                    &entry.catalog,
+                                    &protocol,
+                                    &secret_name,
+                                    version,
+                                    &username,
+                                    &password,
+                                )
+                            }
+                            None => rockstream_connectors::KafkaSink::connect(
+                                connector_id,
+                                &entry.path,
+                                &entry.catalog,
+                            ),
+                        };
+                        let kafka_sink = match kafka_sink_result {
+                            Ok(sink) => sink,
+                            Err(error) => {
+                                return Ok(vec![create_sink_error_response(format!(
+                                    "[RS-4008] sink.kafka_connect_failed: failed to connect Kafka sink '{}' to '{}': {error}. Next steps: verify Kafka broker reachability, topic configuration, and secret credentials.",
+                                    parsed.name, entry.path,
+                                ))]);
+                            }
+                        };
+                        let mut view_sink = rockstream_ops::kafka_sink::KafkaViewSink::new(
+                            kafka_sink,
+                            shard_db,
+                            OperatorId(op_id),
+                            view.columns.len(),
+                        );
+                        if let Some(max_bytes) = entry.parquet_row_group_bytes {
+                            view_sink = view_sink.with_max_envelope_bytes(max_bytes as usize);
+                        }
+                        if let Err(err) = view_sink.drain_all().await {
+                            return Ok(vec![create_sink_error_response(format!(
+                                "[RS-4008] sink.kafka_delivery_failed: initial snapshot delivery for Kafka sink '{}' failed: {err}. Next steps: verify Kafka topic '{}' exists and broker is healthy.",
+                                parsed.name, entry.catalog
+                            ))]);
+                        }
+                        self.kafka_sinks.insert(
+                            parsed.name.clone(),
+                            Arc::new(tokio::sync::Mutex::new(view_sink)),
+                        );
+                    }
+                }
+            }
+        }
 
         let secret_reference_added = if let Some(secret_name) = secret_name {
             match self
@@ -10665,7 +12154,9 @@ impl GatewayHandler {
             })
         };
         match remove_result {
-            Ok(true) => {}
+            Ok(true) => {
+                self.kafka_sinks.remove(&name);
+            }
             Ok(false) => {
                 return Ok(vec![Response::Execution(
                     Tag::new("DROP SINK").with_rows(0),
@@ -10987,6 +12478,14 @@ impl GatewayHandler {
             Ok(parsed) => parsed,
             Err(message) => return Ok(vec![secret_error_response(message)]),
         };
+        let operation_id = conn_id.and_then(|id| {
+            self.sessions
+                .get(id)
+                .and_then(|session| session.idempotency_operation_id.clone())
+        });
+        let Some(operation_id) = operation_id else {
+            return Err(GatewayError::IdempotencyKeyRequired.into());
+        };
 
         let ns = match self.secret_namespace_id(namespace).await {
             Ok(namespace_id) => namespace_id,
@@ -11026,7 +12525,7 @@ impl GatewayHandler {
             name: parsed.name.clone(),
             consumer: None,
         };
-        let scope = match serde_json::to_string(&scope) {
+        let scope_json = match serde_json::to_string(&scope) {
             Ok(scope) => scope,
             Err(_) => {
                 return Ok(vec![secret_error_response(
@@ -11036,17 +12535,17 @@ impl GatewayHandler {
         };
         let audit = SecurityAuditRecord {
             format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
-            event_id: format!("gateway-secret-rotation-{:032x}", rand::random::<u128>()),
+            event_id: format!("gateway-secret-rotation-{operation_id}"),
             timestamp_ms: current_time_ms().max(1),
             actor,
             target: AuditField::Known(format!("secret:{namespace}/{}", parsed.name)),
-            scope: AuditField::Known(scope),
+            scope: AuditField::Known(scope_json),
             action: SecurityAuditClass::SecretRotation,
             outcome: SecurityAuditOutcome::Success,
             correlation: conn_id.map_or(AuditCorrelation::Unknown, |id| {
                 AuditCorrelation::Observed(id.to_string())
             }),
-            operation_id: AuditField::Unknown,
+            operation_id: AuditField::Known(operation_id.clone()),
             policy_revision: durable_principal
                 .as_ref()
                 .map_or(AuditField::Unknown, |principal| {
@@ -11055,12 +12554,49 @@ impl GatewayHandler {
             before_state: AuditField::Unknown,
             after_state: AuditField::Unknown,
         };
-        if let Err(err) = self
+        let operation = match self
             .secret_store
-            .alter_secret_with_security_audit(ns, &parsed.name, parsed.payload, "pgwire", audit)
+            .alter_secret_with_operation(
+                ns,
+                &parsed.name,
+                parsed.payload,
+                "pgwire",
+                rockstream_control::secret_store::SecretRotationOperationContext {
+                    actor_id: durable_principal.as_ref().map(|principal| principal.id.0),
+                    scope,
+                    operation_id: operation_id.clone(),
+                    audit,
+                },
+            )
             .await
         {
-            return Ok(vec![secret_error_response(err.to_string())]);
+            Ok(operation) => operation,
+            Err(error) => return Ok(vec![secret_error_response(error.to_string())]),
+        };
+        match operation.status() {
+            rockstream_control::OperationStatus::Succeeded => {}
+            rockstream_control::OperationStatus::Failed => {
+                return Ok(vec![secret_error_response(
+                    operation
+                        .result()
+                        .and_then(|result| result.get("error"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("secret rotation failed")
+                        .to_owned(),
+                )]);
+            }
+            rockstream_control::OperationStatus::Cancelled => {
+                return Ok(vec![secret_error_response(
+                    "secret rotation operation was cancelled before it started".to_owned(),
+                )]);
+            }
+            rockstream_control::OperationStatus::Pending
+            | rockstream_control::OperationStatus::Running
+            | rockstream_control::OperationStatus::Waiting => {
+                return Ok(vec![secret_error_response(
+                    "secret rotation operation is still in progress; retry using the same idempotency UUID".to_owned(),
+                )]);
+            }
         }
 
         Ok(vec![Response::Execution(
@@ -11862,65 +13398,66 @@ impl GatewayHandler {
     /// Handle `SET rockstream.<var> = <value>` — update per-connection session state.
     fn handle_set_rockstream(
         &self,
-        _q: &str,
-        ql: &str,
+        q: &str,
+        _ql: &str,
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<Response<'static>>> {
         let Some(id) = conn_id else {
             return Ok(vec![promote_response(Response::Execution(Tag::new("SET")))]);
         };
 
-        // Parse: SET [LOCAL] rockstream.<var> = <value>
-        // ql is already lowercased
-        let after_set = if let Some(rest) = ql.strip_prefix("set local rockstream.") {
-            rest
-        } else {
-            ql.strip_prefix("set rockstream.").unwrap_or(ql)
+        let Some((var_name, val_raw)) = parse_set_rockstream(q) else {
+            return Ok(vec![promote_response(Response::Execution(Tag::new("SET")))]);
         };
-        // after_set: "idempotency_key = 'str'" or "source_epoch = 42"
-        let eq_pos = after_set.find('=').unwrap_or(after_set.len());
-        let var_name = after_set[..eq_pos].trim();
-        let val_raw = after_set[eq_pos + 1..].trim().trim_end_matches(';');
 
         let mut session = self.sessions.entry(id.to_string()).or_default();
 
-        match var_name {
+        match var_name.as_str() {
             "idempotency_key" => {
-                if val_raw == "default" || val_raw == "null" || val_raw == "''" {
+                let key_str = decode_sql_setting_literal(val_raw);
+                if val_raw.eq_ignore_ascii_case("default")
+                    || val_raw.eq_ignore_ascii_case("null")
+                    || key_str.is_empty()
+                {
                     session.idempotency_key = None;
+                    session.idempotency_operation_id = None;
                 } else {
-                    // Strip surrounding single quotes
-                    let key_str = val_raw.trim_matches('\'');
-                    let hash = sha256_16(key_str.as_bytes());
-                    session.idempotency_key = Some(hash);
+                    session.idempotency_key = Some(sha256_16(key_str.as_bytes()));
+                    session.idempotency_operation_id = uuid::Uuid::parse_str(&key_str)
+                        .ok()
+                        .filter(|key| key.hyphenated().to_string() == key_str)
+                        .map(|key| key.hyphenated().to_string());
                 }
             }
             "source_epoch" => {
-                if let Ok(n) = val_raw.trim_matches('\'').parse::<u64>() {
+                if let Ok(n) = decode_sql_setting_literal(val_raw).parse::<u64>() {
                     session.source_epoch_envelope = Some(n);
                 }
             }
             "wait_for" => {
                 // Accepts JSON: {"table_name":"t","source_epoch":42}
-                let json_str = val_raw.trim_matches('\'');
-                if let Ok(token) = serde_json::from_str::<FreshnessToken>(json_str) {
+                let json_str = decode_sql_setting_literal(val_raw);
+                if let Ok(token) = serde_json::from_str::<FreshnessToken>(&json_str) {
                     session.wait_for_token = Some(token);
                     session.max_staleness = None;
                 }
             }
             "session_wait_for" => {
-                session.session_wait_for_enabled = val_raw.trim_matches('\'') != "off";
+                session.session_wait_for_enabled =
+                    !decode_sql_setting_literal(val_raw).eq_ignore_ascii_case("off");
                 if session.session_wait_for_enabled {
                     session.max_staleness = None;
                 }
             }
             "session_wait_for_timeout_ms" => {
-                if let Ok(n) = val_raw.trim_matches('\'').parse::<u64>() {
+                if let Ok(n) = decode_sql_setting_literal(val_raw).parse::<u64>() {
                     session.session_wait_for_timeout_ms = n;
                 }
             }
             "max_staleness" => {
-                let parsed = parse_duration_literal(val_raw.trim_matches('\''));
+                let parsed = parse_duration_literal(
+                    &decode_sql_setting_literal(val_raw).to_ascii_lowercase(),
+                );
                 session.max_staleness = parsed;
                 session.frontier_age_ms = None;
                 session.pending_notice = None;
@@ -12002,16 +13539,69 @@ impl GatewayHandler {
         } else {
             idempotency_key
         };
-        if !server_generated {
+        let ops = entry.drain();
+        drop(entry); // release DashMap entry guard before await
+        self.commit_local_ops(
+            shard_db,
+            ops,
+            idempotency_key,
+            !server_generated,
+            Some(conn_id),
+        )
+        .await
+    }
+
+    async fn commit_local_ops(
+        &self,
+        shard_db: &Arc<rockstream_storage::ShardDb>,
+        ops: Vec<DmlOp>,
+        idempotency_key: Option<[u8; 16]>,
+        check_idempotency: bool,
+        conn_id: Option<&str>,
+    ) -> PgWireResult<Vec<Response<'static>>> {
+        if check_idempotency {
+            if let Some(barrier) = &self.commit_lock_barrier_for_test {
+                barrier.wait().await;
+            }
+        }
+        // Serialize the entire local commit through idempotency admission,
+        // materialized-view refresh, durable flush and subscription publication.
+        // Releasing this guard before flushing allowed a later epoch to publish
+        // out of order; checking idempotency before acquiring it allowed
+        // concurrent identical retries to both pass and double-apply.
+        let _commit_guard = self.shard_commit_lock.lock().await;
+        if check_idempotency {
             if let Some(key_hash) = idempotency_key {
-                // Explicit client key — check for prior commit with this key
-                // (idempotent replay → noop). Server-generated keys skip this
-                // lookup: they are freshly minted per commit and can never
-                // collide with a previous one.
+                // Explicit client key — check under the commit lock so concurrent
+                // identical retries linearize and at most one applies.
                 match shard_db.get_idempotency_epoch(0, key_hash).await {
-                    Ok(Some(_prev_epoch)) => {
-                        // Already committed — discard buffer and return COMMIT noop
-                        entry.clear();
+                    Ok(Some(prev_epoch)) => {
+                        if let Some(conn_id) = conn_id {
+                            // Discard transactional NOTIFYs — a replayed commit must
+                            // not re-deliver or leak buffered notifications.
+                            self.pending_notifies.remove(conn_id);
+                            let table_name = ops
+                                .iter()
+                                .last()
+                                .map(|op| match op {
+                                    DmlOp::Insert { table, .. }
+                                    | DmlOp::Update { table, .. }
+                                    | DmlOp::Delete { table, .. } => table.clone(),
+                                })
+                                .unwrap_or_default();
+                            if !table_name.is_empty() {
+                                if let Some(mut session) = self.sessions.get_mut(conn_id) {
+                                    let should_update = session
+                                        .last_written_epoch
+                                        .as_ref()
+                                        .is_none_or(|tok| prev_epoch > tok.source_epoch);
+                                    if should_update {
+                                        session.last_written_epoch =
+                                            Some(FreshnessToken::new(table_name, prev_epoch));
+                                    }
+                                }
+                            }
+                        }
                         return Ok(vec![promote_response(Response::TransactionEnd(Tag::new(
                             "COMMIT",
                         )))]);
@@ -12025,31 +13615,24 @@ impl GatewayHandler {
                 }
             }
         }
-
-        let ops = entry.drain();
-        drop(entry); // release DashMap entry guard before await
-        self.commit_local_ops(shard_db, ops, idempotency_key, Some(conn_id))
+        // Reject before view recovery can flush unrelated work for this commit attempt.
+        let (ops, conflicted) = committed_dml_ops(shard_db, ops)
             .await
-    }
-
-    async fn commit_local_ops(
-        &self,
-        shard_db: &Arc<rockstream_storage::ShardDb>,
-        ops: Vec<DmlOp>,
-        idempotency_key: Option<[u8; 16]>,
-        conn_id: Option<&str>,
-    ) -> PgWireResult<Vec<Response<'static>>> {
-        // Serialize the entire local commit through materialized-view refresh,
-        // durable flush and subscription publication. Releasing this guard
-        // before flushing allowed a later epoch to publish out of order.
-        let _commit_guard = self.shard_commit_lock.lock().await;
+            .map_err(|e| PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e))))?;
+        if conflicted {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "40001".to_owned(),
+                "transaction conflict: a row changed or a primary key became occupied after this transaction staged its writes; no writes were committed. Re-read current rows, resolve any key conflicts, and retry the transaction.".to_owned(),
+            ))));
+        }
         self.recover_pending_views_locked()
             .await
             .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-        let (epoch, ops, changes) = {
-            let ops = committed_dml_ops(shard_db, ops).await.map_err(|e| {
-                PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
-            })?;
+        self.ensure_no_pending_distributed_locked()
+            .await
+            .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+        let (epoch, ops, changes, distributed_deltas) = {
             if ops.is_empty() {
                 if let Some(conn_id) = conn_id {
                     self.flush_pending_notifies(conn_id);
@@ -12082,19 +13665,95 @@ impl GatewayHandler {
                 &epoch.to_be_bytes(),
             );
 
+            let changed_tables: std::collections::HashSet<String> = ops
+                .iter()
+                .map(|op| match op {
+                    DmlOp::Insert { table, .. }
+                    | DmlOp::Update { table, .. }
+                    | DmlOp::Delete { table, .. } => table.clone(),
+                })
+                .collect();
             let views = if self.distributed_data_plane.is_none() {
-                let changed_tables = ops
-                    .iter()
-                    .map(|op| match op {
-                        DmlOp::Insert { table, .. }
-                        | DmlOp::Update { table, .. }
-                        | DmlOp::Delete { table, .. } => table.clone(),
-                    })
-                    .collect();
                 self.reachable_compiled_views(&changed_tables)
             } else {
                 Vec::new()
             };
+            let mut distributed_deltas = Vec::new();
+            if self.distributed_data_plane.is_some() {
+                let namespace = conn_id
+                    .and_then(|id| {
+                        self.sessions
+                            .get(id)
+                            .map(|session| session.current_namespace.clone())
+                    })
+                    .unwrap_or_else(|| "public".to_owned());
+                for view_name in self.reachable_compiled_views(&changed_tables) {
+                    for source in self.catalog.get_view_deps(&view_name) {
+                        if !changed_tables
+                            .iter()
+                            .any(|table| table.eq_ignore_ascii_case(&source))
+                        {
+                            continue;
+                        }
+                        let rows = runtime_rows_for_table(&source, &ops);
+                        if rows.is_empty() {
+                            continue;
+                        }
+                        let request = SourceDeltaRequest {
+                            version: DEPLOYMENT_DESCRIPTOR_VERSION,
+                            request_id: format!(
+                                "{}-{epoch}-{}",
+                                std::process::id(),
+                                NEXT_DISTRIBUTED_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+                            ),
+                            workload_id: WorkloadId(stable_name_id("workload", &view_name)),
+                            epoch,
+                            source: source.clone(),
+                            rows,
+                        };
+                        let assertion = self
+                            .actor_assertion_for_request(
+                                conn_id,
+                                SecurityAction::DataWrite,
+                                PolicyScope::Resource {
+                                    namespace: namespace.clone(),
+                                    kind: ResourceKind::Table,
+                                    name: source,
+                                },
+                                &rockstream_types::topology::WorkerMessage::SubmitSourceDelta(
+                                    request.clone(),
+                                ),
+                            )
+                            .await
+                            .map_err(|error| {
+                                PgWireError::ApiError(Box::new(
+                                    GatewayError::QueryTimeExecutionFailed {
+                                        detail: format!(
+                                            "distributed view refresh {view_name}: {error}"
+                                        ),
+                                    },
+                                ))
+                            })?;
+                        distributed_deltas.push((view_name.clone(), request, assertion));
+                    }
+                }
+            }
+            if !distributed_deltas.is_empty() {
+                let pending = distributed_deltas
+                    .iter()
+                    .map(|(view, request, _)| {
+                        format!(
+                            "{} {} {} {}",
+                            view, request.epoch, request.source, request.request_id
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                batch.put(
+                    &rockstream_storage::ShardKeyEncoder::meta_key(b"distributed-source-pending"),
+                    pending.as_bytes(),
+                );
+            }
             *self.pending_view_recovery.lock() = views.clone();
             for view in &views {
                 if let Err(error) = self
@@ -12124,6 +13783,7 @@ impl GatewayHandler {
                     }
                 }
             }
+            self.deliver_kafka_sinks_for_views(&views).await;
             // Publish a complete committed epoch per table under one registry
             // lock. Readers cannot poll half an UPDATE or half an epoch.
             let mut changes: std::collections::HashMap<
@@ -12178,7 +13838,7 @@ impl GatewayHandler {
             }
             // Do not expose this epoch yet. The table write is staged, but
             // dependent materialized view writes and the durable flush follow.
-            (epoch, ops, changes)
+            (epoch, ops, changes, distributed_deltas)
         };
         let affected = ops.len();
 
@@ -12187,52 +13847,21 @@ impl GatewayHandler {
         // every view that transitively depends on them.  This converts the
         // serving shard from a raw DML store into a live view serving layer.
         {
-            let changed_tables: std::collections::HashSet<String> = ops
-                .iter()
-                .map(|op| match op {
-                    DmlOp::Insert { table, .. } => table.clone(),
-                    DmlOp::Update { table, .. } => table.clone(),
-                    DmlOp::Delete { table, .. } => table.clone(),
-                })
-                .collect();
             if let Some(data_plane) = &self.distributed_data_plane {
-                for view_name in self.reachable_compiled_views(&changed_tables) {
-                    for source in self.catalog.get_view_deps(&view_name) {
-                        if !changed_tables
-                            .iter()
-                            .any(|table| table.eq_ignore_ascii_case(&source))
-                        {
-                            continue;
+                for (view_name, request, assertion) in &distributed_deltas {
+                    let response = match assertion {
+                        Some(assertion) => {
+                            data_plane
+                                .submit_delta_delegated(request.clone(), assertion)
+                                .await
                         }
-                        let rows = runtime_rows_for_table(&source, &ops);
-                        if rows.is_empty() {
-                            continue;
-                        }
-                        let request_id = format!(
-                            "{}-{epoch}-{}",
-                            std::process::id(),
-                            NEXT_DISTRIBUTED_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
-                        );
-                        data_plane
-                            .submit_delta(SourceDeltaRequest {
-                                version: DEPLOYMENT_DESCRIPTOR_VERSION,
-                                request_id,
-                                workload_id: WorkloadId(stable_name_id("workload", &view_name)),
-                                epoch,
-                                source,
-                                rows,
-                            })
-                            .await
-                            .map_err(|error| {
-                                PgWireError::ApiError(Box::new(
-                                    GatewayError::QueryTimeExecutionFailed {
-                                        detail: format!(
-                                            "distributed view refresh {view_name}: {error}"
-                                        ),
-                                    },
-                                ))
-                            })?;
-                    }
+                        None => data_plane.submit_delta(request.clone()).await,
+                    };
+                    response.map_err(|error| {
+                        PgWireError::ApiError(Box::new(GatewayError::QueryTimeExecutionFailed {
+                            detail: format!("distributed view refresh {view_name}: {error}; preserve source input and shard storage and contact the operator before retrying"),
+                        }))
+                    })?;
                 }
             }
             // Flush the WAL so that materialised view output is immediately
@@ -12243,6 +13872,14 @@ impl GatewayHandler {
             shard_db.flush().await.map_err(|e| {
                 PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
             })?;
+            if !distributed_deltas.is_empty() {
+                shard_db
+                    .delete(&rockstream_storage::ShardKeyEncoder::meta_key(
+                        b"distributed-source-pending",
+                    ))
+                    .await
+                    .map_err(|e| PgWireError::ApiError(Box::new(GatewayError::Storage(e))))?;
+            }
             self.frontier_published_at_ms
                 .store(current_time_ms(), Ordering::SeqCst);
             self.pending_view_recovery.lock().clear();
@@ -12342,6 +13979,7 @@ impl GatewayHandler {
             if let Some(mut session) = self.sessions.get_mut(id) {
                 session.cursors.clear();
                 session.idempotency_key = None;
+                session.idempotency_operation_id = None;
                 session.source_epoch_envelope = None;
                 session.wait_for_token = None;
                 session.last_written_epoch = None;
@@ -12960,22 +14598,37 @@ impl GatewayHandler {
             .get(&table)
             .map(|entry| entry.value().clone());
 
-        let decimal_columns: Vec<_> = self
-            .catalog
-            .get_table(&table)
+        let catalog_table = self.catalog.get_table(&table);
+        let column_types = catalog_table
+            .as_ref()
+            .map(|ct| catalog_column_types(&ct.columns))
+            .unwrap_or_default();
+        let decimal_columns: Vec<_> = catalog_table
+            .as_ref()
             .into_iter()
-            .flat_map(|table| table.columns)
+            .flat_map(|table| table.columns.iter())
             .filter_map(|column| {
                 let datatype = string_to_arrow_datatype(&column.data_type);
-                matches!(datatype, DataType::Decimal128(_, _)).then_some((column.name, datatype))
+                matches!(datatype, DataType::Decimal128(_, _))
+                    .then_some((column.name.clone(), datatype))
             })
             .collect();
 
-        let pk_cols = self
-            .catalog
-            .get_table(&table)
-            .map(|ct| ct.pk_cols)
-            .unwrap_or_default();
+        let pk_cols = catalog_table.map(|ct| ct.pk_cols).unwrap_or_default();
+
+        if !pk_cols.is_empty() {
+            if let Err(e) = self.ensure_table_pk_keys_reconciled(&table).await {
+                let msg = e.to_string();
+                let sqlstate = if msg.contains("RS-2057") {
+                    "23505"
+                } else {
+                    "58000"
+                };
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), msg),
+                )))]);
+            }
+        }
 
         let mut returning_rows: Vec<Vec<String>> = Vec::with_capacity(rows.len());
         let mut row_keys = Vec::with_capacity(rows.len());
@@ -13026,6 +14679,22 @@ impl GatewayHandler {
                 }
             }
 
+            // Validate and normalize primary key columns against declared types.
+            for pk in &pk_cols {
+                if let Some(dt) = column_types.get(&pk.to_lowercase()) {
+                    if let Some(value) = value_map.get_mut(pk).filter(|v| v.as_str() != r"\N") {
+                        match normalize_typed_value(value, dt) {
+                            Ok(normalized) => *value = normalized,
+                            Err(err) => {
+                                return Ok(vec![promote_response(Response::Error(Box::new(
+                                    ErrorInfo::new("ERROR".to_owned(), "22P02".to_owned(), err),
+                                )))]);
+                            }
+                        }
+                    }
+                }
+            }
+
             let stored_cols = if table_columns.is_empty() {
                 cols.clone()
             } else {
@@ -13040,7 +14709,19 @@ impl GatewayHandler {
                         .unwrap_or_else(|| r"\N".to_string())
                 })
                 .collect();
-            let row_key = build_table_row_key(&pk_cols, &stored_cols, &stored_values);
+            let row_key = match build_table_row_key_typed(
+                &pk_cols,
+                &stored_cols,
+                &stored_values,
+                &column_types,
+            ) {
+                Ok(k) => k,
+                Err(err) => {
+                    return Ok(vec![promote_response(Response::Error(Box::new(
+                        ErrorInfo::new("ERROR".to_owned(), "22P02".to_owned(), err),
+                    )))]);
+                }
+            };
 
             if !pk_cols.is_empty() {
                 if !seen_keys.insert(row_key.clone()) {
@@ -13280,6 +14961,93 @@ impl GatewayHandler {
         let mut response = QueryResponse::new(schema, stream);
         response.set_command_tag(command);
         promote_response(Response::Query(response))
+    }
+
+    /// Reconcile any legacy unescaped `{col}={val}` persisted keys under
+    /// `view_output/{table}/` to the canonical `__pk1:` typed tuple format.
+    /// Fails closed if two persisted rows map to the same canonical primary key
+    /// or if a persisted key's row image cannot be normalized.
+    async fn ensure_table_pk_keys_reconciled(&self, table: &str) -> Result<(), GatewayError> {
+        let table_lower = table.to_lowercase();
+        if self.reconciled_pk_tables.contains(&table_lower) {
+            return Ok(());
+        }
+        let Some(shard_db) = &self.shard_db else {
+            return Ok(());
+        };
+        let Some(catalog_table) = self.catalog.get_table(table) else {
+            return Ok(());
+        };
+        if catalog_table.pk_cols.is_empty() {
+            self.reconciled_pk_tables.insert(table_lower);
+            return Ok(());
+        }
+
+        let prefix = format!("view_output/{table}/");
+        let kvs = shard_db.scan_prefix(prefix.as_bytes()).await?;
+        let col_names: Vec<String> = catalog_table
+            .columns
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        let col_types = catalog_column_types(&catalog_table.columns);
+
+        let mut seen_canonical = HashSet::new();
+        let mut legacy_entries = Vec::new();
+        for (k, v) in kvs {
+            let Ok(key_str) = std::str::from_utf8(&k) else {
+                continue;
+            };
+            let Some(row_key) = key_str.strip_prefix(&prefix) else {
+                continue;
+            };
+            if row_key.starts_with(PK_KEY_PREFIX_V1) {
+                if !seen_canonical.insert(row_key.to_string()) {
+                    return Err(GatewayError::QueryTimeExecutionFailed {
+                        detail: format!(
+                            "[RS-2057] duplicate canonical primary key '{row_key}' persisted on table '{table}'"
+                        ),
+                    });
+                }
+            } else if !row_key.starts_with("__heap_") {
+                legacy_entries.push((k, v));
+            }
+        }
+
+        if !legacy_entries.is_empty() {
+            let mut batch = rockstream_storage::WriteBatch::new();
+            for (old_key, val_bytes) in legacy_entries {
+                let val_str = std::str::from_utf8(&val_bytes).map_err(|_| {
+                    GatewayError::QueryTimeExecutionFailed {
+                        detail: format!(
+                            "[RS-2057] legacy row on table '{table}' is not valid UTF-8 and cannot be reconciled"
+                        ),
+                    }
+                })?;
+                let fields: Vec<String> = val_str.split('\t').map(|s| s.to_string()).collect();
+                let canonical_row_key =
+                    build_pk_row_key_typed(&catalog_table.pk_cols, &col_names, &fields, &col_types)
+                        .map_err(|e| GatewayError::QueryTimeExecutionFailed {
+                            detail: format!(
+                        "[RS-2057] legacy primary key reconciliation failed on table '{table}': {e}"
+                    ),
+                        })?;
+                if !seen_canonical.insert(canonical_row_key.clone()) {
+                    return Err(GatewayError::QueryTimeExecutionFailed {
+                        detail: format!(
+                            "[RS-2057] legacy primary key reconciliation conflict on table '{table}': multiple persisted rows map to the same canonical primary key"
+                        ),
+                    });
+                }
+                let new_key = format!("view_output/{table}/{canonical_row_key}");
+                batch.delete(&old_key);
+                batch.put(new_key.as_bytes(), &val_bytes);
+            }
+            shard_db.write_batch(batch).await?;
+        }
+
+        self.reconciled_pk_tables.insert(table_lower);
+        Ok(())
     }
 
     async fn check_pk_exists(
@@ -13574,6 +15342,20 @@ impl GatewayHandler {
             .unwrap_or_default();
         let pk_cols = table_entry.map(|ct| ct.pk_cols).unwrap_or_default();
 
+        if !pk_cols.is_empty() {
+            if let Err(e) = self.ensure_table_pk_keys_reconciled(&table).await {
+                let msg = e.to_string();
+                let sqlstate = if msg.contains("RS-2057") {
+                    "23505"
+                } else {
+                    "58000"
+                };
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), msg),
+                )))]);
+            }
+        }
+
         let matched_rows = match self
             .find_matching_rows_predicate(&table, &table_columns, predicate.as_ref(), conn_id)
             .await
@@ -13619,16 +15401,18 @@ impl GatewayHandler {
         let mut new_keys_in_batch = HashSet::new();
 
         for (old_row_key, existing_fields) in &matched_rows {
-            let mut row_map: HashMap<String, Option<String>> = HashMap::new();
+            let mut original_row: HashMap<String, Option<String>> = HashMap::new();
             for (i, col) in table_columns.iter().enumerate() {
                 let val = existing_fields.get(i).cloned();
                 let val_opt = match val {
                     Some(ref s) if s == r"\N" => None,
                     other => other,
                 };
-                row_map.insert(col.clone(), val_opt);
+                original_row.insert(col.clone(), val_opt);
             }
 
+            let mut staged_assignments: Vec<(String, Option<String>)> =
+                Vec::with_capacity(assignments.len());
             for (col_name, scalar_expr) in &assignments {
                 let Some(target_type) = column_types.get(col_name) else {
                     return Ok(vec![promote_response(Response::Error(Box::new(
@@ -13639,34 +15423,47 @@ impl GatewayHandler {
                         ),
                     )))]);
                 };
-                let new_val =
-                    match scalar_expr.evaluate_assignment(&row_map, &column_types, target_type) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            let err_str = e.to_string();
-                            let sqlstate = if err_str.contains("RS-1016") {
-                                if err_str.contains("division by zero") {
-                                    "22012"
-                                } else {
-                                    "22003"
-                                }
-                            } else if err_str.contains("RS-1013") {
-                                "0A000"
+                let new_val = match scalar_expr.evaluate_assignment(
+                    &original_row,
+                    &column_types,
+                    target_type,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        let sqlstate = if err_str.contains("RS-1016") {
+                            if err_str.contains("division by zero") {
+                                "22012"
                             } else {
-                                "42601"
-                            };
-                            return Ok(vec![promote_response(Response::Error(Box::new(
-                                ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), err_str),
-                            )))]);
-                        }
-                    };
-                row_map.insert(col_name.clone(), new_val);
+                                "22003"
+                            }
+                        } else if err_str.contains("RS-1013") {
+                            "0A000"
+                        } else {
+                            "42601"
+                        };
+                        return Ok(vec![promote_response(Response::Error(Box::new(
+                            ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), err_str),
+                        )))]);
+                    }
+                };
+                staged_assignments.push((col_name.clone(), new_val));
+            }
+
+            let mut updated_row = original_row;
+            for (col_name, new_val) in staged_assignments {
+                let target_col = table_columns
+                    .iter()
+                    .find(|tc| tc.eq_ignore_ascii_case(&col_name))
+                    .cloned()
+                    .unwrap_or(col_name);
+                updated_row.insert(target_col, new_val);
             }
 
             let new_vals: Vec<String> = table_columns
                 .iter()
                 .map(|c| {
-                    row_map
+                    updated_row
                         .get(c)
                         .and_then(|o| o.clone())
                         .unwrap_or_else(|| r"\N".to_string())
@@ -13674,7 +15471,14 @@ impl GatewayHandler {
                 .collect();
 
             let new_row_key = if !pk_cols.is_empty() {
-                build_pk_row_key(&pk_cols, &table_columns, &new_vals)
+                match build_pk_row_key_typed(&pk_cols, &table_columns, &new_vals, &column_types) {
+                    Ok(k) => k,
+                    Err(err) => {
+                        return Ok(vec![promote_response(Response::Error(Box::new(
+                            ErrorInfo::new("ERROR".to_owned(), "22P02".to_owned(), err),
+                        )))]);
+                    }
+                }
             } else {
                 old_row_key.clone()
             };
@@ -13839,9 +15643,26 @@ impl GatewayHandler {
         };
 
         let table_entry = self.catalog.get_table(&table);
+        let has_pk = table_entry
+            .as_ref()
+            .is_some_and(|ct| !ct.pk_cols.is_empty());
         let table_columns: Vec<String> = table_entry
             .map(|ct| ct.columns.iter().map(|c| c.name.clone()).collect())
             .unwrap_or_default();
+
+        if has_pk {
+            if let Err(e) = self.ensure_table_pk_keys_reconciled(&table).await {
+                let msg = e.to_string();
+                let sqlstate = if msg.contains("RS-2057") {
+                    "23505"
+                } else {
+                    "58000"
+                };
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), msg),
+                )))]);
+            }
+        }
 
         let matched_rows = match self
             .find_matching_rows_predicate(&table, &table_columns, predicate.as_ref(), conn_id)
@@ -14060,7 +15881,7 @@ impl GatewayHandler {
         let Some(shard_db) = &self.shard_db else {
             return Ok(rows.len()); // no storage — pretend success
         };
-        self.commit_local_ops(shard_db, rows.to_vec(), None, None)
+        self.commit_local_ops(shard_db, rows.to_vec(), None, false, None)
             .await?;
 
         // Audit: log the flush.
@@ -15636,12 +17457,28 @@ impl CopyHandler for GatewayHandler {
                     state.columns.clone()
                 };
 
-                let row_key = cols
-                    .iter()
-                    .zip(fields.iter())
-                    .map(|(c, v)| format!("{c}={v}"))
-                    .collect::<Vec<_>>()
-                    .join("|");
+                let table_entry = self.catalog.get_table(&state.table);
+                let pk_cols = table_entry
+                    .as_ref()
+                    .map(|ct| ct.pk_cols.clone())
+                    .unwrap_or_default();
+                let column_types = table_entry
+                    .as_ref()
+                    .map(|ct| catalog_column_types(&ct.columns))
+                    .unwrap_or_default();
+                let field_strings: Vec<String> = fields.iter().map(|s| (*s).to_string()).collect();
+                let row_key = if !pk_cols.is_empty() {
+                    build_pk_row_key_typed(&pk_cols, &cols, &field_strings, &column_types)
+                } else {
+                    build_row_key_typed(&cols, &field_strings, &column_types)
+                }
+                .map_err(|err| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "22P02".to_owned(),
+                        err,
+                    )))
+                })?;
                 let values_tsv = fields.join("\t");
                 let op_bytes = values_tsv.len() + row_key.len() + state.table.len() + 64;
 
@@ -16004,6 +17841,22 @@ async fn relay_negotiated_3_2_connection(
 // ── GatewayServer ─────────────────────────────────────────────────────────────
 
 /// A running PostgreSQL-wire-protocol server.
+/// Cloneable read-only handle to a gateway's shared time-slice window fabric.
+#[derive(Clone)]
+pub struct SharedWindowHandle {
+    fabric: Arc<Mutex<rockstream_ops::SharedWindowFabric>>,
+}
+
+impl SharedWindowHandle {
+    pub fn consumer_count(&self, spec: &rockstream_types::SharedWindowSpec) -> Option<usize> {
+        self.fabric.lock().consumer_count(spec)
+    }
+
+    pub fn slice_count(&self, spec: &rockstream_types::SharedWindowSpec) -> Option<usize> {
+        self.fabric.lock().slice_count(spec)
+    }
+}
+
 pub struct GatewayServer {
     addr: std::net::SocketAddr,
     handler: Arc<GatewayHandler>,
@@ -16083,12 +17936,55 @@ impl GatewayServer {
         self
     }
 
+    pub fn with_stateless_read_router(
+        mut self,
+        router: Arc<crate::stateless_serving::StatelessReadRouter>,
+    ) -> Self {
+        if let Some(handler) = Arc::get_mut(&mut self.handler) {
+            handler.stateless_read_router = Some(router);
+        }
+        self
+    }
+
+    pub fn with_read_admission(
+        mut self,
+        admission: Arc<crate::stateless_serving::ReadAdmissionController>,
+    ) -> Self {
+        if let Some(handler) = Arc::get_mut(&mut self.handler) {
+            handler.read_admission = admission;
+        }
+        self
+    }
+
+    pub fn with_actor_assertion_signer(
+        mut self,
+        signer: rockstream_control::delegation::ActorAssertionSigner,
+    ) -> Self {
+        if let Some(handler) = Arc::get_mut(&mut self.handler) {
+            handler.actor_assertion_signer = Some(Arc::new(signer));
+        }
+        self
+    }
+
     /// Attach a custom `SecretStore` to the server.
     pub fn with_secret_store(mut self, secret_store: Arc<rockstream_control::SecretStore>) -> Self {
         if let Some(h) = Arc::get_mut(&mut self.handler) {
             h.secret_store = secret_store;
         }
         self
+    }
+
+    #[doc(hidden)]
+    pub fn with_commit_lock_barrier_for_test(mut self, barrier: Arc<tokio::sync::Barrier>) -> Self {
+        if let Some(h) = Arc::get_mut(&mut self.handler) {
+            h.commit_lock_barrier_for_test = Some(barrier);
+        }
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn subscribe_registry(&self) -> &Arc<SubscribeRegistry> {
+        &self.handler.subscribe_registry
     }
 
     /// Create a new gateway server listening on `addr`.
@@ -16117,6 +18013,13 @@ impl GatewayServer {
             addr,
             GatewayHandler::with_shard_db(catalog, view_reader, shard_db),
         )
+    }
+
+    /// Return a cloneable handle to inspect the shared time-slice window fabric.
+    pub fn shared_window_handle(&self) -> SharedWindowHandle {
+        SharedWindowHandle {
+            fabric: Arc::clone(&self.handler.shared_windows),
+        }
     }
 
     /// Create a shard-backed gateway whose query-time reads scatter across the
@@ -18007,6 +19910,67 @@ fn query_time_relation_schema(catalog: &CatalogStubs, relation_name: &str) -> Sc
     )]))
 }
 
+fn sort_rows_by_order(
+    rows: &mut [Vec<u8>],
+    schema_fields: &[FieldInfo],
+    order_by: &[(String, bool, bool)],
+) {
+    if order_by.is_empty() {
+        return;
+    }
+    let col_idx: std::collections::HashMap<String, usize> = schema_fields
+        .iter()
+        .enumerate()
+        .map(|(i, field)| (field.name().to_lowercase(), i))
+        .collect();
+    rows.sort_by(|a, b| {
+        let a_fields: Vec<&str> = std::str::from_utf8(a).unwrap_or("").split('\t').collect();
+        let b_fields: Vec<&str> = std::str::from_utf8(b).unwrap_or("").split('\t').collect();
+        for (col, desc, nulls_first) in order_by {
+            let Some(&idx) = col_idx.get(col.as_str()) else {
+                continue;
+            };
+            let av = a_fields.get(idx).copied().unwrap_or(r"\N");
+            let bv = b_fields.get(idx).copied().unwrap_or(r"\N");
+            let ord = match (av == r"\N", bv == r"\N") {
+                (true, true) => std::cmp::Ordering::Equal,
+                (true, false) => {
+                    if *nulls_first {
+                        std::cmp::Ordering::Less
+                    } else {
+                        std::cmp::Ordering::Greater
+                    }
+                }
+                (false, true) => {
+                    if *nulls_first {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        std::cmp::Ordering::Less
+                    }
+                }
+                (false, false) => {
+                    let base = if let (Ok(an), Ok(bn)) = (av.parse::<i64>(), bv.parse::<i64>()) {
+                        an.cmp(&bn)
+                    } else if let (Ok(af), Ok(bf)) = (av.parse::<f64>(), bv.parse::<f64>()) {
+                        af.partial_cmp(&bf).unwrap_or(std::cmp::Ordering::Equal)
+                    } else {
+                        av.cmp(bv)
+                    };
+                    if *desc {
+                        base.reverse()
+                    } else {
+                        base
+                    }
+                }
+            };
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        a.cmp(b)
+    });
+}
+
 fn stored_rows_to_batches(
     catalog: &CatalogStubs,
     relation_name: &str,
@@ -18196,29 +20160,71 @@ fn runtime_rows_for_table(table: &str, ops: &[DmlOp]) -> Vec<RuntimeRow> {
 }
 
 fn merge_workload_snapshot(snapshot: &WorkloadSnapshot) -> Result<Vec<Vec<u8>>, GatewayError> {
-    let mut shard_rows = Vec::new();
-    for shard in &snapshot.shards {
-        let mut state = BTreeMap::<String, i64>::new();
-        for delta in &shard.deltas {
-            for row in &delta.rows {
-                *state.entry(row.values_tsv.clone()).or_default() += row.weight;
-            }
-        }
-        shard_rows.extend(
-            state
-                .into_iter()
-                .filter_map(|(row, weight)| (weight > 0).then_some(row)),
-        );
+    let invalid_snapshot = || GatewayError::QueryTimeExecutionFailed {
+        detail: "distributed workload snapshot is incomplete or unsupported".to_owned(),
+    };
+    if snapshot.version != rockstream_types::data_plane::WORKLOAD_SNAPSHOT_VERSION
+        || !snapshot.complete
+    {
+        return Err(invalid_snapshot());
+    }
+    let column_count = snapshot.deployment.output_columns.len();
+    let merge_keys = &snapshot.deployment.merge_key_columns;
+    if column_count == 0 || merge_keys.iter().any(|column| *column >= column_count) {
+        return Err(invalid_snapshot());
     }
 
-    let merge_keys = &snapshot.deployment.merge_key_columns;
+    let mut shard_rows = Vec::new();
+    for shard in &snapshot.shards {
+        if shard.lease_token.is_none() || !shard.deltas.is_empty() {
+            return Err(invalid_snapshot());
+        }
+        let mut state = BTreeMap::<String, i64>::new();
+        for row in &shard.rows {
+            let weight = state.entry(row.values_tsv.clone()).or_default();
+            *weight = weight.checked_add(row.weight).ok_or_else(|| {
+                GatewayError::QueryTimeExecutionFailed {
+                    detail: "distributed row multiplicity overflow".to_owned(),
+                }
+            })?;
+        }
+        for (row, weight) in state {
+            if weight <= 0 {
+                continue;
+            }
+            let fields = row.split('\t').count();
+            if fields != column_count {
+                return Err(invalid_snapshot());
+            }
+            let copies =
+                usize::try_from(weight).map_err(|_| GatewayError::QueryTimeExecutionFailed {
+                    detail: "distributed row multiplicity exceeds addressable memory".to_owned(),
+                })?;
+            shard_rows.try_reserve(copies).map_err(|error| {
+                GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("distributed result allocation failed: {error}"),
+                }
+            })?;
+            let row = row.into_bytes();
+            for _ in 0..copies {
+                shard_rows.push(row.clone());
+            }
+        }
+    }
+
     if merge_keys.is_empty() {
-        return Ok(shard_rows.into_iter().map(|row| row.into_bytes()).collect());
+        return Ok(shard_rows);
     }
 
     let mut merged = BTreeMap::<String, Vec<String>>::new();
     for row in shard_rows {
-        let fields = row.split('\t').map(str::to_string).collect::<Vec<_>>();
+        let fields = std::str::from_utf8(&row)
+            .map_err(|error| GatewayError::QueryTimeExecutionFailed {
+                detail: format!("distributed result row is not UTF-8: {error}"),
+            })?
+            .split('\t')
+            .map(str::to_string)
+            .collect::<Vec<_>>();
         let key = merge_keys
             .iter()
             .filter_map(|column| fields.get(*column))
@@ -18259,6 +20265,73 @@ fn merge_workload_snapshot(snapshot: &WorkloadSnapshot) -> Result<Vec<Vec<u8>>, 
         .into_values()
         .map(|fields| fields.join("\t").into_bytes())
         .collect())
+}
+
+#[cfg(test)]
+mod distributed_workload_snapshot_tests {
+    use super::*;
+    use rockstream_types::data_plane::{ShardOutput, WorkerExecutionStatus};
+    use rockstream_types::ids::{LeaseToken, WorkerId};
+
+    fn snapshot(complete: bool) -> WorkloadSnapshot {
+        WorkloadSnapshot {
+            version: rockstream_types::data_plane::WORKLOAD_SNAPSHOT_VERSION,
+            complete,
+            deployment: DeploymentRequest {
+                version: DEPLOYMENT_DESCRIPTOR_VERSION,
+                workload_id: WorkloadId(7),
+                namespace: "public".to_owned(),
+                workload_name: "view".to_owned(),
+                plan_json: "{}".to_owned(),
+                join_strategy: JoinStrategy::Auto,
+                schemas: Vec::new(),
+                frontier: 0,
+                storage_root: "/tmp/view".to_owned(),
+                sink_operator_id: OperatorId(1),
+                output_columns: vec!["value".to_owned()],
+                primary_key: vec![0],
+                merge_key_columns: Vec::new(),
+                routing_columns: BTreeMap::new(),
+            },
+            shards: vec![ShardOutput {
+                shard_id: ShardId(1),
+                lease_token: Some(LeaseToken(1)),
+                deltas: Vec::new(),
+                rows: vec![
+                    RuntimeRow {
+                        values_tsv: "1".to_owned(),
+                        weight: 2,
+                    },
+                    RuntimeRow {
+                        values_tsv: "\\N".to_owned(),
+                        weight: 1,
+                    },
+                ],
+            }],
+            workers: vec![WorkerExecutionStatus {
+                worker_id: WorkerId(1),
+                process_id: 1,
+                shard_ids: vec![ShardId(1)],
+                input_rows: 0,
+                output_rows: 0,
+                frontier: 0,
+                ready: true,
+            }],
+        }
+    }
+
+    #[test]
+    fn complete_snapshot_preserves_duplicate_and_null_rows() {
+        assert!(matches!(
+            merge_workload_snapshot(&snapshot(true)),
+            Ok(rows) if rows == vec![b"1".to_vec(), b"1".to_vec(), b"\\N".to_vec()]
+        ));
+    }
+
+    #[test]
+    fn incomplete_snapshot_is_rejected() {
+        assert!(merge_workload_snapshot(&snapshot(false)).is_err());
+    }
 }
 
 /// v0.51.4 Slice 0: build a signed-weight `ArrowZSet` from the commit's own
@@ -18522,7 +20595,7 @@ fn append_dml_ops(batch: &mut rockstream_storage::WriteBatch, ops: &[DmlOp]) {
 async fn committed_dml_ops(
     shard_db: &rockstream_storage::ShardDb,
     ops: Vec<DmlOp>,
-) -> Result<Vec<DmlOp>, rockstream_storage::StorageError> {
+) -> Result<(Vec<DmlOp>, bool), rockstream_storage::StorageError> {
     let mut images = stream::iter(dml_image_tables(&ops))
         .map(|(key, table)| async move {
             let storage_key = format!("view_output/{table}/{}", key.1);
@@ -18538,6 +20611,7 @@ async fn committed_dml_ops(
         .into_iter()
         .collect::<HashMap<_, _>>();
     let mut committed = Vec::with_capacity(ops.len());
+    let mut conflicted = false;
     for op in ops {
         let valid = match &op {
             DmlOp::Insert {
@@ -18565,7 +20639,11 @@ async fn committed_dml_ops(
                 new_tsv,
             } => {
                 let image = cached_row_image(shard_db, &mut images, table, old_row_key).await?;
-                if image.as_deref() == Some(old_tsv) {
+                let destination_available = old_row_key == new_row_key
+                    || cached_row_image(shard_db, &mut images, table, new_row_key)
+                        .await?
+                        .is_none();
+                if image.as_deref() == Some(old_tsv) && destination_available {
                     images.insert((table.to_ascii_lowercase(), old_row_key.clone()), None);
                     images.insert(
                         (table.to_ascii_lowercase(), new_row_key.clone()),
@@ -18592,9 +20670,11 @@ async fn committed_dml_ops(
         };
         if valid {
             committed.push(op);
+        } else {
+            conflicted = true;
         }
     }
-    Ok(committed)
+    Ok((committed, conflicted))
 }
 
 fn dml_image_tables(ops: &[DmlOp]) -> HashMap<(String, String), String> {
@@ -18785,11 +20865,38 @@ fn pgoutput_change_to_dml(
     route: &RelationRoute,
     change: &EncodedChange,
 ) -> Result<DmlOp, GatewayError> {
+    let EncodedChange::Row {
+        operation,
+        old_values,
+        new_values,
+        ..
+    } = change
+    else {
+        return Err(pgoutput_truncate_error(
+            "TRUNCATE marker must be expanded before row conversion",
+        ));
+    };
     let names = route
         .columns
         .iter()
         .map(|column| column.imported_name.clone())
         .collect::<Vec<_>>();
+    let pk_cols = route
+        .columns
+        .iter()
+        .filter(|column| column.key)
+        .map(|column| column.imported_name.clone())
+        .collect::<Vec<_>>();
+    let column_types = route
+        .columns
+        .iter()
+        .map(|column| {
+            (
+                column.imported_name.to_lowercase(),
+                pg_oid_to_arrow_datatype(column.type_oid, column.type_modifier),
+            )
+        })
+        .collect::<HashMap<_, _>>();
     let row = |values: &Option<Vec<Option<String>>>, kind: &str| {
         let values = values
             .as_ref()
@@ -18809,11 +20916,17 @@ fn pgoutput_change_to_dml(
             .iter()
             .map(|value| value.clone().unwrap_or_else(|| r"\N".to_string()))
             .collect::<Vec<_>>();
-        Ok((values.join("\t"), build_row_key(&names, &values)))
+        let row_key = if !pk_cols.is_empty() {
+            build_pk_row_key_typed(&pk_cols, &names, &values, &column_types)
+        } else {
+            build_row_key_typed(&names, &values, &column_types)
+        }
+        .map_err(|detail| GatewayError::QueryTimeExecutionFailed { detail })?;
+        Ok((values.join("\t"), row_key))
     };
-    match change.operation {
+    match operation {
         CdcOperation::Insert => {
-            let (values_tsv, row_key) = row(&change.new_values, "INSERT")?;
+            let (values_tsv, row_key) = row(new_values, "INSERT")?;
             Ok(DmlOp::Insert {
                 table: route.imported_table_name.clone(),
                 cols: names,
@@ -18822,8 +20935,8 @@ fn pgoutput_change_to_dml(
             })
         }
         CdcOperation::Update => {
-            let (old_tsv, old_row_key) = row(&change.old_values, "UPDATE old")?;
-            let (new_tsv, new_row_key) = row(&change.new_values, "UPDATE new")?;
+            let (old_tsv, old_row_key) = row(old_values, "UPDATE old")?;
+            let (new_tsv, new_row_key) = row(new_values, "UPDATE new")?;
             Ok(DmlOp::Update {
                 table: route.imported_table_name.clone(),
                 old_row_key,
@@ -18833,13 +20946,381 @@ fn pgoutput_change_to_dml(
             })
         }
         CdcOperation::Delete => {
-            let (returning_tsv, row_key) = row(&change.old_values, "DELETE")?;
+            let (returning_tsv, row_key) = row(old_values, "DELETE")?;
             Ok(DmlOp::Delete {
                 table: route.imported_table_name.clone(),
                 row_key,
                 returning_tsv: Some(returning_tsv),
             })
         }
+    }
+}
+
+/// A native TRUNCATE has no per-row preimages. Bound retraction expansion and
+/// fail closed when a table is too large for one atomic CDC epoch. Do not
+/// acknowledge the upstream LSN on incomplete state reconstruction.
+const MAX_PGOUTPUT_TRUNCATE_ROWS: usize = 65_536;
+
+fn pgoutput_truncate_error(detail: &str) -> GatewayError {
+    GatewayError::QueryTimeExecutionFailed {
+        detail: format!(
+            "RS-4014: pgoutput TRUNCATE cannot commit atomically: {detail}; source remains blocked and its slot must not advance"
+        ),
+    }
+}
+
+async fn load_pgoutput_truncate_images(
+    shard_db: &rockstream_storage::ShardDb,
+    changes: &[EncodedChange],
+    routes: &HashMap<u32, &RelationRoute>,
+) -> Result<HashMap<String, BTreeMap<String, String>>, GatewayError> {
+    let mut images = HashMap::new();
+    let mut total_rows = 0_usize;
+    let mut total_bytes = 0_usize;
+    for change in changes {
+        let EncodedChange::Truncate { relation_id, .. } = change else {
+            continue;
+        };
+        let route = routes.get(relation_id).ok_or_else(|| {
+            pgoutput_truncate_error(&format!("relation {relation_id} has no durable route"))
+        })?;
+        let table = &route.imported_table_name;
+        if images.contains_key(table) {
+            continue;
+        }
+        let prefix = format!("view_output/{table}/");
+        let (rows, incomplete) = shard_db
+            .scan_prefix_bounded(
+                prefix.as_bytes(),
+                rockstream_connectors::POSTGRES_CDC_MAX_TRANSACTION_BYTES,
+            )
+            .await?;
+        if incomplete {
+            return Err(pgoutput_truncate_error(&format!(
+                "incomplete scan of '{table}' (8 MiB transaction limit)"
+            )));
+        }
+        let mut table_images = BTreeMap::new();
+        for (key, value) in rows {
+            total_rows = total_rows.saturating_add(1);
+            total_bytes = total_bytes
+                .saturating_add(key.len())
+                .saturating_add(value.len());
+            if total_rows > MAX_PGOUTPUT_TRUNCATE_ROWS
+                || total_bytes > rockstream_connectors::POSTGRES_CDC_MAX_TRANSACTION_BYTES
+            {
+                return Err(pgoutput_truncate_error(
+                    "retractions exceed the 65,536-row / 8 MiB atomic epoch limit",
+                ));
+            }
+            let key = std::str::from_utf8(&key)
+                .map_err(|_| pgoutput_truncate_error("non-UTF8 stored row key"))?;
+            let row_key = key.strip_prefix(prefix.as_str()).ok_or_else(|| {
+                pgoutput_truncate_error("stored row key is outside its relation prefix")
+            })?;
+            let image = std::str::from_utf8(&value)
+                .map_err(|_| pgoutput_truncate_error("non-UTF8 stored row image"))?;
+            table_images.insert(row_key.to_string(), image.to_string());
+        }
+        images.insert(table.clone(), table_images);
+    }
+    Ok(images)
+}
+
+/// Expand pgoutput's ordered row and TRUNCATE events to ordinary weighted DML.
+/// Staged changes before a TRUNCATE update the in-memory row images first:
+/// INSERT; TRUNCATE; INSERT therefore retracts the first INSERT and preserves
+/// only the second. All effects reach views and source LSN in one M3 epoch.
+fn pgoutput_envelope_to_dml_ops(
+    changes: &[EncodedChange],
+    routes: &HashMap<u32, &RelationRoute>,
+    mut truncate_images: HashMap<String, BTreeMap<String, String>>,
+) -> Result<Vec<DmlOp>, GatewayError> {
+    let has_truncate = changes
+        .iter()
+        .any(|change| matches!(change, EncodedChange::Truncate { .. }));
+    let mut ops = Vec::new();
+    let mut bytes = 0_usize;
+    for change in changes {
+        let relation_id = change.relation_id();
+        let route =
+            routes
+                .get(&relation_id)
+                .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                    detail: format!(
+                        "RS-4013: pgoutput relation {relation_id} has no durable route"
+                    ),
+                })?;
+        if route.schema_version != change.schema_version() {
+            return Err(GatewayError::QueryTimeExecutionFailed {
+                detail: format!(
+                    "RS-1002: pgoutput relation {relation_id} change used schema version {}, expected {}",
+                    change.schema_version(), route.schema_version
+                ),
+            });
+        }
+        let table = &route.imported_table_name;
+        match change {
+            EncodedChange::Row { .. } => {
+                let op = pgoutput_change_to_dml(route, change)?;
+                if let Some(images) = truncate_images.get_mut(table) {
+                    match &op {
+                        DmlOp::Insert {
+                            row_key,
+                            values_tsv,
+                            ..
+                        } => {
+                            images.insert(row_key.clone(), values_tsv.clone());
+                        }
+                        DmlOp::Update {
+                            old_row_key,
+                            new_row_key,
+                            new_tsv,
+                            ..
+                        } => {
+                            images.remove(old_row_key);
+                            images.insert(new_row_key.clone(), new_tsv.clone());
+                        }
+                        DmlOp::Delete { row_key, .. } => {
+                            images.remove(row_key);
+                        }
+                    }
+                }
+                if has_truncate {
+                    bytes = bytes.saturating_add(pgoutput_dml_op_size(&op));
+                }
+                ops.push(op);
+            }
+            EncodedChange::Truncate { .. } => {
+                let images = truncate_images
+                    .get_mut(table)
+                    .ok_or_else(|| pgoutput_truncate_error("missing imported table images"))?;
+                for (row_key, returning_tsv) in std::mem::take(images) {
+                    let op = DmlOp::Delete {
+                        table: table.clone(),
+                        row_key,
+                        returning_tsv: Some(returning_tsv),
+                    };
+                    bytes = bytes.saturating_add(pgoutput_dml_op_size(&op));
+                    ops.push(op);
+                }
+            }
+        }
+        if has_truncate
+            && (ops.len() > MAX_PGOUTPUT_TRUNCATE_ROWS
+                || bytes > rockstream_connectors::POSTGRES_CDC_MAX_TRANSACTION_BYTES)
+        {
+            return Err(pgoutput_truncate_error(
+                "expanded changes exceed the 65,536-row / 8 MiB atomic epoch limit",
+            ));
+        }
+    }
+    Ok(ops)
+}
+
+fn pgoutput_dml_op_size(op: &DmlOp) -> usize {
+    match op {
+        DmlOp::Insert {
+            row_key,
+            values_tsv,
+            ..
+        } => row_key.len().saturating_add(values_tsv.len()),
+        DmlOp::Update {
+            old_row_key,
+            new_row_key,
+            old_tsv,
+            new_tsv,
+            ..
+        } => old_row_key
+            .len()
+            .saturating_add(new_row_key.len())
+            .saturating_add(old_tsv.len())
+            .saturating_add(new_tsv.len()),
+        DmlOp::Delete {
+            row_key,
+            returning_tsv,
+            ..
+        } => row_key
+            .len()
+            .saturating_add(returning_tsv.as_ref().map_or(0, String::len)),
+    }
+}
+
+#[cfg(test)]
+// These regression tests use unwrap/expect only for fixture construction and assertions.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod pgoutput_truncate_unit_tests {
+    use super::*;
+    use crate::pgoutput_coordinator::PgOutputTruncateTag;
+
+    fn route(id: u32, table: &str) -> RelationRoute {
+        RelationRoute {
+            version: 1,
+            relation_id: id,
+            upstream_namespace: "public".to_string(),
+            upstream_relation: table.to_string(),
+            imported_table_id: u64::from(id),
+            imported_table_name: table.to_string(),
+            columns: vec![ColumnRoute {
+                upstream_name: "id".to_string(),
+                imported_name: "id".to_string(),
+                type_oid: 20,
+                type_modifier: -1,
+                nullable: false,
+                has_default: false,
+                key: true,
+            }],
+            replica_identity: ReplicaIdentity::Full,
+            schema_version: 1,
+        }
+    }
+
+    fn insert(relation_id: u32, id: &str) -> EncodedChange {
+        EncodedChange::Row {
+            relation_id,
+            operation: CdcOperation::Insert,
+            old_values: None,
+            new_values: Some(vec![Some(id.to_string())]),
+            schema_version: 1,
+        }
+    }
+
+    #[test]
+    fn truncate_expansion_retracts_preexisting_and_pending_rows_in_wire_order() {
+        let a = route(7, "a");
+        let b = route(8, "b");
+        let routes = HashMap::from([(7, &a), (8, &b)]);
+        let images = HashMap::from([
+            (
+                "a".to_string(),
+                BTreeMap::from([
+                    ("__pk1:V1:1;".to_string(), "1".to_string()),
+                    ("__pk1:V1:2;".to_string(), "2".to_string()),
+                ]),
+            ),
+            (
+                "b".to_string(),
+                BTreeMap::from([("__pk1:V1:9;".to_string(), "9".to_string())]),
+            ),
+        ]);
+        let ops = pgoutput_envelope_to_dml_ops(
+            &[
+                insert(7, "3"),
+                EncodedChange::Truncate {
+                    relation_id: 7,
+                    schema_version: 1,
+                    tag: PgOutputTruncateTag::Truncate,
+                },
+                insert(7, "4"),
+                EncodedChange::Truncate {
+                    relation_id: 8,
+                    schema_version: 1,
+                    tag: PgOutputTruncateTag::Truncate,
+                },
+                EncodedChange::Truncate {
+                    relation_id: 8,
+                    schema_version: 1,
+                    tag: PgOutputTruncateTag::Truncate,
+                },
+            ],
+            &routes,
+            images,
+        )
+        .unwrap();
+        assert_eq!(ops.len(), 6); // INSERT(3), DELETE(1,2,3), INSERT(4), DELETE(9)
+        assert!(matches!(
+            &ops[0],
+            DmlOp::Insert { row_key, .. } if row_key == "__pk1:V1:3;"
+        ));
+        assert!(matches!(
+            &ops[1],
+            DmlOp::Delete {
+                row_key,
+                returning_tsv: Some(tsv),
+                ..
+            } if row_key == "__pk1:V1:1;" && tsv == "1"
+        ));
+        assert!(matches!(
+            &ops[2],
+            DmlOp::Delete { row_key, .. } if row_key == "__pk1:V1:2;"
+        ));
+        assert!(matches!(
+            &ops[3],
+            DmlOp::Delete { row_key, .. } if row_key == "__pk1:V1:3;"
+        ));
+        assert!(matches!(
+            &ops[4],
+            DmlOp::Insert { row_key, .. } if row_key == "__pk1:V1:4;"
+        ));
+        assert!(matches!(
+            &ops[5],
+            DmlOp::Delete { table, row_key, .. } if table == "b" && row_key == "__pk1:V1:9;"
+        ));
+    }
+
+    #[test]
+    fn truncate_expansion_rejects_missing_route_or_schema_mismatch() {
+        let a = route(7, "a");
+        let routes = HashMap::from([(7, &a)]);
+        let bad_route = EncodedChange::Truncate {
+            relation_id: 8,
+            schema_version: 1,
+            tag: PgOutputTruncateTag::Truncate,
+        };
+        let bad_schema = EncodedChange::Truncate {
+            relation_id: 7,
+            schema_version: 2,
+            tag: PgOutputTruncateTag::Truncate,
+        };
+        for change in [bad_route, bad_schema] {
+            assert!(pgoutput_envelope_to_dml_ops(
+                &[change],
+                &routes,
+                HashMap::from([("a".to_string(), BTreeMap::new())]),
+            )
+            .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn truncate_preimage_scan_refuses_oversized_state_without_partial_rows() {
+        let db = rockstream_storage::ShardDb::builder(
+            "pgoutput-truncate-bounded",
+            Arc::new(object_store::memory::InMemory::new()),
+        )
+        .build()
+        .await
+        .unwrap();
+        // Exceed the aggregate scan budget with bounded individual writes.
+        // A single oversized WAL entry can stall before the scan is exercised.
+        let row_image = vec![b'9'; 512 * 1024];
+        for id in 0..17 {
+            let key = format!("view_output/a/id={id}");
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                db.put(key.as_bytes(), &row_image),
+            )
+            .await
+            .expect("bounded fixture write timed out")
+            .unwrap();
+        }
+        let a = route(7, "a");
+        let routes = HashMap::from([(7, &a)]);
+        let changes = [EncodedChange::Truncate {
+            relation_id: 7,
+            schema_version: 1,
+            tag: PgOutputTruncateTag::Truncate,
+        }];
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            load_pgoutput_truncate_images(&db, &changes, &routes),
+        )
+        .await
+        .expect("bounded preimage scan timed out")
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("RS-4014"), "{error}");
+        assert!(db.get(b"view_output/a/id=0").await.unwrap().is_some());
     }
 }
 
@@ -18863,6 +21344,7 @@ fn source_backfill_error(error: rockstream_connectors::SourceError) -> GatewayEr
 fn source_batch_to_dml_ops(
     table: &str,
     columns: &[CatalogColumn],
+    pk_cols: &[String],
     batch: &RecordBatch,
 ) -> Result<Vec<DmlOp>, String> {
     use datafusion::arrow::util::display::array_value_to_string;
@@ -18880,6 +21362,7 @@ fn source_batch_to_dml_ops(
         .iter()
         .map(|column| column.name.clone())
         .collect::<Vec<_>>();
+    let column_types = catalog_column_types(columns);
     let mut ops = Vec::with_capacity(data.num_rows());
     for (row, &weight) in weights.iter().enumerate().take(data.num_rows()) {
         let values = data
@@ -18894,7 +21377,11 @@ fn source_batch_to_dml_ops(
             })
             .collect::<Result<Vec<_>, _>>()?;
         let values_tsv = values.join("\t");
-        let row_key = build_row_key(&names, &values);
+        let row_key = if !pk_cols.is_empty() {
+            build_pk_row_key_typed(pk_cols, &names, &values, &column_types)?
+        } else {
+            build_row_key_typed(&names, &values, &column_types)?
+        };
         match weight {
             weight if weight > 0 => ops.push(DmlOp::Insert {
                 table: table.to_string(),
@@ -18921,6 +21408,7 @@ async fn query_time_datafusion_select(
 ) -> Result<Vec<RecordBatch>, GatewayError> {
     let ctx = SessionContext::new();
     rockstream_sql::frontend::register_session_sql_udf(&ctx);
+    rockstream_sql::frontend::register_hop_sql_udf(&ctx);
 
     for relation_name in referenced_tables {
         let schema = query_time_relation_schema(catalog, relation_name);
@@ -19356,8 +21844,9 @@ fn extract_limit(q: &str) -> Option<usize> {
 }
 
 /// Extract ORDER BY columns from a query string.
-/// Returns a list of `(column_name, descending)` pairs.
-fn extract_order_by(q: &str) -> Vec<(String, bool)> {
+/// Returns a list of `(column_name, descending, nulls_first)` tuples following
+/// PostgreSQL defaults (`ASC` -> `NULLS LAST`, `DESC` -> `NULLS FIRST`).
+fn extract_order_by(q: &str) -> Vec<(String, bool, bool)> {
     let ql = q.to_lowercase();
     let ob_pos = match ql.find(" order by ") {
         Some(p) => p,
@@ -19376,13 +21865,32 @@ fn extract_order_by(q: &str) -> Vec<(String, bool)> {
             if part.is_empty() {
                 return None;
             }
-            let tokens: Vec<&str> = part.split_whitespace().collect();
-            let col = tokens.first()?.to_lowercase();
-            let desc = tokens
-                .last()
-                .map(|t| t.to_lowercase() == "desc")
-                .unwrap_or(false);
-            Some((col, desc))
+            let tokens: Vec<String> = part.split_whitespace().map(|t| t.to_lowercase()).collect();
+            let col = tokens.first()?.trim_matches('"').to_string();
+            let mut desc = false;
+            let mut explicit_nulls_first: Option<bool> = None;
+            let mut idx = 1usize;
+            while idx < tokens.len() {
+                match tokens[idx].as_str() {
+                    "desc" => desc = true,
+                    "asc" => desc = false,
+                    "nulls" => {
+                        if let Some(next) = tokens.get(idx + 1) {
+                            match next.as_str() {
+                                "first" => explicit_nulls_first = Some(true),
+                                "last" => explicit_nulls_first = Some(false),
+                                _ => {}
+                            }
+                            idx += 1;
+                        }
+                    }
+                    _ => {}
+                }
+                idx += 1;
+            }
+            // PostgreSQL standard: DESC defaults to NULLS FIRST, ASC defaults to NULLS LAST.
+            let nulls_first = explicit_nulls_first.unwrap_or(desc);
+            Some((col, desc, nulls_first))
         })
         .collect()
 }
@@ -19647,6 +22155,7 @@ async fn describe_fields_for_query(
         ) {
             let ctx = SessionContext::new();
             rockstream_sql::frontend::register_session_sql_udf(&ctx);
+            rockstream_sql::frontend::register_hop_sql_udf(&ctx);
             if let Ok(df) = ctx.sql(&sql).await {
                 return df
                     .schema()
@@ -19823,6 +22332,7 @@ struct ParsedCreateSink {
     partition_by: Vec<String>,
     catalog: String,
     secret: Option<String>,
+    security_protocol: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19892,6 +22402,141 @@ fn parse_create_sink_ddl(q: &str) -> Result<ParsedCreateSink, String> {
         raw_after_create
     };
     let after_create_lower = after_create.to_lowercase();
+
+    // SQL-wired Kafka sink syntax (issue #404 R4):
+    //   CREATE SINK [IF NOT EXISTS] <name> FROM <view> INTO KAFKA [WITH] (brokers = '...', topic = '...', secret = '...', security.protocol = 'SASL_SSL')
+    if let Some(from_pos) = after_create_lower.find(" from ") {
+        if after_create_lower.contains(" into kafka") {
+            let name = after_create[..from_pos]
+                .trim()
+                .trim_matches('"')
+                .to_lowercase();
+            if name.is_empty() {
+                return Err(
+                    "[RS-4007] CREATE SINK requires a sink name. Next steps: use CREATE SINK <name> FROM <view> INTO KAFKA (brokers = '...', topic = '...')."
+                        .to_string(),
+                );
+            }
+            let after_from = after_create[from_pos + " from ".len()..].trim();
+            let after_from_lower = after_from.to_lowercase();
+            let into_pos = after_from_lower.find(" into kafka").ok_or_else(|| {
+                "[RS-4007] CREATE SINK FROM <view> requires INTO KAFKA (...). Next steps: specify INTO KAFKA (brokers = '...', topic = '...').".to_string()
+            })?;
+            let view = after_from[..into_pos]
+                .trim()
+                .trim_matches('"')
+                .rsplit('.')
+                .next()
+                .unwrap_or("")
+                .to_lowercase();
+            if view.is_empty() {
+                return Err(
+                    "[RS-4007] CREATE SINK requires a referenced view name. Next steps: use CREATE SINK <name> FROM <view> INTO KAFKA (brokers = '...', topic = '...').".to_string()
+                );
+            }
+            let mut after_kafka = after_from[into_pos + " into kafka".len()..].trim();
+            if after_kafka.to_lowercase().starts_with("with") {
+                after_kafka = after_kafka["with".len()..].trim();
+            }
+            let option_map = parse_create_sink_options(after_kafka)?;
+            let brokers = match option_map
+                .get("brokers")
+                .or_else(|| option_map.get("bootstrap_servers"))
+            {
+                Some(CreateSinkOptionValue::String(s)) if !s.trim().is_empty() => {
+                    s.trim().to_string()
+                }
+                _ => {
+                    return Err(
+                        "[RS-4007] CREATE SINK INTO KAFKA requires brokers = '<host:port>'. Next steps: provide brokers = '...' and topic = '...' in the Kafka sink options.".to_string()
+                    );
+                }
+            };
+            let topic = match option_map.get("topic") {
+                Some(CreateSinkOptionValue::String(s)) if !s.trim().is_empty() => {
+                    s.trim().to_string()
+                }
+                _ => {
+                    return Err(
+                        "[RS-4007] CREATE SINK INTO KAFKA requires topic = '<topic>'. Next steps: provide brokers = '...' and topic = '...' in the Kafka sink options.".to_string()
+                    );
+                }
+            };
+            let max_envelope_bytes = parse_optional_u64_option(&option_map, "max_envelope_bytes")?;
+            let secret = match option_map.get("secret") {
+                Some(CreateSinkOptionValue::String(s)) => Some(s.clone()),
+                Some(_) => {
+                    return Err(
+                        "[RS-4007] CREATE SINK option secret must be a string. Next steps: use secret = '<name>'.".to_string()
+                    );
+                }
+                None => None,
+            };
+            let security_protocol = match option_map.get("security.protocol") {
+                Some(CreateSinkOptionValue::String(value)) => {
+                    Some(value.trim().to_ascii_uppercase())
+                }
+                Some(_) => {
+                    return Err("[RS-4007] CREATE SINK option security.protocol must be a string. Next steps: use SASL_SSL or SASL_PLAINTEXT with a SASL secret.".to_string());
+                }
+                None => None,
+            };
+            match (secret.is_some(), security_protocol.as_deref()) {
+                (true, None) => {
+                    return Err("[RS-4007] Kafka sink secret requires security.protocol. Next steps: provide security.protocol = 'SASL_SSL' or 'SASL_PLAINTEXT' with secret = '<name>'.".to_string());
+                }
+                (false, Some(_)) => {
+                    return Err("[RS-4007] Kafka sink security.protocol requires secret. Next steps: add secret = '<name>' or omit security.protocol.".to_string());
+                }
+                (true, Some(protocol)) if !matches!(protocol, "SASL_SSL" | "SASL_PLAINTEXT") => {
+                    return Err("[RS-4007] Kafka sink security.protocol must be SASL_SSL or SASL_PLAINTEXT. Next steps: choose a supported SASL transport.".to_string());
+                }
+                _ => {}
+            }
+            let transactional_id = match option_map.get("transactional_id") {
+                Some(CreateSinkOptionValue::String(s)) if !s.trim().is_empty() => {
+                    vec![s.trim().to_string()]
+                }
+                Some(_) => {
+                    return Err(
+                        "[RS-4007] CREATE SINK option transactional_id must be a non-empty string. Next steps: omit transactional_id or pass a non-empty string.".to_string()
+                    );
+                }
+                None => Vec::new(),
+            };
+            for key in option_map.keys() {
+                if !matches!(
+                    key.as_str(),
+                    "brokers"
+                        | "bootstrap_servers"
+                        | "topic"
+                        | "max_envelope_bytes"
+                        | "secret"
+                        | "security.protocol"
+                        | "transactional_id"
+                ) {
+                    return Err(format!(
+                        "[RS-4007] CREATE SINK INTO KAFKA does not recognize option '{key}'. Next steps: use brokers, topic, optional max_envelope_bytes, transactional_id, secret, and security.protocol."
+                    ));
+                }
+            }
+            return Ok(ParsedCreateSink {
+                name: name.clone(),
+                view,
+                format: "KAFKA".to_string(),
+                path: brokers,
+                snapshot_interval_epochs: None,
+                snapshot_interval_ms: None,
+                parquet_row_group_bytes: max_envelope_bytes,
+                format_version: Some(stable_name_id("kafka-sink", &name)),
+                partition_by: transactional_id,
+                catalog: topic,
+                secret,
+                security_protocol,
+            });
+        }
+    }
+
     let for_view_pos = after_create_lower.find(" for view ").ok_or_else(|| {
         format!(
             "[RS-4007] CREATE SINK requires FOR VIEW clause. Next steps: {CREATE_SINK_NEXT_STEPS}"
@@ -19995,6 +22640,7 @@ fn parse_create_sink_ddl(q: &str) -> Result<ParsedCreateSink, String> {
         partition_by,
         catalog,
         secret,
+        security_protocol: None,
     })
 }
 
@@ -20121,6 +22767,83 @@ fn parse_sql_single_quoted_string(input: &str) -> Result<(String, usize), String
     Err(format!(
         "[RS-4007] unterminated string literal. Next steps: {CREATE_SINK_NEXT_STEPS}"
     ))
+}
+
+fn strip_ascii_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    if s.len() >= prefix.len()
+        && s.is_char_boundary(prefix.len())
+        && s[..prefix.len()].eq_ignore_ascii_case(prefix)
+    {
+        Some(&s[prefix.len()..])
+    } else {
+        None
+    }
+}
+
+/// Parse `SET [LOCAL] rockstream.<var> = <value>` while preserving the original
+/// case and content of `<value>`.
+fn parse_set_rockstream(q: &str) -> Option<(String, &str)> {
+    let rest = strip_ascii_prefix_ci(q.trim(), "set")?;
+    if !rest.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    let rest = rest.trim_start();
+    let rest = if let Some(after_local) = strip_ascii_prefix_ci(rest, "local") {
+        if after_local.chars().next().is_some_and(char::is_whitespace) {
+            after_local.trim_start()
+        } else {
+            rest
+        }
+    } else {
+        rest
+    };
+    let after_ns = strip_ascii_prefix_ci(rest, "rockstream.")?;
+    let (var_part, val_part) = if let Some(eq_pos) = after_ns.find('=') {
+        (&after_ns[..eq_pos], &after_ns[eq_pos + 1..])
+    } else {
+        let mut ws_idx = None;
+        for (idx, ch) in after_ns.char_indices() {
+            if ch.is_whitespace() {
+                ws_idx = Some(idx);
+                break;
+            }
+        }
+        let idx = ws_idx?;
+        let var_part = &after_ns[..idx];
+        let after_var = after_ns[idx..].trim_start();
+        let after_to = strip_ascii_prefix_ci(after_var, "to")?;
+        if !after_to.chars().next().is_some_and(char::is_whitespace) {
+            return None;
+        }
+        (var_part, after_to)
+    };
+    let var_name = var_part.trim().to_ascii_lowercase();
+    let val_raw = val_part.trim().trim_end_matches(';').trim();
+    Some((var_name, val_raw))
+}
+
+/// Decode a SQL setting value, unescaping doubled single quotes (`''` -> `'`)
+/// while preserving UTF-8 characters and exact case.
+fn decode_sql_setting_literal(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with('\'') {
+        return trimmed.to_string();
+    }
+    let mut out = String::with_capacity(trimmed.len());
+    let mut chars = trimmed[1..].chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\'' {
+            if chars.peek() == Some(&'\'') {
+                chars.next();
+                out.push('\'');
+            } else {
+                return out;
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    trimmed.trim_matches('\'').to_string()
 }
 
 const CREATE_SECRET_NEXT_STEPS: &str =
@@ -20911,15 +23634,15 @@ fn parse_create_view_name(q: &str) -> Option<String> {
     }
     // Take up to " AS" followed by any whitespace (handles AS\n, AS\t, AS )
     let as_pos = find_as_separator(&after.to_lowercase())?;
-    let raw = after[..as_pos]
-        .split_once(" WITH WORKLOAD ")
-        .map(|(before, _)| before)
-        .or_else(|| {
-            after[..as_pos]
-                .split_once(" with workload ")
-                .map(|(before, _)| before)
-        })
-        .unwrap_or(&after[..as_pos])
+    let header_slice = &after[..as_pos];
+    let header_lower = header_slice.to_lowercase();
+    let cut_pos = header_lower
+        .find(" with workload ")
+        .or_else(|| header_lower.find(" with ("))
+        .or_else(|| header_lower.find(" with("));
+    let raw = cut_pos
+        .map(|pos| &header_slice[..pos])
+        .unwrap_or(header_slice)
         .trim()
         .trim_matches('"');
     let name = raw.rsplit('.').next().unwrap_or(raw).trim_matches('"');
@@ -20958,6 +23681,28 @@ fn parse_create_view_workload(q: &str) -> Option<String> {
     } else {
         Some(workload.to_string())
     }
+}
+
+fn parse_create_view_async(q: &str) -> bool {
+    let ql = q.trim().to_lowercase();
+    let name_start: usize = if ql.starts_with("create or replace materialized view ") {
+        36
+    } else if ql.starts_with("create materialized view ") {
+        25
+    } else if ql.starts_with("create or replace view ") {
+        23
+    } else if ql.starts_with("create view ") {
+        12
+    } else {
+        return false;
+    };
+    let after_lower = &ql[name_start..];
+    let Some(as_pos) = find_as_separator(after_lower) else {
+        return false;
+    };
+    let header = &after_lower[..as_pos];
+    let compact: String = header.chars().filter(|c| !c.is_whitespace()).collect();
+    compact.contains("with(async=true)")
 }
 
 /// Extract the SELECT SQL from `CREATE … AS <select>`.
@@ -21651,28 +24396,176 @@ fn pg_type_to_arrow(pg_type: &str) -> &'static str {
 
 static NEXT_HEAP_ROW_ID: AtomicU64 = AtomicU64::new(1);
 
-fn build_pk_row_key(pk_cols: &[String], cols: &[String], vals: &[String]) -> String {
-    pk_cols
-        .iter()
-        .map(|pk| {
-            let pos = cols.iter().position(|c| c.eq_ignore_ascii_case(pk));
-            let val = pos
-                .and_then(|p| vals.get(p))
-                .map(|s| s.as_str())
-                .unwrap_or("");
-            format!("{pk}={val}")
-        })
-        .collect::<Vec<_>>()
-        .join("|")
+const PK_KEY_PREFIX_V1: &str = "__pk1:";
+
+/// Normalize and validate a textual value against its declared Arrow `DataType`
+/// so numerically/semantically equivalent spellings produce one canonical key.
+fn normalize_typed_value(raw: &str, data_type: &DataType) -> Result<String, String> {
+    if raw == r"\N" {
+        return Ok(r"\N".to_string());
+    }
+    match data_type {
+        DataType::Int16 => raw
+            .trim()
+            .parse::<i16>()
+            .map(|v| v.to_string())
+            .map_err(|e| format!("[RS-2056] invalid SMALLINT key value '{raw}': {e}")),
+        DataType::Int32 => raw
+            .trim()
+            .parse::<i32>()
+            .map(|v| v.to_string())
+            .map_err(|e| format!("[RS-2056] invalid INTEGER key value '{raw}': {e}")),
+        DataType::Int64 => raw
+            .trim()
+            .parse::<i64>()
+            .map(|v| v.to_string())
+            .map_err(|e| format!("[RS-2056] invalid BIGINT key value '{raw}': {e}")),
+        DataType::Float32 => {
+            let v = raw
+                .trim()
+                .parse::<f32>()
+                .map_err(|e| format!("[RS-2056] invalid REAL key value '{raw}': {e}"))?;
+            let v = if v == 0.0 { 0.0 } else { v };
+            Ok(v.to_string())
+        }
+        DataType::Float64 => {
+            let v = raw.trim().parse::<f64>().map_err(|e| {
+                format!("[RS-2056] invalid DOUBLE PRECISION key value '{raw}': {e}")
+            })?;
+            let v = if v == 0.0 { 0.0 } else { v };
+            Ok(v.to_string())
+        }
+        DataType::Boolean => match raw.trim().to_ascii_lowercase().as_str() {
+            "true" | "t" | "1" | "yes" | "y" | "on" => Ok("true".to_string()),
+            "false" | "f" | "0" | "no" | "n" | "off" => Ok("false".to_string()),
+            _ => Err(format!("[RS-2056] invalid BOOLEAN key value '{raw}'")),
+        },
+        DataType::Decimal128(_, _) => {
+            use rockstream_sql::dml::{DmlLiteral, DmlScalarExpr};
+            match DmlScalarExpr::Literal(DmlLiteral::String(raw.to_string())).evaluate_assignment(
+                &HashMap::new(),
+                &HashMap::new(),
+                data_type,
+            ) {
+                Ok(Some(formatted)) => Ok(formatted),
+                Ok(None) => Ok(r"\N".to_string()),
+                Err(error) => Err(error.to_string()),
+            }
+        }
+        DataType::FixedSizeBinary(16) => uuid::Uuid::parse_str(raw.trim())
+            .map(|u| u.hyphenated().to_string())
+            .map_err(|e| format!("[RS-2056] invalid UUID key value '{raw}': {e}")),
+        DataType::Date32 | DataType::Timestamp(_, _) => {
+            use datafusion::arrow::compute::CastOptions;
+            use datafusion::scalar::ScalarValue;
+            let opts = CastOptions {
+                safe: false,
+                ..Default::default()
+            };
+            let parsed = ScalarValue::Utf8(Some(raw.to_string()))
+                .cast_to_with_options(data_type, &opts)
+                .map_err(|e| format!("[RS-2056] invalid temporal key value '{raw}': {e}"))?;
+            let text = parsed
+                .cast_to_with_options(&DataType::Utf8, &opts)
+                .map_err(|e| {
+                    format!("[RS-2056] failed to format temporal key value '{raw}': {e}")
+                })?;
+            Ok(text.to_string())
+        }
+        _ => Ok(raw.to_string()),
+    }
 }
 
-fn build_table_row_key(pk_cols: &[String], cols: &[String], vals: &[String]) -> String {
+/// Encode a tuple of canonical key components using an unambiguous length-prefixed
+/// format (`__pk1:V<byte_len>:<bytes>;` or `N;` for NULL) so delimiters in values
+/// can never collide.
+fn encode_key_components<'a>(components: impl IntoIterator<Item = &'a str>) -> String {
+    use std::fmt::Write;
+    let mut out = String::from(PK_KEY_PREFIX_V1);
+    for val in components {
+        if val == r"\N" {
+            out.push_str("N;");
+        } else {
+            let _ = write!(out, "V{}:{val};", val.len());
+        }
+    }
+    out
+}
+
+fn catalog_column_types(columns: &[CatalogColumn]) -> HashMap<String, DataType> {
+    columns
+        .iter()
+        .map(|c| {
+            (
+                c.name.to_lowercase(),
+                string_to_arrow_datatype(&c.data_type),
+            )
+        })
+        .collect()
+}
+
+fn pg_oid_to_arrow_datatype(type_oid: u32, type_modifier: i32) -> DataType {
+    match type_oid {
+        21 => DataType::Int16,
+        23 => DataType::Int32,
+        20 => DataType::Int64,
+        700 => DataType::Float32,
+        701 => DataType::Float64,
+        16 => DataType::Boolean,
+        2950 => DataType::FixedSizeBinary(16),
+        1082 => DataType::Date32,
+        1114 => DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, None),
+        1184 => DataType::Timestamp(
+            datafusion::arrow::datatypes::TimeUnit::Microsecond,
+            Some("+00:00".into()),
+        ),
+        1700 if type_modifier > 4 => {
+            let mod_val = type_modifier - 4;
+            let precision = ((mod_val >> 16) & 0xffff) as u8;
+            let scale = (mod_val & 0xffff) as i8;
+            if precision > 0 && precision <= 38 {
+                DataType::Decimal128(precision, scale)
+            } else {
+                DataType::Utf8
+            }
+        }
+        _ => DataType::Utf8,
+    }
+}
+
+fn build_pk_row_key_typed(
+    pk_cols: &[String],
+    cols: &[String],
+    vals: &[String],
+    column_types: &HashMap<String, DataType>,
+) -> Result<String, String> {
+    let mut normalized = Vec::with_capacity(pk_cols.len());
+    for pk in pk_cols {
+        let pos = cols.iter().position(|c| c.eq_ignore_ascii_case(pk));
+        let raw = pos
+            .and_then(|p| vals.get(p))
+            .map(|s| s.as_str())
+            .unwrap_or(r"\N");
+        let dt = column_types
+            .get(&pk.to_lowercase())
+            .unwrap_or(&DataType::Utf8);
+        normalized.push(normalize_typed_value(raw, dt)?);
+    }
+    Ok(encode_key_components(normalized.iter().map(String::as_str)))
+}
+
+fn build_table_row_key_typed(
+    pk_cols: &[String],
+    cols: &[String],
+    vals: &[String],
+    column_types: &HashMap<String, DataType>,
+) -> Result<String, String> {
     if !pk_cols.is_empty() {
-        build_pk_row_key(pk_cols, cols, vals)
+        build_pk_row_key_typed(pk_cols, cols, vals, column_types)
     } else {
         let id = NEXT_HEAP_ROW_ID.fetch_add(1, Ordering::Relaxed);
         let uuid = generate_uuid_v4_string();
-        format!("__heap_{uuid}_{id}")
+        Ok(format!("__heap_{uuid}_{id}"))
     }
 }
 
@@ -21728,27 +24621,23 @@ fn try_normalize_where_commas(q: &str) -> Option<String> {
     Some(format!("{prefix}{normalized_where}{returning_part}"))
 }
 
-/// Build a deterministic row key from column names and values.
-///
-/// Format: `col1=val1|col2=val2|...` — stable ordering is preserved from the
-/// input slice. This ensures retries of the same INSERT produce the same key
-/// (idempotent within the write buffer).
-fn build_row_key(cols: &[String], vals: &[String]) -> String {
+/// Build a deterministic, collision-free row key from column names, values, and types.
+fn build_row_key_typed(
+    cols: &[String],
+    vals: &[String],
+    column_types: &HashMap<String, DataType>,
+) -> Result<String, String> {
     if cols.is_empty() {
-        // No explicit column list: use positional indices so each row gets a
-        // unique key even when column names are unknown (e.g. INSERT INTO t
-        // VALUES (...) without a column list).
-        vals.iter()
-            .enumerate()
-            .map(|(i, v)| format!("col{i}={v}"))
-            .collect::<Vec<_>>()
-            .join("|")
+        Ok(encode_key_components(vals.iter().map(String::as_str)))
     } else {
-        cols.iter()
-            .zip(vals.iter())
-            .map(|(c, v)| format!("{c}={v}"))
-            .collect::<Vec<_>>()
-            .join("|")
+        let mut normalized = Vec::with_capacity(cols.len());
+        for (c, v) in cols.iter().zip(vals.iter()) {
+            let dt = column_types
+                .get(&c.to_lowercase())
+                .unwrap_or(&DataType::Utf8);
+            normalized.push(normalize_typed_value(v, dt)?);
+        }
+        Ok(encode_key_components(normalized.iter().map(String::as_str)))
     }
 }
 
@@ -22177,6 +25066,39 @@ mod s4_tests {
         );
     }
 
+    #[test]
+    fn stored_row_sort_honors_null_order_and_numeric_values() {
+        let schema = vec![
+            FieldInfo::new("id".to_string(), None, None, Type::INT8, FieldFormat::Text),
+            FieldInfo::new(
+                "score".to_string(),
+                None,
+                None,
+                Type::INT8,
+                FieldFormat::Text,
+            ),
+        ];
+        let order_by = [("score".to_string(), false, true)];
+        let mut rows = vec![
+            b"1\t\\N".to_vec(),
+            b"2\t10".to_vec(),
+            b"3\t2".to_vec(),
+            b"4\t2".to_vec(),
+        ];
+
+        sort_rows_by_order(&mut rows, &schema, &order_by);
+
+        assert_eq!(
+            rows,
+            vec![
+                b"1\t\\N".to_vec(),
+                b"3\t2".to_vec(),
+                b"4\t2".to_vec(),
+                b"2\t10".to_vec(),
+            ]
+        );
+    }
+
     struct NoopViewReader;
 
     #[async_trait]
@@ -22201,7 +25123,11 @@ mod s4_tests {
         Arc::new(GatewayHandler::new(catalog, reader))
     }
 
-    async fn make_handler_with_admin() -> (Arc<GatewayHandler>, String) {
+    pub(super) async fn make_handler_with_admin() -> (
+        Arc<GatewayHandler>,
+        String,
+        Arc<dyn object_store::ObjectStore>,
+    ) {
         use rockstream_storage::catalog::{
             CatalogMutation, CatalogNamespace, CatalogStore, CatalogTxn, DurableCatalogStore,
         };
@@ -22252,8 +25178,10 @@ mod s4_tests {
                 },
             }],
         };
+        let object_store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
         let durable = Arc::new(DurableCatalogStore::new(
-            Arc::new(object_store::memory::InMemory::new()),
+            object_store.clone(),
             "gateway-unit-admin".to_string(),
         ));
         durable
@@ -22293,7 +25221,7 @@ mod s4_tests {
             username: "unit-admin".to_string(),
         };
         handler.sessions.insert(conn_id.clone(), session);
-        (handler, conn_id)
+        (handler, conn_id, object_store)
     }
 
     fn assert_authentication_event(
@@ -22491,6 +25419,144 @@ mod s4_tests {
 
     // ── S5: audit_carries_principal_actor ────────────────────────────────────
 
+    #[tokio::test]
+    async fn gateway_security_audit_writers_refresh_after_catalog_conflicts() {
+        use rockstream_storage::catalog::{
+            CatalogMutation, CatalogStore, CatalogTxn, DurableCatalogStore,
+        };
+        use rockstream_types::authorization::{
+            AuditCorrelation, AuditField, AuditIdentity, SecurityAuditClass, SecurityAuditOutcome,
+            SecurityAuditRecord, SECURITY_AUDIT_FORMAT_VERSION,
+        };
+
+        let object_store = Arc::new(object_store::memory::InMemory::new());
+        let current_catalog = Arc::new(DurableCatalogStore::new(
+            object_store.clone(),
+            "audit-retry",
+        ));
+        let stale_auth_catalog = Arc::new(DurableCatalogStore::new(
+            object_store.clone(),
+            "audit-retry",
+        ));
+        let stale_denial_catalog = Arc::new(DurableCatalogStore::new(object_store, "audit-retry"));
+        let now_ms = current_time_ms().max(1);
+        let seed_records = ["concurrent-1", "concurrent-2"].map(|event_id| SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: event_id.to_owned(),
+            timestamp_ms: now_ms,
+            actor: AuditIdentity::Unknown,
+            target: AuditField::Unknown,
+            scope: AuditField::NotApplicable,
+            action: SecurityAuditClass::AuthenticationFailure,
+            outcome: SecurityAuditOutcome::Failure,
+            correlation: AuditCorrelation::NotApplicable,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::NotApplicable,
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        });
+        for (index, record) in seed_records.iter().cloned().enumerate() {
+            current_catalog
+                .commit_txn(
+                    CatalogTxn::new(
+                        current_catalog.get_revision().await + 1,
+                        index as u64 + 1,
+                        vec![CatalogMutation::AppendSecurityAudit(record)],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let shard_db = Arc::new(
+            rockstream_storage::ShardDb::builder(
+                "audit-retry-shard",
+                Arc::new(object_store::memory::InMemory::new()),
+            )
+            .build()
+            .await
+            .unwrap(),
+        );
+        let catalog = Arc::new(CatalogStubs::default());
+        catalog.set_durable_store(stale_auth_catalog.clone());
+        let handler =
+            GatewayHandler::with_shard_db(catalog.clone(), Arc::new(NoopViewReader), shard_db);
+        handler
+            .append_authentication_audit(
+                AuditIdentity::Unknown,
+                AuditField::Unknown,
+                AuditField::NotApplicable,
+                false,
+            )
+            .await
+            .unwrap();
+        catalog.set_durable_store(stale_denial_catalog.clone());
+        handler
+            .append_authorization_denial(None, None, None, None, None)
+            .await
+            .unwrap();
+
+        current_catalog.refresh().await.unwrap();
+        let records = current_catalog.list_security_audit_records().await.unwrap();
+        for seed_record in seed_records {
+            assert!(records.contains(&seed_record));
+        }
+        assert_eq!(records.len(), 4);
+        let auth = records
+            .iter()
+            .find(|record| {
+                record.action == SecurityAuditClass::AuthenticationFailure
+                    && record.event_id.starts_with("gateway-authn-")
+            })
+            .unwrap();
+        assert!(auth.timestamp_ms > 0);
+        assert_eq!(
+            auth,
+            &SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: auth.event_id.clone(),
+                timestamp_ms: auth.timestamp_ms,
+                actor: AuditIdentity::Unknown,
+                target: AuditField::Unknown,
+                scope: AuditField::NotApplicable,
+                action: SecurityAuditClass::AuthenticationFailure,
+                outcome: SecurityAuditOutcome::Failure,
+                correlation: AuditCorrelation::Unknown,
+                operation_id: AuditField::NotApplicable,
+                policy_revision: AuditField::NotApplicable,
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::NotApplicable,
+            }
+        );
+        let denial = records
+            .iter()
+            .find(|record| record.action == SecurityAuditClass::AuthorizationDenial)
+            .unwrap();
+        assert!(denial.event_id.starts_with("gateway-authz-"));
+        assert!(denial.timestamp_ms > 0);
+        assert_eq!(
+            denial,
+            &SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: denial.event_id.clone(),
+                timestamp_ms: denial.timestamp_ms,
+                actor: AuditIdentity::Unknown,
+                target: AuditField::Unknown,
+                scope: AuditField::Unknown,
+                action: SecurityAuditClass::AuthorizationDenial,
+                outcome: SecurityAuditOutcome::Denied,
+                correlation: AuditCorrelation::Unknown,
+                operation_id: AuditField::NotApplicable,
+                policy_revision: AuditField::Unknown,
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::NotApplicable,
+            }
+        );
+        assert_eq!(stale_auth_catalog.get_revision().await, 3);
+        assert_eq!(stale_denial_catalog.get_revision().await, 4);
+    }
+
     /// S5 green gate: COMMIT with a Jwt principal produces an audit event with actor = "jwt:alice".
     #[tokio::test]
     async fn audit_carries_principal_actor() {
@@ -22672,7 +25738,7 @@ mod s4_tests {
 
     #[tokio::test]
     async fn sink_secret_reference_blocks_secret_drop_until_sink_drop() {
-        let (handler, conn_id) = make_handler_with_admin().await;
+        let (handler, conn_id, _) = make_handler_with_admin().await;
         handler.catalog.add_view_in_namespace(CatalogView {
             name: "orders_view".to_string(),
             sql: "SELECT 1".to_string(),
@@ -23578,6 +26644,7 @@ mod source_batch_tests {
                     data_type: "Utf8".to_string(),
                 },
             ],
+            &[],
             &batch,
         )
         .unwrap();
@@ -23595,7 +26662,7 @@ mod source_batch_tests {
                     &"orders".to_string(),
                     &vec!["id".to_string(), "customer".to_string()],
                     &"7\tada".to_string(),
-                    &"id=7|customer=ada".to_string(),
+                    &"__pk1:V1:7;V3:ada;".to_string(),
                 )
             ),
             _ => panic!("positive source weight must insert"),
@@ -23609,7 +26676,7 @@ mod source_batch_tests {
                 (table, row_key, returning_tsv),
                 (
                     &"orders".to_string(),
-                    &"id=8|customer=bea".to_string(),
+                    &"__pk1:V1:8;V3:bea;".to_string(),
                     &Some("8\tbea".to_string()),
                 )
             ),
@@ -23638,6 +26705,7 @@ mod source_batch_tests {
                 name: "amount".to_string(),
                 data_type: "Decimal(12,2)".to_string(),
             }],
+            &[],
             &batch,
         )
         .unwrap();
@@ -23656,6 +26724,230 @@ mod source_batch_tests {
             ),
             ("10.25".to_string(), "5.50".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+// These subscription fixtures use unwrap for concise setup and assertions.
+#[allow(clippy::unwrap_used)]
+mod v073_subscription_policy_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn live_subscriptions_reauthorize_across_catalog_instances_and_keep_other_principals_streaming(
+    ) {
+        use crate::catalog_stubs::CatalogView;
+        use crate::change_log::ChangeEntry;
+        use rockstream_storage::catalog::{
+            CatalogMutation, CatalogStore, CatalogTxn, DurableCatalogStore,
+        };
+        use rockstream_types::authorization::{PermissionPreset, ScopedPresetGrant};
+        use rockstream_types::ids::PrincipalId;
+
+        async fn subscribe(
+            handler: &GatewayHandler,
+            conn_id: &str,
+        ) -> futures::stream::BoxStream<'static, PgWireResult<pgwire::messages::data::DataRow>>
+        {
+            match handler
+                .handle_subscribe(
+                    "SUBSCRIBE v072_live_auth AS OF NOW WITH SNAPSHOT",
+                    Some(conn_id),
+                )
+                .await
+                .unwrap()
+                .pop()
+            {
+                Some(Response::Query(response)) => response.data_rows(),
+                _ => panic!("authorized subscription must return a row stream"),
+            }
+        }
+
+        let (handler, admin_conn_id, object_store) =
+            super::s4_tests::make_handler_with_admin().await;
+        handler.bind_server(&handler);
+        handler.catalog.add_view_in_namespace(CatalogView {
+            name: "v072_live_auth".to_string(),
+            sql: "SELECT value FROM source".to_string(),
+            columns: vec![CatalogColumn {
+                name: "value".to_string(),
+                data_type: "Utf8".to_string(),
+            }],
+            namespace: "public".to_string(),
+            op_id: None,
+        });
+        let durable = handler
+            .catalog
+            .get_durable_store()
+            .unwrap_or_else(|| panic!("durable security store"));
+        let salt = vec![2; 16];
+        let (_, stored_key, server_key) =
+            crate::role_catalog::gen_scram_verifiers("reader-password", &salt, 4096);
+        let mut reader = SecurityPrincipal {
+            format_version: rockstream_types::authorization::SECURITY_PRINCIPAL_FORMAT_VERSION,
+            id: PrincipalId(2),
+            display_name: "Subscription reader".to_string(),
+            enabled: true,
+            revision: 1,
+            login_methods: vec![LoginMethod::ScramSha256 {
+                username: "subscription-reader".to_string(),
+                salt,
+                iterations: 4096,
+                stored_key: stored_key.to_vec(),
+                server_key: server_key.to_vec(),
+            }],
+            preset_grants: vec![ScopedPresetGrant {
+                preset: PermissionPreset::DataReader,
+                scope: PolicyScope::Namespace {
+                    namespace: "public".to_string(),
+                },
+            }],
+            scoped_grants: vec![],
+        };
+        let reader_policy =
+            serde_json::to_string(&(reader.enabled, &reader.preset_grants, &reader.scoped_grants))
+                .unwrap();
+        let grant_audit = SecurityAuditRecord {
+            format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: "subscription-reader-grant".to_string(),
+            timestamp_ms: current_time_ms(),
+            actor: AuditIdentity::Verified("principal:1".to_string()),
+            target: AuditField::Known("principal:2".to_string()),
+            scope: AuditField::Known("cluster".to_string()),
+            action: SecurityAuditClass::GrantChange,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::Known("3".to_string()),
+            policy_revision: AuditField::Known(1),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::Known(format!("revision=1;policy={reader_policy}")),
+        };
+        durable
+            .commit_txn(
+                CatalogTxn::new(
+                    3,
+                    3,
+                    vec![CatalogMutation::PutSecurityPrincipal {
+                        principal: reader.clone(),
+                        expected_revision: None,
+                        grantor_revision: Some((PrincipalId(1), 1)),
+                        audit: grant_audit,
+                    }],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let independent_catalog =
+            Arc::new(DurableCatalogStore::new(object_store, "gateway-unit-admin"));
+        independent_catalog.refresh().await.unwrap();
+
+        let reader_conn_id = "subscription-reader-session";
+        handler
+            .sessions
+            .entry(reader_conn_id.to_string())
+            .or_default()
+            .principal = Principal::ScramUser {
+            username: "subscription-reader".to_string(),
+        };
+        let mut admin_rows = subscribe(&handler, &admin_conn_id).await;
+        let mut reader_rows = subscribe(&handler, reader_conn_id).await;
+
+        reader.enabled = false;
+        reader.revision = 2;
+        reader.preset_grants.clear();
+        let revoked_policy =
+            serde_json::to_string(&(reader.enabled, &reader.preset_grants, &reader.scoped_grants))
+                .unwrap();
+        let revoke_audit = SecurityAuditRecord {
+            format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: "subscription-reader-revoked".to_string(),
+            timestamp_ms: current_time_ms(),
+            actor: AuditIdentity::Verified("principal:1".to_string()),
+            target: AuditField::Known("principal:2".to_string()),
+            scope: AuditField::Known("cluster".to_string()),
+            action: SecurityAuditClass::GrantChange,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::Known("4".to_string()),
+            policy_revision: AuditField::Known(2),
+            before_state: AuditField::Known(format!("revision=1;policy={reader_policy}")),
+            after_state: AuditField::Known(format!("revision=2;policy={revoked_policy}")),
+        };
+        let revocation_started = std::time::Instant::now();
+        independent_catalog
+            .commit_txn(
+                CatalogTxn::new(
+                    4,
+                    4,
+                    vec![CatalogMutation::PutSecurityPrincipal {
+                        principal: reader,
+                        expected_revision: Some(1),
+                        grantor_revision: Some((PrincipalId(1), 1)),
+                        audit: revoke_audit,
+                    }],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        handler
+            .subscribe_registry
+            .push_epoch(
+                "v072_live_auth",
+                vec![ChangeEntry {
+                    epoch: 1,
+                    row_key: Bytes::from_static(b"1"),
+                    mz_diff: 1,
+                    encoded_row: Bytes::from_static(b"live"),
+                }],
+            )
+            .unwrap();
+        tokio::time::sleep(SECURITY_POLICY_REFRESH_INTERVAL + Duration::from_millis(100)).await;
+
+        let row = tokio::time::timeout(Duration::from_secs(2), admin_rows.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.field_count, 3);
+        assert_eq!(row.data.as_ref(), b"\0\0\0\x04live\0\0\0\x011\0\0\0\x011");
+
+        let error = tokio::time::timeout(Duration::from_secs(2), reader_rows.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        let reauthorization_elapsed = revocation_started.elapsed();
+        assert!(
+            reauthorization_elapsed <= Duration::from_secs(60),
+            "authorization revocation took {reauthorization_elapsed:?}"
+        );
+        match error {
+            PgWireError::UserError(error) => {
+                assert_eq!(error.severity, "ERROR");
+                assert_eq!(error.code, "42501");
+                assert_eq!(
+                    error.message,
+                    "[RS-2401] auth.permission_denied: principal 'subscription-reader' is not authorized for action 'DataRead' on public.v072_live_auth. next_steps: Request an authorized scoped grant, then retry."
+                );
+            }
+            error => panic!("revoked subscription must return a user denial: {error:?}"),
+        }
+        assert!(reader_rows.next().await.is_none());
+        assert!(handler.sessions.contains_key(reader_conn_id));
+        assert!(durable
+            .list_security_audit_records()
+            .await
+            .unwrap()
+            .iter()
+            .any(|record| {
+                record.action == SecurityAuditClass::AuthorizationDenial
+                    && record.actor
+                        == AuditIdentity::Verified("scram:subscription-reader".to_string())
+                    && record.target == AuditField::Known("public.v072_live_auth".to_string())
+                    && record.correlation == AuditCorrelation::Observed(reader_conn_id.to_string())
+            }));
     }
 }
 
@@ -23895,5 +27187,167 @@ mod v072_datafusion_fallback_limits {
         .is_err());
         assert!(account_fallback_query_batch(usize::MAX, 0, &batch).is_err());
         assert!(account_fallback_query_batch(0, usize::MAX, &batch).is_err());
+    }
+}
+
+#[cfg(test)]
+mod v073_secret_policy_refresh_tests {
+    use super::*;
+
+    struct NoopViewReader;
+
+    #[async_trait::async_trait]
+    impl ViewReader for NoopViewReader {
+        async fn read_view(
+            &self,
+            _view_name: &str,
+            _limit: Option<usize>,
+            _strategy: ViewReadStrategy,
+        ) -> Result<Vec<Vec<u8>>, GatewayError> {
+            Ok(Vec::new())
+        }
+
+        fn published_frontier(&self) -> Option<u64> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn source_secret_use_refreshes_durable_policy_before_resolution() {
+        use rockstream_storage::catalog::{
+            CatalogMutation, CatalogStore, CatalogTxn, DurableCatalogStore,
+        };
+        use rockstream_types::authorization::{
+            PermissionPreset, ScopedActionGrant, ScopedPresetGrant,
+            SECURITY_PRINCIPAL_FORMAT_VERSION,
+        };
+
+        let object_store = Arc::new(object_store::memory::InMemory::new());
+        let writer = Arc::new(DurableCatalogStore::new(
+            object_store.clone(),
+            "secret-policy-refresh",
+        ));
+        let salt = vec![1; 16];
+        let (_, stored_key, server_key) =
+            crate::role_catalog::gen_scram_verifiers("admin-password", &salt, 4096);
+        let administrator = SecurityPrincipal {
+            format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+            id: PrincipalId(1),
+            display_name: "Secret policy administrator".to_string(),
+            enabled: true,
+            revision: 1,
+            login_methods: vec![LoginMethod::ScramSha256 {
+                username: "secret-policy-admin".to_string(),
+                salt,
+                iterations: 4096,
+                stored_key: stored_key.to_vec(),
+                server_key: server_key.to_vec(),
+            }],
+            preset_grants: vec![ScopedPresetGrant {
+                preset: PermissionPreset::Administrator,
+                scope: PolicyScope::Cluster,
+            }],
+            scoped_grants: vec![ScopedActionGrant {
+                action: SecurityAction::SecretUse,
+                scope: PolicyScope::Secret {
+                    namespace: "public".to_string(),
+                    name: "kafka".to_string(),
+                    consumer: Some(PrincipalId(1)),
+                },
+            }],
+        };
+        writer
+            .preprovision_first_administrator(administrator.clone(), 1)
+            .await
+            .unwrap_or_else(|error| panic!("failed to provision test administrator: {error}"));
+
+        let stale_store = Arc::new(DurableCatalogStore::new(
+            object_store,
+            "secret-policy-refresh",
+        ));
+        stale_store
+            .refresh()
+            .await
+            .unwrap_or_else(|error| panic!("failed to refresh test catalog: {error}"));
+        let mut revoked = administrator.clone();
+        revoked.revision = 2;
+        revoked.scoped_grants.clear();
+        let before_policy = serde_json::to_string(&(
+            administrator.enabled,
+            &administrator.preset_grants,
+            &administrator.scoped_grants,
+        ))
+        .unwrap_or_else(|error| panic!("failed to serialize test policy: {error}"));
+        let after_policy = serde_json::to_string(&(
+            revoked.enabled,
+            &revoked.preset_grants,
+            &revoked.scoped_grants,
+        ))
+        .unwrap_or_else(|error| panic!("failed to serialize revoked test policy: {error}"));
+        writer
+            .commit_txn(
+                CatalogTxn::new(
+                    2,
+                    2,
+                    vec![CatalogMutation::PutSecurityPrincipal {
+                        principal: revoked,
+                        expected_revision: Some(1),
+                        grantor_revision: Some((PrincipalId(1), 1)),
+                        audit: SecurityAuditRecord {
+                            format_version:
+                                rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+                            event_id: "secret-use-revocation".to_string(),
+                            timestamp_ms: current_time_ms(),
+                            actor: AuditIdentity::Verified("principal:1".to_string()),
+                            target: AuditField::Known("principal:1".to_string()),
+                            scope: AuditField::Known("cluster".to_string()),
+                            action: SecurityAuditClass::GrantChange,
+                            outcome: SecurityAuditOutcome::Success,
+                            correlation: AuditCorrelation::Unknown,
+                            operation_id: AuditField::Known("2".to_string()),
+                            policy_revision: AuditField::Known(2),
+                            before_state: AuditField::Known(format!(
+                                "revision=1;policy={before_policy}"
+                            )),
+                            after_state: AuditField::Known(format!(
+                                "revision=2;policy={after_policy}"
+                            )),
+                        },
+                    }],
+                )
+                .unwrap_or_else(|error| panic!("invalid test catalog transaction: {error}")),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("failed to revoke test policy: {error}"));
+        assert_eq!(
+            stale_store
+                .list_security_principals()
+                .await
+                .unwrap_or_else(|error| panic!("failed to read stale test policy: {error}")),
+            vec![administrator]
+        );
+
+        let catalog = Arc::new(CatalogStubs::new());
+        catalog.set_durable_store(stale_store);
+        let handler = GatewayHandler::new(catalog, Arc::new(NoopViewReader));
+        let source = CatalogSourceEntry {
+            name: "kafka_source".to_string(),
+            table_name: Some("orders".to_string()),
+            source_type: "kafka".to_string(),
+            format: "json".to_string(),
+            options: HashMap::from([("secret".to_string(), "secret://kafka".to_string())]),
+            status: "RUNNING".to_string(),
+            live_offset: "0".to_string(),
+            live_lag: 0,
+            secret_consumer: Some(PrincipalId(1)),
+            secret_namespace: Some("public".to_string()),
+        };
+        assert_eq!(
+            handler
+                .authorize_source_secret_use(&source, "secret://kafka")
+                .await
+                .map_err(|error| error.to_string()),
+            Err("[RS-2401] source secret consumer is no longer authorized".to_string())
+        );
     }
 }

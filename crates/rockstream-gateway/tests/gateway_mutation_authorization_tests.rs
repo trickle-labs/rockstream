@@ -11,7 +11,7 @@ use rockstream_control::SecretStore;
 use rockstream_gateway::auth::Principal;
 use rockstream_gateway::catalog_stubs::{CatalogColumn, CatalogStubs, CatalogTable, CatalogView};
 use rockstream_gateway::role_catalog::{gen_scram_verifiers, RoleEntry};
-use rockstream_gateway::server::GatewayHandler;
+use rockstream_gateway::server::{CancelToken, GatewayHandler, CANCEL_TOKEN};
 use rockstream_gateway::view_reader::{ViewReadStrategy, ViewReader};
 use rockstream_gateway::GatewayError;
 use rockstream_storage::catalog::{
@@ -612,8 +612,10 @@ async fn viewer_cannot_bypass_mutation_policy_with_multi_statement_sql() {
 #[tokio::test]
 async fn administrator_can_manage_secret_and_read_only_its_metadata() {
     let catalog = Arc::new(CatalogStubs::new());
+    let object_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
     let durable = Arc::new(DurableCatalogStore::new(
-        Arc::new(object_store::memory::InMemory::new()),
+        object_store.clone(),
         "secret-administration-policy-test",
     ));
     seed_public_namespace(&durable).await;
@@ -648,14 +650,18 @@ async fn administrator_can_manage_secret_and_read_only_its_metadata() {
     let secret_store = Arc::new(
         SecretStore::open_durable(
             "secret-administration-policy-test-secrets",
-            Arc::new(object_store::memory::InMemory::new()),
+            object_store.clone(),
             Arc::new(EnvKekProvider::from_passphrase(
                 "secret-admin-policy-test-kek",
             )),
         )
         .await
         .unwrap()
-        .with_security_audit_catalog(durable),
+        .with_security_audit_catalog(durable)
+        .with_management_operation_store(
+            rockstream_control::ManagementOperationStore::new(object_store),
+            "secret-administration-policy-test".to_string(),
+        ),
     );
     let handler = GatewayHandler::new(catalog, Arc::new(NoopViewReader))
         .with_secret_store(secret_store.clone());
@@ -757,6 +763,17 @@ async fn administrator_can_manage_secret_and_read_only_its_metadata() {
     assert!(sales_rows.next().await.is_none());
     assert!(!format!("{sales_row:?}").contains("sales-secret"));
 
+    let idempotency_key = handler
+        .dispatch_async_with_conn(
+            "SET rockstream.idempotency_key = '00000000-0000-4000-8000-000000000360'",
+            Some("secret-admin-connection"),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        idempotency_key.as_slice(),
+        [pgwire::api::results::Response::Execution(_)]
+    ));
     let altered_sales = handler
         .dispatch_async_with_conn(
             "ALTER SECRET kafka_auth SET (password = 'replacement')",
@@ -1314,7 +1331,7 @@ async fn show_security_audit_returns_stable_pages_and_denies_operator_only_acces
     durable
         .commit_txn(
             CatalogTxn::new(
-                3,
+                2,
                 203,
                 vec![
                     CatalogMutation::AppendSecurityAudit(event_z.clone()),
@@ -1367,7 +1384,7 @@ async fn show_security_audit_returns_stable_pages_and_denies_operator_only_acces
     durable
         .commit_txn(
             CatalogTxn::new(
-                4,
+                3,
                 204,
                 vec![CatalogMutation::PutSecurityPrincipal {
                     principal: operator.clone(),
@@ -1515,6 +1532,32 @@ async fn show_security_audit_returns_stable_pages_and_denies_operator_only_acces
         denied_event.correlation,
         AuditCorrelation::Observed("audit-operator".to_string())
     );
+
+    let cancel_token = CancelToken::new();
+    cancel_token.cancel();
+    let cancelled = CANCEL_TOKEN
+        .scope(
+            cancel_token,
+            handler.dispatch_async_with_conn(
+                &format!(
+                    "SHOW SECURITY AUDIT FROM {base_ms} TO {} LIMIT 1",
+                    base_ms + 2
+                ),
+                Some("audit-admin"),
+            ),
+        )
+        .await
+        .unwrap();
+    let [pgwire::api::results::Response::Error(error)] = cancelled.as_slice() else {
+        panic!("a cancelled audit page must return one error response");
+    };
+    assert_eq!(error.severity, "ERROR");
+    assert_eq!(error.code, "57014");
+    assert_eq!(
+        error.message,
+        "[RS-2050] query.cancelled: query was cancelled by a client CancelRequest. next_steps: Retry the query or await client timeout settings."
+    );
+    assert_eq!(durable.list_security_audit_records().await.unwrap(), audit);
 }
 
 #[cfg(feature = "testcontainers")]

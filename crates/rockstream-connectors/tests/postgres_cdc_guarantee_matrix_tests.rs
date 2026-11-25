@@ -123,11 +123,11 @@ async fn postgres_cdc_snapshot_stream_fence_has_exact_transcript() {
 }
 
 #[tokio::test]
-async fn postgres_cdc_all_mutation_types_have_exact_transcript() {
+async fn postgres_cdc_insert_update_delete_have_exact_transcript() {
     let fixture = common::connector_fixture("mutations").await;
     fixture
         .postgres
-        .batch_execute("INSERT INTO orders VALUES (1); UPDATE orders SET id = 2 WHERE id = 1; DELETE FROM orders WHERE id = 2; TRUNCATE orders")
+        .batch_execute("INSERT INTO orders VALUES (1); UPDATE orders SET id = 2 WHERE id = 1; DELETE FROM orders WHERE id = 2")
         .await
         .unwrap();
     let mut source = source();
@@ -149,6 +149,53 @@ async fn postgres_cdc_all_mutation_types_have_exact_transcript() {
         .await
         .unwrap()
         .is_empty());
+}
+
+#[tokio::test]
+async fn postgres_cdc_row_only_truncate_retries_same_frame_without_ack() {
+    let fixture = common::connector_fixture("row_only_truncate").await;
+    let mut source = PostgresCdcSource::connect_pgoutput(
+        ConnectorId(5_259),
+        schema(),
+        config(&fixture, "row_only_truncate"),
+        false,
+    )
+    .await
+    .unwrap();
+    let fence = source.capture_snapshot_delta_fence(None).await.unwrap();
+    fixture
+        .postgres
+        .batch_execute("BEGIN; INSERT INTO orders VALUES (1); TRUNCATE orders; COMMIT")
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match source
+            .poll_delta(fence.live.clone(), 8 * 1024 * 1024, 4_096, None)
+            .await
+        {
+            Err(error) => {
+                assert!(error.to_string().contains("TRUNCATE"), "{error}");
+                break;
+            }
+            Ok(result) => {
+                assert!(
+                    result.batches.is_empty(),
+                    "must not emit a partial transaction"
+                );
+                assert!(Instant::now() < deadline, "TRUNCATE did not reach decoder");
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+    for _ in 0..2 {
+        let error = source
+            .poll_delta(fence.live.clone(), 8 * 1024 * 1024, 4_096, None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("TRUNCATE"), "{error}");
+    }
+    assert_eq!(source.last_committed_lsn(), None);
 }
 
 #[tokio::test]
@@ -482,4 +529,219 @@ async fn test_quad_lsn_persistence_and_acknowledgment_barrier() {
     assert!(recovered
         .quad_lsn_progress()
         .is_duplicate(PgLsn::parse("0/20").unwrap()));
+}
+
+fn apply_pair_batches(
+    state: &mut std::collections::BTreeMap<(i64, i64), i64>,
+    batches: &[arrow::record_batch::RecordBatch],
+) {
+    for batch in batches {
+        let (batch, weights) = split_weight_column(batch).unwrap();
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        let vals = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        for (index, weight) in weights.iter().enumerate() {
+            let key = (ids.value(index), vals.value(index));
+            let entry = state.entry(key).or_insert(0);
+            *entry += weight;
+            if *entry == 0 {
+                state.remove(&key);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn postgres_cdc_synchronized_snapshot_handoff_is_exact_across_restart() {
+    let fixture = common::connector_fixture("sync_handoff").await;
+    fixture
+        .postgres
+        .batch_execute(
+            "CREATE TABLE items (id BIGINT PRIMARY KEY, val BIGINT NOT NULL); \
+             ALTER TABLE items REPLICA IDENTITY FULL; \
+             CREATE PUBLICATION items_pub FOR TABLE items; \
+             INSERT INTO items VALUES (1, 10);",
+        )
+        .await
+        .unwrap();
+
+    let dsn = format!(
+        "host={} port={} user=postgres password=postgres dbname=postgres",
+        fixture.postgres_host, fixture.postgres_port
+    );
+    let (concurrent_pg, conn) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    // Opposite boundary: an in-flight transaction started BEFORE slot creation
+    // that commits while CREATE_REPLICATION_SLOT is building its snapshot must
+    // appear in the exported snapshot and MUST NOT be re-emitted in deltas.
+    concurrent_pg
+        .batch_execute("BEGIN; INSERT INTO items VALUES (2, 20);")
+        .await
+        .unwrap();
+
+    let slot_name = "rockstream_sync_handoff";
+    let items_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("val", DataType::Int64, false),
+    ]));
+    let items_config = PgOutputConfig {
+        host: fixture.postgres_host.clone(),
+        port: fixture.postgres_port,
+        database: "postgres".to_string(),
+        user: "postgres".to_string(),
+        password: Some("postgres".to_string()),
+        slot: slot_name.to_string(),
+        publication: "items_pub".to_string(),
+        table: "public.items".to_string(),
+    };
+
+    let (bound_tx, bound_rx) = tokio::sync::oneshot::channel::<()>();
+    let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel::<()>();
+    let bound_tx = Arc::new(tokio::sync::Mutex::new(Some(bound_tx)));
+    let proceed_rx = Arc::new(tokio::sync::Mutex::new(Some(proceed_rx)));
+    PostgresCdcSource::register_snapshot_sync_hook(
+        slot_name,
+        Arc::new(move || {
+            let bound_tx = Arc::clone(&bound_tx);
+            let proceed_rx = Arc::clone(&proceed_rx);
+            Box::pin(async move {
+                if let Some(tx) = bound_tx.lock().await.take() {
+                    let _ = tx.send(());
+                }
+                if let Some(rx) = proceed_rx.lock().await.take() {
+                    let _ = rx.await;
+                }
+            })
+        }),
+    );
+
+    let mut source = PostgresCdcSource::connect_pgoutput(
+        ConnectorId(5_501),
+        items_schema.clone(),
+        items_config.clone(),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let snapshot_task = tokio::spawn(async move {
+        let fence = source.capture_snapshot_delta_fence(None).await.unwrap();
+        (source, fence)
+    });
+
+    // Let CREATE_REPLICATION_SLOT reach the running-xact wait, then commit (2, 20).
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    concurrent_pg.batch_execute("COMMIT;").await.unwrap();
+
+    // Wait until the exported snapshot is bound to the REPEATABLE READ transaction
+    // and BEFORE the relation rows are scanned.
+    bound_rx.await.unwrap();
+
+    // Exact failing schedule from #347: commit concurrent INSERT, UPDATE, DELETE
+    // after the MVCC snapshot is fixed and ensure commit WAL is written.
+    concurrent_pg
+        .batch_execute(
+            "INSERT INTO items VALUES (3, 30); \
+             UPDATE items SET val = 15 WHERE id = 1; \
+             DELETE FROM items WHERE id = 2; \
+             SELECT pg_switch_wal();",
+        )
+        .await
+        .unwrap();
+
+    proceed_tx.send(()).unwrap();
+    let (mut source, fence) = snapshot_task.await.unwrap();
+
+    let snapshot = source
+        .start_snapshot(&fence, None, None)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>();
+    let mut materialized = std::collections::BTreeMap::new();
+    apply_pair_batches(
+        &mut materialized,
+        &snapshot
+            .iter()
+            .map(|batch| batch.batch.clone())
+            .collect::<Vec<_>>(),
+    );
+    // Snapshot must contain ONLY the state at consistent_point: (1, 10) and (2, 20).
+    assert_eq!(
+        materialized,
+        std::collections::BTreeMap::from([((1, 10), 1), ((2, 20), 1)])
+    );
+
+    // Acknowledge the snapshot boundary only after snapshot is captured/durable.
+    source
+        .commit_offset(0, fence.snapshot.clone())
+        .await
+        .unwrap();
+
+    let mut offset = fence.live.clone();
+    let mut epoch = 1u64;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while materialized != std::collections::BTreeMap::from([((1, 15), 1), ((3, 30), 1)])
+        && tokio::time::Instant::now() < deadline
+    {
+        let delta = source
+            .poll_delta(offset.clone(), 8 * 1024 * 1024, 4_096, None)
+            .await
+            .unwrap();
+        if !delta.batches.is_empty() {
+            apply_pair_batches(&mut materialized, &delta.batches);
+            source
+                .commit_offset(epoch, delta.new_offset.clone())
+                .await
+                .unwrap();
+            offset = delta.new_offset;
+            epoch += 1;
+        } else {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+    assert_eq!(
+        materialized,
+        std::collections::BTreeMap::from([((1, 15), 1), ((3, 30), 1)])
+    );
+
+    // Restart from durable checkpoint (has_checkpoint = true) and verify no
+    // duplicates or missed changes.
+    drop(source);
+    let mut restarted =
+        PostgresCdcSource::connect_pgoutput(ConnectorId(5_501), items_schema, items_config, true)
+            .await
+            .unwrap();
+    assert!(restarted
+        .poll_delta(offset.clone(), 8 * 1024 * 1024, 4_096, None)
+        .await
+        .unwrap()
+        .batches
+        .is_empty());
+
+    concurrent_pg
+        .batch_execute("INSERT INTO items VALUES (4, 40);")
+        .await
+        .unwrap();
+    let delta = poll_until_rows(&mut restarted, offset).await;
+    apply_pair_batches(&mut materialized, &delta.batches);
+    restarted
+        .commit_offset(epoch, delta.new_offset)
+        .await
+        .unwrap();
+    assert_eq!(
+        materialized,
+        std::collections::BTreeMap::from([((1, 15), 1), ((3, 30), 1), ((4, 40), 1)])
+    );
 }

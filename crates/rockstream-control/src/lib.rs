@@ -24,6 +24,7 @@ pub mod checkpoint;
 pub mod checkpoint_export;
 pub mod checkpoint_store;
 pub mod config_deriver;
+pub mod delegation;
 pub mod freshness;
 pub mod frontier;
 pub mod kek;
@@ -41,6 +42,7 @@ pub mod service;
 pub mod shard;
 pub mod shard_stats;
 pub mod skew;
+mod support_artifact;
 pub mod tls;
 pub mod topology;
 
@@ -54,10 +56,11 @@ pub use checkpoint::{
 };
 pub use checkpoint_export::{
     CheckpointExportError, CheckpointExportOutcome, CheckpointExportService,
-    CheckpointRestoreOutcome, MAX_CHECKPOINT_EXPORT_OBJECTS_IN_FLIGHT,
-    MAX_CHECKPOINT_EXPORT_OBJECT_BYTES, MAX_CHECKPOINT_EXPORT_SCAN_WINDOW,
+    CheckpointRestoreOutcome, CHECKPOINT_EXPORT_STREAM_CHUNK_BYTES,
+    MAX_CHECKPOINT_EXPORT_OBJECTS_IN_FLIGHT, MAX_CHECKPOINT_EXPORT_OBJECT_BYTES,
+    MAX_CHECKPOINT_EXPORT_SCAN_WINDOW,
 };
-pub use checkpoint_store::CheckpointManifestStore;
+pub use checkpoint_store::{CheckpointManifestStore, GcPin, GcPinKind, GcPinStore};
 pub use freshness::{
     AdmissionMode, CheckpointMode, FreshnessAction, FreshnessBounds, FreshnessController,
     FreshnessObservation,
@@ -68,7 +71,8 @@ pub use management::{ManagementService, ManagementServiceHandle};
 pub use management_store::{
     IdempotencyRecord, ManagementOperationStore, OperationKind, OperationLifecycleError,
     OperationRecord, OperationStatus, OperationStoreError, OperationUpdate,
-    IDEMPOTENCY_KEY_RETENTION_MS, MANAGEMENT_OPERATION_RECORD_VERSION,
+    SecretRotationOperationRequest, IDEMPOTENCY_KEY_RETENTION_MS,
+    MANAGEMENT_OPERATION_RECORD_VERSION,
 };
 pub use manifest::{
     compute_file_sha256, validate_catalog_reference, verify_backup_payload_files,
@@ -89,7 +93,11 @@ pub use placement::PlacementAlgorithm;
 pub use qualification_store::QualificationEvidenceStore;
 pub use rockstream_types::migration::MigrationProgress;
 pub use scheduler::{ShardAssignment, ShardScheduler};
-pub use secret_store::{SecretListing, SecretStore, SecretStoreError};
+pub use secret_store::{
+    SecretListing, SecretRotationOperationError, SecretStore, SecretStoreError,
+    SecretStoreMetricsSnapshot, MAX_KEK_ROTATION_STAGED_ENTRIES, MAX_KEK_ROTATION_STAGING_BYTES,
+    MAX_SECRET_STORE_WAITERS,
+};
 pub use service::{ControlService, ControlServiceHandle};
 pub use shard::{LeaseError, ShardManager, ShardManagerSnapshot, ShardPersistentStore};
 pub use shard_stats::ShardStatsPersistentStore;

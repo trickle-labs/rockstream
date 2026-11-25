@@ -9,16 +9,24 @@ use std::time::{Duration, Instant};
 use rockstream_cli::output::{
     CliErrorEnvelope, ManagementClusterStatusInfo, ManagementConfigSummaryInfo, ManagementNodeInfo,
 };
+use rockstream_test_support::pki::TestPki;
 use tempfile::TempDir;
+
+#[path = "common/management_auth.rs"]
+mod management_auth;
+
+use management_auth::{add_client_tls_args, add_server_tls_args, preprovision_administrator};
 
 fn free_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     listener.local_addr().expect("read ephemeral port").port()
 }
 
-fn run_status(binary: &Path, management_addr: &str) -> Output {
-    Command::new(binary)
-        .env("RUST_LOG", "off")
+fn run_status(binary: &Path, management_addr: &str, pki: &TestPki) -> Output {
+    let mut command = Command::new(binary);
+    command.env("RUST_LOG", "off");
+    add_client_tls_args(&mut command, pki);
+    command
         .args([
             "--output",
             "text",
@@ -30,9 +38,11 @@ fn run_status(binary: &Path, management_addr: &str) -> Output {
         .expect("run rockstream status")
 }
 
-fn run_json_status(binary: &Path, management_addr: &str) -> Output {
-    Command::new(binary)
-        .env("RUST_LOG", "off")
+fn run_json_status(binary: &Path, management_addr: &str, pki: &TestPki) -> Output {
+    let mut command = Command::new(binary);
+    command.env("RUST_LOG", "off");
+    add_client_tls_args(&mut command, pki);
+    command
         .args([
             "--output",
             "json",
@@ -72,6 +82,15 @@ fn assert_json_status_transcript(
             .iter()
             .find(|actual| actual.node_id == node.node_id)
             .expect("expected node is present in status");
+        if node.address == "127.0.0.1:0" {
+            let address: std::net::SocketAddr = actual.address.parse().expect("worker address");
+            assert_eq!(
+                address.ip(),
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+            );
+            assert_ne!(address.port(), 0);
+            node.address = actual.address.clone();
+        }
         assert!((0.0..=1.0).contains(&actual.capacity_headroom));
         node.capacity_headroom = actual.capacity_headroom;
         node.registered_at_ms = 0;
@@ -99,11 +118,16 @@ fn assert_json_status_transcript(
     status
 }
 
-fn wait_for_status(binary: &Path, management_addr: &str, expected_nodes: usize) -> Output {
+fn wait_for_status(
+    binary: &Path,
+    management_addr: &str,
+    expected_nodes: usize,
+    pki: &TestPki,
+) -> Output {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut last_error = String::new();
     while Instant::now() < deadline {
-        let output = run_json_status(binary, management_addr);
+        let output = run_json_status(binary, management_addr, pki);
         if output.status.success() {
             let status: ManagementClusterStatusInfo =
                 serde_json::from_slice(&output.stdout).expect("management status JSON");
@@ -172,8 +196,9 @@ fn acceptance_suite_proves_product_truth_lifecycle() {
     let binary = Path::new(env!("CARGO_BIN_EXE_rockstream"));
     let control_addr = format!("127.0.0.1:{}", free_port());
     let management_addr = format!("127.0.0.1:{}", free_port());
+    let pki = TestPki::generate();
 
-    let unavailable = run_status(binary, &management_addr);
+    let unavailable = run_status(binary, &management_addr, &pki);
     assert!(!unavailable.status.success());
     assert_eq!(unavailable.stdout, b"");
     let unavailable_stderr = String::from_utf8(unavailable.stderr).expect("utf-8 status error");
@@ -191,29 +216,30 @@ fn acceptance_suite_proves_product_truth_lifecycle() {
     assert!(!unavailable_stderr.contains("Shards:"));
 
     let storage = TempDir::new().expect("create control storage");
+    preprovision_administrator(binary, storage.path(), &pki, "gateway");
+    let mut control_command = Command::new(binary);
+    control_command.env("RUST_LOG", "off").args([
+        "start",
+        "--role",
+        "control",
+        "--storage",
+        storage.path().to_str().expect("storage path is utf-8"),
+        "--control-bind",
+        &control_addr,
+        "--management-addr",
+        &management_addr,
+    ]);
+    add_server_tls_args(&mut control_command, &pki);
     let node = RunningControl(
-        Command::new(binary)
-            .env("RUST_LOG", "off")
-            .args([
-                "start",
-                "--role",
-                "control",
-                "--storage",
-                storage.path().to_str().expect("storage path is utf-8"),
-                "--control-bind",
-                &control_addr,
-                "--management-addr",
-                &management_addr,
-                "--allow-insecure-internal-dev",
-                "--daemon",
-            ])
+        control_command
+            .arg("--daemon")
             .spawn()
             .expect("start one-node control service"),
     );
 
     let deadline = Instant::now() + Duration::from_secs(5);
     let live = loop {
-        let output = run_status(binary, &management_addr);
+        let output = run_status(binary, &management_addr, &pki);
         if output.status.success() {
             break output;
         }
@@ -242,7 +268,7 @@ fn acceptance_suite_proves_product_truth_lifecycle() {
     );
 
     drop(node);
-    let after_shutdown = run_status(binary, &management_addr);
+    let after_shutdown = run_status(binary, &management_addr, &pki);
     assert!(!after_shutdown.status.success());
     assert_eq!(after_shutdown.stdout, b"");
     let shutdown_stderr = String::from_utf8(after_shutdown.stderr).expect("utf-8 shutdown error");
@@ -265,73 +291,91 @@ fn standalone_worker_management_status_is_an_exact_json_lifecycle_transcript() {
     let management_addr = format!("127.0.0.1:{}", free_port());
     let control_storage = root.path().join("control");
     let worker_storage = root.path().join("worker");
+    let pki = TestPki::generate_with_worker_ids([77]);
+    preprovision_administrator(binary, &control_storage, &pki, "gateway");
     let canary = "v066-management-config-canary-93e1";
+    let exchange_addr = format!("127.0.0.1:{}", free_port());
     std::fs::write(
         root.path().join("rockstream.toml"),
-        format!("version = 1\n[auth]\nsecret_path = \"{canary}\"\n"),
+        format!(
+            "version = 1\n[auth]\nsecret_path = \"{canary}\"\n[worker]\nexchange_bind_addr = \"{exchange_addr}\"\nexchange_advertise_addr = \"{exchange_addr}\"\n"
+        ),
     )
     .expect("write canary config");
 
+    let mut control_command = Command::new(binary);
+    control_command
+        .env("RUST_LOG", "off")
+        .current_dir(root.path())
+        .args([
+            "start",
+            "--role",
+            "control",
+            "--storage",
+            control_storage.to_str().unwrap(),
+            "--control-bind",
+            &control_addr,
+            "--management-addr",
+            &management_addr,
+            "--daemon",
+        ]);
+    add_server_tls_args(&mut control_command, &pki);
     let control = RunningControl(
-        Command::new(binary)
-            .env("RUST_LOG", "off")
-            .current_dir(root.path())
-            .args([
-                "start",
-                "--role",
-                "control",
-                "--storage",
-                control_storage.to_str().unwrap(),
-                "--control-bind",
-                &control_addr,
-                "--management-addr",
-                &management_addr,
-                "--allow-insecure-internal-dev",
-                "--daemon",
-            ])
+        control_command
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .expect("start standalone control process"),
     );
 
-    let empty_output = wait_for_status(binary, &management_addr, 0);
+    let empty_output = wait_for_status(binary, &management_addr, 0, &pki);
     let empty = assert_json_status_transcript(&empty_output, "unknown", vec![]);
     let empty_revision = topology_revision(&empty);
 
+    let (worker_cert, worker_key) = pki.worker_certs.get(&77).unwrap();
+    let mut worker_command = Command::new(binary);
+    worker_command
+        .env("RUST_LOG", "off")
+        .env_remove("ROCKSTREAM_CONFIG")
+        .current_dir(root.path())
+        .args([
+            "start",
+            "--role",
+            "worker",
+            "--storage",
+            worker_storage.to_str().unwrap(),
+            "--control",
+            &control_addr,
+            "--worker-id",
+            "77",
+            "--host-id",
+            "standalone-host",
+            "--availability-zone",
+            "standalone-zone",
+        ]);
+    worker_command
+        .args(["--internal-tls-cert-path"])
+        .arg(worker_cert)
+        .args(["--internal-tls-key-path"])
+        .arg(worker_key)
+        .args(["--internal-tls-ca-cert-path"])
+        .arg(&pki.ca_cert_path);
     let mut worker = RunningWorker(
-        Command::new(binary)
-            .env("RUST_LOG", "off")
-            .args([
-                "start",
-                "--role",
-                "worker",
-                "--storage",
-                worker_storage.to_str().unwrap(),
-                "--control",
-                &control_addr,
-                "--allow-insecure-internal-dev",
-                "--worker-id",
-                "77",
-                "--host-id",
-                "standalone-host",
-                "--availability-zone",
-                "standalone-zone",
-            ])
+        worker_command
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .expect("start standalone worker process"),
     );
 
-    let live_output = wait_for_status(binary, &management_addr, 1);
+    let live_output = wait_for_status(binary, &management_addr, 1, &pki);
     let live = assert_json_status_transcript(
         &live_output,
         "healthy",
         vec![ManagementNodeInfo {
             node_id: 77,
             role: "worker".to_owned(),
-            address: "127.0.0.1:0".to_owned(),
+            address: exchange_addr.clone(),
             state: "active".to_owned(),
             capacity_headroom: 1.0,
             host_id: "standalone-host".to_owned(),
@@ -347,7 +391,7 @@ fn standalone_worker_management_status_is_an_exact_json_lifecycle_transcript() {
     let memory_pressure = allocate_memory_pressure();
     let pressure_deadline = Instant::now() + Duration::from_secs(30);
     let pressure_output = loop {
-        let output = run_json_status(binary, &management_addr);
+        let output = run_json_status(binary, &management_addr, &pki);
         if output.status.success()
             && serde_json::from_slice::<ManagementClusterStatusInfo>(&output.stdout).is_ok_and(
                 |status| {
@@ -372,12 +416,16 @@ fn standalone_worker_management_status_is_an_exact_json_lifecycle_transcript() {
     }
     let pressure_status =
         assert_json_status_transcript(&pressure_output, "healthy", pressure_nodes);
+    assert_eq!(pressure_status.nodes[0].address, live.nodes[0].address);
     assert!(pressure_status.nodes[0].capacity_headroom < before_headroom);
     std::hint::black_box(&memory_pressure);
 
-    let config = Command::new(binary)
+    let mut config_command = Command::new(binary);
+    config_command
         .env("RUST_LOG", "off")
-        .current_dir(root.path())
+        .current_dir(root.path());
+    add_client_tls_args(&mut config_command, &pki);
+    let config = config_command
         .args([
             "--output",
             "json",
@@ -412,8 +460,10 @@ fn standalone_worker_management_status_is_an_exact_json_lifecycle_transcript() {
     assert_eq!(secret.value, "[REDACTED]");
     assert!(secret.redacted);
     assert_eq!(config_summary.source_version, "effective-node-config:v0.62");
-    let missing_operation = Command::new(binary)
-        .env("RUST_LOG", "off")
+    let mut operation_command = Command::new(binary);
+    operation_command.env("RUST_LOG", "off");
+    add_client_tls_args(&mut operation_command, &pki);
+    let missing_operation = operation_command
         .args([
             "--output",
             "json",
@@ -453,7 +503,7 @@ fn standalone_worker_management_status_is_an_exact_json_lifecycle_transcript() {
     );
 
     stop(&mut worker.0);
-    let removed_output = wait_for_status(binary, &management_addr, 0);
+    let removed_output = wait_for_status(binary, &management_addr, 0, &pki);
     let removed = assert_json_status_transcript(&removed_output, "unknown", vec![]);
     assert!(topology_revision(&removed) > topology_revision(&live));
     drop(control);

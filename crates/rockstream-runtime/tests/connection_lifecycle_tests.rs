@@ -18,7 +18,8 @@ use parking_lot::RwLock;
 use rockstream_ops::ArrowZSet;
 use rockstream_runtime::exchange::pool::ShuffleClientPool;
 use rockstream_runtime::exchange::proto::shuffle_service_server::ShuffleServiceServer;
-use rockstream_runtime::exchange::serialization::build_exchange_frame;
+use rockstream_runtime::exchange::proto::ShuffleFrame;
+use rockstream_runtime::exchange::serialization::serialize_zset;
 use rockstream_runtime::exchange::service::{ExchangeRegistry, ShuffleServer};
 use rockstream_types::ids::WorkerId;
 use tonic::transport::Server;
@@ -79,15 +80,21 @@ async fn test_shuffle_client_pool_generation_fencing_and_permit_safety() {
 /// Test 2 (Slice 4): Persistent connection multiplexing across multiple concurrent streams.
 #[tokio::test]
 async fn test_persistent_connection_multiplexing_bounds() {
+    let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+    let array = Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef;
+    let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+    let zset = ArrowZSet::new(batch, vec![1, 1]);
+    let expected_payload = serialize_zset(&zset).unwrap().to_vec();
+    let registry = ExchangeRegistry::new();
+    let (inlet_tx, mut inlet_rx) = tokio::sync::mpsc::channel(32);
+    registry.register(500, 1, inlet_tx, schema.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
 
     let server_handle = tokio::spawn(async move {
         Server::builder()
-            .add_service(ShuffleServiceServer::new(ShuffleServer::new(
-                ExchangeRegistry::new(),
-            )))
+            .add_service(ShuffleServiceServer::new(ShuffleServer::new(registry)))
             .serve(addr)
             .await
             .unwrap();
@@ -104,11 +111,6 @@ async fn test_persistent_connection_multiplexing_bounds() {
     let client1 = pool.get_client(worker_id).await.expect("get client 1");
     let client2 = pool.get_client(worker_id).await.expect("get client 2");
 
-    let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
-    let array = Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef;
-    let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
-    let zset = ArrowZSet::new(batch, vec![1, 1]);
-
     // Launch 16 concurrent multiplexed streams over the connection
     let mut handles = Vec::new();
     for stream_idx in 0..16 {
@@ -117,23 +119,48 @@ async fn test_persistent_connection_multiplexing_bounds() {
         } else {
             client2.clone()
         };
-        let frame = build_exchange_frame(500, 1, stream_idx as u64, 1, 10, &schema, &zset).unwrap();
+        let frame = ShuffleFrame {
+            exchange_id: 500,
+            src_shard: 1,
+            target_shard: 1,
+            epoch: 1,
+            seq: stream_idx as u64,
+            payload: expected_payload.clone(),
+            row_count: 2,
+        };
 
         handles.push(tokio::spawn(async move {
             let mut request = tonic::Request::new(futures::stream::iter(vec![frame]));
             request
                 .metadata_mut()
                 .insert("protocol_version", "1".parse().unwrap());
-            let mut response_stream = client.exchange_stream(request).await.unwrap().into_inner();
+            let mut response_stream = client.shuffle_stream(request).await.unwrap().into_inner();
             let ack = response_stream.next().await.unwrap().unwrap();
-            assert!(ack.success);
-            assert_eq!(ack.operator_id, stream_idx as u64);
+            assert_eq!(ack.exchange_id, 500);
+            assert_eq!(ack.src_shard, 1);
+            assert_eq!(ack.target_shard, 1);
+            assert_eq!(ack.epoch, 1);
+            assert_eq!(ack.seq, stream_idx as u64);
+            assert_eq!(ack.credit_grant, 2);
         }));
     }
 
     for h in handles {
         h.await.expect("stream task panicked");
     }
+
+    let mut delivered = Vec::with_capacity(16);
+    for _ in 0..16 {
+        delivered.push(
+            serialize_zset(&inlet_rx.recv().await.unwrap())
+                .unwrap()
+                .to_vec(),
+        );
+    }
+    delivered.sort();
+    let mut expected = vec![expected_payload; 16];
+    expected.sort();
+    assert_eq!(delivered, expected);
 
     server_handle.abort();
 }

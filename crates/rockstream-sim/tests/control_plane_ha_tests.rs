@@ -372,9 +372,12 @@ async fn leader_crash_composed_with_shard_fence_no_split_brain() {
 // gracefully (rather than failing, and rather than `#[ignore]`, which has
 // no precedent anywhere in this codebase) when Docker is not present.
 mod tc {
+    use super::management_security::preprovision_management_catalog;
     use std::net::SocketAddr;
+    use std::path::Path;
     use std::time::{Duration, Instant};
 
+    use sha2::Digest;
     use testcontainers::core::{ContainerPort, Mount, WaitFor};
     use testcontainers::runners::AsyncRunner;
     use testcontainers::{ContainerAsync, GenericImage, ImageExt};
@@ -383,7 +386,11 @@ mod tc {
     use tokio_rustls::client::TlsStream;
 
     use rockstream_test_support::pki::TestPki;
-    use rockstream_types::ids::{ShardId, WorkerId};
+    use rockstream_types::authorization::{
+        LoginMethod, PermissionPreset, PolicyScope, ScopedPresetGrant, SecurityPrincipal,
+        SECURITY_PRINCIPAL_FORMAT_VERSION,
+    };
+    use rockstream_types::ids::{PrincipalId, ShardId, WorkerId};
     use rockstream_types::topology::{
         CapacityHeadroom, ControlMessage, NodeRole, RaftRoleWire, WorkerMessage, WorkerRegistration,
     };
@@ -425,6 +432,47 @@ mod tc {
         pub shared_dir: tempfile::TempDir,
     }
 
+    fn certificate_sha256(path: &Path) -> [u8; 32] {
+        let mut reader = std::io::BufReader::new(std::fs::File::open(path).unwrap());
+        let certificate = rustls_pemfile::certs(&mut reader)
+            .next()
+            .expect("test PKI must include an administrator certificate")
+            .unwrap();
+        sha2::Sha256::digest(certificate.as_ref()).into()
+    }
+
+    fn preprovision_admin(storage_dir: &Path, shared_dir: &Path, operation_id: u64) {
+        let storage_mount = format!("{}:/data", storage_dir.display());
+        let shared_mount = format!("{}:/shared", shared_dir.display());
+        let output = std::process::Command::new("docker")
+            .args(["run", "--rm", "--volume"])
+            .arg(storage_mount)
+            .args(["--volume"])
+            .arg(shared_mount)
+            .arg(format!("{IMAGE_NAME}:{IMAGE_TAG}"))
+            .args([
+                "security",
+                "preprovision-admin",
+                "--layout",
+                "gateway",
+                "--storage",
+                "/data",
+                "--principal-file",
+                "/shared/ha-administrator.json",
+                "--operation-id",
+            ])
+            .arg(operation_id.to_string())
+            .arg("--yes")
+            .output()
+            .expect("failed to invoke the supported administrator preprovisioning CLI");
+        assert!(
+            output.status.success(),
+            "administrator preprovisioning failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     impl TcCluster {
         pub async fn boot(test_id: &str) -> Self {
             let network = format!("rs-net-{test_id}");
@@ -438,6 +486,26 @@ mod tc {
                 std::fs::copy(source, shared_dir.path().join(name))
                     .unwrap_or_else(|error| panic!("copy test TLS file {name}: {error}"));
             }
+            for i in 0..3 {
+                let node_storage = shared_dir.path().join(format!("node-storage-{i}"));
+                preprovision_management_catalog(&node_storage, &pki).await;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+
+                    let catalog_root = node_storage.join("gateway-shard");
+                    for path in [
+                        node_storage.clone(),
+                        catalog_root.clone(),
+                        catalog_root.join("gateway"),
+                        catalog_root.join("gateway/catalog"),
+                        catalog_root.join("gateway/catalog/log"),
+                    ] {
+                        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777))
+                            .unwrap();
+                    }
+                }
+            }
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -446,10 +514,42 @@ mod tc {
                     std::fs::Permissions::from_mode(0o777),
                 );
             }
+            let principal = SecurityPrincipal {
+                format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+                id: PrincipalId(1),
+                display_name: "HA smoke administrator".to_owned(),
+                enabled: true,
+                revision: 1,
+                login_methods: vec![LoginMethod::Mtls {
+                    certificate_sha256: certificate_sha256(&pki.cli_cert_path),
+                }],
+                preset_grants: vec![ScopedPresetGrant {
+                    preset: PermissionPreset::Administrator,
+                    scope: PolicyScope::Cluster,
+                }],
+                scoped_grants: Vec::new(),
+            };
+            std::fs::write(
+                shared_dir.path().join("ha-administrator.json"),
+                serde_json::to_vec(&principal).unwrap(),
+            )
+            .expect("write HA smoke administrator preprovisioning record");
             let names: Vec<String> = (0..3).map(|i| format!("rs-ctl-{test_id}-{i}")).collect();
 
             let mut nodes = Vec::new();
             for i in 0..3u64 {
+                let storage_dir = shared_dir.path().join(format!("node-{i}-data"));
+                std::fs::create_dir_all(&storage_dir)
+                    .expect("create per-node durable catalog directory");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&storage_dir, std::fs::Permissions::from_mode(0o777))
+                        .expect(
+                            "make per-node durable catalog directory writable in the container",
+                        );
+                }
+                preprovision_admin(&storage_dir, shared_dir.path(), i + 1);
                 let peers: Vec<String> = (0..3u64)
                     .filter(|&j| j != i)
                     .map(|j| format!("{j}@{}:7000", names[j as usize]))
@@ -477,6 +577,10 @@ mod tc {
                     .with_cmd(cmd)
                     .with_container_name(names[i as usize].clone())
                     .with_network(network.clone())
+                    .with_mount(Mount::bind_mount(
+                        storage_dir.to_str().unwrap().to_string(),
+                        "/data".to_string(),
+                    ))
                     .with_mount(Mount::bind_mount(
                         shared_dir.path().to_str().unwrap().to_string(),
                         "/shared".to_string(),
@@ -534,14 +638,15 @@ mod tc {
             }
         }
 
-        /// Poll every node (skipping unreachable ones) until exactly one
-        /// reachable node reports itself as `Leader`, or `timeout` elapses.
-        /// Panics if at any observed instant *more than one* node reports
-        /// `Leader` (split-brain — must never happen, checked on every
-        /// poll, not just the final one).
+        /// Poll every node (skipping unreachable ones) until the same node
+        /// and term remain the sole reported leader for three election windows,
+        /// or `timeout` elapses. Panics if at any observed instant *more than
+        /// one* node reports `Leader` (split-brain — checked on every poll).
         pub async fn wait_for_single_leader(&self, timeout: Duration) -> (usize, u64) {
             let deadline = Instant::now() + timeout;
             let mut stable_leader = None;
+            let mut stable_since = None;
+            let stability_window = rockstream_control::raft::DEFAULT_ELECTION_TIMEOUT_MAX * 3;
             loop {
                 let mut statuses = Vec::new();
                 for node in &self.nodes {
@@ -564,11 +669,18 @@ mod tc {
                         None => unreachable!(),
                     };
                     if stable_leader == Some((idx, term)) {
-                        return (idx, term);
+                        if stable_since
+                            .is_some_and(|since: Instant| since.elapsed() >= stability_window)
+                        {
+                            return (idx, term);
+                        }
+                    } else {
+                        stable_leader = Some((idx, term));
+                        stable_since = Some(Instant::now());
                     }
-                    stable_leader = Some((idx, term));
                 } else {
                     stable_leader = None;
+                    stable_since = None;
                 }
                 if Instant::now() > deadline {
                     if std::env::var("RS_TC_DEBUG").is_ok() {
@@ -730,7 +842,7 @@ mod tc {
         assert!(
             matches!(
                 serde_json::from_str::<ControlMessage>(response.trim()),
-                Ok(ControlMessage::Registered { worker_id: registered })
+                Ok(ControlMessage::Registered { worker_id: registered, .. })
                     if registered == WorkerId(worker_id)
             ),
             "worker registration was rejected; response: {response:?}"
@@ -908,6 +1020,9 @@ mod tc {
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 }
+
+#[path = "common/management_security.rs"]
+mod management_security;
 
 /// **S1 (closing the item deferred from Phase 3a) / S4 precondition** —
 /// `three_node_tc_cluster_boots_and_elects_leader`: a real 3-container
@@ -1446,32 +1561,17 @@ mod real_leader_fencing_108 {
             .await;
         assert_ne!(old_idx, new_idx);
         assert!(new_term > old_term);
-        let new_addr = cluster.nodes[new_idx].control_addr;
 
-        // Keep original socket alive for isolation: avoid a synthetic worker
-        // disconnect that would release the original lease.
-        let mut new_worker = tc::register_worker(new_addr, 10, &cluster.pki).await;
-        let wire = serde_json::to_string(&WorkerMessage::RequestShard {
-            worker_id: WorkerId(10),
-            shard_id: ShardId(108),
-        })
-        .unwrap()
-            + "\n";
-        new_worker.write_all(wire.as_bytes()).await.unwrap();
-        let new_lease = loop {
-            let line = tokio::time::timeout(
-                Duration::from_secs(5),
-                tc::read_message_line(&mut new_worker),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            match serde_json::from_str::<ControlMessage>(line.trim()).unwrap() {
-                ControlMessage::ShardAssigned { lease, .. } => break lease,
-                ControlMessage::TopologyChanged { .. } => continue,
-                other => panic!("replacement leader did not renew ownership: {other:?}"),
-            }
-        };
+        // Keep the original socket alive for isolation: disconnecting it
+        // would synthetically release the old lease. A status probe can observe
+        // a leader just before its short quorum lease expires, so a safe
+        // NotLeader response is transient and must trigger leader rediscovery.
+        // The existing bounded helper retries, but still requires a real
+        // ShardAssigned response; the stale/new fencing assertions below remain
+        // mandatory.
+        let (lease_leader_idx, new_lease, mut new_worker) =
+            tc::register_and_request_shard(&cluster, 10, 108).await;
+        assert_ne!(lease_leader_idx, old_idx);
         assert_eq!(new_lease.worker_id, WorkerId(10));
         assert!(new_lease.lease_token.0 > old_lease.lease_token.0);
 

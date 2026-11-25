@@ -107,6 +107,7 @@ pub struct SqlFrontend {
     // Audit: this set is updated synchronously before planning; retaining an
     // inserted name after a holder panic is valid and no guard crosses an await.
     snapshot_tables: Mutex<std::collections::HashSet<String>>,
+    distribution_config: Mutex<crate::distribution::DistributionConfig>,
 }
 
 pub fn register_session_sql_udf(ctx: &SessionContext) {
@@ -121,6 +122,21 @@ pub fn register_session_sql_udf(ctx: &SessionContext) {
         std::sync::Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
     );
     ctx.register_udf(session_udf);
+}
+
+pub fn register_hop_sql_udf(ctx: &SessionContext) {
+    let hop_udf = create_udf(
+        "hop",
+        vec![
+            DataType::Int64,
+            DataType::Interval(IntervalUnit::MonthDayNano),
+            DataType::Interval(IntervalUnit::MonthDayNano),
+        ],
+        DataType::Int64,
+        Volatility::Immutable,
+        std::sync::Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
+    );
+    ctx.register_udf(hop_udf);
 }
 
 impl Default for SqlFrontend {
@@ -139,10 +155,34 @@ impl SqlFrontend {
         let config = SessionConfig::new();
         let ctx = SessionContext::new_with_config(config);
         register_session_sql_udf(&ctx);
+        register_hop_sql_udf(&ctx);
         Self {
             ctx,
             snapshot_tables: Mutex::new(std::collections::HashSet::new()),
+            distribution_config: Mutex::new(crate::distribution::DistributionConfig::single_shard()),
         }
+    }
+
+    /// Configure distributed physical planning for this frontend.
+    ///
+    /// When `config.shard_count > 1`, `sql_to_plan_node`,
+    /// `sql_to_plan_node_with_catalog`, `create_view`, and
+    /// `explain_incremental_for_sql` automatically invoke
+    /// [`crate::distribution::apply_distribution_with_config`] to emit real
+    /// distributed physical plans with hash/broadcast/single exchanges.
+    pub fn with_distribution_config(self, config: crate::distribution::DistributionConfig) -> Self {
+        *self.distribution_config.lock() = config;
+        self
+    }
+
+    /// Update the active distribution configuration in place.
+    pub fn set_distribution_config(&self, config: crate::distribution::DistributionConfig) {
+        *self.distribution_config.lock() = config;
+    }
+
+    /// Return the active distribution configuration.
+    pub fn distribution_config(&self) -> crate::distribution::DistributionConfig {
+        self.distribution_config.lock().clone()
     }
 
     /// Register an empty in-memory table with the given Arrow schema.
@@ -173,7 +213,43 @@ impl SqlFrontend {
         })?;
         let logical = df.into_optimized_plan()?;
         let snapshot_sources = self.snapshot_tables.lock().clone();
-        lower_with_views(&logical, &Default::default(), &snapshot_sources)
+        let lowered = lower_with_views(&logical, &Default::default(), &snapshot_sources)?;
+        let dist_cfg = self.distribution_config.lock().clone();
+        if dist_cfg.is_distributed() {
+            Ok(crate::distribution::apply_distribution_with_config(lowered, &dist_cfg)?.plan)
+        } else {
+            Ok(lowered)
+        }
+    }
+
+    /// Parse SQL and produce a full [`crate::distribution::DistributedPlan`]
+    /// using the supplied [`crate::distribution::DistributionConfig`].
+    pub async fn sql_to_distributed_plan(
+        &self,
+        sql: &str,
+        config: &crate::distribution::DistributionConfig,
+    ) -> Result<crate::distribution::DistributedPlan, SqlError> {
+        let df = self.ctx.sql(sql).await.map_err(|e| SqlError::ParseError {
+            message: e.to_string(),
+        })?;
+        let logical = df.into_optimized_plan()?;
+        let snapshot_sources = self.snapshot_tables.lock().clone();
+        let lowered = lower_with_views(&logical, &Default::default(), &snapshot_sources)?;
+        crate::distribution::apply_distribution_with_config(lowered, config)
+    }
+
+    /// Render `EXPLAIN INCREMENTAL` for the real distributed physical plan
+    /// (partition keys, network exchanges, worker placement, estimated state,
+    /// and expected shuffle).
+    pub async fn explain_incremental_distributed_for_sql(
+        &self,
+        sql: &str,
+        config: &crate::distribution::DistributionConfig,
+    ) -> Result<String, SqlError> {
+        let distributed = self.sql_to_distributed_plan(sql, config).await?;
+        Ok(crate::explain_incremental::explain_incremental_distributed(
+            &distributed,
+        ))
     }
 
     /// Parse a DML statement (INSERT, UPDATE, DELETE) into typed AST IR.
@@ -255,7 +331,13 @@ impl SqlFrontend {
         let registered_views: std::collections::HashSet<String> =
             catalog.list_view_names().await?.into_iter().collect();
         let snapshot_sources = self.snapshot_tables.lock().clone();
-        lower_with_views(&logical, &registered_views, &snapshot_sources)
+        let lowered = lower_with_views(&logical, &registered_views, &snapshot_sources)?;
+        let dist_cfg = self.distribution_config.lock().clone();
+        if dist_cfg.is_distributed() {
+            Ok(crate::distribution::apply_distribution_with_config(lowered, &dist_cfg)?.plan)
+        } else {
+            Ok(lowered)
+        }
     }
 
     /// Parse SQL with catalog-defined views and return the **unoptimized** `PlanNode`.
@@ -271,7 +353,13 @@ impl SqlFrontend {
         let registered_views: std::collections::HashSet<String> =
             catalog.list_view_names().await?.into_iter().collect();
         let snapshot_sources = self.snapshot_tables.lock().clone();
-        lower_with_views(&logical, &registered_views, &snapshot_sources)
+        let lowered = lower_with_views(&logical, &registered_views, &snapshot_sources)?;
+        let dist_cfg = self.distribution_config.lock().clone();
+        if dist_cfg.is_distributed() {
+            Ok(crate::distribution::apply_distribution_with_config(lowered, &dist_cfg)?.plan)
+        } else {
+            Ok(lowered)
+        }
     }
 
     /// Parse a `CREATE VIEW name AS <query>` statement and store the view in
@@ -1556,6 +1644,7 @@ mod tests {
                 k: 5,
                 rank_col: 2,
                 partition_by: vec![0],
+                order_by: vec![],
             }),
             columns: vec![Expr::Column(0), Expr::Column(2)],
         };
@@ -1675,5 +1764,123 @@ mod tests {
         }
 
         assert!(contains_session_window(&sql_plan), "plan: {sql_plan:?}");
+    }
+
+    #[tokio::test]
+    async fn sql_order_by_limit_lowers_to_topk_with_nulls_and_direction() {
+        let frontend = SqlFrontend::new();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("score", DataType::Int64, true),
+        ]));
+        frontend.register_table("scores", schema).unwrap();
+
+        let plan = frontend
+            .sql_to_plan_node(
+                "SELECT id, score FROM scores ORDER BY score DESC NULLS LAST, id ASC LIMIT 3",
+            )
+            .await
+            .expect("ORDER BY ... LIMIT should lower to PlanNode::TopK");
+
+        assert_eq!(
+            plan,
+            PlanNode::TopK {
+                input: Box::new(PlanNode::Project {
+                    input: Box::new(PlanNode::Source {
+                        name: "scores".to_string(),
+                    }),
+                    columns: vec![Expr::Column(0), Expr::Column(1)],
+                }),
+                k: 3,
+                rank_col: 1,
+                partition_by: vec![],
+                order_by: vec![
+                    rockstream_plan::TopKOrderKey {
+                        col: 1,
+                        asc: false,
+                        nulls_first: false,
+                    },
+                    rockstream_plan::TopKOrderKey {
+                        col: 0,
+                        asc: true,
+                        nulls_first: false,
+                    },
+                ],
+            }
+        );
+
+        // Bare ORDER BY without LIMIT must fail closed with an RS-* error.
+        let err = frontend
+            .sql_to_plan_node("SELECT id, score FROM scores ORDER BY score DESC")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("order_by_without_limit"),
+            "expected order_by_without_limit error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sql_direct_hop_and_general_session_windows_lower() {
+        let frontend = SqlFrontend::new();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Int64, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("amount", DataType::Int64, false),
+        ]));
+        frontend.register_table("events", schema).unwrap();
+
+        let hop_plan = frontend
+            .sql_to_plan_node(
+                "SELECT HOP(ts, INTERVAL '5 seconds', INTERVAL '10 seconds') AS w, COUNT(*) AS cnt, SUM(amount) AS total \
+                 FROM events GROUP BY HOP(ts, INTERVAL '5 seconds', INTERVAL '10 seconds')",
+            )
+            .await
+            .expect("direct HOP(...) SQL should lower to HopWindow");
+        assert!(
+            matches!(
+                &hop_plan,
+                PlanNode::Project { input, .. }
+                    if matches!(
+                        input.as_ref(),
+                        PlanNode::Aggregate { input: agg_in, .. }
+                            if matches!(
+                                agg_in.as_ref(),
+                                PlanNode::HopWindow {
+                                    window_size_ms: 10_000,
+                                    slide_ms: 5_000,
+                                    ..
+                                }
+                            )
+                    )
+            ),
+            "unexpected hop plan: {hop_plan:?}"
+        );
+
+        let session_plan = frontend
+            .sql_to_plan_node(
+                "SELECT user_id, SESSION(ts, INTERVAL '10 seconds') AS s, COUNT(*) AS cnt, SUM(amount) AS total \
+                 FROM events GROUP BY user_id, SESSION(ts, INTERVAL '10 seconds')",
+            )
+            .await
+            .expect("general SESSION(...) SQL should lower to SessionWindow");
+        assert!(
+            matches!(
+                &session_plan,
+                PlanNode::Project { input, .. }
+                    if matches!(
+                        input.as_ref(),
+                        PlanNode::Aggregate { input: agg_in, .. }
+                            if matches!(
+                                agg_in.as_ref(),
+                                PlanNode::SessionWindow {
+                                    gap_ms: 10_000,
+                                    ..
+                                }
+                            )
+                    )
+            ),
+            "unexpected session plan: {session_plan:?}"
+        );
     }
 }

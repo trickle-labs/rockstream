@@ -1,9 +1,9 @@
-# Default values for rockstream Helm chart (v0.59.22).
+# Default values for rockstream Helm chart (v0.72.0).
 
 image:
   repository: ghcr.io/trickle-labs/rockstream
   pullPolicy: IfNotPresent
-  tag: "0.59.22"
+  tag: "0.72.0"
 
 securityContext:
   runAsNonRoot: true
@@ -28,27 +28,54 @@ cluster:
   id: "k8s-cluster"
   shutdownTimeoutSecs: 30
 
+# S3-compatible object store contract (ROCKSTREAM_OBJECT_STORE_*)
+objectStore:
+  enabled: true
+  endpoint: "http://rockstream-minio:9000"
+  bucket: "rockstream"
+  region: "us-east-1"
+  existingSecret: ""
+  accessKey: "rockstream"
+  secretKey: "rockstream-secret"
+
+# Optional bundled MinIO for local k3d/kind evaluation and smoke testing
+minio:
+  enabled: false
+  image: "minio/minio:RELEASE.2025-02-28T09-55-16Z"
+  port: 9000
+  consolePort: 9001
+
 gateway:
   replicas: 2
   port: 5432
   managementPort: 9090
+  autoscaling:
+    enabled: true
+    minReplicas: 1
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
   resources:
     requests:
-      cpu: 1000m
-      memory: 2Gi
+      cpu: 500m
+      memory: 1Gi
     limits:
       cpu: 4000m
       memory: 8Gi
 
 worker:
-  replicas: 3
+  replicas: 2
   port: 9100
   managementPort: 9090
   storageSize: 50Gi
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 16
+    targetCPUUtilizationPercentage: 75
   resources:
     requests:
-      cpu: 2000m
-      memory: 4Gi
+      cpu: 1000m
+      memory: 2Gi
     limits:
       cpu: 8000m
       memory: 16Gi
@@ -60,8 +87,32 @@ control:
   storageSize: 20Gi
   resources:
     requests:
-      cpu: 1000m
-      memory: 2Gi
+      cpu: 500m
+      memory: 1Gi
     limits:
       cpu: 2000m
       memory: 4Gi
+
+# Optional dedicated compaction workers sharing S3-compatible storage
+compactor:
+  enabled: false
+  replicas: 1
+  port: 9150
+  managementPort: 9090
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: 2000m
+      memory: 4Gi
+
+monitoring:
+  serviceMonitor:
+    enabled: false
+    interval: 15s
+    labels: {}
+  grafanaDashboard:
+    enabled: true
+    labels:
+      grafana_dashboard: "1"

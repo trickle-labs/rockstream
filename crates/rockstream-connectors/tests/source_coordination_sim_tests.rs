@@ -1,5 +1,8 @@
 use async_trait::async_trait;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use object_store::memory::InMemory;
@@ -26,8 +29,14 @@ fn m3_batch(epoch: u64) -> WriteBatch {
     batch
 }
 
+#[derive(Default)]
 struct RecordingSource {
+    /// Complete ACK transcript, including failed broker attempts.
     acknowledgements: Vec<(Epoch, OffsetToken)>,
+    poll_calls: usize,
+    pause_calls: Vec<String>,
+    resume_calls: usize,
+    fail_next_ack: Arc<AtomicBool>,
 }
 
 #[async_trait]
@@ -51,12 +60,17 @@ impl SourceConnector for RecordingSource {
 
     async fn poll_delta(
         &mut self,
-        _after: OffsetToken,
+        after: OffsetToken,
         _max_bytes: usize,
         _credits_available: usize,
         _partition_filter: Option<PartitionFilter>,
     ) -> Result<PollDeltaResult, SourceError> {
-        unreachable!("coordination tests commit explicit source input")
+        self.poll_calls += 1;
+        Ok(PollDeltaResult {
+            batches: vec![],
+            new_offset: after,
+            watermark: None,
+        })
     }
 
     async fn commit_offset(
@@ -65,14 +79,22 @@ impl SourceConnector for RecordingSource {
         offset: OffsetToken,
     ) -> Result<(), SourceError> {
         self.acknowledgements.push((epoch, offset));
+        if self.fail_next_ack.swap(false, Ordering::SeqCst) {
+            return Err(SourceError::CommitOffsetFailed {
+                epoch,
+                reason: "injected transient Kafka broker ACK failure".to_string(),
+            });
+        }
         Ok(())
     }
 
-    async fn pause(&mut self, _reason: String) -> Result<(), SourceError> {
+    async fn pause(&mut self, reason: String) -> Result<(), SourceError> {
+        self.pause_calls.push(reason);
         Ok(())
     }
 
     async fn resume(&mut self) -> Result<(), SourceError> {
+        self.resume_calls += 1;
         Ok(())
     }
 }
@@ -85,9 +107,7 @@ async fn runtime(connector_id: ConnectorId) -> SourceRuntimeCoordinator<Recordin
             .unwrap(),
     );
     SourceRuntimeCoordinator::new(
-        RecordingSource {
-            acknowledgements: vec![],
-        },
+        RecordingSource::default(),
         connector_id,
         OffsetToken::new(vec![]),
         SourceCheckpointStore::new(db, 0, connector_id),
@@ -158,9 +178,7 @@ async fn backfill_fence_simruntime_restarts_preserve_exactly_once() {
         );
         let records = [b"snapshot-1".as_slice(), b"snapshot-2", b"live-3"];
         let mut coordinator = SourceRuntimeCoordinator::new(
-            RecordingSource {
-                acknowledgements: vec![],
-            },
+            RecordingSource::default(),
             connector_id,
             OffsetToken::new(vec![]),
             store.clone(),
@@ -203,9 +221,7 @@ async fn backfill_fence_simruntime_restarts_preserve_exactly_once() {
 
             if epoch == 1 || epoch == 2 {
                 let mut recovered = SourceRuntimeCoordinator::new(
-                    RecordingSource {
-                        acknowledgements: vec![],
-                    },
+                    RecordingSource::default(),
                     connector_id,
                     OffsetToken::new(vec![]),
                     store.clone(),
@@ -222,6 +238,9 @@ async fn backfill_fence_simruntime_restarts_preserve_exactly_once() {
                     )
                 );
                 owner = recovered.acquire_owner("worker-b").unwrap();
+                // Recovery fences input until the exact durable token is
+                // acknowledged, even if the old owner already ACKed it.
+                recovered.acknowledge_recovered(&owner).await.unwrap();
                 coordinator = recovered;
             }
         }
@@ -290,9 +309,7 @@ async fn seeded_owner_crash_after_prepare_retries_from_last_committed_token() {
         .await
         .unwrap();
     let mut coordinator = SourceRuntimeCoordinator::new(
-        RecordingSource {
-            acknowledgements: vec![],
-        },
+        RecordingSource::default(),
         connector_id,
         OffsetToken::new(vec![]),
         store,
@@ -342,9 +359,7 @@ async fn seeded_owner_crash_after_m3_commit_acks_once_after_recovery() {
     store.commit_m3(m3_input).await.unwrap();
 
     let mut coordinator = SourceRuntimeCoordinator::new(
-        RecordingSource {
-            acknowledgements: vec![],
-        },
+        RecordingSource::default(),
         connector_id,
         OffsetToken::new(vec![]),
         store,
@@ -484,9 +499,7 @@ async fn recovery_uses_only_committed_checkpoint_and_fences_replaced_owner() {
     store.commit_m3(batch).await.unwrap();
 
     let mut coordinator = SourceRuntimeCoordinator::new(
-        RecordingSource {
-            acknowledgements: vec![],
-        },
+        RecordingSource::default(),
         connector_id,
         OffsetToken::new(vec![]),
         store,
@@ -577,9 +590,7 @@ async fn replayable_commit_writes_one_visibility_batch_then_acknowledges_exact_l
     );
     let store = SourceCheckpointStore::new(Arc::clone(&db), 0, connector_id);
     let mut coordinator = SourceRuntimeCoordinator::new(
-        RecordingSource {
-            acknowledgements: vec![],
-        },
+        RecordingSource::default(),
         connector_id,
         OffsetToken::new(vec![]),
         store.clone(),
@@ -634,4 +645,227 @@ async fn replayable_commit_writes_one_visibility_batch_then_acknowledges_exact_l
             vec![(7, offset)],
         )
     );
+}
+
+#[tokio::test]
+async fn pending_ack_blocks_poll_until_idle_recovery_acks_exact_durable_checkpoint() {
+    let connector_id = ConnectorId(5130);
+    let db = Arc::new(
+        ShardDb::builder("source-idle-ack-recovery", Arc::new(InMemory::new()))
+            .build()
+            .await
+            .unwrap(),
+    );
+    let store = SourceCheckpointStore::new(Arc::clone(&db), 0, connector_id);
+    let fail_next_ack = Arc::new(AtomicBool::new(true));
+    let mut coordinator = SourceRuntimeCoordinator::new(
+        RecordingSource {
+            fail_next_ack: Arc::clone(&fail_next_ack),
+            ..Default::default()
+        },
+        connector_id,
+        OffsetToken::new(vec![]),
+        store.clone(),
+    );
+    coordinator.recover().await.unwrap();
+    let owner = coordinator.acquire_owner("same-worker").unwrap();
+    let durable = OffsetToken::new(b"durable-01".to_vec());
+
+    let error = coordinator
+        .commit_epoch(&owner, 1, durable.clone(), m3_batch(1))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("RS-4016"));
+    assert_eq!(coordinator.committed_epoch(), 1);
+    assert_eq!(coordinator.committed_offset(), &durable);
+    assert!(coordinator.has_pending_ack());
+    assert!(coordinator.blocked_reason().is_some());
+    assert_eq!(
+        coordinator
+            .metrics()
+            .await
+            .unwrap()
+            .source_runtime_in_flight_epochs,
+        1
+    );
+    // No further read or M3 write is allowed before the broker ACK.
+    assert!(coordinator.poll_delta(1024, 1).await.is_err());
+    assert!(coordinator
+        .commit_epoch(
+            &owner,
+            2,
+            OffsetToken::new(b"unread-02".to_vec()),
+            m3_batch(2)
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        store.highest_committed().await.unwrap(),
+        Some(SourceCheckpoint::prepared(connector_id, 1, durable.clone()).committed())
+    );
+
+    // The injected fault is one-shot. Recovery must work without any poll.
+    assert!(!fail_next_ack.load(Ordering::SeqCst));
+    coordinator.acknowledge_recovered(&owner).await.unwrap();
+    assert!(!coordinator.has_pending_ack());
+    assert_eq!(coordinator.blocked_reason(), None);
+    assert_eq!(
+        coordinator
+            .metrics()
+            .await
+            .unwrap()
+            .source_runtime_in_flight_epochs,
+        0
+    );
+    assert!(coordinator
+        .poll_delta(1024, 1)
+        .await
+        .unwrap()
+        .batches
+        .is_empty());
+    let next = OffsetToken::new(b"healthy-02".to_vec());
+    coordinator
+        .commit_epoch(&owner, 2, next.clone(), m3_batch(2))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.highest_committed().await.unwrap(),
+        Some(SourceCheckpoint::prepared(connector_id, 2, next.clone()).committed())
+    );
+    assert_eq!(
+        db.get(&[ShardPrefix::ViewOutput.as_byte(), 1])
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(b"output".as_slice()),
+    );
+    let source = coordinator.into_inner();
+    assert_eq!(
+        source.acknowledgements,
+        vec![(1, durable.clone()), (1, durable), (2, next)]
+    );
+    assert_eq!(
+        source.poll_calls, 1,
+        "the blocked poll never reached the connector"
+    );
+    assert_eq!(source.pause_calls.len(), 1, "async pause must actually run");
+    assert_eq!(source.resume_calls, 1, "recovery must resume the source");
+}
+
+#[tokio::test]
+async fn repeated_backfill_ack_failures_do_not_leak_in_flight_epochs_or_replay_m3() {
+    const COUNT: u64 = 70; // More than SOURCE_RUNTIME_MAX_IN_FLIGHT_EPOCHS.
+    let connector_id = ConnectorId(5131);
+    let db = Arc::new(
+        ShardDb::builder("source-repeated-ack-recovery", Arc::new(InMemory::new()))
+            .build()
+            .await
+            .unwrap(),
+    );
+    let store = SourceCheckpointStore::new(Arc::clone(&db), 0, connector_id);
+    let fail_next_ack = Arc::new(AtomicBool::new(false));
+    let mut coordinator = SourceRuntimeCoordinator::new(
+        RecordingSource {
+            fail_next_ack: Arc::clone(&fail_next_ack),
+            ..Default::default()
+        },
+        connector_id,
+        OffsetToken::new(vec![]),
+        store.clone(),
+    );
+    coordinator.recover().await.unwrap();
+    let owner = coordinator
+        .acquire_owner("same-worker-over-64-failures")
+        .unwrap();
+    let fence = SnapshotDeltaFence::new(
+        OffsetToken::new(b"snapshot-fence".to_vec()),
+        OffsetToken::new(b"live-fence".to_vec()),
+    );
+    let mut transcript = Vec::new();
+    for epoch in 1..=COUNT {
+        let token = OffsetToken::new(format!("offset-{epoch:03}").into_bytes());
+        let lifecycle = BackfillLifecycle::new(
+            BackfillPhase::Running,
+            BackfillCursor::new(
+                "repeat_view",
+                0,
+                token.as_bytes().to_vec(),
+                fence.clone(),
+                epoch,
+            ),
+            0,
+            COUNT,
+            0,
+            Some(epoch),
+        );
+        let mut batch = m3_batch(epoch);
+        batch.put(
+            format!("view_output/repeat_view/{epoch}").as_bytes(),
+            b"once",
+        );
+        fail_next_ack.store(true, Ordering::SeqCst);
+        assert!(coordinator
+            .commit_backfill_epoch(&owner, epoch, token.clone(), lifecycle, batch)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("RS-4016"));
+        assert!(coordinator.has_pending_ack());
+        assert_eq!(
+            coordinator
+                .metrics()
+                .await
+                .unwrap()
+                .source_runtime_in_flight_epochs,
+            1,
+        );
+        assert!(coordinator.poll_delta(1024, 1).await.is_err());
+        coordinator.acknowledge_recovered(&owner).await.unwrap();
+        assert!(!coordinator.has_pending_ack());
+        assert_eq!(coordinator.blocked_reason(), None);
+        assert_eq!(
+            coordinator
+                .metrics()
+                .await
+                .unwrap()
+                .source_runtime_in_flight_epochs,
+            0,
+        );
+        transcript.push((epoch, token.clone())); // first attempt failed
+        transcript.push((epoch, token)); // exact checkpoint retried
+    }
+    // Healthy input still commits normally after a lifetime of transient errors.
+    let healthy = OffsetToken::new(b"offset-healthy".to_vec());
+    coordinator
+        .commit_epoch(&owner, COUNT + 1, healthy.clone(), m3_batch(COUNT + 1))
+        .await
+        .unwrap();
+    transcript.push((COUNT + 1, healthy.clone()));
+    assert_eq!(
+        store.highest_committed().await.unwrap(),
+        Some(SourceCheckpoint::prepared(connector_id, COUNT + 1, healthy).committed())
+    );
+    let output = db.scan_prefix(b"view_output/repeat_view/").await.unwrap();
+    assert_eq!(
+        output.len(),
+        COUNT as usize,
+        "no M3 output can be reapplied by retrying ACK"
+    );
+    assert!(output.iter().all(|(_, value)| value.as_ref() == b"once"));
+    assert_eq!(
+        coordinator
+            .metrics()
+            .await
+            .unwrap()
+            .source_runtime_in_flight_epochs,
+        0
+    );
+    let source = coordinator.into_inner();
+    assert_eq!(
+        source.acknowledgements, transcript,
+        "complete broker ACK transcript"
+    );
+    assert_eq!(source.poll_calls, 0, "all blocked polls were fenced");
+    assert_eq!(source.pause_calls.len(), COUNT as usize);
+    assert_eq!(source.resume_calls, COUNT as usize);
 }

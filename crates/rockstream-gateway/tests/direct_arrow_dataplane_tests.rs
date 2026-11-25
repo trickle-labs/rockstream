@@ -1,7 +1,7 @@
 //! v0.67 Slice 3 exit tests: Direct Arrow IPC data plane ingestion & read hot path.
 //!
 //! Verifies:
-//! 1. Direct Arrow IPC batches ingested to worker shard owners over gRPC (ExchangeStream).
+//! 1. Worker shuffle delivers exact Arrow Z-sets to registered inlets over gRPC.
 //! 2. Direct Arrow RecordBatch read hot path (`ViewReader::read_view_batches`) without TSV conversion.
 //! 3. Preservation of NULLs, exact column types, signed multiplicities, and result multisets.
 
@@ -18,25 +18,49 @@ use rockstream_ops::sink::{write_view_directory_entry, ViewSinkOp};
 use rockstream_ops::ArrowZSet;
 use rockstream_runtime::exchange::proto::shuffle_service_client::ShuffleServiceClient;
 use rockstream_runtime::exchange::proto::shuffle_service_server::ShuffleServiceServer;
-use rockstream_runtime::exchange::proto::ExchangeFrame;
-use rockstream_runtime::exchange::serialization::build_exchange_frame;
+use rockstream_runtime::exchange::proto::ShuffleFrame;
+use rockstream_runtime::exchange::serialization::{build_exchange_frame, serialize_zset};
 use rockstream_runtime::exchange::service::{ExchangeRegistry, ShuffleServer};
 use rockstream_storage::ShardDb;
 use rockstream_types::ids::OperatorId;
 use tonic::transport::Server;
 
-/// Test 1 (Slice 3): Gateway ingests direct Arrow RecordBatches to worker shard owners via gRPC.
+/// Test 1: Worker shuffle delivers the full Arrow Z-set to its registered inlet.
 #[tokio::test]
-async fn test_gateway_ingest_direct_arrow_batches_to_workers() {
+async fn test_worker_shuffle_delivers_exact_arrow_zset_to_registered_inlet() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("label", DataType::Utf8, true),
+        Field::new("score", DataType::Float64, true),
+    ]));
+    let id_array = Arc::new(Int64Array::from(vec![1, 2, 2, 3])) as ArrayRef;
+    let label_array = Arc::new(StringArray::from(vec![
+        Some("alpha"),
+        None,
+        None,
+        Some("gamma"),
+    ])) as ArrayRef;
+    let score_array = Arc::new(Float64Array::from(vec![
+        Some(10.5),
+        Some(20.0),
+        Some(20.0),
+        None,
+    ])) as ArrayRef;
+    let batch = RecordBatch::try_new(schema.clone(), vec![id_array, label_array, score_array])
+        .expect("valid record batch");
+    let zset = ArrowZSet::new(batch, vec![1, 2, -1, 1]);
+    let expected_payload = serialize_zset(&zset).expect("serialize expected Arrow Z-set");
+
+    let registry = ExchangeRegistry::new();
+    let (inlet_tx, mut inlet_rx) = tokio::sync::mpsc::channel(1);
+    registry.register(1001, 1, inlet_tx, schema.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
 
     let server_handle = tokio::spawn(async move {
         Server::builder()
-            .add_service(ShuffleServiceServer::new(ShuffleServer::new(
-                ExchangeRegistry::new(),
-            )))
+            .add_service(ShuffleServiceServer::new(ShuffleServer::new(registry)))
             .serve(addr)
             .await
             .unwrap();
@@ -49,42 +73,24 @@ async fn test_gateway_ingest_direct_arrow_batches_to_workers() {
         .await
         .expect("connect to worker shuffle service");
 
-    // Build multi-column typed Arrow RecordBatch
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("label", DataType::Utf8, true),
-        Field::new("score", DataType::Float64, true),
-    ]));
-
-    let id_array = Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef;
-    let label_array =
-        Arc::new(StringArray::from(vec![Some("alpha"), None, Some("gamma")])) as ArrayRef;
-    let score_array = Arc::new(Float64Array::from(vec![Some(10.5), Some(20.0), None])) as ArrayRef;
-
-    let batch = RecordBatch::try_new(schema.clone(), vec![id_array, label_array, score_array])
-        .expect("valid record batch");
-    let weights = vec![1i64, 2i64, 1i64];
-    let zset = ArrowZSet::new(batch, weights);
-
-    let frame: ExchangeFrame = build_exchange_frame(
-        1001, // workload_id
-        1,    // shard_id
-        50,   // operator_id
-        3,    // epoch
-        42,   // lease_token
-        &schema, &zset,
-    )
-    .expect("build exchange frame");
-
+    let frame = ShuffleFrame {
+        exchange_id: 1001,
+        src_shard: 2,
+        target_shard: 1,
+        epoch: 3,
+        seq: 42,
+        payload: expected_payload.to_vec(),
+        row_count: zset.num_rows() as u32,
+    };
     let mut request = tonic::Request::new(futures::stream::iter(vec![frame]));
     request
         .metadata_mut()
         .insert("protocol_version", "1".parse().unwrap());
 
     let mut response_stream = client
-        .exchange_stream(request)
+        .shuffle_stream(request)
         .await
-        .expect("call exchange_stream")
+        .expect("call shuffle_stream")
         .into_inner();
 
     let ack = response_stream
@@ -93,13 +99,58 @@ async fn test_gateway_ingest_direct_arrow_batches_to_workers() {
         .expect("response stream item")
         .expect("valid ack");
 
-    assert!(ack.success, "expected exchange frame ack success");
-    assert_eq!(ack.workload_id, 1001);
-    assert_eq!(ack.shard_id, 1);
-    assert_eq!(ack.operator_id, 50);
+    assert_eq!(ack.exchange_id, 1001);
+    assert_eq!(ack.src_shard, 2);
+    assert_eq!(ack.target_shard, 1);
     assert_eq!(ack.epoch, 3);
-    assert_eq!(ack.lease_token, 42);
+    assert_eq!(ack.seq, 42);
+    assert_eq!(ack.credit_grant, 4);
+    let received = inlet_rx.recv().await.expect("registered inlet delivery");
+    assert_eq!(serialize_zset(&received).unwrap(), expected_payload);
 
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_exchange_stream_rejects_frames_without_an_execution_handler() {
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from(vec![1])) as ArrayRef],
+    )
+    .unwrap();
+    let frame =
+        build_exchange_frame(1001, 1, 50, 3, 42, &schema, &ArrowZSet::new(batch, vec![1])).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let server_handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(ShuffleServiceServer::new(ShuffleServer::new(
+                ExchangeRegistry::new(),
+            )))
+            .serve(addr)
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut client = ShuffleServiceClient::connect(format!("http://{addr}"))
+        .await
+        .expect("connect to worker shuffle service");
+    let mut request = tonic::Request::new(futures::stream::iter(vec![frame]));
+    request
+        .metadata_mut()
+        .insert("protocol_version", "1".parse().unwrap());
+
+    let status = match client.exchange_stream(request).await {
+        Err(status) => status,
+        Ok(_) => panic!("ExchangeStream must not acknowledge an unexecuted frame"),
+    };
+    assert_eq!(status.code(), tonic::Code::Unimplemented);
+    assert_eq!(
+        status.message(),
+        "ExchangeStream has no execution handler; use ShuffleStream for worker shuffle delivery"
+    );
     server_handle.abort();
 }
 

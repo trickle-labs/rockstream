@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -7,20 +8,37 @@ use object_store::{local::LocalFileSystem, prefix::PrefixStore, ObjectStore};
 use rockstream_cli::output::{
     ManagementClusterStatusInfo, ManagementNodeInfo, ManagementOperationInfo,
 };
-use rockstream_control::{ShardManager, ShardPersistentStore};
+use rockstream_control::{ShardManager, ShardPersistentStore, MANAGEMENT_OPERATION_RECORD_VERSION};
 use rockstream_management_proto::v1::{
-    management_service_client::ManagementServiceClient, CancelOperationRequest, GetNodeRequest,
-    GetOperationRequest, GetShardRequest, ListShardsRequest, MigrateShardRequest,
+    CancelOperationRequest, GetNodeRequest, GetOperationRequest, GetShardRequest,
+    ListShardsRequest, MigrateShardRequest,
 };
 use rockstream_runtime::data_plane::DataPlaneClient;
 use rockstream_storage::ShardDb;
 use rockstream_test_support::minio::{minio_object_store, start_minio, MINIO_PASS, MINIO_USER};
+use rockstream_test_support::pki::TestPki;
 use rockstream_types::data_plane::WorkerExecutionStatus;
 use rockstream_types::ids::{ShardId, WorkerId, WorkloadId};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio_postgres::{Client, NoTls};
 
+#[path = "common/management_auth.rs"]
+mod management_auth;
+
+use management_auth::{
+    add_client_tls_args, add_identity_tls_args, management_client, preprovision_administrator,
+};
+
 static PROCESS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct TestChild(Child);
+
+impl Drop for TestChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 
 struct Processes {
     control: Child,
@@ -47,36 +65,83 @@ fn free_addr() -> String {
     listener.local_addr().unwrap().to_string()
 }
 
-fn spawn(args: &[&str]) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_rockstream"))
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap()
+fn worker_exchange_config(args: &[&str]) -> Option<PathBuf> {
+    if !args.windows(2).any(|pair| pair == ["--role", "worker"]) {
+        return None;
+    }
+    let storage = args
+        .windows(2)
+        .find(|pair| pair[0] == "--storage")
+        .map(|pair| Path::new(pair[1]))
+        .unwrap();
+    std::fs::create_dir_all(storage).unwrap();
+    let address = free_addr();
+    let mut config = rockstream_types::config::NodeConfig::default();
+    config.worker.exchange_bind_addr = Some(address.clone());
+    config.worker.exchange_advertise_addr = Some(address);
+    let path = storage.join("worker-shuffle.toml");
+    std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+    Some(path)
 }
 
-fn spawn_worker(
+fn spawn(args: &[&str]) -> Child {
+    let worker_config = worker_exchange_config(args);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rockstream"));
+    command
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(path) = worker_config {
+        command.env("ROCKSTREAM_CONFIG", path);
+    }
+    command.spawn().unwrap()
+}
+
+fn spawn_with_tls(
+    args: &[&str],
+    certificate: &std::path::Path,
+    key: &std::path::Path,
+    pki: &TestPki,
+) -> Child {
+    let worker_config = worker_exchange_config(args);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rockstream"));
+    command
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(path) = worker_config {
+        command.env("ROCKSTREAM_CONFIG", path);
+    }
+    add_identity_tls_args(&mut command, certificate, key, pki);
+    command.spawn().unwrap()
+}
+
+fn spawn_worker_with_tls(
     storage: &std::path::Path,
     control_addr: &str,
     worker_id: u64,
     minio_port: u16,
     bucket: &str,
+    pki: &TestPki,
 ) -> Child {
+    let (certificate, key) = pki.worker_certs.get(&worker_id).unwrap();
     let worker_id = worker_id.to_string();
-    Command::new(env!("CARGO_BIN_EXE_rockstream"))
-        .args([
-            "start",
-            "--storage",
-            storage.to_str().unwrap(),
-            "--role",
-            "worker",
-            "--allow-insecure-internal-dev",
-            "--control",
-            control_addr,
-            "--worker-id",
-            &worker_id,
-        ])
+    let args = [
+        "start",
+        "--storage",
+        storage.to_str().unwrap(),
+        "--role",
+        "worker",
+        "--control",
+        control_addr,
+        "--worker-id",
+        &worker_id,
+    ];
+    let worker_config = worker_exchange_config(&args).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rockstream"));
+    command
+        .args(args)
+        .env("ROCKSTREAM_CONFIG", worker_config)
         .env(
             "ROCKSTREAM_OBJECT_STORE_ENDPOINT",
             format!("http://127.0.0.1:{minio_port}"),
@@ -86,14 +151,16 @@ fn spawn_worker(
         .env("ROCKSTREAM_OBJECT_STORE_ACCESS_KEY", MINIO_USER)
         .env("ROCKSTREAM_OBJECT_STORE_SECRET_KEY", MINIO_PASS)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap()
+        .stderr(Stdio::null());
+    add_identity_tls_args(&mut command, certificate, key, pki);
+    command.spawn().unwrap()
 }
 
-fn management_status_json(management_addr: &str) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_rockstream"))
-        .env("RUST_LOG", "off")
+fn management_status_json(management_addr: &str, pki: &TestPki) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rockstream"));
+    command.env("RUST_LOG", "off");
+    add_client_tls_args(&mut command, pki);
+    command
         .args([
             "--output",
             "json",
@@ -133,6 +200,15 @@ fn assert_management_status_transcript(
             .iter()
             .find(|actual| actual.node_id == node.node_id)
             .expect("expected node is present in status");
+        if node.address == "127.0.0.1:0" {
+            let address: std::net::SocketAddr = actual.address.parse().expect("worker address");
+            assert_eq!(
+                address.ip(),
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+            );
+            assert_ne!(address.port(), 0);
+            node.address = actual.address.clone();
+        }
         assert!((0.0..=1.0).contains(&actual.capacity_headroom));
         node.capacity_headroom = actual.capacity_headroom;
         node.registered_at_ms = 0;
@@ -160,11 +236,15 @@ fn assert_management_status_transcript(
     status
 }
 
-async fn wait_for_management_status_nodes(management_addr: &str, expected_nodes: usize) -> Output {
+async fn wait_for_management_status_nodes(
+    management_addr: &str,
+    expected_nodes: usize,
+    pki: &TestPki,
+) -> Output {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut last_error = String::new();
     while Instant::now() < deadline {
-        let output = management_status_json(management_addr);
+        let output = management_status_json(management_addr, pki);
         if output.status.success() {
             let status: ManagementClusterStatusInfo =
                 serde_json::from_slice(&output.stdout).expect("management status JSON");
@@ -280,13 +360,6 @@ fn stable_name_id(namespace: &str, name: &str) -> u64 {
         .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
         })
-}
-
-fn stable_route(value: &str, shard_count: usize) -> usize {
-    value.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
-    }) as usize
-        % shard_count
 }
 
 async fn query_text_rows(client: &Client, sql: &str) -> Vec<Vec<String>> {
@@ -454,14 +527,10 @@ async fn run_cluster(worker_count: usize, kill_worker: bool) {
 
     let workload_id = WorkloadId(stable_name_id("workload", "r1_uniform_scaling"));
     let snapshot = DataPlaneClient::new(&control_addr)
+        .with_insecure_internal_dev()
         .read_workload(workload_id)
         .await
         .unwrap();
-    let shard_base = workload_id.0.wrapping_mul(16);
-    let mut routed = vec![0_u64; worker_count];
-    for group in 0..values.len() {
-        routed[stable_route(&group.to_string(), worker_count)] += 1;
-    }
     let mut assigned_shards = BTreeMap::new();
     for status in &snapshot.workers {
         assert_eq!(status.shard_ids.len(), 1);
@@ -477,26 +546,33 @@ async fn run_cluster(worker_count: usize, kill_worker: bool) {
         assigned_shards.keys().copied().collect::<Vec<_>>(),
         (1..=worker_count as u64).map(WorkerId).collect::<Vec<_>>()
     );
+    let mut shard_ids: Vec<ShardId> = assigned_shards.values().copied().collect();
+    shard_ids.sort();
     assert_eq!(
-        assigned_shards
-            .values()
+        shard_ids
+            .iter()
             .copied()
-            .collect::<std::collections::BTreeSet<_>>(),
-        (0..worker_count)
-            .map(|index| ShardId(shard_base.wrapping_add(index as u64)))
-            .collect()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        worker_count
     );
+    let mut routed_by_shard = BTreeMap::<ShardId, u64>::new();
+    for group in 0..values.len() {
+        let bucket = rockstream_types::rendezvous::fnv1a_64(group.to_string().as_bytes()) % 4096;
+        let target = rockstream_types::rendezvous::rendezvous_hash(bucket, &shard_ids, 1).unwrap();
+        *routed_by_shard.entry(target).or_default() += 1;
+    }
     let expected_statuses = (1..=worker_count as u64)
         .map(|worker_id| {
             let worker_id = WorkerId(worker_id);
             let shard_id = assigned_shards[&worker_id];
-            let shard_index = shard_id.0.wrapping_sub(shard_base) as usize;
+            let expected_rows = routed_by_shard.get(&shard_id).copied().unwrap_or(0);
             WorkerExecutionStatus {
                 worker_id,
                 process_id: processes.workers[worker_id.0 as usize - 1].id(),
                 shard_ids: vec![shard_id],
-                input_rows: routed[shard_index],
-                output_rows: routed[shard_index],
+                input_rows: expected_rows,
+                output_rows: expected_rows,
                 frontier: 2,
                 ready: true,
             }
@@ -506,6 +582,7 @@ async fn run_cluster(worker_count: usize, kill_worker: bool) {
 
     let join_workload_id = WorkloadId(stable_name_id("workload", "r1_ordinary_join"));
     let join_snapshot = DataPlaneClient::new(&control_addr)
+        .with_insecure_internal_dev()
         .read_workload(join_workload_id)
         .await
         .unwrap();
@@ -575,14 +652,23 @@ async fn run_cluster(worker_count: usize, kill_worker: bool) {
     }
 
     if kill_worker {
+        let worker1_shard = assigned_shards[&WorkerId(1)];
+        let worker2_shard = assigned_shards[&WorkerId(2)];
+        let worker2_rows = routed_by_shard.get(&worker2_shard).copied().unwrap_or(0);
         let dead_route = (0..16)
-            .find(|id| stable_route(&id.to_string(), worker_count) == 0)
+            .find(|id| {
+                let bucket =
+                    rockstream_types::rendezvous::fnv1a_64(id.to_string().as_bytes()) % 4096;
+                rockstream_types::rendezvous::rendezvous_hash(bucket, &shard_ids, 1)
+                    == Some(worker1_shard)
+            })
             .unwrap();
         processes.workers[0].kill().unwrap();
         processes.workers[0].wait().unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let snapshot = DataPlaneClient::new(&control_addr)
+                .with_insecure_internal_dev()
                 .read_workload(workload_id)
                 .await
                 .unwrap();
@@ -590,9 +676,9 @@ async fn run_cluster(worker_count: usize, kill_worker: bool) {
                 == vec![WorkerExecutionStatus {
                     worker_id: WorkerId(2),
                     process_id: processes.workers[1].id(),
-                    shard_ids: vec![ShardId(shard_base), ShardId(shard_base.wrapping_add(1))],
-                    input_rows: routed[1],
-                    output_rows: routed[1],
+                    shard_ids: shard_ids.clone(),
+                    input_rows: worker2_rows,
+                    output_rows: worker2_rows,
                     frontier: 2,
                     ready: true,
                 }]
@@ -636,6 +722,245 @@ async fn run_cluster(worker_count: usize, kill_worker: bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupted_dispatch_blocks_distributed_reads_after_gateway_restart() {
+    use rockstream_types::topology::{ControlMessage, WorkerMessage};
+
+    let _test_guard = PROCESS_TEST_LOCK.lock().await;
+    let root = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let control_addr = listener.local_addr().unwrap().to_string();
+    let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+    let control = tokio::spawn(async move {
+        let mut request_tx = Some(request_tx);
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut line = String::new();
+            BufReader::new(read).read_line(&mut line).await.unwrap();
+            match serde_json::from_str::<WorkerMessage>(&line).unwrap() {
+                WorkerMessage::DeployWorkload(request) => {
+                    let response = ControlMessage::DeploymentReady {
+                        workload_id: request.workload_id,
+                        workers: Vec::new(),
+                    };
+                    let wire = serde_json::to_string(&response).unwrap() + "\n";
+                    write.write_all(wire.as_bytes()).await.unwrap();
+                }
+                WorkerMessage::SubmitSourceDelta(request) => {
+                    request_tx.take().unwrap().send(request).unwrap();
+                    // Keep the source dispatch unanswered while continuing to
+                    // accept shard discovery requests after the gateway restarts.
+                    tokio::spawn(async move {
+                        let _pending_connection = write;
+                        std::future::pending::<()>().await;
+                    });
+                }
+                WorkerMessage::DiscoverShards => {
+                    // A stateless gateway now discovers shards at bootstrap.
+                    // This fixture intentionally has no serving replicas.
+                    let response = ControlMessage::ServingTopology {
+                        shards: Vec::new(),
+                        cluster_frontier: None,
+                    };
+                    let wire = serde_json::to_string(&response).unwrap() + "\n";
+                    write.write_all(wire.as_bytes()).await.unwrap();
+                }
+                WorkerMessage::GetWorkloadTopology { workload_id } => {
+                    // This mock fixture has no live workers; returning an empty
+                    // shard list lets the gateway fall back to the interrupted
+                    // SubmitSourceDelta path under test.
+                    let response = ControlMessage::WorkloadTopology {
+                        snapshot: rockstream_types::data_plane::WorkloadTopologySnapshot {
+                            topology_epoch: 1,
+                            workload_id,
+                            routing_columns: BTreeMap::new(),
+                            schemas: Vec::new(),
+                            shards: Vec::new(),
+                            workers: Vec::new(),
+                        },
+                    };
+                    let wire = serde_json::to_string(&response).unwrap() + "\n";
+                    write.write_all(wire.as_bytes()).await.unwrap();
+                }
+                other => panic!("unexpected request: {other:?}"),
+            }
+        }
+    });
+    let gateway_addr = free_addr();
+    let gateway_storage = root.path().join("gateway");
+    let start_gateway = || {
+        TestChild(spawn(&[
+            "start",
+            "--storage",
+            gateway_storage.to_str().unwrap(),
+            "--role",
+            "gateway",
+            "--allow-insecure-internal-dev",
+            "--control",
+            &control_addr,
+            "--listen",
+            &gateway_addr,
+        ]))
+    };
+    let mut gateway = start_gateway();
+    let client = connect_gateway(&gateway_addr).await;
+    execute(
+        &client,
+        "CREATE TABLE pending_items (id BIGINT PRIMARY KEY, value BIGINT NOT NULL)",
+    )
+    .await;
+    execute(&client, "CREATE MATERIALIZED VIEW pending_view AS SELECT id, SUM(value) AS total FROM pending_items GROUP BY id").await;
+    let insert = tokio::spawn(async move {
+        client
+            .simple_query("INSERT INTO pending_items VALUES (1, 10), (2, 20)")
+            .await
+    });
+    let request = tokio::time::timeout(Duration::from_secs(10), request_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(request.source, "pending_items");
+    assert_eq!(
+        request.rows,
+        vec![
+            rockstream_types::data_plane::RuntimeRow {
+                values_tsv: "1\t10".to_string(),
+                weight: 1
+            },
+            rockstream_types::data_plane::RuntimeRow {
+                values_tsv: "2\t20".to_string(),
+                weight: 1
+            },
+        ]
+    );
+    gateway.0.kill().unwrap();
+    gateway.0.wait().unwrap();
+    assert!(insert.await.unwrap().is_err());
+    let _gateway = start_gateway();
+    let client = connect_gateway(&gateway_addr).await;
+    let error = client
+        .simple_query("SELECT * FROM pending_view")
+        .await
+        .unwrap_err();
+    let error = error.as_db_error().unwrap();
+    assert_eq!(error.code().code(), "XX000");
+    assert_eq!(error.message(), "[RS-2026] query.query_time_execution_failed: query-time execution failed: distributed source requires recovery; preserve source input and shard storage and contact the operator before retrying. next_steps: Simplify the query, validate referenced table/view schemas, or materialize the query into a view.");
+    control.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_dispatch_blocks_distributed_reads_after_gateway_restart() {
+    let _test_guard = PROCESS_TEST_LOCK.lock().await;
+    let root = tempfile::tempdir().unwrap();
+    let catalog = rockstream_control::TopologyCatalog::new();
+    let control = rockstream_control::ControlService::new(catalog.clone())
+        .with_shard_manager(ShardManager::new())
+        .with_insecure_dev_mode()
+        .start("127.0.0.1:0")
+        .await
+        .unwrap();
+    let control_addr = control.addr.to_string();
+    let gateway_addr = free_addr();
+    let worker_storage = root.path().join("worker");
+    let gateway_storage = root.path().join("gateway");
+    let mut worker = TestChild(spawn(&[
+        "start",
+        "--storage",
+        worker_storage.to_str().unwrap(),
+        "--role",
+        "worker",
+        "--allow-insecure-internal-dev",
+        "--control",
+        &control_addr,
+        "--worker-id",
+        "1",
+    ]));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while catalog.get(WorkerId(1)).is_none() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let start_gateway = || {
+        TestChild(spawn(&[
+            "start",
+            "--storage",
+            gateway_storage.to_str().unwrap(),
+            "--role",
+            "gateway",
+            "--allow-insecure-internal-dev",
+            "--control",
+            &control_addr,
+            "--listen",
+            &gateway_addr,
+        ]))
+    };
+    let mut gateway = start_gateway();
+    let client = connect_gateway(&gateway_addr).await;
+    execute(
+        &client,
+        "CREATE TABLE dispatch_items (id BIGINT PRIMARY KEY, value BIGINT NOT NULL)",
+    )
+    .await;
+    execute(&client, "CREATE MATERIALIZED VIEW dispatch_view AS SELECT id, SUM(value) AS total FROM dispatch_items GROUP BY id").await;
+    execute(&client, "INSERT INTO dispatch_items VALUES (3, 30)").await;
+    execute(&client, "INSERT INTO dispatch_items VALUES (4, 40)").await;
+    let error = client
+        .simple_query("SELECT * FROM dispatch_view")
+        .await
+        .unwrap_err();
+    let error = error.as_db_error().unwrap();
+    assert_eq!(error.code().code(), "XX000");
+    assert_eq!(error.message(), "[RS-2026] query.query_time_execution_failed: query-time execution failed: distributed view dispatch_view output is unavailable; contact the operator before relying on this result. next_steps: Simplify the query, validate referenced table/view schemas, or materialize the query into a view.");
+    worker.0.kill().unwrap();
+    worker.0.wait().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while catalog.get(WorkerId(1)).is_some() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let error = client
+        .simple_query("INSERT INTO dispatch_items VALUES (1, 10), (2, 20)")
+        .await
+        .unwrap_err();
+    let error = error.as_db_error().unwrap();
+    assert_eq!(error.code().code(), "XX000");
+    assert_eq!(error.message(), "[RS-2026] query.query_time_execution_failed: query-time execution failed: distributed view refresh dispatch_view: RS-0001: a routed shard owner has no active worker connection; Retry after the workload and workers are ready.; preserve source input and shard storage and contact the operator before retrying. next_steps: Simplify the query, validate referenced table/view schemas, or materialize the query into a view.");
+    let assert_pending = |error: tokio_postgres::Error| {
+        let error = error.as_db_error().unwrap();
+        assert_eq!(error.code().code(), "XX000");
+        assert_eq!(error.message(), "[RS-2026] query.query_time_execution_failed: query-time execution failed: distributed source requires recovery; preserve source input and shard storage and contact the operator before retrying. next_steps: Simplify the query, validate referenced table/view schemas, or materialize the query into a view.");
+    };
+    assert_pending(
+        client
+            .simple_query("SELECT * FROM dispatch_view")
+            .await
+            .unwrap_err(),
+    );
+    drop(client);
+    gateway.0.kill().unwrap();
+    gateway.0.wait().unwrap();
+    let _gateway = start_gateway();
+    let client = connect_gateway(&gateway_addr).await;
+    assert_pending(
+        client
+            .simple_query("SELECT * FROM dispatch_view")
+            .await
+            .unwrap_err(),
+    );
+    assert_pending(
+        client
+            .simple_query("INSERT INTO dispatch_items VALUES (5, 50)")
+            .await
+            .unwrap_err(),
+    );
+    control.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires the direct gateway-to-worker source transport"]
 async fn real_workers_execute_aggregate_join_and_fenced_failover() {
     let _test_guard = PROCESS_TEST_LOCK.lock().await;
@@ -654,27 +979,39 @@ async fn real_multi_process_management_status_is_an_exact_json_worker_lifecycle_
         management_addr = free_addr();
     }
     let control_storage = root.path().join("management-control");
-    let control = spawn(&[
-        "start",
-        "--storage",
-        control_storage.to_str().unwrap(),
-        "--role",
-        "control",
-        "--allow-insecure-internal-dev",
-        "--control-bind",
-        &control_addr,
-        "--management-addr",
-        &management_addr,
-        "--daemon",
-    ]);
+    let pki = TestPki::generate_with_worker_ids([501, 502]);
+    preprovision_administrator(
+        Path::new(env!("CARGO_BIN_EXE_rockstream")),
+        &control_storage,
+        &pki,
+        "gateway",
+    );
+    let control = spawn_with_tls(
+        &[
+            "start",
+            "--storage",
+            control_storage.to_str().unwrap(),
+            "--role",
+            "control",
+            "--control-bind",
+            &control_addr,
+            "--management-addr",
+            &management_addr,
+            "--daemon",
+        ],
+        &pki.control_cert_path,
+        &pki.control_key_path,
+        &pki,
+    );
     let mut processes = ManagementProcesses {
         control,
         workers: Vec::new(),
     };
 
-    let empty_output = wait_for_management_status_nodes(&management_addr, 0).await;
+    let empty_output = wait_for_management_status_nodes(&management_addr, 0, &pki).await;
     let empty = assert_management_status_transcript(&empty_output, "unknown", vec![]);
     let empty_revision = topology_revision(&empty);
+    let mut worker_addresses = Vec::new();
 
     for (worker_id, host_id, zone) in [
         (501_u64, "multi-host-a", "multi-zone-a"),
@@ -682,26 +1019,35 @@ async fn real_multi_process_management_status_is_an_exact_json_worker_lifecycle_
     ] {
         let storage = root.path().join(format!("management-worker-{worker_id}"));
         let id = worker_id.to_string();
-        processes.workers.push(spawn(&[
-            "start",
-            "--storage",
-            storage.to_str().unwrap(),
-            "--role",
-            "worker",
-            "--allow-insecure-internal-dev",
-            "--control",
-            &control_addr,
-            "--worker-id",
-            &id,
-            "--host-id",
-            host_id,
-            "--availability-zone",
-            zone,
-        ]));
+        let (certificate, key) = pki.worker_certs.get(&worker_id).unwrap();
+        processes.workers.push(spawn_with_tls(
+            &[
+                "start",
+                "--storage",
+                storage.to_str().unwrap(),
+                "--role",
+                "worker",
+                "--control",
+                &control_addr,
+                "--worker-id",
+                &id,
+                "--host-id",
+                host_id,
+                "--availability-zone",
+                zone,
+            ],
+            certificate,
+            key,
+            &pki,
+        ));
+        let config: rockstream_types::config::NodeConfig =
+            toml::from_str(&std::fs::read_to_string(storage.join("worker-shuffle.toml")).unwrap())
+                .unwrap();
+        worker_addresses.push(config.worker.exchange_advertise_addr.unwrap());
     }
     wait_for_registered_workers(&control_storage.join("audit.jsonl"), 2).await;
 
-    let two_workers_output = wait_for_management_status_nodes(&management_addr, 2).await;
+    let two_workers_output = wait_for_management_status_nodes(&management_addr, 2, &pki).await;
     let two_workers = assert_management_status_transcript(
         &two_workers_output,
         "healthy",
@@ -709,7 +1055,7 @@ async fn real_multi_process_management_status_is_an_exact_json_worker_lifecycle_
             ManagementNodeInfo {
                 node_id: 501,
                 role: "worker".to_owned(),
-                address: "127.0.0.1:0".to_owned(),
+                address: worker_addresses[0].clone(),
                 state: "active".to_owned(),
                 capacity_headroom: 1.0,
                 host_id: "multi-host-a".to_owned(),
@@ -722,7 +1068,7 @@ async fn real_multi_process_management_status_is_an_exact_json_worker_lifecycle_
             ManagementNodeInfo {
                 node_id: 502,
                 role: "worker".to_owned(),
-                address: "127.0.0.1:0".to_owned(),
+                address: worker_addresses[1].clone(),
                 state: "active".to_owned(),
                 capacity_headroom: 1.0,
                 host_id: "multi-host-b".to_owned(),
@@ -738,14 +1084,14 @@ async fn real_multi_process_management_status_is_an_exact_json_worker_lifecycle_
 
     processes.workers[0].kill().unwrap();
     processes.workers[0].wait().unwrap();
-    let one_worker_output = wait_for_management_status_nodes(&management_addr, 1).await;
+    let one_worker_output = wait_for_management_status_nodes(&management_addr, 1, &pki).await;
     let one_worker = assert_management_status_transcript(
         &one_worker_output,
         "healthy",
         vec![ManagementNodeInfo {
             node_id: 502,
             role: "worker".to_owned(),
-            address: "127.0.0.1:0".to_owned(),
+            address: worker_addresses[1].clone(),
             state: "active".to_owned(),
             capacity_headroom: 1.0,
             host_id: "multi-host-b".to_owned(),
@@ -757,6 +1103,7 @@ async fn real_multi_process_management_status_is_an_exact_json_worker_lifecycle_
         }],
     );
     assert!(topology_revision(&one_worker) > topology_revision(&two_workers));
+    assert_eq!(one_worker.nodes[0].address, two_workers.nodes[1].address);
 }
 
 #[tokio::test]
@@ -767,6 +1114,13 @@ async fn real_multi_process_management_migration_moves_a_shard_and_keeps_its_dat
     let management_addr = free_addr();
     let control_storage = root.path().join("migration-control");
     let shared_control_storage = root.path().join("shared-control-state");
+    let pki = TestPki::generate_with_worker_ids([601, 602]);
+    preprovision_administrator(
+        Path::new(env!("CARGO_BIN_EXE_rockstream")),
+        &control_storage,
+        &pki,
+        "gateway",
+    );
     std::fs::create_dir_all(&control_storage).unwrap();
     std::fs::create_dir_all(&shared_control_storage).unwrap();
     let bucket = "v066-migration";
@@ -793,41 +1147,43 @@ async fn real_multi_process_management_migration_moves_a_shard_and_keeps_its_dat
     db.flush().await.unwrap();
     db.close().await.unwrap();
 
-    let control = spawn(&[
-        "start",
-        "--storage",
-        control_storage.to_str().unwrap(),
-        "--role",
-        "control",
-        "--allow-insecure-internal-dev",
-        "--control-shared-storage",
-        shared_control_storage.to_str().unwrap(),
-        "--control-bind",
-        &control_addr,
-        "--management-addr",
-        &management_addr,
-        "--daemon",
-    ]);
+    let control = spawn_with_tls(
+        &[
+            "start",
+            "--storage",
+            control_storage.to_str().unwrap(),
+            "--role",
+            "control",
+            "--control-shared-storage",
+            shared_control_storage.to_str().unwrap(),
+            "--control-bind",
+            &control_addr,
+            "--management-addr",
+            &management_addr,
+            "--daemon",
+        ],
+        &pki.control_cert_path,
+        &pki.control_key_path,
+        &pki,
+    );
     let mut workers = Vec::new();
     for worker_id in [601_u64, 602] {
         let worker_storage = root.path().join(format!("worker-{worker_id}"));
         std::fs::create_dir_all(&worker_storage).unwrap();
-        workers.push(spawn_worker(
+        workers.push(spawn_worker_with_tls(
             &worker_storage,
             &control_addr,
             worker_id,
             minio_port,
             bucket,
+            &pki,
         ));
     }
     wait_for_registered_workers(&control_storage.join("audit.jsonl"), 2).await;
     let mut processes = ManagementProcesses { control, workers };
-    wait_for_management_status_nodes(&management_addr, 2).await;
+    wait_for_management_status_nodes(&management_addr, 2, &pki).await;
 
-    let endpoint = format!("http://{management_addr}");
-    let mut management = ManagementServiceClient::connect(endpoint)
-        .await
-        .expect("connect to release management process");
+    let mut management = management_client(management_addr.parse().unwrap(), &pki).await;
     let shard_page = management
         .list_shards(ListShardsRequest {
             protocol_version: 1,
@@ -888,8 +1244,10 @@ async fn real_multi_process_management_migration_moves_a_shard_and_keeps_its_dat
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let cancel_output = Command::new(env!("CARGO_BIN_EXE_rockstream"))
-        .env("RUST_LOG", "off")
+    let mut cancel_command = Command::new(env!("CARGO_BIN_EXE_rockstream"));
+    cancel_command.env("RUST_LOG", "off");
+    add_client_tls_args(&mut cancel_command, &pki);
+    let cancel_output = cancel_command
         .args([
             "--output",
             "json",
@@ -929,7 +1287,10 @@ async fn real_multi_process_management_migration_moves_a_shard_and_keeps_its_dat
     assert_eq!(cancelled.phase, "cancelled_before_lease_transfer");
     assert_eq!(cancelled.error_code, "");
     assert!(cancelled.next_steps.is_empty());
-    assert_eq!(cancelled.source_version, "operation-record:2");
+    assert_eq!(
+        cancelled.source_version,
+        format!("operation-record:{MANAGEMENT_OPERATION_RECORD_VERSION}")
+    );
     assert_eq!(
         cancelled_cli,
         ManagementOperationInfo {
@@ -982,8 +1343,10 @@ async fn real_multi_process_management_migration_moves_a_shard_and_keeps_its_dat
         .expect("cancelled shard remains leased");
     assert_eq!(cancelled_shard.owner_node_id, "601");
     assert_eq!(cancelled_shard.lease_token, old_lease_token);
-    let cancelled_output = Command::new(env!("CARGO_BIN_EXE_rockstream"))
-        .env("RUST_LOG", "off")
+    let mut cancelled_command = Command::new(env!("CARGO_BIN_EXE_rockstream"));
+    cancelled_command.env("RUST_LOG", "off");
+    add_client_tls_args(&mut cancelled_command, &pki);
+    let cancelled_output = cancelled_command
         .args([
             "--output",
             "json",
@@ -1026,7 +1389,7 @@ async fn real_multi_process_management_migration_moves_a_shard_and_keeps_its_dat
             phase: "cancelled_before_lease_transfer".to_owned(),
             error_code: String::new(),
             next_steps: vec![],
-            source_version: "operation-record:2".to_owned(),
+            source_version: format!("operation-record:{MANAGEMENT_OPERATION_RECORD_VERSION}"),
         }
     );
     let request = MigrateShardRequest {
@@ -1148,7 +1511,10 @@ async fn real_multi_process_management_migration_moves_a_shard_and_keeps_its_dat
     assert_eq!(terminal.phase, "completed");
     assert_eq!(terminal.error_code, "");
     assert!(terminal.next_steps.is_empty());
-    assert_eq!(terminal.source_version, "operation-record:2");
+    assert_eq!(
+        terminal.source_version,
+        format!("operation-record:{MANAGEMENT_OPERATION_RECORD_VERSION}")
+    );
 
     let current_shard = management
         .get_shard(GetShardRequest {
@@ -1163,8 +1529,10 @@ async fn real_multi_process_management_migration_moves_a_shard_and_keeps_its_dat
     assert_eq!(current_shard.owner_node_id, target_node_id.to_string());
     assert!(current_shard.lease_token > old_lease_token);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rockstream"))
-        .env("RUST_LOG", "off")
+    let mut output_command = Command::new(env!("CARGO_BIN_EXE_rockstream"));
+    output_command.env("RUST_LOG", "off");
+    add_client_tls_args(&mut output_command, &pki);
+    let output = output_command
         .args([
             "--output",
             "json",
@@ -1194,7 +1562,10 @@ async fn real_multi_process_management_migration_moves_a_shard_and_keeps_its_dat
     assert_eq!(operation.phase, "completed");
     assert_eq!(operation.error_code, "");
     assert!(operation.next_steps.is_empty());
-    assert_eq!(operation.source_version, "operation-record:2");
+    assert_eq!(
+        operation.source_version,
+        format!("operation-record:{MANAGEMENT_OPERATION_RECORD_VERSION}")
+    );
 
     unsafe {
         assert_eq!(
@@ -1203,8 +1574,10 @@ async fn real_multi_process_management_migration_moves_a_shard_and_keeps_its_dat
             "pause drain recipient worker"
         );
     }
-    let drain_accepted_output = Command::new(env!("CARGO_BIN_EXE_rockstream"))
-        .env("RUST_LOG", "off")
+    let mut drain_command = Command::new(env!("CARGO_BIN_EXE_rockstream"));
+    drain_command.env("RUST_LOG", "off");
+    add_client_tls_args(&mut drain_command, &pki);
+    let drain_accepted_output = drain_command
         .args([
             "--output",
             "json",
@@ -1263,8 +1636,10 @@ async fn real_multi_process_management_migration_moves_a_shard_and_keeps_its_dat
     };
     assert_eq!(draining_node.node_id, "602");
     assert!(draining_node.healthy);
-    let draining_status = Command::new(env!("CARGO_BIN_EXE_rockstream"))
-        .env("RUST_LOG", "off")
+    let mut status_command = Command::new(env!("CARGO_BIN_EXE_rockstream"));
+    status_command.env("RUST_LOG", "off");
+    add_client_tls_args(&mut status_command, &pki);
+    let draining_status = status_command
         .args([
             "--output",
             "json",
@@ -1297,8 +1672,10 @@ async fn real_multi_process_management_migration_moves_a_shard_and_keeps_its_dat
     }
     let drain_deadline = Instant::now() + Duration::from_secs(30);
     let drain_terminal = loop {
-        let shown = Command::new(env!("CARGO_BIN_EXE_rockstream"))
-            .env("RUST_LOG", "off")
+        let mut show_command = Command::new(env!("CARGO_BIN_EXE_rockstream"));
+        show_command.env("RUST_LOG", "off");
+        add_client_tls_args(&mut show_command, &pki);
+        let shown = show_command
             .args([
                 "--output",
                 "json",
@@ -1338,7 +1715,10 @@ async fn real_multi_process_management_migration_moves_a_shard_and_keeps_its_dat
     assert_eq!(drain_terminal.phase, "completed");
     assert_eq!(drain_terminal.error_code, "");
     assert!(drain_terminal.next_steps.is_empty());
-    assert_eq!(drain_terminal.source_version, "operation-record:2");
+    assert_eq!(
+        drain_terminal.source_version,
+        format!("operation-record:{MANAGEMENT_OPERATION_RECORD_VERSION}")
+    );
     let drained_shard = management
         .get_shard(GetShardRequest {
             protocol_version: 1,
@@ -1354,26 +1734,27 @@ async fn real_multi_process_management_migration_moves_a_shard_and_keeps_its_dat
 
     processes.control.kill().unwrap();
     processes.control.wait().unwrap();
-    processes.control = spawn(&[
-        "start",
-        "--storage",
-        control_storage.to_str().unwrap(),
-        "--role",
-        "control",
-        "--allow-insecure-internal-dev",
-        "--control-shared-storage",
-        shared_control_storage.to_str().unwrap(),
-        "--control-bind",
-        &control_addr,
-        "--management-addr",
-        &management_addr,
-        "--daemon",
-    ]);
-    wait_for_management_status_nodes(&management_addr, 2).await;
-    let endpoint = format!("http://{management_addr}");
-    management = ManagementServiceClient::connect(endpoint)
-        .await
-        .expect("reconnect to restarted management process");
+    processes.control = spawn_with_tls(
+        &[
+            "start",
+            "--storage",
+            control_storage.to_str().unwrap(),
+            "--role",
+            "control",
+            "--control-shared-storage",
+            shared_control_storage.to_str().unwrap(),
+            "--control-bind",
+            &control_addr,
+            "--management-addr",
+            &management_addr,
+            "--daemon",
+        ],
+        &pki.control_cert_path,
+        &pki.control_key_path,
+        &pki,
+    );
+    wait_for_management_status_nodes(&management_addr, 2, &pki).await;
+    management = management_client(management_addr.parse().unwrap(), &pki).await;
     let recovered = management
         .get_operation(GetOperationRequest {
             protocol_version: 1,

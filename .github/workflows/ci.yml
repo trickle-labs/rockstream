@@ -9,7 +9,7 @@ on:
       - "**/openwiki/**"
       - "**/.openwikiignore"
   pull_request:
-    branches: [main]
+    branches: [main, codex/pr303-management-auth-mainline]
     paths-ignore:
       - "**/AGENTS.md"
       - "**/openwiki/**"
@@ -238,6 +238,9 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         if: needs.ci-policy.outputs.expensive == 'true'
+        with:
+          cache-on-failure: ${{ matrix.os == 'macos-15' && matrix.phase == 'release' }}
+          cache-workspace-crates: ${{ matrix.os == 'macos-15' && matrix.phase == 'release' }}
       - name: Cache pinned Verus
         if: needs.ci-policy.outputs.expensive == 'true'
         uses: actions/cache@v4
@@ -354,6 +357,48 @@ jobs:
       - name: Build ordinary Cargo consumer
         run: cargo build --locked --release -p rockstream-cli
 
+  security-release-process:
+    needs: ci-policy
+    if: needs.ci-policy.outputs.scope == 'full'
+    name: Security release-process (release CLI)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: security-release-process
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: Require Docker
+        run: docker info
+      - name: Record release test metadata
+        run: |
+          mkdir -p target/security-release-evidence
+          printf 'revision: %s\n' "$GITHUB_SHA" > target/security-release-evidence/manifest.txt
+          printf '%s\n' 'cargo test --locked --release -p rockstream-cli --test oidc_release_process_tests -- --test-threads=1' >> target/security-release-evidence/manifest.txt
+      - name: Run security release-process tests against the release CLI
+        run: |
+          set -o pipefail
+          cargo test --locked --release -p rockstream-cli --test oidc_release_process_tests -- --test-threads=1 2>&1 | tee target/security-release-evidence/test.log
+      - name: Record release CLI digest
+        if: always()
+        run: sha256sum target/release/rockstream > target/security-release-evidence/rockstream.sha256
+      - name: Upload release-process evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-release-process-evidence
+          path: target/security-release-evidence/
+          if-no-files-found: error
+          retention-days: 90
+
   check-tests:
     needs: ci-policy
     if: needs.ci-policy.outputs.scope == 'full'
@@ -394,6 +439,21 @@ jobs:
       - name: Require Docker
         if: contains(fromJSON('["crates", "oracle", "ops", "storage-sql", "gateway-components"]'), matrix.shard)
         run: docker info
+      - name: Pre-pull oracle Kafka fixture with bounded registry retries
+        if: matrix.shard == 'oracle'
+        run: |
+          # Testcontainers uses this exact image. Transient Docker Hub 502/503
+          # errors must not fail an unrelated mandatory oracle assertion.
+          for attempt in 1 2 3 4 5; do
+            if docker pull apache/kafka-native:3.8.0; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "::error::Kafka fixture image pull failed after five attempts" >&2
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
       - name: Record workspace test case execution
         if: matrix.shard == 'workspace'
         run: python3 scripts/ci-test-inventory.py run --job pr-workspace
@@ -520,6 +580,7 @@ jobs:
       - nexmark-regression-gate
       - benchmark
       - docker-build
+      - security-release-process
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

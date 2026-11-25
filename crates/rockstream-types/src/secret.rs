@@ -5,6 +5,9 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock};
 
+/// Maximum serialized credential payload carried by one worker secret token.
+pub const MAX_WORKER_SECRET_TOKEN_PAYLOAD_BYTES: usize = 1024 * 1024;
+
 /// Return the name carried by a supported secret reference.
 ///
 /// Bare names are accepted for reading legacy catalog entries and the
@@ -120,7 +123,9 @@ pub struct EncryptedSecret {
 /// Short-lived secret token issued to a worker node identity.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SecretToken {
+    pub format_version: u32,
     pub token_id: String,
+    pub workload_id: crate::ids::WorkloadId,
     pub secret_name: String,
     pub secret_type: SecretType,
     pub worker_identity: String,
@@ -131,6 +136,8 @@ pub struct SecretToken {
 }
 
 impl SecretToken {
+    pub const FORMAT_VERSION: u32 = 2;
+
     /// Stable key derivation shared by the control plane and worker process.
     pub fn worker_key(identity: &str) -> [u8; 32] {
         use sha2::{Digest, Sha256};
@@ -142,6 +149,16 @@ impl SecretToken {
         let mut key = [0u8; 32];
         key.copy_from_slice(&digest);
         key
+    }
+
+    pub fn workload_key(identity: &str, workload_id: crate::ids::WorkloadId) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"rockstream-worker-secret-token-workload-key-v1");
+        hasher.update(Self::worker_key(identity));
+        hasher.update(workload_id.0.to_be_bytes());
+        hasher.finalize().into()
     }
 
     pub fn is_expired(&self, current_time_secs: u64) -> bool {
@@ -333,7 +350,9 @@ mod tests {
         assert_eq!(secret.secret_type.as_str(), "sasl_plain");
 
         let token = SecretToken {
+            format_version: SecretToken::FORMAT_VERSION,
             token_id: "tok-1".to_string(),
+            workload_id: crate::ids::WorkloadId(1),
             secret_name: "kafka_auth".to_string(),
             secret_type: SecretType::SaslPlain,
             worker_identity: "worker-1".to_string(),

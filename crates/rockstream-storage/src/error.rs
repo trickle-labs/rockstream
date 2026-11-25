@@ -77,6 +77,10 @@ pub enum StorageError {
     #[error("RS-3001: shard writer fenced out: lease lost")]
     Fenced,
 
+    /// RS-1702: writer presented a lease token older than the storage-boundary fence.
+    #[error("RS-1702: stale lease token {provided} rejected by storage fence (current {current})")]
+    StaleLeaseToken { provided: u64, current: u64 },
+
     /// RS-2006: historical epoch outside checkpoint retention window.
     #[error("[RS-2006] Requested epoch {requested_epoch} is outside the retention window (minimum epoch: {min_retention_epoch})")]
     EpochPruned {

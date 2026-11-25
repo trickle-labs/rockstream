@@ -17,6 +17,7 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Int64Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use rockstream_types::BatchKeyCapsule;
 
 use crate::error::OpError;
 
@@ -24,6 +25,9 @@ use crate::error::OpError;
 ///
 /// The `data` batch holds the user-visible columns; `weights` holds the
 /// per-row IVM weights. Both have the same number of rows.
+///
+/// `key_capsules` optionally carries once-per-batch canonical key encodings and
+/// hashes reused across exchange, stateless fusion, join, aggregate, and storage.
 #[derive(Debug, Clone)]
 pub struct ArrowZSet {
     /// Row data (user schema, no `_weight` column).
@@ -32,6 +36,8 @@ pub struct ArrowZSet {
     pub weights: Vec<i64>,
     /// Optional progress frontier associated with this Z-set.
     pub frontier: Option<rockstream_types::frontier::FreshnessToken>,
+    /// Cached once-per-batch canonical key capsules keyed by `KeySpec`.
+    pub key_capsules: Vec<Arc<BatchKeyCapsule>>,
 }
 
 impl ArrowZSet {
@@ -48,6 +54,7 @@ impl ArrowZSet {
             data,
             weights,
             frontier: None,
+            key_capsules: Vec::new(),
         })
     }
 
@@ -78,6 +85,57 @@ impl ArrowZSet {
     pub fn with_frontier(mut self, frontier: rockstream_types::frontier::FreshnessToken) -> Self {
         self.frontier = Some(frontier);
         self
+    }
+
+    /// Attach a pre-encoded once-per-batch `BatchKeyCapsule` to this Z-set.
+    pub fn with_key_capsule(mut self, capsule: Arc<BatchKeyCapsule>) -> Self {
+        self.push_key_capsule(capsule);
+        self
+    }
+
+    /// Insert or replace a cached `BatchKeyCapsule` matching its `KeySpec`.
+    pub fn push_key_capsule(&mut self, capsule: Arc<BatchKeyCapsule>) {
+        if let Some(existing) = self
+            .key_capsules
+            .iter_mut()
+            .find(|c| c.spec == capsule.spec)
+        {
+            *existing = capsule;
+        } else {
+            self.key_capsules.push(capsule);
+        }
+    }
+
+    /// Look up an already-attached `BatchKeyCapsule` matching `key_cols` (zero re-encoding).
+    pub fn key_capsule_for(&self, key_cols: &[usize]) -> Option<Arc<BatchKeyCapsule>> {
+        self.key_capsules
+            .iter()
+            .find(|c| c.spec.columns.as_slice() == key_cols && c.len() == self.num_rows())
+            .cloned()
+    }
+
+    /// Reuse an attached `BatchKeyCapsule` for `key_cols` if present, otherwise encode it once
+    /// for this batch.
+    pub fn get_or_build_key_capsule(
+        &self,
+        key_cols: &[usize],
+    ) -> Result<Arc<BatchKeyCapsule>, OpError> {
+        if let Some(existing) = self.key_capsule_for(key_cols) {
+            return Ok(existing);
+        }
+        BatchKeyCapsule::from_record_batch(&self.data, key_cols)
+            .map(Arc::new)
+            .map_err(|error| OpError::unsupported_plan_node(error.to_string()))
+    }
+
+    /// Ensure a `BatchKeyCapsule` for `key_cols` is encoded and attached to this batch.
+    pub fn attach_key_capsule(
+        &mut self,
+        key_cols: &[usize],
+    ) -> Result<Arc<BatchKeyCapsule>, OpError> {
+        let capsule = self.get_or_build_key_capsule(key_cols)?;
+        self.push_key_capsule(Arc::clone(&capsule));
+        Ok(capsule)
     }
 
     /// Number of rows in this batch.
@@ -128,6 +186,7 @@ impl ArrowZSet {
             data,
             weights,
             frontier: None,
+            key_capsules: Vec::new(),
         }
     }
 
@@ -152,6 +211,7 @@ impl ArrowZSet {
             data,
             weights,
             frontier: None,
+            key_capsules: Vec::new(),
         }
     }
 
@@ -169,6 +229,11 @@ impl ArrowZSet {
         if mask.iter().all(|&b| b) {
             return self; // nothing to remove
         }
+        let surviving: Vec<usize> = mask
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &keep)| keep.then_some(i))
+            .collect();
         let bool_array = arrow::array::BooleanArray::from(mask.clone());
         let filtered_cols: Vec<ArrayRef> = self
             .data
@@ -184,10 +249,17 @@ impl ArrowZSet {
             .filter(|(b, _)| **b)
             .map(|(_, w)| *w)
             .collect();
+        let new_capsules = self
+            .key_capsules
+            .iter()
+            .filter(|c| c.len() == self.weights.len())
+            .map(|c| Arc::new(c.select_rows(&surviving)))
+            .collect();
         ArrowZSet {
             data: new_data,
             weights: new_weights,
             frontier: self.frontier,
+            key_capsules: new_capsules,
         }
     }
 
@@ -230,10 +302,10 @@ impl ArrowZSet {
         let a_col = self.data.column(0).as_any().downcast_ref::<Int64Array>();
         let b_col = self.data.column(1).as_any().downcast_ref::<Int64Array>();
         if let (Some(a), Some(b)) = (a_col, b_col) {
-            for i in 0..self.num_rows() {
+            for (i, &weight) in self.weights.iter().enumerate() {
                 let key = (a.value(i), b.value(i));
                 let current = acc.get(&key).copied().unwrap_or(0);
-                let next = rockstream_verified::zset::consolidate_weight(current, self.weights[i])
+                let next = rockstream_verified::zset::consolidate_weight(current, weight)
                     .ok_or_else(|| OpError::numeric_overflow("Z-set weight consolidation"))?;
                 if rockstream_verified::zset::weight_cancels(next) {
                     acc.remove(&key);
@@ -286,6 +358,12 @@ impl ArrowZSet {
         let new_weights = indices.iter().map(|&i| self.weights[i]).collect();
         let mut result = Self::try_new(new_data, new_weights)?;
         result.frontier = self.frontier.clone();
+        result.key_capsules = self
+            .key_capsules
+            .iter()
+            .filter(|c| c.len() == n)
+            .map(|c| Arc::new(c.select_rows(indices)))
+            .collect();
         Ok(result)
     }
 }
@@ -338,6 +416,7 @@ mod tests {
             data: zs.data,
             weights,
             frontier: None,
+            key_capsules: Vec::new(),
         };
 
         let compacted = zs2.compact();

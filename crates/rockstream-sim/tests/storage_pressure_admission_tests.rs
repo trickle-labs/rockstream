@@ -510,7 +510,14 @@ fn test_configuration_surface_cli_lock() {
     // Assert zero new roles or top-level configuration subcommands added
     assert_eq!(
         rockstream_cli::KNOWN_ROLES,
-        &["all", "control", "worker", "gateway", "frontier"]
+        &[
+            "all",
+            "control",
+            "worker",
+            "gateway",
+            "frontier",
+            "compactor"
+        ]
     );
 }
 

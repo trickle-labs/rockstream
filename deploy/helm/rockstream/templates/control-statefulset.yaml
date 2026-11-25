@@ -17,6 +17,10 @@ spec:
       labels:
         app.kubernetes.io/name: {{ .Chart.Name }}
         app.kubernetes.io/component: control
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ .Values.control.managementPort }}"
+        prometheus.io/path: "/metrics"
     spec:
       serviceAccountName: {{ .Values.serviceAccount.name }}
       securityContext:
@@ -32,6 +36,10 @@ spec:
             - "--raft-bind=0.0.0.0:{{ .Values.control.port }}"
             - "--metrics-addr=0.0.0.0:{{ .Values.control.managementPort }}"
             - "--storage=/data"
+          {{- if .Values.objectStore.enabled }}
+          env:
+            {{- include "rockstream.objectStoreEnv" . | nindent 12 }}
+          {{- end }}
           ports:
             - name: raft-rpc
               containerPort: {{ .Values.control.port }}

@@ -1,0 +1,114 @@
+# RockStream 5-Minute Quickstart Compose Stack
+# Starts PostgreSQL (wal_level=logical), MinIO (S3-compatible), and RockStream.
+# Add `--profile kafka` to also launch a local Kafka-compatible broker (Redpanda).
+
+services:
+  postgres:
+    image: postgres:18.0-bookworm
+    container_name: rockstream-quickstart-pg
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: rockstream_demo
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=10
+      - -c
+      - max_wal_senders=10
+    volumes:
+      - ./init-postgres.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - quickstart_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d rockstream_demo"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  minio:
+    image: minio/minio:RELEASE.2025-02-28T09-55-16Z
+    container_name: rockstream-quickstart-minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: rockstream
+      MINIO_ROOT_PASSWORD: rockstream-secret
+    command: server /data --console-address ":9001"
+    volumes:
+      - quickstart_minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/minio/health/live"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  kafka:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.3.6
+    container_name: rockstream-quickstart-kafka
+    profiles: ["kafka"]
+    ports:
+      - "9092:9092"
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp
+      - "1"
+      - --memory
+      - 512M
+      - --reserve-memory
+      - 0M
+      - --node-id
+      - "0"
+      - --kafka-addr
+      - PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr
+      - PLAINTEXT://kafka:9092
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  rockstream:
+    image: ${ROCKSTREAM_IMAGE:-ghcr.io/trickle-labs/rockstream:0.72.0}
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: rockstream-quickstart-engine
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    ports:
+      - "5432:5432"
+      - "9090:9090"
+    volumes:
+      - quickstart_rs_data:/data:rw
+    environment:
+      RUST_LOG: info
+      ROCKSTREAM_CONTAINER: "1"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command:
+      - start
+      - --role=all
+      - --listen=0.0.0.0:5432
+      - --metrics-addr=0.0.0.0:9090
+      - --storage=/data
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9090/ready"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  quickstart_pg_data:
+  quickstart_minio_data:
+  quickstart_rs_data:

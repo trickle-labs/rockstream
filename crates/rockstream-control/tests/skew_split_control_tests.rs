@@ -151,11 +151,10 @@ fn skew_control_loop_audits_non_composable_spill_decision() {
     let events = log.read_all().unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].action, "skew_splitting.adjusted");
-    assert!(events[0]
-        .detail
-        .as_deref()
-        .unwrap()
-        .contains("load_factor="));
+    let detail = events[0].detail.as_deref().unwrap();
+    assert!(detail.contains("load_factor="));
+    assert!(detail.contains("decision=single_owner_fallback"));
+    assert!(detail.contains("reassociation_admitted=false"));
 }
 
 #[test]
@@ -205,4 +204,126 @@ fn disabled_skew_controller_ignores_an_overloaded_cluster() {
             .unwrap(),
         None
     );
+}
+
+#[test]
+fn changing_hot_keys_must_restart_the_sustained_window() {
+    let mut controller = AdaptiveSkewSplitter::new(SkewSplitConfig {
+        enabled: true,
+        hot_key_factor: 10.0,
+        max_skew_buckets: 15,
+    });
+    let operator = OperatorId(31);
+    let law = LawDescriptor::from_bundle(&SumCountV1);
+    let mut samples = make_cluster_samples();
+    let window = SKEW_SPLIT_TRIGGER_WINDOW.as_millis() as u64;
+    assert_eq!(
+        controller
+            .observe(operator, &law, &samples, None, ShardId(99), 0, None)
+            .unwrap(),
+        None
+    );
+    samples[0] = make_shard_sample(1, b"new-hot", 60_000, 1_000);
+    assert_eq!(
+        controller
+            .observe(operator, &law, &samples, None, ShardId(99), window, None)
+            .unwrap(),
+        None
+    );
+    let decision = controller
+        .observe(
+            operator,
+            &law,
+            &samples,
+            None,
+            ShardId(99),
+            window * 2,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(decision.hot_key.key_prefix, b"new-hot".to_vec());
+    assert_eq!(decision.bucket_count, 8);
+    assert!(matches!(
+        decision.plan,
+        HotKeyMitigationPlan::Spill { shard_id, .. } if shard_id == ShardId(99)
+    ));
+}
+
+#[test]
+fn equal_score_keys_and_shards_do_not_depend_on_report_order() {
+    let mut samples = make_cluster_samples();
+    samples[0] = make_shard_sample(1, b"alpha", 60_000, 1_000);
+    samples[0].key_loads.push(KeyLoadSample {
+        key_prefix: b"zeta".to_vec(),
+        cpu_nanos: 60_000,
+        bytes_per_epoch: 30_000,
+        state_writes_per_epoch: 15_000,
+    });
+    let mut tied_shard = samples[0].clone();
+    tied_shard.shard_id = ShardId(4);
+    samples.push(tied_shard);
+    let mut reversed = samples.clone();
+    reversed.reverse();
+    for sample in &mut reversed {
+        sample.key_loads.reverse();
+    }
+    let decide = |samples: &[ShardLoadSample]| {
+        let mut controller = AdaptiveSkewSplitter::new(SkewSplitConfig {
+            enabled: true,
+            hot_key_factor: 10.0,
+            max_skew_buckets: 16,
+        });
+        let law = LawDescriptor::from_bundle(&SumCountV1);
+        let operator = OperatorId(31);
+        assert_eq!(
+            controller
+                .observe(operator, &law, samples, None, ShardId(99), 0, None)
+                .unwrap(),
+            None
+        );
+        controller
+            .observe(
+                operator,
+                &law,
+                samples,
+                None,
+                ShardId(99),
+                SKEW_SPLIT_TRIGGER_WINDOW.as_millis() as u64,
+                None,
+            )
+            .unwrap()
+            .unwrap()
+    };
+    let decision = decide(&samples);
+    assert_eq!(decision.shard_id, ShardId(1));
+    assert_eq!(decision.hot_key.key_prefix, b"alpha".to_vec());
+    assert_eq!(decide(&reversed), decision);
+}
+
+#[test]
+fn invalid_skew_configuration_cannot_trigger_a_split() {
+    for (factor, max_buckets) in [(f64::NAN, 16), (10.0, 0)] {
+        let mut controller = AdaptiveSkewSplitter::new(SkewSplitConfig {
+            enabled: true,
+            hot_key_factor: factor,
+            max_skew_buckets: max_buckets,
+        });
+        for now in [0, SKEW_SPLIT_TRIGGER_WINDOW.as_millis() as u64] {
+            assert_eq!(
+                controller
+                    .observe(
+                        OperatorId(17),
+                        &LawDescriptor::from_bundle(&SumCountV1),
+                        &make_cluster_samples(),
+                        None,
+                        ShardId(99),
+                        now,
+                        None,
+                    )
+                    .unwrap(),
+                None
+            );
+        }
+    }
 }

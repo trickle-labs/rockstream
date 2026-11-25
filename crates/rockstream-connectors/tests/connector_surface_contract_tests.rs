@@ -17,7 +17,7 @@ fn root() -> PathBuf {
 }
 
 #[test]
-fn kafka_sink_row_delivery_has_consumer_proofs_and_remains_experimental() {
+fn kafka_sink_row_delivery_has_consumer_proofs_and_is_core() {
     let sink = rockstream_types::capability::CapabilityRegistry::current()
         .get_by_id("sink.kafka")
         .expect("Kafka sink capability");
@@ -36,8 +36,8 @@ fn kafka_sink_row_delivery_has_consumer_proofs_and_remains_experimental() {
                 .collect::<Vec<_>>(),
         ),
         (
-            "Experimental",
-            "",
+            "Core",
+            "crates/rockstream-ops/tests/kafka_view_delivery_tests.rs::view_snapshot_changes_and_recovery_match_exact_consumer_stream",
             vec![
                 (
                     "incremental",
@@ -239,7 +239,7 @@ fn connector_guarantee_document_is_exact_and_all_matrix_tests_exist() {
             "crates/rockstream-connectors/tests/postgres_cdc_guarantee_matrix_tests.rs",
             &[
                 "postgres_cdc_snapshot_stream_fence_has_exact_transcript",
-                "postgres_cdc_all_mutation_types_have_exact_transcript",
+                "postgres_cdc_insert_update_delete_have_exact_transcript",
                 "postgres_cdc_each_commit_boundary_recovers_exactly_once",
                 "postgres_cdc_wal_lag_pauses_at_bound_and_recovers_within_slo",
                 "postgres_cdc_malformed_replication_record_fails_closed_then_recovers_exactly",

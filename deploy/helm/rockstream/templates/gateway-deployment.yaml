@@ -16,6 +16,10 @@ spec:
       labels:
         app.kubernetes.io/name: {{ .Chart.Name }}
         app.kubernetes.io/component: gateway
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ .Values.gateway.managementPort }}"
+        prometheus.io/path: "/metrics"
     spec:
       serviceAccountName: {{ .Values.serviceAccount.name }}
       securityContext:
@@ -32,6 +36,10 @@ spec:
             - "--listen=0.0.0.0:{{ .Values.gateway.port }}"
             - "--metrics-addr=0.0.0.0:{{ .Values.gateway.managementPort }}"
             - "--storage=/data"
+          {{- if .Values.objectStore.enabled }}
+          env:
+            {{- include "rockstream.objectStoreEnv" . | nindent 12 }}
+          {{- end }}
           ports:
             - name: pgwire
               containerPort: {{ .Values.gateway.port }}

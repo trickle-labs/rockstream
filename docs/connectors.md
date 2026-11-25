@@ -2,23 +2,29 @@
 
 ## Secret rotation
 
-Kafka sources/sinks and PostgreSQL CDC sources can bind to `secret = '<name>'`.
-New source and sink catalog entries store the binding as `secret://<name>`;
-resolved credential values are not copied into connector metadata. Attaching a
-secret requires an explicit `SecretUse` grant scoped to the secret and consumer
-principal; missing identity or durable policy fails closed. Source and sink
-metadata is committed before CREATE or DROP is acknowledged. The gateway
-rechecks a source consumer's current grant before resolving its credential.
-Older entries without persisted consumer scope fail closed; an authorized
-migration route remains to be qualified.
+Kafka and PostgreSQL CDC sources, and SQL-wired Kafka sinks, can bind to
+`secret = '<name>'`. Kafka sinks also require
+`security.protocol = 'SASL_SSL'` or `'SASL_PLAINTEXT'`. New catalog entries store
+the binding as `secret://<name>`; resolved credential values are not copied
+into connector metadata. Attaching a secret requires an explicit `SecretUse`
+grant scoped to the secret and consumer principal; missing identity or durable
+policy fails closed. The gateway rechecks a source or sink consumer's current
+grant before resolving credentials. Older secret-bound sink entries without a
+persisted SASL protocol fail closed. The Docker-backed
+[`kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_consumers`](../crates/rockstream-cli/tests/oidc_release_process_tests.rs)
+release proof checks source and sink records through live rotation and
+lost-response gateway recovery, with pending rows across two views and three
+partitions plus an unaffected consumer.
 
 The gateway pgoutput source checks the durable secret version before a source
 transaction and after its committed epoch. If it changes during the transaction,
 the worker commits the complete result and slot checkpoint, then opens a new
 upstream connection with the authorized replacement while keeping the source
-worker alive. Kafka source/sink rotation remains unqualified; the experimental
-sink is not configured by SQL `CREATE SINK` and has no supported full-Core
-qualification route.
+worker alive. A Kafka source uses an explicit SASL transport and PLAIN credentials;
+at the next source epoch it replaces the consumer with the authorized credentials,
+seeking from the durable source checkpoint while keeping the worker alive. A Kafka
+sink checks its bound secret version before each committed view delivery and
+recreates its transactional producer at an epoch boundary when credentials rotate.
 
 RockStream supports exactly three external connector boundaries: PostgreSQL
 CDC, Kafka source, and Kafka sink. `object_store` is internal durable state,
@@ -35,7 +41,7 @@ Experimental and delivers bounded runtime view snapshot/change envelopes. The ge
 | --- | --- | --- | --- |
 | PostgreSQL CDC source | **Core** | [PostgreSQL CDC](#postgresql-cdc) | [`postgres_cdc_snapshot_stream_fence_has_exact_transcript`](../crates/rockstream-connectors/tests/postgres_cdc_guarantee_matrix_tests.rs) |
 | Kafka source | **Core** | [Kafka source](#kafka-source) | [`kafka_source_mid_epoch_rebalance_recovers_exact_transcript`](../crates/rockstream-connectors/tests/kafka_source_guarantee_matrix_tests.rs) |
-| Kafka sink | **Experimental** | [Kafka sink](#kafka-sink) | Bounded view snapshot/change envelopes; full Core qualification remains incomplete. |
+| Kafka sink | **Core** | [Kafka sink](#kafka-sink) | [`view_snapshot_changes_and_recovery_match_exact_consumer_stream`](../crates/rockstream-ops/tests/kafka_view_delivery_tests.rs) |
 
 These are the only external connector boundaries. Removed Iceberg, Delta,
 object-store, S3, and HTTP webhook surfaces fail closed with `RS-4017`; their
@@ -43,6 +49,34 @@ permanent replacements are documented in
 [`docs/connector-migration.md`](connector-migration.md).
 
 ## PostgreSQL CDC
+
+### Bounded pgoutput transport and oversize recovery
+
+The gateway and row-only pgoutput readers stream binary COPY results from a
+single logical-decoding peek per upstream transaction. PostgreSQL is allowed to
+exceed `upto_nchanges` at transaction boundaries; RockStream does not treat
+that argument as an allocation limit. Instead, COPY exposes at most 8 KiB per
+wire row, announces each pgoutput frame's full length first, and rejects any
+frame or cumulative upstream transaction that would exceed the 8 MiB source
+limit **before** buffering the excessive frame. BEGIN, relation metadata and
+COMMIT frames count toward the bound, not just routed row changes.
+
+`PgOutputTransportStats` reports actual received frames, payload bytes,
+peak COPY chunk and frame buffer sizes, and per-transaction payload bytes,
+independently of the coordinator's encoded-change fill metrics.
+The gateway still publishes all changes and the slot LSN together only after
+the transaction-wide M3 durability fence. A transport protocol or size failure
+returns `RS-4014`, blocks further reads and acknowledgments, and leaves the
+durable source checkpoint and PostgreSQL slot position unchanged. After such a
+failure the operator must reduce the upstream transaction size (or repair the
+source), then perform the supported resnapshot/replacement-slot recovery
+workflow; retrying against the unchanged oversized transaction will fail
+closed rather than skip it.
+
+Real PostgreSQL regression coverage:
+`pgoutput_bounded_copy_preserves_complete_ordered_thousand_row_transcript_and_ack`,
+`pgoutput_copy_rejects_oversized_frame_before_buffer_or_checkpoint_advances`,
+and gateway test `pgoutput_gateway_publishes_complete_large_transaction_atomically_and_acks_after_commit`.
 
 | Axis | Guarantee |
 | --- | --- |
@@ -101,9 +135,46 @@ Standby status updates sent to PostgreSQL never outrun durable SlateDB storage.
 
 Unaffected tables in a publication continue ingestion without interruption (relation isolation).
 
+### TRUNCATE semantics
+
+The source-wide pgoutput gateway applies PostgreSQL `TRUNCATE` to the imported
+relation and every dependent materialized view in the **same durable M3 epoch**
+as its transaction and LSN. It reconstructs exact negative row deltas from
+local committed table images (not from the already-truncated upstream table),
+including earlier and later row changes in that PostgreSQL transaction and
+multi-relation TRUNCATE messages. A TRUNCATE of an empty table is a no-op.
+
+For bounded, atomic processing, expansion is limited to **65,536 DML operations
+and 8 MiB of expanded row keys/images per upstream transaction**. A full scan
+that exceeds the same bound, malformed row storage, or a missing route blocks
+the source with `RS-4014` (or `RS-4013` for a protocol error) **without advancing
+the slot**. Operators must resolve the bound or resnapshot; the source cannot
+silently ignore or partially apply TRUNCATE. The legacy row-only
+`PostgresCdcSource::poll_delta` path does not have local imported-row state and
+therefore rejects TRUNCATE with `RS-4015`; it does not claim support for it.
+
 ### Recovery and Resnapshot
 
-When PostgreSQL invalidates a replication slot (e.g. WAL retention exhaustion, errors `55000` / `58P01`), the connector transitions to `BLOCKED` with error code `RS-4011` / `RS-4016` and requires an operator-initiated resnapshot.
+When PostgreSQL invalidates a replication slot (e.g. WAL retention exhaustion, errors `55000` / `58P01`), the connector transitions to `BLOCKED` with error code `RS-4011` / `RS-4016`. A source with a durable checkpoint **does not silently create a replacement slot**. If the original slot cannot be recovered, a new snapshot alone is not sufficient to reconstruct already-pruned events.
+
+### Partitioned sources, retention, and historical view correctness
+
+For a PostgreSQL partitioned **root** used as an imported source table, its publication **must** set `publish_via_partition_root = true`; RockStream rejects a root published under child partition relation IDs with `RS-4013`, rather than silently missing their changes. For example:
+
+```sql
+CREATE PUBLICATION events_pub FOR TABLE public.events
+    WITH (publish_via_partition_root = true);
+```
+
+PostgreSQL defaults this flag to false. Changes are otherwise published using individual child relation identities, not the parent identity imported by RockStream. Configure the publication before initial capture and keep its identity mode stable.
+
+**Important retention boundary:** `ALTER TABLE ... DETACH PARTITION` and `DROP TABLE` on a partition do not produce row-level DELETE events over `pgoutput`. A maintained view may therefore still contain the historical rows or aggregates from that partition. This is a consequence of retaining local materialization, **not** a source-retention or rebuild guarantee. A fresh initial snapshot/backfill sees only the rows still present in PostgreSQL and **cannot** reconstruct omitted historical aggregates. This includes rebuilding a view, discarding a checkpoint, and recovery after replication-slot loss. A normal process restart that restores an intact RockStream checkpoint is different from rebuilding from the upstream snapshot.
+
+`TRUNCATE` is different from row-by-row DELETE: `pgoutput` carries a TRUNCATE message without old row images. The legacy row-only decoder fails closed with `RS-4015` before acknowledging its LSN; the relation-aware gateway expands it atomically into row retractions and blocks with `RS-4014` if the local preimages cannot be reconstructed within bounds. PostgreSQL **does not publish** direct child-partition TRUNCATE when `publish_via_partition_root = true`, so even this guard cannot detect those operations. Do not perform direct partition TRUNCATE against a source whose view must stay exact.
+
+**Operational contract until historical resnapshot retention is implemented:** Do not treat source-side partition pruning as safe, reconstructable materialized-view retention. Keep a complete replayable source/archive and validated checkpoints, or accept that rebuilding pruned historical groups is impossible. After slot loss, preserve the current RockStream checkpoint and investigate upstream history availability; never replace it with a newly truncated snapshot and describe the result as complete. A finalized TUMBLE window surviving a checkpoint restart is **not** evidence that it can be re-derived after the input partitions have been dropped.
+
+See [PostgreSQL's publication settings](https://www.postgresql.org/docs/current/sql-createpublication.html) for partition identity, DDL, and TRUNCATE limitations.
 
 ## Kafka source
 
@@ -121,6 +192,7 @@ Apache Kafka 2.8+ or Redpanda 23+ cluster with topic partitions and consumer gro
 - `enable.auto.commit = false` (RockStream strictly commits offsets via durable SlateDB epochs)
 - `auto.offset.reset = earliest` (or `latest`)
 - Multiple partitions supported with dynamic group rebalance
+- For a `sasl_plain` secret, set `security_protocol` to `SASL_SSL` or `SASL_PLAINTEXT`; prefer `SASL_SSL` to protect credentials in transit.
 
 ### Canonical Source DDL Contract
 
@@ -131,6 +203,8 @@ CREATE SOURCE events_source TYPE kafka (
     endpoint = 'kafka:9092',
     topic = 'events',
     group_id = 'rockstream_group',
+    security_protocol = 'SASL_SSL',
+    secret = 'kafka_auth',
     offset_policy = 'earliest',
     schema_policy = 'strict',
     poll_max_records = 1000,
@@ -174,8 +248,23 @@ delta log. Construct it with a connected `KafkaSink`, the view's `ShardDb`,
 operator ID, and column count, then call `deliver_next()` until it returns false.
 The first envelope contains the complete materialized snapshot; later envelopes
 contain signed changes for one nonempty view epoch each. The legacy
-`SinkConnector::pre_commit(epoch, row_count)` still emits count markers.
-SQL `CREATE SINK` does not configure this runtime adapter.
+`SinkConnector::pre_commit(epoch, row_count)` still emits count markers. SQL
+`CREATE SINK` wires this adapter through pgwire, durable catalog persistence,
+commit-time delivery, and restart recovery.
+
+An authenticated sink uses a `sasl_plain` secret and an explicit transport:
+
+```sql
+CREATE SINK orders_out FROM orders_mv INTO KAFKA (
+    brokers = 'kafka:9092', topic = 'orders',
+    secret = 'kafka_auth', security.protocol = 'SASL_SSL'
+);
+```
+
+The gateway resolves credentials through the durable secret catalog. It checks
+for secret rotation before each committed view delivery and recreates the
+transactional producer at an epoch boundary. Failed authorization or credential
+refresh skips delivery.
 
 The canonical v1 payload is a JSON object with `version: 1`, `connector_id`,
 `view` (operator ID), `epoch` (sink transaction sequence starting at zero),
@@ -200,8 +289,8 @@ checks durable topic delivery before republishing. An unresolved lookup returns
 Use one owner, a dedicated topic/connector ID, an append-only monotonically
 committed view log, and a fixed schema. Retain the log and Kafka delivery records
 until recovery no longer needs them. Envelopes above 900 KiB and view log reads
-above 64 MiB fail closed; chunked snapshots, automatic log compaction, SQL sink
-wiring, and full Core release qualification remain outside this adapter.
+above 64 MiB fail closed; chunked snapshots, automatic log compaction, and full
+Core release qualification remain outside this adapter.
 
 The [#122 acceptance contract](acceptance-contracts/122.md) is checked through a
 real consumer, including exact payloads, four crash windows, and wrong-value,
@@ -255,7 +344,8 @@ sink cells below exercise legacy marker transport and recovery only.
 | Cell | Test |
 | --- | --- |
 | Snapshot → stream handoff over the v0.52.1 fence | `postgres_cdc_snapshot_stream_fence_has_exact_transcript` |
-| INSERT, UPDATE including key change, DELETE, and TRUNCATE | `postgres_cdc_all_mutation_types_have_exact_transcript` |
+| INSERT, UPDATE including key change, and DELETE | `postgres_cdc_insert_update_delete_have_exact_transcript` |
+| TRUNCATE (nonempty tables, multi-relation, same-transaction row changes, dependent views, gateway restart) | `pgoutput_truncate_retracts_nonempty_views_and_survives_gateway_restart` (gateway TestContainers) |
 | Restart at every commit boundary | `postgres_cdc_each_commit_boundary_recovers_exactly_once` |
 | WAL lag | `postgres_cdc_wal_lag_pauses_at_bound_and_recovers_within_slo` |
 | Malformed replication record | `postgres_cdc_malformed_replication_record_fails_closed_then_recovers_exactly` |
@@ -278,7 +368,8 @@ sink cells below exercise legacy marker transport and recovery only.
 
 ### Kafka sink
 
-Epoch/count marker transport checks only; row-delivery qualification is unsupported.
+The Docker-backed release proof named above exercises authenticated SQL sink
+row delivery, rotation, exact final relation recovery, and a gateway restart.
 
 | Cell | Test |
 | --- | --- |

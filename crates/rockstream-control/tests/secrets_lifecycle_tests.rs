@@ -4,7 +4,7 @@ use rockstream_control::audit::FileAuditLog;
 use rockstream_control::kek::EnvKekProvider;
 use rockstream_control::secret_store::SecretStore;
 use rockstream_storage::catalog::DurableCatalogStore;
-use rockstream_types::secret::SecretType;
+use rockstream_types::secret::{SecretType, MAX_WORKER_SECRET_TOKEN_PAYLOAD_BYTES};
 use slatedb::Db;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -219,12 +219,20 @@ async fn test_secrets_lifecycle_slatedb_persistence() {
 
     // Issue worker token
     let token = store
-        .issue_worker_token(ns, "kafka_source_secret", "worker_node_1", 300, "root")
+        .issue_worker_token(
+            ns,
+            rockstream_types::ids::WorkloadId(7),
+            "kafka_source_secret",
+            "worker_node_1",
+            300,
+            "root",
+        )
         .await
         .unwrap();
     assert_eq!(token.secret_name, "kafka_source_secret");
     assert_eq!(token.worker_identity, "worker_node_1");
-    assert!(!token.is_expired(token.issued_at + 100));
+    assert!(!token.is_expired(token.issued_at + 59));
+    assert!(token.is_expired(token.issued_at + 60));
 
     // Point-delete one secret
     store
@@ -284,4 +292,65 @@ async fn test_secret_references_survive_store_reopen() {
         .drop_secret(ns, "orders_secret", "root")
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn worker_secret_payload_limit_accepts_exact_bound_and_rejects_overflow() {
+    let store = SecretStore::new(
+        None,
+        Arc::new(EnvKekProvider::from_passphrase("secret-payload-limit-kek")),
+    );
+    let empty_payload = HashMap::from([("credential".to_owned(), String::new())]);
+    let empty_payload_bytes = serde_json::to_vec(&empty_payload).unwrap().len();
+    let exact_payload = HashMap::from([(
+        "credential".to_owned(),
+        "x".repeat(MAX_WORKER_SECRET_TOKEN_PAYLOAD_BYTES - empty_payload_bytes),
+    )]);
+    assert_eq!(
+        serde_json::to_vec(&exact_payload).unwrap().len(),
+        MAX_WORKER_SECRET_TOKEN_PAYLOAD_BYTES
+    );
+
+    store
+        .create_secret(
+            0,
+            "bounded",
+            SecretType::BearerToken,
+            exact_payload.clone(),
+            "test",
+        )
+        .await
+        .unwrap();
+    let token = store
+        .issue_worker_token(
+            0,
+            rockstream_types::ids::WorkloadId(17),
+            "bounded",
+            "worker-7",
+            60,
+            "test",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        token.encrypted_payload.len(),
+        MAX_WORKER_SECRET_TOKEN_PAYLOAD_BYTES + 16
+    );
+
+    let oversized_payload = HashMap::from([(
+        "credential".to_owned(),
+        "x".repeat(MAX_WORKER_SECRET_TOKEN_PAYLOAD_BYTES - empty_payload_bytes + 1),
+    )]);
+    let error = store
+        .alter_secret(0, "bounded", oversized_payload, "test")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "[RS-3601] secret.capacity_exceeded: secret payload exceeds 1048576 serialized bytes. Next steps: remove unused secrets or references, then retry."
+    );
+    assert_eq!(
+        store.get_secret(0, "bounded").await.unwrap().payload,
+        exact_payload
+    );
 }

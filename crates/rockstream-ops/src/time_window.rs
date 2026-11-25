@@ -970,6 +970,7 @@ pub struct SessionWindowOp {
     pub n_input_cols: usize,
     pub time_col: usize,
     pub gap_ms: i64,
+    partition_by: Option<Vec<usize>>,
     late_data_policy: LateDataPolicy,
     state: Mutex<SessionWindowState>,
     fill_level: Arc<AtomicUsize>,
@@ -993,6 +994,16 @@ impl SessionWindowOp {
         gap_ms: i64,
         late_data_policy: LateDataPolicy,
     ) -> Self {
+        Self::new_with_partition_by(input_schema, time_col, gap_ms, late_data_policy, None)
+    }
+
+    pub fn new_with_partition_by(
+        input_schema: SchemaRef,
+        time_col: usize,
+        gap_ms: i64,
+        late_data_policy: LateDataPolicy,
+        partition_by: Option<Vec<usize>>,
+    ) -> Self {
         let schema = Self::output_schema(&input_schema);
         let n_input_cols = input_schema.fields().len();
         Self {
@@ -1000,6 +1011,7 @@ impl SessionWindowOp {
             n_input_cols,
             time_col,
             gap_ms,
+            partition_by,
             late_data_policy,
             state: Mutex::new(SessionWindowState::new()),
             fill_level: Arc::new(AtomicUsize::new(0)),
@@ -1037,7 +1049,8 @@ impl SessionWindowOp {
         st.input_frontier = input_frontier;
         for (_key, value) in entries {
             if let Some((row_vals, weight)) = decode_window_value(&value, self.n_input_cols) {
-                let partition_key = encode_partition_key(&row_vals, self.time_col);
+                let partition_key =
+                    encode_partition_key(&row_vals, self.time_col, self.partition_by.as_deref());
                 let row_key = encode_row(&row_vals);
                 st.partitions
                     .entry(partition_key)
@@ -1130,7 +1143,8 @@ impl SessionWindowOp {
                 watermark_ms: event_time_ms,
             });
 
-            let partition_key = encode_partition_key(&row_vals, self.time_col);
+            let partition_key =
+                encode_partition_key(&row_vals, self.time_col, self.partition_by.as_deref());
             let row_key = encode_row(&row_vals);
             let partition = next.partitions.entry(partition_key.clone()).or_default();
             let entry = partition
@@ -1265,7 +1279,16 @@ fn hop_window_ids(event_time_ms: i64, window_size_ms: i64, slide_ms: i64) -> Vec
     window_ids
 }
 
-fn encode_partition_key(vals: &[i64], time_col: usize) -> Vec<u8> {
+fn encode_partition_key(vals: &[i64], time_col: usize, partition_by: Option<&[usize]>) -> Vec<u8> {
+    if let Some(cols) = partition_by {
+        let mut key = Vec::with_capacity(cols.len() * 8);
+        for &idx in cols {
+            if let Some(value) = vals.get(idx) {
+                key.extend_from_slice(&value.to_be_bytes());
+            }
+        }
+        return key;
+    }
     let mut key = Vec::with_capacity(vals.len().saturating_sub(1) * 8);
     for (idx, value) in vals.iter().enumerate() {
         if idx != time_col {
@@ -1766,6 +1789,8 @@ mod tests {
     }
 
     fn accumulate(state: &mut HashMap<(i64, i64, i64), i64>, zset: &ArrowZSet) {
+        zset.validate()
+            .expect("window output must have aligned row weights");
         if zset.is_empty() {
             return;
         }
@@ -1787,10 +1812,10 @@ mod tests {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        for i in 0..zset.num_rows() {
+        for (i, &weight) in zset.weights.iter().enumerate() {
             *state
                 .entry((wid_col.value(i), t_col.value(i), v_col.value(i)))
-                .or_insert(0) += zset.weights[i];
+                .or_insert(0) += weight;
         }
     }
 
@@ -1846,6 +1871,8 @@ mod tests {
     }
 
     fn accumulate_session(state: &mut HashMap<(i64, i64, i64, i64), i64>, zset: &ArrowZSet) {
+        zset.validate()
+            .expect("session output must have aligned row weights");
         if zset.is_empty() {
             return;
         }
@@ -1873,7 +1900,7 @@ mod tests {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        for i in 0..zset.num_rows() {
+        for (i, &weight) in zset.weights.iter().enumerate() {
             *state
                 .entry((
                     session_start.value(i),
@@ -1881,7 +1908,7 @@ mod tests {
                     t_col.value(i),
                     v_col.value(i),
                 ))
-                .or_insert(0) += zset.weights[i];
+                .or_insert(0) += weight;
         }
     }
 
@@ -1896,6 +1923,8 @@ mod tests {
     }
 
     fn session_rows(zset: &ArrowZSet) -> Vec<(i64, i64, i64, i64, i64)> {
+        zset.validate()
+            .expect("session output must have aligned row weights");
         if zset.is_empty() {
             return Vec::new();
         }
@@ -1924,13 +1953,13 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         let mut rows = Vec::new();
-        for i in 0..zset.num_rows() {
+        for (i, &weight) in zset.weights.iter().enumerate() {
             rows.push((
                 session_start.value(i),
                 session_end.value(i),
                 t_col.value(i),
                 v_col.value(i),
-                zset.weights[i],
+                weight,
             ));
         }
         rows.sort();
