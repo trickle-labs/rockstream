@@ -947,10 +947,13 @@ check exact-bound and overflow rejection without changing the stored secret or
 retained-byte metric. `worker_secret_resolution_tests.rs::worker_resolves_exact_payload_in_memory_and_rejects_wrong_identity`
 checks active/pending promotion, and
 `runtime/src/secrets.rs::cache_byte_admission_counts_active_and_pending_generations`
-checks cache byte-accounting arithmetic. These worker-local resource bounds add
-no M1–M7 coordination transition; the formal models still do not represent
-cache bytes or token admission. This is partial #304 resource-bound evidence,
-not release-process cache-pressure, cancellation/expiry recovery, or complete
+checks cache byte-accounting arithmetic, and
+`runtime/src/secrets.rs::expired_cache_entry_does_not_block_replacement_admission`
+verifies that an expired active payload releases its recorded bytes before a
+fresh token is admitted. These worker-local resource bounds add no M1–M7
+coordination transition; the formal models still do not represent cache bytes
+or token admission. This is partial #304 resource-bound evidence, not
+release-process cache-pressure, cancellation/expiry recovery, or complete
 secret-rotation qualification.
 
 Issue #306 keeps release support artifacts sanitized and addresses downloads by

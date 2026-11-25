@@ -73,6 +73,22 @@ impl WorkerSecretCache {
             .fold(0usize, usize::saturating_add)
     }
 
+    fn remove_expired(&mut self, now_secs: u64) {
+        self.entries
+            .retain(|_, value| value.expires_at != 0 && now_secs < value.expires_at);
+        self.pending
+            .retain(|_, value| value.expires_at != 0 && now_secs < value.expires_at);
+        let Self {
+            entries,
+            entry_bytes,
+            pending,
+            pending_bytes,
+            ..
+        } = self;
+        entry_bytes.retain(|key, _| entries.contains_key(key));
+        pending_bytes.retain(|key, _| pending.contains_key(key));
+    }
+
     fn bytes_after_insert(&self, key: &(WorkloadId, String), bytes: usize) -> usize {
         self.bytes_used()
             .saturating_sub(self.pending_bytes.get(key).copied().unwrap_or_default())
@@ -261,6 +277,9 @@ impl WorkerSecretManager {
         self.track_refresh(resolved.workload_id, resolved.secret_name.clone())?;
         let cache_key = (resolved.workload_id, resolved.secret_name.clone());
         let mut cache = self.cache.write();
+        cache.remove_expired(now_secs);
+        self.fill_level.store(cache.len(), Ordering::Relaxed);
+        self.fill_bytes.store(cache.bytes_used(), Ordering::Relaxed);
         let active = cache.entries.contains_key(&cache_key);
         let pending = cache.pending.contains_key(&cache_key);
         if (!active && !pending && cache.len() >= MAX_WORKER_SECRET_TOKENS)
@@ -288,21 +307,7 @@ impl WorkerSecretManager {
         now_secs: u64,
     ) -> Option<ResolvedSecret> {
         let mut cache = self.cache.write();
-        cache
-            .entries
-            .retain(|_, value| value.expires_at != 0 && now_secs < value.expires_at);
-        cache
-            .pending
-            .retain(|_, value| value.expires_at != 0 && now_secs < value.expires_at);
-        let WorkerSecretCache {
-            entries,
-            entry_bytes,
-            pending,
-            pending_bytes,
-            ..
-        } = &mut *cache;
-        entry_bytes.retain(|key, _| entries.contains_key(key));
-        pending_bytes.retain(|key, _| pending.contains_key(key));
+        cache.remove_expired(now_secs);
         self.fill_level.store(cache.len(), Ordering::Relaxed);
         self.fill_bytes.store(cache.bytes_used(), Ordering::Relaxed);
         cache
@@ -356,6 +361,67 @@ mod tests {
         assert_eq!(
             cache.bytes_after_insert(&active, 11),
             MAX_WORKER_SECRET_CACHE_BYTES + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_cache_entry_does_not_block_replacement_admission() {
+        let store = SecretStore::new(
+            None,
+            Arc::new(EnvKekProvider::from_passphrase("worker-test-kek")),
+        );
+        let payload = HashMap::from([("token".to_owned(), "fresh-value".to_owned())]);
+        store
+            .create_secret(
+                0,
+                "short_lived",
+                SecretType::BearerToken,
+                payload.clone(),
+                "test",
+            )
+            .await
+            .unwrap();
+        let token = store
+            .issue_worker_token(0, WorkloadId(17), "short_lived", "worker-7", 300, "test")
+            .await
+            .unwrap();
+        let manager = WorkerSecretManager::new("worker-7");
+        let cache_key = (WorkloadId(17), "short_lived".to_owned());
+        {
+            let mut cache = manager.cache.write();
+            cache.entries.insert(
+                cache_key.clone(),
+                ResolvedSecret {
+                    workload_id: WorkloadId(17),
+                    secret_name: "short_lived".to_owned(),
+                    secret_type: SecretType::BearerToken,
+                    payload: HashMap::from([("token".to_owned(), "expired-value".to_owned())]),
+                    token_id: "expired-token".to_owned(),
+                    expires_at: token.issued_at,
+                },
+            );
+            cache
+                .entry_bytes
+                .insert(cache_key, MAX_WORKER_SECRET_CACHE_BYTES);
+            manager.fill_level.store(cache.len(), Ordering::Relaxed);
+            manager
+                .fill_bytes
+                .store(cache.bytes_used(), Ordering::Relaxed);
+        }
+
+        let resolved = manager.resolve_token(&token, token.issued_at).unwrap();
+
+        assert_eq!(resolved.token_id, token.token_id);
+        assert_eq!(resolved.payload, payload);
+        let current = manager
+            .get(WorkloadId(17), "short_lived", token.issued_at)
+            .unwrap();
+        assert_eq!(current.token_id, token.token_id);
+        assert_eq!(current.payload["token"], "fresh-value");
+        assert_eq!(manager.fill_level(), 1);
+        assert_eq!(
+            manager.fill_bytes(),
+            token.encrypted_payload.len() - AES_256_GCM_TAG_BYTES
         );
     }
 
