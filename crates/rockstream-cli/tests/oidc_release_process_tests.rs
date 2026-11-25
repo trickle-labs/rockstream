@@ -7149,6 +7149,18 @@ async fn mtls_certificate_rejections_run_in_release_process_and_audit_after_rest
         .signed_by(&wrong_ca_key, &rogue_ca_cert, &rogue_ca_key)
         .unwrap();
 
+    let mut future_client_params =
+        rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    future_client_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "alice");
+    future_client_params.not_before = rcgen::date_time_ymd(2099, 1, 1);
+    future_client_params.not_after = rcgen::date_time_ymd(2100, 1, 2);
+    let future_client_key = rcgen::KeyPair::generate().unwrap();
+    let future_client_cert = future_client_params
+        .signed_by(&future_client_key, &ca_cert, &ca_key)
+        .unwrap();
+
     let principal = mtls_principal(&client_cert);
     let store =
         rockstream_storage::build_runtime_object_store(&shard_dir, "gateway-shard").unwrap();
@@ -7345,6 +7357,12 @@ async fn mtls_certificate_rejections_run_in_release_process_and_audit_after_rest
     )
     .await;
     assert!(wrong_ca_error.as_db_error().is_none());
+    let future_client_error = mtls_connection_error(
+        address.port(),
+        mtls_client_config(&ca_cert, &future_client_cert, &future_client_key),
+    )
+    .await;
+    assert!(future_client_error.as_db_error().is_none());
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     process.0.kill().unwrap();
@@ -7357,8 +7375,8 @@ async fn mtls_certificate_rejections_run_in_release_process_and_audit_after_rest
     let records = recovered.list_security_audit_records().await.unwrap();
     assert_eq!(
         records.len(),
-        4,
-        "expired TLS error: {expired_error}; wrong-CA TLS error: {wrong_ca_error}; records: {records:?}"
+        5,
+        "expired TLS error: {expired_error}; wrong-CA TLS error: {wrong_ca_error}; not-yet-valid TLS error: {future_client_error}; records: {records:?}"
     );
     assert_eq!(records[0].action, SecurityAuditClass::GrantChange);
     assert_eq!(records[0].outcome, SecurityAuditOutcome::Success);
@@ -7376,7 +7394,7 @@ async fn mtls_certificate_rejections_run_in_release_process_and_audit_after_rest
             .iter()
             .filter(|record| record.action == SecurityAuditClass::AuthenticationFailure)
             .count(),
-        2
+        3
     );
     let normalized_failures = records[2..]
         .iter()
@@ -7401,6 +7419,8 @@ async fn mtls_certificate_rejections_run_in_release_process_and_audit_after_rest
         })
         .collect::<Vec<_>>();
     assert_ne!(records[2].correlation, records[3].correlation);
+    assert_ne!(records[2].correlation, records[4].correlation);
+    assert_ne!(records[3].correlation, records[4].correlation);
     let expected_failure = SecurityAuditRecord {
         format_version: SECURITY_AUDIT_FORMAT_VERSION,
         event_id: "<event_id>".to_owned(),
@@ -7418,7 +7438,11 @@ async fn mtls_certificate_rejections_run_in_release_process_and_audit_after_rest
     };
     assert_eq!(
         normalized_failures,
-        vec![expected_failure.clone(), expected_failure]
+        vec![
+            expected_failure.clone(),
+            expected_failure.clone(),
+            expected_failure
+        ]
     );
     assert_eq!(
         recovered.list_security_principals().await.unwrap(),
