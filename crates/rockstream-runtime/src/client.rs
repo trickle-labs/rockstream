@@ -926,7 +926,7 @@ async fn install_direct_epoch_grant(
     grant: rockstream_types::direct_epoch::DirectEpochGrant,
 ) -> Result<(), String> {
     if !grant.metadata.is_valid() || grant.members.is_empty() || grant.members.len() > 4096 {
-        return Err("invalid direct epoch grant".into());
+        return Err("RS-2401: invalid direct epoch grant".into());
     }
     let _admission = client
         .direct_grants
@@ -940,13 +940,13 @@ async fn install_direct_epoch_grant(
         .collect();
     targets.sort_by_key(|deployment| deployment.descriptor.shard.shard_id);
     if targets.is_empty() || targets.len() > grant.members.len() {
-        return Err("direct epoch grant has no complete local membership".into());
+        return Err("RS-2401: direct epoch grant has no complete local membership".into());
     }
     let mut execution_guards = Vec::with_capacity(targets.len());
     for deployment in &targets {
         let guard = deployment.execution_requires_recovery.lock().await;
         if *guard {
-            return Err("direct epoch deployment requires recovery".into());
+            return Err("RS-3602: direct epoch deployment requires recovery".into());
         }
         execution_guards.push(guard);
     }
@@ -957,7 +957,7 @@ async fn install_direct_epoch_grant(
             || !client.verify_local_lease_fence(shard.shard_id, shard.lease_token)
             || !deployment.schemas.contains_key(&grant.metadata.source)
         {
-            return Err("direct epoch grant does not match local deployment".into());
+            return Err("RS-2401: direct epoch grant does not match local deployment".into());
         }
         deployment
             .db
@@ -970,7 +970,7 @@ async fn install_direct_epoch_grant(
                 || intent.request_id != grant.metadata.request_id
                 || intent.epoch != grant.metadata.epoch
             {
-                return Err("another owned source epoch requires reconciliation".into());
+                return Err("RS-3602: another owned source epoch requires reconciliation".into());
             }
         }
         let routing =
@@ -979,7 +979,7 @@ async fn install_direct_epoch_grant(
             if !crate::direct_grants::metadata_matches_record(&grant.metadata, &pending)
                 || pending.shard_ids != grant.members.keys().copied().collect::<Vec<_>>()
             {
-                return Err("another routing epoch requires reconciliation".into());
+                return Err("RS-3602: another routing epoch requires reconciliation".into());
             }
         }
     }
@@ -987,7 +987,9 @@ async fn install_direct_epoch_grant(
         .direct_grants
         .install(grant, crate::direct_grants::now_ms())
     {
-        return Err("direct epoch grant is expired, conflicting, or exceeds capacity".into());
+        return Err(
+            "RS-2401: direct epoch grant is expired, conflicting, or exceeds capacity".into(),
+        );
     }
     Ok(())
 }
@@ -1328,13 +1330,13 @@ mod data_plane_tests {
         drop(execution);
         assert_eq!(
             installing.await,
-            Err("another routing epoch requires reconciliation".into())
+            Err("RS-3602: another routing epoch requires reconciliation".into())
         );
         grant.metadata.request_id = pending.request_id.clone();
         // Matching labels alone cannot replay a different original input.
         assert_eq!(
             install_direct_epoch_grant(&client, &deployments, grant.clone()).await,
-            Err("another routing epoch requires reconciliation".into())
+            Err("RS-3602: another routing epoch requires reconciliation".into())
         );
         grant.metadata.input_digest = pending.input_digest;
         assert_eq!(
@@ -1353,7 +1355,7 @@ mod data_plane_tests {
         *deployment.execution_requires_recovery.lock().await = true;
         assert_eq!(
             install_direct_epoch_grant(&client, &deployments, grant.clone()).await,
-            Err("direct epoch deployment requires recovery".into())
+            Err("RS-3602: direct epoch deployment requires recovery".into())
         );
         *deployment.execution_requires_recovery.lock().await = false;
         let mut owned = rockstream_types::data_plane::OwnedEpochIntent {
@@ -1369,7 +1371,7 @@ mod data_plane_tests {
         deployment.owned_epoch.prepare(&owned).await.unwrap();
         assert_eq!(
             install_direct_epoch_grant(&client, &deployments, grant.clone()).await,
-            Err("another owned source epoch requires reconciliation".into())
+            Err("RS-3602: another owned source epoch requires reconciliation".into())
         );
         deployment.owned_epoch.finish(&owned).await.unwrap();
         owned.request_id = grant.metadata.request_id.clone();
