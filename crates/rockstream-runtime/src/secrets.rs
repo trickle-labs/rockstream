@@ -324,6 +324,9 @@ impl WorkerSecretManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rockstream_control::kek::EnvKekProvider;
+    use rockstream_control::SecretStore;
+    use std::sync::Arc;
 
     #[test]
     fn cache_byte_admission_counts_active_and_pending_generations() {
@@ -353,6 +356,145 @@ mod tests {
         assert_eq!(
             cache.bytes_after_insert(&active, 11),
             MAX_WORKER_SECRET_CACHE_BYTES + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregate_cache_limit_accepts_exact_fill_and_preserves_active_on_overflow() {
+        let store = SecretStore::new(
+            None,
+            Arc::new(EnvKekProvider::from_passphrase("worker-cache-budget-kek")),
+        );
+        let old_payload = HashMap::from([("credential".to_owned(), "old".to_owned())]);
+        let old_payload_bytes = serde_json::to_vec(&old_payload).unwrap().len();
+        store
+            .create_secret(0, "bounded", SecretType::BearerToken, old_payload, "test")
+            .await
+            .unwrap();
+        let workload_id = WorkloadId(17);
+        let old_token = store
+            .issue_worker_token(0, workload_id, "bounded", "worker-7", 60, "test")
+            .await
+            .unwrap();
+
+        let payload_for_size = |size: usize| {
+            let empty = HashMap::from([("credential".to_owned(), String::new())]);
+            let overhead = serde_json::to_vec(&empty).unwrap().len();
+            HashMap::from([("credential".to_owned(), "x".repeat(size - overhead))])
+        };
+        let exact_payload_bytes = MAX_WORKER_SECRET_TOKEN_PAYLOAD_BYTES - old_payload_bytes;
+        let exact_payload = payload_for_size(exact_payload_bytes);
+        assert_eq!(
+            serde_json::to_vec(&exact_payload).unwrap().len(),
+            exact_payload_bytes
+        );
+        store
+            .alter_secret(0, "bounded", exact_payload, "test")
+            .await
+            .unwrap();
+        let exact_token = store
+            .issue_worker_token(0, workload_id, "bounded", "worker-7", 60, "test")
+            .await
+            .unwrap();
+
+        let over_payload_bytes = exact_payload_bytes + 1;
+        let over_payload = payload_for_size(over_payload_bytes);
+        assert_eq!(
+            serde_json::to_vec(&over_payload).unwrap().len(),
+            over_payload_bytes
+        );
+        store
+            .alter_secret(0, "bounded", over_payload, "test")
+            .await
+            .unwrap();
+        let over_token = store
+            .issue_worker_token(0, workload_id, "bounded", "worker-7", 60, "test")
+            .await
+            .unwrap();
+        assert_eq!(
+            exact_token.encrypted_payload.len() - AES_256_GCM_TAG_BYTES,
+            exact_payload_bytes
+        );
+        assert_eq!(
+            over_token.encrypted_payload.len() - AES_256_GCM_TAG_BYTES,
+            over_payload_bytes
+        );
+
+        let manager = WorkerSecretManager::new("worker-7");
+        manager.initialize_workload_epoch(workload_id, 5);
+        manager
+            .resolve_token(&old_token, old_token.issued_at)
+            .unwrap();
+        let mut cache = manager.cache.write();
+        // Model 63 admitted 1 MiB secrets without allocating their payloads.
+        for index in 0..63 {
+            let filler_workload = WorkloadId(100 + index);
+            let filler_name = format!("filler-{index}");
+            let key = (filler_workload, filler_name.clone());
+            cache.entries.insert(
+                key.clone(),
+                ResolvedSecret {
+                    workload_id: filler_workload,
+                    secret_name: filler_name.clone(),
+                    secret_type: SecretType::BearerToken,
+                    payload: HashMap::new(),
+                    token_id: filler_name,
+                    expires_at: old_token.expires_at,
+                },
+            );
+            cache
+                .entry_bytes
+                .insert(key, MAX_WORKER_SECRET_TOKEN_PAYLOAD_BYTES);
+        }
+        manager.fill_level.store(cache.len(), Ordering::Relaxed);
+        manager
+            .fill_bytes
+            .store(cache.bytes_used(), Ordering::Relaxed);
+        assert_eq!(
+            cache.bytes_used(),
+            63 * MAX_WORKER_SECRET_TOKEN_PAYLOAD_BYTES + old_payload_bytes
+        );
+        drop(cache);
+
+        manager
+            .resolve_token(&exact_token, exact_token.issued_at)
+            .unwrap();
+        assert_eq!(manager.fill_bytes(), MAX_WORKER_SECRET_CACHE_BYTES);
+        assert_eq!(
+            manager
+                .get(workload_id, "bounded", exact_token.issued_at)
+                .unwrap()
+                .token_id,
+            old_token.token_id
+        );
+
+        let error = manager
+            .resolve_token(&over_token, over_token.issued_at)
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "[RS-3601] secret token cache is full. Next steps: remove unused secret bindings before retrying."
+        );
+        assert_eq!(manager.fill_bytes(), MAX_WORKER_SECRET_CACHE_BYTES);
+        assert_eq!(
+            manager
+                .get(workload_id, "bounded", over_token.issued_at)
+                .unwrap()
+                .token_id,
+            old_token.token_id
+        );
+
+        assert_eq!(manager.advance_workload_epoch(workload_id, 6), 1);
+        assert_eq!(
+            manager
+                .get(workload_id, "bounded", exact_token.issued_at)
+                .unwrap()
+                .token_id,
+            exact_token.token_id
+        );
+        assert_eq!(
+            manager.fill_bytes(),
+            63 * MAX_WORKER_SECRET_TOKEN_PAYLOAD_BYTES + exact_payload_bytes
         );
     }
 }
