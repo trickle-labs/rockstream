@@ -5073,6 +5073,7 @@ dependencies = [
  "object_store 0.14.2",
  "parking_lot",
  "proptest",
+ "prost 0.13.5",
  "rand 0.8.6",
  "reqwest 0.12.28",
  "ring",

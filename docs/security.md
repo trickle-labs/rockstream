@@ -15,7 +15,9 @@ Set `page_size` to 1–100 (0 selects 50). Optional timestamp bounds filter the
 versioned `SecurityAuditRecord` JSON value. Use the opaque `next_page_token`
 unchanged with the same timestamp bounds to continue; it follows the stable
 `(timestamp_ms, event_id)` order. A changed range requires a new first-page
-request.
+request. Pages also fit within the 1 MiB management response limit, so a page
+can contain fewer records than requested. If a single record exceeds that
+limit, the method returns `RESOURCE_EXHAUSTED` for that page.
 
 The durable catalog retains at most 1 GiB of encoded audit records. When that
 budget is full, required security writes fail instead of discarding events.

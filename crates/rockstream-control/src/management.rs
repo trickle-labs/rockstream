@@ -12,6 +12,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{SecondsFormat, Utc};
 use futures::Stream;
+use prost::Message;
 use rockstream_management_proto::{ensure_protocol_version, v1};
 use rockstream_storage::catalog::{CatalogMutation, CatalogStore, CatalogTxn};
 use rockstream_types::authorization::{
@@ -50,6 +51,32 @@ use crate::topology::TopologyCatalog;
 const DEFAULT_PAGE_SIZE: usize = 50;
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_MANAGEMENT_REQUESTS: usize = 64;
+
+struct BoundedJsonBuffer {
+    bytes: Vec<u8>,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl io::Write for BoundedJsonBuffer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let remaining = self.limit.saturating_sub(self.bytes.len());
+        if bytes.len() > remaining {
+            self.bytes.extend_from_slice(&bytes[..remaining]);
+            self.exceeded = true;
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "security audit record exceeds response limit",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 pub fn security_deployment_fingerprint(config: &NodeConfig, catalog_namespace: &str) -> String {
     let context = format!(
@@ -2299,7 +2326,7 @@ impl v1::management_service_server::ManagementService for ManagementService {
             .security_catalog
             .as_ref()
             .ok_or_else(|| Status::unavailable("management security catalog is unavailable"))?;
-        let mut records = catalog
+        let records = catalog
             .list_security_audit_page(
                 (principal_id, policy_revision),
                 from_timestamp_ms,
@@ -2309,26 +2336,56 @@ impl v1::management_service_server::ManagementService for ManagementService {
             )
             .await
             .map_err(|_| Status::unavailable("management security audit history is unavailable"))?;
-        let next_page_token = if records.len() > size {
-            security_audit_page_token(&records[size - 1], from_timestamp_ms, to_timestamp_ms)?
-        } else {
-            String::new()
-        };
-        records.truncate(size);
-        let records_json = records
-            .into_iter()
-            .map(|record| {
-                serde_json::to_string(&record)
-                    .map_err(|_| Status::internal("security audit record could not be encoded"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Response::new(v1::ListSecurityAuditRecordsResponse {
+        let record_count = records.len();
+        let mut response = v1::ListSecurityAuditRecordsResponse {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
             observed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
             source_version: format!("security-audit-records:v{SECURITY_AUDIT_FORMAT_VERSION}"),
-            records_json,
-            next_page_token,
-        }))
+            records_json: Vec::new(),
+            next_page_token: String::new(),
+        };
+        for (index, record) in records.into_iter().take(size).enumerate() {
+            let mut json = BoundedJsonBuffer {
+                bytes: Vec::new(),
+                limit: MAX_MESSAGE_BYTES,
+                exceeded: false,
+            };
+            if serde_json::to_writer(&mut json, &record).is_err() {
+                if json.exceeded {
+                    if response.records_json.is_empty() {
+                        return Err(Status::resource_exhausted(
+                            "security audit record exceeds the management response size limit",
+                        ));
+                    }
+                    break;
+                }
+                return Err(Status::internal(
+                    "security audit record could not be encoded",
+                ));
+            }
+            let record_json = String::from_utf8(json.bytes)
+                .map_err(|_| Status::internal("security audit record could not be encoded"))?;
+            response.records_json.push(record_json);
+            let previous_page_token = std::mem::replace(
+                &mut response.next_page_token,
+                if index + 1 < record_count {
+                    security_audit_page_token(&record, from_timestamp_ms, to_timestamp_ms)?
+                } else {
+                    String::new()
+                },
+            );
+            if response.encoded_len() > MAX_MESSAGE_BYTES {
+                response.records_json.pop();
+                response.next_page_token = previous_page_token;
+                if response.records_json.is_empty() {
+                    return Err(Status::resource_exhausted(
+                        "security audit record exceeds the management response size limit",
+                    ));
+                }
+                break;
+            }
+        }
+        Ok(Response::new(response))
     }
 
     async fn list_operations(
@@ -4177,13 +4234,17 @@ mod tests {
     async fn security_audit_history_is_range_authorized_and_paginated() {
         let security_catalog = test_security_catalog().await;
         let from_timestamp_ms = Utc::now().timestamp_millis().max(1) as u64 + 60_000;
-        let events = (0..3)
+        let events = (0..4)
             .map(|index| SecurityAuditRecord {
                 format_version: SECURITY_AUDIT_FORMAT_VERSION,
                 event_id: format!("audit-history-{index}"),
                 timestamp_ms: from_timestamp_ms + index,
                 actor: AuditIdentity::Verified("principal:1".to_owned()),
-                target: AuditField::Known("audit-history-test".to_owned()),
+                target: AuditField::Known(if index == 3 {
+                    "x".repeat(MAX_MESSAGE_BYTES)
+                } else {
+                    "audit-history-test".to_owned()
+                }),
                 scope: AuditField::Known("cluster".to_owned()),
                 action: SecurityAuditClass::AuthenticationSuccess,
                 outcome: SecurityAuditOutcome::Success,
@@ -4221,7 +4282,7 @@ mod tests {
         .with_security_catalog(security_catalog.clone());
         let granted_range = PolicyScope::AuditRange {
             from_ms: Some(from_timestamp_ms + 1),
-            to_ms: Some(from_timestamp_ms + 2),
+            to_ms: Some(from_timestamp_ms + 3),
         };
         let grant_operation_id = uuid::Uuid::new_v4().to_string();
         let grant_response = <ManagementService as v1::management_service_server::ManagementService>::set_security_principal_grants(
@@ -4316,6 +4377,53 @@ mod tests {
             vec![serde_json::to_string(&events[2]).unwrap()]
         );
         assert!(second_page.next_page_token.is_empty());
+
+        let bounded_page = <ManagementService as v1::management_service_server::ManagementService>::list_security_audit_records(
+            &service,
+            audit_request(
+                PrincipalId(2),
+                [8; 32],
+                Some(from_timestamp_ms + 1),
+                Some(from_timestamp_ms + 3),
+                3,
+                String::new(),
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            bounded_page.records_json,
+            vec![
+                serde_json::to_string(&events[1]).unwrap(),
+                serde_json::to_string(&events[2]).unwrap(),
+            ]
+        );
+        let bounded_page_token = security_audit_page_token(
+            &events[2],
+            Some(from_timestamp_ms + 1),
+            Some(from_timestamp_ms + 3),
+        )
+        .unwrap();
+        assert_eq!(bounded_page.next_page_token, bounded_page_token);
+        let oversized_record = <ManagementService as v1::management_service_server::ManagementService>::list_security_audit_records(
+            &service,
+            audit_request(
+                PrincipalId(2),
+                [8; 32],
+                Some(from_timestamp_ms + 1),
+                Some(from_timestamp_ms + 3),
+                3,
+                bounded_page_token,
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(oversized_record.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(
+            oversized_record.message(),
+            "security audit record exceeds the management response size limit"
+        );
 
         let changed_range = <ManagementService as v1::management_service_server::ManagementService>::list_security_audit_records(
             &service,
