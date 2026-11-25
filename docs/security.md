@@ -62,10 +62,11 @@ must identify an authorized principal. Run explicitly with
 
 `SecretStore::rotate_kek` stages at most 1,000,000 catalog entries and 64 MiB
 of serialized envelope and audit values in the pending rotation before
-publishing one atomic SlateDB batch (or replacing the in-memory catalog). Exceeding either limit returns
-`RS-3601` before publishing rewrapped secrets; the catalog and active provider
-remain unchanged. At most 64 callers may wait to enter rotation-protected
-secret operations; excess callers receive `RS-3601` without waiting. The
+publishing one atomic SlateDB batch (or replacing the in-memory catalog).
+Exceeding either limit returns `RS-3601` before publishing rewrapped secrets;
+existing secret envelopes and the active provider remain unchanged. At most 64
+callers may wait to enter rotation-protected secret operations; excess callers
+receive `RS-3601` without waiting. The
 `SecretStore::metrics()` snapshot exposes the current waiter, staging-entry,
 and staging-byte fill levels. Secret reads and mutations wait for rotation;
 once the batch is submitted, cancelling the caller does not cancel its commit.
