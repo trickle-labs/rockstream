@@ -135,6 +135,12 @@ cache lifetime. Fetches time out after 5 seconds and make at most one retry
 after 250 milliseconds for transient transport, 429, or server errors. An
 expired key is never used after a failed refresh.
 
+Service-only principals (`LoginMethod::Service`) do not log in interactively.
+They may retain a consumer-scoped `SecretUse` grant for a background connector;
+that grant does not provide user, data, support, or grant-management authority.
+A user-delegated operation must also pass the acting user's current scoped
+policy.
+
 Active `SUBSCRIBE` streams recheck the caller's current read authorization at
 one-second intervals before delivering pending or live rows. In durable
 security mode, a revoked grant produces a durable denial audit and closes that

@@ -1523,6 +1523,250 @@ async fn delegated_actor_policy_is_rechecked_by_release_control_process() {
 }
 
 #[tokio::test]
+async fn management_rejects_stale_grantor_revision_by_release_process() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("control-storage");
+    let pki = rockstream_test_support::pki::TestPki::generate();
+    let address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let management_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let target = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(2),
+        display_name: "Release stale grantor target".to_owned(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::Service {
+            service_id: "release-stale-grantor-target".to_owned(),
+        }],
+        preset_grants: vec![ScopedPresetGrant {
+            preset: PermissionPreset::Builder,
+            scope: PolicyScope::Cluster,
+        }],
+        scoped_grants: Vec::new(),
+    };
+    let mut process = start_control_process_with_operator(
+        temp.path(),
+        &storage,
+        address,
+        management_address,
+        &pki,
+        None,
+        true,
+        Some(target.clone()),
+        true,
+        false,
+    )
+    .await;
+    wait_for_gateway(&mut process.0, address).await;
+    let mut management = wait_for_management_client(management_address, &pki).await;
+    let store = rockstream_storage::build_runtime_object_store(
+        &storage.join("gateway-shard"),
+        "gateway-shard",
+    )
+    .unwrap();
+    let catalog = DurableCatalogStore::recover(store, "gateway")
+        .await
+        .unwrap();
+    let original_grantor = catalog
+        .get_security_principal(PrincipalId(1))
+        .await
+        .unwrap()
+        .unwrap();
+    let audit_before = catalog.list_security_audit_records().await.unwrap();
+    let mut changed_grantor = original_grantor.clone();
+    changed_grantor.revision += 1;
+    changed_grantor
+        .preset_grants
+        .retain(|grant| grant.preset != PermissionPreset::Operator);
+    let policy_state = |principal: &SecurityPrincipal| {
+        format!(
+            "revision={};policy={}",
+            principal.revision,
+            serde_json::to_string(&(
+                principal.enabled,
+                &principal.preset_grants,
+                &principal.scoped_grants
+            ))
+            .unwrap()
+        )
+    };
+    let catalog_revision = catalog.get_revision().await + 1;
+    let concurrent_audit = SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: "release-stale-grantor-policy-update".to_owned(),
+        timestamp_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64,
+        actor: AuditIdentity::Verified("principal:1".to_owned()),
+        target: AuditField::Known("principal:1".to_owned()),
+        scope: AuditField::Known("cluster".to_owned()),
+        action: SecurityAuditClass::GrantChange,
+        outcome: SecurityAuditOutcome::Success,
+        correlation: AuditCorrelation::NotApplicable,
+        operation_id: AuditField::Known(catalog_revision.to_string()),
+        policy_revision: AuditField::Known(changed_grantor.revision),
+        before_state: AuditField::Known(policy_state(&original_grantor)),
+        after_state: AuditField::Known(policy_state(&changed_grantor)),
+    };
+    catalog
+        .commit_txn(
+            CatalogTxn::new(
+                catalog_revision,
+                catalog_revision,
+                vec![CatalogMutation::PutSecurityPrincipal {
+                    principal: changed_grantor.clone(),
+                    expected_revision: Some(original_grantor.revision),
+                    grantor_revision: Some((PrincipalId(1), original_grantor.revision)),
+                    audit: concurrent_audit.clone(),
+                }],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let operation_id = "00000000-0000-4000-8000-000000000127";
+    let mut operation = management
+        .set_security_principal_grants(SetSecurityPrincipalGrantsRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            principal_id: target.id.0,
+            expected_revision: target.revision,
+            expected_grantor_revision: original_grantor.revision,
+            idempotency_key: operation_id.to_owned(),
+            preset_grants: vec![SecurityPresetGrant {
+                preset: "operator".to_owned(),
+                scope_json: serde_json::to_string(&PolicyScope::Cluster).unwrap(),
+            }],
+            scoped_grants: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .operation
+        .unwrap();
+    assert!(chrono::DateTime::parse_from_rfc3339(&operation.started_at).is_ok());
+    assert!(chrono::DateTime::parse_from_rfc3339(&operation.updated_at).is_ok());
+    let returned_operation = operation.clone();
+    operation.started_at = "<timestamp>".to_owned();
+    operation.updated_at = "<timestamp>".to_owned();
+    assert_eq!(
+        operation,
+        ManagementWireOperation {
+            operation_id: operation_id.to_owned(),
+            kind: "security_principal_grants".to_owned(),
+            state: "failed".to_owned(),
+            started_at: "<timestamp>".to_owned(),
+            updated_at: "<timestamp>".to_owned(),
+            progress: "100%".to_owned(),
+            phase: "security_policy_rejected".to_owned(),
+            error_code: String::new(),
+            next_steps: vec![
+                "Review current authority and principal revisions before submitting a new mutation."
+                    .to_owned()
+            ],
+            source_version: format!("operation-record:{MANAGEMENT_OPERATION_RECORD_VERSION}"),
+            result_json: r#"{"reason":"RS-2401: grantor authority or reviewed revision is no longer current","status":"failed"}"#.to_owned(),
+        }
+    );
+    let recovered_operation = management
+        .get_operation(GetOperationRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            operation_id: operation_id.to_owned(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .operation
+        .unwrap();
+    assert_eq!(recovered_operation, returned_operation);
+
+    catalog.refresh().await.unwrap();
+    assert_eq!(
+        catalog
+            .get_security_principal(PrincipalId(1))
+            .await
+            .unwrap()
+            .unwrap(),
+        changed_grantor
+    );
+    assert_eq!(
+        catalog
+            .get_security_principal(target.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        target
+    );
+    assert_eq!(
+        catalog
+            .get_security_audit_record(&concurrent_audit.event_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        concurrent_audit
+    );
+    let audit_records = catalog.list_security_audit_records().await.unwrap();
+    assert_eq!(
+        &audit_records[..audit_before.len()],
+        audit_before.as_slice()
+    );
+    let mut operation_events = audit_records
+        .iter()
+        .filter(|record| record.operation_id == AuditField::Known(operation_id.to_owned()))
+        .collect::<Vec<_>>();
+    operation_events.sort_by_key(|record| record.event_id.as_str());
+    assert_eq!(
+        operation_events
+            .iter()
+            .map(|record| record.event_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            format!("management-security-grants-completion:{operation_id}"),
+            format!("management-security-grants-start:{operation_id}")
+        ]
+    );
+    for (record, action, outcome) in [
+        (
+            operation_events[0],
+            SecurityAuditClass::AdminOperationCompletion,
+            SecurityAuditOutcome::Failure,
+        ),
+        (
+            operation_events[1],
+            SecurityAuditClass::AdminOperationStart,
+            SecurityAuditOutcome::Success,
+        ),
+    ] {
+        assert!(record.timestamp_ms > 0);
+        assert_eq!(
+            record.actor,
+            AuditIdentity::Verified("principal:1".to_owned())
+        );
+        assert_eq!(record.target, AuditField::Known("principal:2".to_owned()));
+        assert_eq!(record.scope, AuditField::Known("cluster".to_owned()));
+        assert_eq!(record.action, action);
+        assert_eq!(record.outcome, outcome);
+        assert_eq!(
+            record.correlation,
+            AuditCorrelation::Observed(operation_id.to_owned())
+        );
+        assert_eq!(
+            record.operation_id,
+            AuditField::Known(operation_id.to_owned())
+        );
+        assert_eq!(
+            record.policy_revision,
+            AuditField::Known(original_grantor.revision)
+        );
+        assert_eq!(record.before_state, AuditField::NotApplicable);
+        assert_eq!(record.after_state, AuditField::NotApplicable);
+    }
+}
+
+#[tokio::test]
 async fn delegated_gateway_sql_rechecks_control_policy_in_release_process() {
     let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -6232,6 +6476,16 @@ async fn kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_co
             "durable source {source_name} must retain a canonical secret reference"
         );
     }
+    let sinks = durable_catalog.list_sinks().await.unwrap();
+    let sink = sinks
+        .iter()
+        .find(|sink| sink.name == "rotating_out")
+        .expect("the rotated Kafka sink must remain durable");
+    assert_eq!(
+        sink.options.get("secret").map(String::as_str),
+        Some("secret://kafka_auth"),
+        "durable sink must retain a canonical secret reference"
+    );
     let rotation_audits = durable_catalog
         .list_security_audit_records()
         .await
@@ -7231,7 +7485,7 @@ async fn support_artifact_download_is_bound_to_authenticated_principal() {
 }
 
 #[tokio::test]
-async fn operator_with_explicit_backup_scope_can_create_backup_over_release_management_api() {
+async fn operator_scoped_backup_grant_keeps_support_artifact_sanitized() {
     let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     assert!(rockstream_test_support::docker_available());
@@ -7276,6 +7530,26 @@ async fn operator_with_explicit_backup_scope_can_create_backup_over_release_mana
     )
     .await
     .unwrap();
+
+    let artifact_id = uuid::Uuid::new_v4().to_string();
+    let artifact = client
+        .generate_support_artifact(GenerateSupportArtifactRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            node_id: String::new(),
+            idempotency_key: artifact_id.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(artifact.opaque_id, artifact_id);
+    let generated_at_ms = artifact.expires_at_ms - 600_000;
+    let expected_content = format!(
+        "{{\"format_version\":1,\"generated_at_ms\":{generated_at_ms},\"scope\":\"cluster\",\"source_version\":\"rockstream:{}\",\"topology_revision\":1,\"active_operations\":1,\"retained_operations\":1,\"node\":null}}",
+        env!("CARGO_PKG_VERSION")
+    );
+    let (content, expires_at_ms) = download_support_artifact(&mut client, &artifact_id).await;
+    assert_eq!(String::from_utf8(content).unwrap(), expected_content);
+    assert_eq!(expires_at_ms, artifact.expires_at_ms);
 
     let idempotency_key = uuid::Uuid::new_v4().to_string();
     let accepted = client
