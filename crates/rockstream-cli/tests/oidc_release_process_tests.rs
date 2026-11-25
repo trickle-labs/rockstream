@@ -8057,14 +8057,7 @@ async fn operator_scoped_backup_grant_keeps_support_artifact_sanitized() {
     let pki = rockstream_test_support::pki::TestPki::generate();
     let control_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
     let management_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-    let mut operator =
-        mtls_operator_with_fingerprint(certificate_sha256(&pki.secondary_cli_cert_path));
-    operator.scoped_grants.push(ScopedActionGrant {
-        action: SecurityAction::BackupCreate,
-        scope: PolicyScope::BackupDestination {
-            destination: backup_destination.to_string_lossy().into_owned(),
-        },
-    });
+    let operator = mtls_operator_with_fingerprint(certificate_sha256(&pki.secondary_cli_cert_path));
     let mut process = start_control_process_with_operator(
         temp.path(),
         &storage,
@@ -8079,7 +8072,7 @@ async fn operator_scoped_backup_grant_keeps_support_artifact_sanitized() {
     )
     .await;
     wait_for_gateway(&mut process.0, control_address).await;
-    let _admin = wait_for_management_client(management_address, &pki).await;
+    let mut admin = wait_for_management_client(management_address, &pki).await;
     let mut client = management_client_with_identity(
         management_address,
         &pki,
@@ -8088,6 +8081,127 @@ async fn operator_scoped_backup_grant_keeps_support_artifact_sanitized() {
     )
     .await
     .unwrap();
+
+    let backup_scope = PolicyScope::BackupDestination {
+        destination: backup_destination.to_string_lossy().into_owned(),
+    };
+    let denied_key = uuid::Uuid::new_v4().to_string();
+    let denial = client
+        .create_backup(CreateBackupRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            destination: backup_destination.to_string_lossy().into_owned(),
+            idempotency_key: denied_key.clone(),
+        })
+        .await
+        .expect_err("operator-only authority must not create a backup");
+    assert_eq!(denial.code(), tonic::Code::PermissionDenied);
+    assert_eq!(denial.message(), "management action is not authorized");
+    let missing = client
+        .get_operation(GetOperationRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            operation_id: denied_key.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), tonic::Code::NotFound);
+    assert_eq!(
+        missing.message(),
+        format!("operation {denied_key} not found")
+    );
+    assert!(!backup_destination.exists());
+
+    let operator_before = admin
+        .list_security_principals(
+            rockstream_management_proto::v1::ListSecurityPrincipalsRequest {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                page_size: 100,
+                page_token: String::new(),
+            },
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .principals
+        .into_iter()
+        .find(|principal| principal.principal_id == 2)
+        .unwrap();
+    let grant_operation_id = uuid::Uuid::new_v4().to_string();
+    let grant_operation = admin
+        .set_security_principal_grants(SetSecurityPrincipalGrantsRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            principal_id: 2,
+            expected_revision: 1,
+            expected_grantor_revision: 1,
+            idempotency_key: grant_operation_id.clone(),
+            preset_grants: vec![SecurityPresetGrant {
+                preset: "operator".to_owned(),
+                scope_json: serde_json::to_string(&PolicyScope::Cluster).unwrap(),
+            }],
+            scoped_grants: vec![SecurityActionGrant {
+                action: "backup_create".to_owned(),
+                scope_json: serde_json::to_string(&backup_scope).unwrap(),
+            }],
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .operation
+        .unwrap();
+    assert_eq!(grant_operation.operation_id, grant_operation_id);
+    assert_eq!(grant_operation.kind, "security_principal_grants");
+    assert_eq!(grant_operation.state, "succeeded");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&grant_operation.result_json).unwrap(),
+        serde_json::json!({
+            "principal_id": 2,
+            "revision": 2,
+            "preset_grants": [{"preset": "operator", "scope": "cluster"}],
+            "scoped_grants": [{
+                "action": "backup_create",
+                "scope": {"backup_destination": {"destination": backup_destination.to_string_lossy().to_string()}}
+            }],
+            "effective_permissions": [
+                {"action": "cluster_observe", "scope": "cluster"},
+                {"action": "node_drain", "scope": "cluster"},
+                {"action": "shard_migrate", "scope": "cluster"},
+                {"action": "operation_cancel", "scope": "cluster"},
+                {"action": "operation_history_read", "scope": "cluster"},
+                {"action": "diagnostics_read", "scope": "cluster"},
+                {"action": "support_generate", "scope": "cluster"},
+                {"action": "support_download", "scope": "cluster"},
+                {"action": "backup_create", "scope": {"backup_destination": {"destination": backup_destination.to_string_lossy().to_string()}}}
+            ]
+        })
+    );
+    let mut expected_operator = operator_before;
+    expected_operator.revision = 2;
+    let backup_scope_json = serde_json::to_string(&backup_scope).unwrap();
+    expected_operator.scoped_grants = vec![SecurityActionGrant {
+        action: "backup_create".to_owned(),
+        scope_json: backup_scope_json.clone(),
+    }];
+    expected_operator
+        .effective_permissions
+        .push(SecurityActionGrant {
+            action: "backup_create".to_owned(),
+            scope_json: backup_scope_json,
+        });
+    let operator_after = admin
+        .list_security_principals(
+            rockstream_management_proto::v1::ListSecurityPrincipalsRequest {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                page_size: 100,
+                page_token: String::new(),
+            },
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .principals
+        .into_iter()
+        .find(|principal| principal.principal_id == 2)
+        .unwrap();
+    assert_eq!(operator_after, expected_operator);
 
     let artifact_id = uuid::Uuid::new_v4().to_string();
     let artifact = client
@@ -8102,7 +8216,7 @@ async fn operator_scoped_backup_grant_keeps_support_artifact_sanitized() {
     assert_eq!(artifact.opaque_id, artifact_id);
     let generated_at_ms = artifact.expires_at_ms - 600_000;
     let expected_content = format!(
-        "{{\"format_version\":1,\"generated_at_ms\":{generated_at_ms},\"scope\":\"cluster\",\"source_version\":\"rockstream:{}\",\"topology_revision\":1,\"active_operations\":1,\"retained_operations\":1,\"node\":null}}",
+        "{{\"format_version\":1,\"generated_at_ms\":{generated_at_ms},\"scope\":\"cluster\",\"source_version\":\"rockstream:{}\",\"topology_revision\":1,\"active_operations\":1,\"retained_operations\":2,\"node\":null}}",
         env!("CARGO_PKG_VERSION")
     );
     let (content, expires_at_ms) = download_support_artifact(&mut client, &artifact_id).await;
@@ -8582,6 +8696,8 @@ async fn support_artifact_reconciles_durable_boundaries_after_process_exit() {
     let control_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
     let management_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
     let principal = mtls_support_admin_with_fingerprint(certificate_sha256(&pki.cli_cert_path));
+    let other_actor =
+        mtls_operator_with_fingerprint(certificate_sha256(&pki.secondary_cli_cert_path));
     let security_store: Arc<dyn ObjectStore> = Arc::new(object_store::prefix::PrefixStore::new(
         rockstream_test_support::minio::minio_object_store(minio_port, bucket),
         "gateway-shard",
@@ -8618,7 +8734,7 @@ async fn support_artifact_reconciles_durable_boundaries_after_process_exit() {
             &pki,
             Some((minio_port, bucket)),
             true,
-            None,
+            (index == 0).then(|| other_actor.clone()),
             true,
             false,
             Some(*boundary),
@@ -8777,6 +8893,54 @@ async fn support_artifact_reconciles_durable_boundaries_after_process_exit() {
         recovered.0.wait().unwrap();
     }
 
+    let expired_id = operation_ids[0].clone();
+    let mut survivor_process = start_control_process(
+        temp.path(),
+        &storage,
+        control_address,
+        management_address,
+        &pki,
+        Some((minio_port, bucket)),
+        true,
+    )
+    .await;
+    wait_for_gateway(&mut survivor_process.0, control_address).await;
+    let _admin_ready = wait_for_management_client(management_address, &pki).await;
+    let mut survivor_client = management_client_with_identity(
+        management_address,
+        &pki,
+        &pki.secondary_cli_cert_path,
+        &pki.secondary_cli_key_path,
+    )
+    .await
+    .unwrap();
+    let survivor_id = uuid::Uuid::new_v4().to_string();
+    let survivor_response = survivor_client
+        .generate_support_artifact(GenerateSupportArtifactRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            node_id: String::new(),
+            idempotency_key: survivor_id.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(survivor_response.opaque_id, survivor_id);
+    let survivor_expected_content = format!(
+        "{{\"format_version\":1,\"generated_at_ms\":{},\"scope\":\"cluster\",\"source_version\":\"rockstream:{}\",\"topology_revision\":1,\"active_operations\":1,\"retained_operations\":8,\"node\":null}}",
+        survivor_response.expires_at_ms - 600_000,
+        env!("CARGO_PKG_VERSION")
+    );
+    let (survivor_content, survivor_expiry) =
+        download_support_artifact(&mut survivor_client, &survivor_id).await;
+    assert_eq!(
+        String::from_utf8(survivor_content.clone()).unwrap(),
+        survivor_expected_content
+    );
+    assert_eq!(survivor_expiry, survivor_response.expires_at_ms);
+    survivor_process.0.kill().unwrap();
+    survivor_process.0.wait().unwrap();
+    operation_ids.push(survivor_id.clone());
+
     let ledger = serde_json::from_slice::<serde_json::Value>(
         &management_store
             .get(&ledger_path)
@@ -8797,9 +8961,7 @@ async fn support_artifact_reconciles_durable_boundaries_after_process_exit() {
     operation_ids.sort();
     assert_eq!(actual_ids, operation_ids);
 
-    let expired_id = operation_ids[0].clone();
     let expired_path = support_artifact_object_path(&management_store, &expired_id).await;
-    let survivor_id = operation_ids[1].clone();
     let survivor_path = support_artifact_object_path(&management_store, &survivor_id).await;
     let survivor_bytes = management_store
         .get(&survivor_path)
@@ -8876,6 +9038,33 @@ async fn support_artifact_reconciles_durable_boundaries_after_process_exit() {
         management_store.get(&expired_path).await,
         Err(object_store::Error::NotFound { .. })
     ));
+    let admin_denial = client
+        .download_support_artifact(DownloadSupportArtifactRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            opaque_id: survivor_id.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(admin_denial.code(), tonic::Code::NotFound);
+    assert_eq!(
+        admin_denial.message(),
+        "support artifact not found or expired"
+    );
+    let mut survivor_client = management_client_with_identity(
+        management_address,
+        &pki,
+        &pki.secondary_cli_cert_path,
+        &pki.secondary_cli_key_path,
+    )
+    .await
+    .unwrap();
+    let (survivor_content_after_cleanup, survivor_expiry_after_cleanup) =
+        download_support_artifact(&mut survivor_client, &survivor_id).await;
+    assert_eq!(survivor_content_after_cleanup, survivor_content);
+    assert_eq!(
+        survivor_expiry_after_cleanup,
+        survivor_response.expires_at_ms
+    );
     assert_eq!(
         management_store
             .get(&survivor_path)
