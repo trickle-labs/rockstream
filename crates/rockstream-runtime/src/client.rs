@@ -2915,9 +2915,9 @@ where
                 Err(e) => {
                     tracing::error!(
                         code = %rockstream_types::error_code::RS_0001,
-                        "Invalid message from control plane: {:?}, raw: {}",
-                        e,
-                        line
+                        error = ?e,
+                        message_bytes = line.len(),
+                        "Invalid message from control plane"
                     );
                     continue;
                 }
