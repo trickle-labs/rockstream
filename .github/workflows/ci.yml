@@ -172,6 +172,8 @@ jobs:
         run: python3 scripts/ci-policy.test.py
       - name: CI preflight self-tests
         run: python3 -B scripts/ci-preflight.test.py
+      - name: CI timing-report self-tests
+        run: python3 -B scripts/ci-run-metrics.test.py
       - name: CI prose-only scope and required-check self-tests
         run: python3 -B scripts/ci-scope.test.py
       - name: Validate Cargo test target assignment
