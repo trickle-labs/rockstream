@@ -282,6 +282,43 @@ async fn r1_r2_r6_direct_arrow_ingestion_bypasses_control_and_wires_worker_inlet
         "expected RS-1012 for missing routing column/source, got: {bad_source_err}"
     );
 
+    // A rejected source must not reserve the epoch or change committed output.
+    // A valid request with a different identity can still commit epoch 3.
+    assert_eq!(
+        client
+            .submit_delta(SourceDeltaRequest {
+                version: DEPLOYMENT_DESCRIPTOR_VERSION,
+                request_id: "valid-after-bad-source".to_owned(),
+                workload_id,
+                epoch: 3,
+                source: "orders".to_owned(),
+                rows: vec![RuntimeRow {
+                    values_tsv: "1\t5".to_owned(),
+                    weight: 1,
+                }],
+            })
+            .await
+            .unwrap(),
+        3
+    );
+    let snapshot = client.read_workload(workload_id).await.unwrap();
+    let mut totals: BTreeMap<String, i64> = BTreeMap::new();
+    for shard in &snapshot.shards {
+        for row in &shard.rows {
+            *totals.entry(row.values_tsv.clone()).or_default() += row.weight;
+        }
+    }
+    totals.retain(|_, w| *w != 0);
+    assert_eq!(
+        totals,
+        BTreeMap::from([
+            ("1\t180".to_owned(), 1),
+            ("2\t300".to_owned(), 1),
+            ("3\t77".to_owned(), 1),
+        ])
+    );
+    assert_eq!(control_handle.row_payloads_received(), 0);
+
     control_handle.shutdown();
 }
 
