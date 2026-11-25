@@ -5366,6 +5366,7 @@ dependencies = [
  "tonic 0.12.3",
  "tonic-build",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "x509-parser",
  "zstd 0.14.3",
