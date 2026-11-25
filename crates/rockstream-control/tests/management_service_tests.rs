@@ -713,6 +713,211 @@ async fn management_grant_mutation_is_idempotent_and_audits_the_complete_result(
 }
 
 #[tokio::test]
+async fn management_rejects_stale_grantor_revision_without_changing_grants() {
+    let auth = ManagementAuth::with_presets(
+        &[],
+        &[PermissionPreset::Administrator, PermissionPreset::Operator],
+    )
+    .await;
+    let service = ManagementService::new(
+        TopologyCatalog::new(),
+        ShardManager::new(),
+        ManagementOperationStore::new(Arc::new(InMemory::new())),
+        NodeConfig::default(),
+    );
+    let server = auth.start_management(service).await;
+    let mut client = auth.client(server.addr).await;
+
+    let concurrent_catalog =
+        DurableCatalogStore::recover(auth.store.clone(), "management-security")
+            .await
+            .unwrap();
+    let original = concurrent_catalog
+        .get_security_principal(PrincipalId(1))
+        .await
+        .unwrap()
+        .unwrap();
+    let before_state = format!(
+        "revision={};policy={}",
+        original.revision,
+        serde_json::to_string(&(
+            original.enabled,
+            &original.preset_grants,
+            &original.scoped_grants
+        ))
+        .unwrap()
+    );
+    let mut changed = original.clone();
+    changed.revision += 1;
+    changed
+        .preset_grants
+        .retain(|grant| grant.preset != PermissionPreset::Operator);
+    let after_state = format!(
+        "revision={};policy={}",
+        changed.revision,
+        serde_json::to_string(&(
+            changed.enabled,
+            &changed.preset_grants,
+            &changed.scoped_grants
+        ))
+        .unwrap()
+    );
+    let catalog_revision = concurrent_catalog.get_revision().await + 1;
+    let change_audit = SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: format!("management-stale-grantor-{catalog_revision}"),
+        timestamp_ms: chrono::Utc::now().timestamp_millis().max(1) as u64,
+        actor: AuditIdentity::Verified("principal:1".to_owned()),
+        target: AuditField::Known("principal:1".to_owned()),
+        scope: AuditField::Known("cluster".to_owned()),
+        action: SecurityAuditClass::GrantChange,
+        outcome: SecurityAuditOutcome::Success,
+        correlation: AuditCorrelation::NotApplicable,
+        operation_id: AuditField::Known(catalog_revision.to_string()),
+        policy_revision: AuditField::Known(changed.revision),
+        before_state: AuditField::Known(before_state),
+        after_state: AuditField::Known(after_state),
+    };
+    concurrent_catalog
+        .commit_txn(
+            CatalogTxn::new(
+                catalog_revision,
+                catalog_revision,
+                vec![CatalogMutation::PutSecurityPrincipal {
+                    principal: changed.clone(),
+                    expected_revision: Some(original.revision),
+                    grantor_revision: Some((PrincipalId(1), original.revision)),
+                    audit: change_audit,
+                }],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let operation_id = "00000000-0000-4000-8000-000000000126";
+    let operation = client
+        .set_security_principal_grants(SetSecurityPrincipalGrantsRequest {
+            protocol_version: 1,
+            principal_id: 1,
+            expected_revision: changed.revision,
+            expected_grantor_revision: original.revision,
+            idempotency_key: operation_id.to_owned(),
+            preset_grants: vec![
+                rockstream_management_proto::v1::SecurityPresetGrant {
+                    preset: "administrator".to_owned(),
+                    scope_json: "\"cluster\"".to_owned(),
+                },
+                rockstream_management_proto::v1::SecurityPresetGrant {
+                    preset: "operator".to_owned(),
+                    scope_json: "\"cluster\"".to_owned(),
+                },
+            ],
+            scoped_grants: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .operation
+        .unwrap();
+    assert_eq!(operation.operation_id, operation_id);
+    assert_eq!(operation.kind, "security_principal_grants");
+    assert_eq!(operation.state, "failed");
+    assert_eq!(operation.progress, "100%");
+    assert_eq!(operation.phase, "security_policy_rejected");
+    assert_eq!(operation.error_code, "");
+    assert_eq!(
+        operation.next_steps,
+        vec![
+            "Review current authority and principal revisions before submitting a new mutation."
+                .to_owned()
+        ]
+    );
+    assert_eq!(
+        operation.result_json,
+        r#"{"reason":"RS-2401: grantor authority or reviewed revision is no longer current","status":"failed"}"#
+    );
+
+    let recovered_operation = client
+        .get_operation(GetOperationRequest {
+            protocol_version: 1,
+            operation_id: operation_id.to_owned(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .operation
+        .unwrap();
+    assert_eq!(recovered_operation, operation);
+    assert_eq!(
+        auth.catalog
+            .get_security_principal(PrincipalId(1))
+            .await
+            .unwrap()
+            .unwrap(),
+        changed
+    );
+
+    let completion = auth
+        .catalog
+        .get_security_audit_record(&format!(
+            "management-security-grants-completion:{operation_id}"
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut normalized_completion = completion.clone();
+    let timestamp_ms = std::mem::replace(&mut normalized_completion.timestamp_ms, 0);
+    assert!(timestamp_ms > 0);
+    assert_eq!(
+        normalized_completion,
+        SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: format!("management-security-grants-completion:{operation_id}"),
+            timestamp_ms: 0,
+            actor: AuditIdentity::Verified("principal:1".to_owned()),
+            target: AuditField::Known("principal:1".to_owned()),
+            scope: AuditField::Known("cluster".to_owned()),
+            action: SecurityAuditClass::AdminOperationCompletion,
+            outcome: SecurityAuditOutcome::Failure,
+            correlation: AuditCorrelation::Observed(operation_id.to_owned()),
+            operation_id: AuditField::Known(operation_id.to_owned()),
+            policy_revision: AuditField::Known(original.revision),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
+    );
+    let start = auth
+        .catalog
+        .get_security_audit_record(&format!("management-security-grants-start:{operation_id}"))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut normalized_start = start.clone();
+    let start_timestamp_ms = std::mem::replace(&mut normalized_start.timestamp_ms, 0);
+    assert!(start_timestamp_ms > 0 && start_timestamp_ms <= timestamp_ms);
+    assert_eq!(
+        normalized_start,
+        SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: format!("management-security-grants-start:{operation_id}"),
+            timestamp_ms: 0,
+            actor: AuditIdentity::Verified("principal:1".to_owned()),
+            target: AuditField::Known("principal:1".to_owned()),
+            scope: AuditField::Known("cluster".to_owned()),
+            action: SecurityAuditClass::AdminOperationStart,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::Observed(operation_id.to_owned()),
+            operation_id: AuditField::Known(operation_id.to_owned()),
+            policy_revision: AuditField::Known(original.revision),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
+    );
+    server.shutdown();
+}
+
+#[tokio::test]
 async fn secret_rotation_operation_is_listed_and_reconciled_by_its_owner() {
     let auth = ManagementAuth::new(&[]).await;
     let operations = ManagementOperationStore::new(Arc::new(InMemory::new()));
