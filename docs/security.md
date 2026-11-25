@@ -86,12 +86,19 @@ scoped AWS fixture: `ROCKSTREAM_TEST_KMS_KEY_ARN`,
 must identify an authorized principal. Run explicitly with
 `cargo test -p rockstream-control --test aws_kms_tests real_kms_enforces_key_and_principal_permissions -- --ignored --exact`.
 
-`SecretStore::rotate_kek` stages all rewrapped envelopes before publishing one
-atomic SlateDB batch (or replacing the in-memory catalog). Secret reads and
-mutations wait for rotation; once the batch is submitted, cancelling the caller
-does not cancel its commit. Success waits for durable storage before retiring
-the store's old provider. A provider or decode failure during staging leaves
-every stored envelope unchanged.
+`SecretStore::rotate_kek` stages at most 1,000,000 catalog entries and 64 MiB
+of serialized envelope and audit values in the pending rotation before
+publishing one atomic SlateDB batch (or replacing the in-memory catalog).
+Exceeding either limit returns `RS-3601` before publishing rewrapped secrets;
+existing secret envelopes and the active provider remain unchanged. At most 64
+callers may wait to enter rotation-protected secret operations; excess callers
+receive `RS-3601` without waiting. The
+`SecretStore::metrics()` snapshot exposes the current waiter, staging-entry,
+and staging-byte fill levels. Secret reads and mutations wait for rotation;
+once the batch is submitted, cancelling the caller does not cancel its commit.
+Success waits for durable storage before retiring the store's old provider. A
+provider or decode failure during staging leaves every stored envelope
+unchanged.
 
 With durable storage, rotation also requires the durable security audit
 catalog. The rewrap batch carries a structured audit outbox record, and success
@@ -110,7 +117,8 @@ by older releases. The retained provider encrypts with its first provider and
 tries both providers for decryption; it never writes key material to the catalog.
 Only retire the previous key after successful recovery and durable rotation.
 Use one shared `SecretStore` for a catalog; independent instances must not mutate
-that catalog during rotation. Rotation stages memory proportional to the catalog.
+that catalog during rotation. The staged-entry and serialized-value limits
+bound the catalog rotation batch.
 
 Workers receive short-lived tokens over authenticated mTLS. Decrypted payloads
 remain in worker process memory and are refreshed at the next epoch after an
