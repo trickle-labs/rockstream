@@ -17,7 +17,7 @@ pub fn validate_server_certificate(certificate: &CertificateDer<'_>) -> Result<(
     let (_, certificate) = X509Certificate::from_der(certificate.as_ref())
         .map_err(|error| format!("failed to parse server certificate: {error}"))?;
     if !certificate.validity().is_valid() {
-        return Err("server certificate is expired or not yet valid".to_string());
+        return Err("RS-2411: server certificate is expired or not yet valid".to_string());
     }
     Ok(())
 }
@@ -43,7 +43,7 @@ fn build_server_tls_acceptor_with_extra(
 
     let certs = load_certs(cert_path)?;
     let key = load_key(key_path)?;
-    validate_server_certificate(&certs[0]).map_err(|error| format!("RS-2411: {error}"))?;
+    validate_server_certificate(&certs[0])?;
 
     let mut roots = RootCertStore::empty();
     if let Some(ca_path) = &config.ca_cert_path {

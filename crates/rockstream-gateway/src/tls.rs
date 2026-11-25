@@ -113,8 +113,14 @@ pub fn build_tls_acceptor(
     let _ = rustls::crypto::ring::default_provider().install_default();
     let certs = load_certs(cert_path)?;
     let key = load_private_key(key_path)?;
-    rockstream_types::tls::validate_server_certificate(&certs[0])
-        .map_err(GatewayTlsError::Parse)?;
+    rockstream_types::tls::validate_server_certificate(&certs[0]).map_err(|error| {
+        GatewayTlsError::Parse(
+            error
+                .strip_prefix("RS-2411: ")
+                .unwrap_or(&error)
+                .to_string(),
+        )
+    })?;
 
     let config = if let Some(ca_path) = ca_cert_path {
         let ca_certs = load_certs(ca_path)?;
