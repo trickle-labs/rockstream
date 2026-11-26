@@ -146,7 +146,7 @@ fn gateway_webhook_runtime_is_absent() {
             "removed runtime symbol remains: {symbol}"
         );
     }
-    assert!(server.contains(r"HTTP/1.1 410 Gone\r\n"));
+    assert!(server.contains("StatusCode::GONE"));
     assert!(server.contains("[RS-4017] connector.removed: HTTP/webhook sources have been removed."));
 }
 
