@@ -389,26 +389,21 @@ pub(crate) async fn handle_command(
         .await
         .map_err(|error| error.to_string())?;
     if let Some(finish) = completed {
-        client
-            .msg_tx
-            .send(
-                rockstream_types::topology::WorkerMessage::RoutingEpochCommitted {
-                    worker_id: deployment.descriptor.shard.worker_id,
-                    workload_id: command.workload_id,
-                    anchor_shard_id: command.shard_id,
-                    anchor_lease_token: command.lease_token,
-                    epoch: finish.record.epoch,
-                    generation: finish.record.generation,
-                    request_id: finish.record.request_id.clone(),
-                    input_digest: finish.record.input_digest,
-                    decision: serde_json::Value::Null,
-                    shard_leases: finish.shard_leases,
-                },
-            )
-            .await
-            .map_err(|_| {
-                "committed routing notification requires control reconnection".to_owned()
-            })?;
+        // The routing journal is already durable; control cannot gate commit success.
+        let _ = client.msg_tx.try_send(
+            rockstream_types::topology::WorkerMessage::RoutingEpochCommitted {
+                worker_id: deployment.descriptor.shard.worker_id,
+                workload_id: command.workload_id,
+                anchor_shard_id: command.shard_id,
+                anchor_lease_token: command.lease_token,
+                epoch: finish.record.epoch,
+                generation: finish.record.generation,
+                request_id: finish.record.request_id.clone(),
+                input_digest: finish.record.input_digest,
+                decision: serde_json::Value::Null,
+                shard_leases: finish.shard_leases,
+            },
+        );
     }
     Ok(result.into())
 }
