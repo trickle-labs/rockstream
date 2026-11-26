@@ -847,8 +847,8 @@ async fn interrupted_dispatch_blocks_distributed_reads_after_gateway_restart() {
     assert_eq!(request.source, expected.source);
     assert_eq!(request.rows, expected.rows);
     // Separately preserve the metadata-only authorization wire assertion.
-    let authorization = rockstream_runtime::DataPlaneClient::source_authorization_request(&request)
-        .unwrap();
+    let authorization =
+        rockstream_runtime::DataPlaneClient::source_authorization_request(&request).unwrap();
     let WorkerMessage::AuthorizeSourceEpoch { metadata } = authorization else {
         panic!("expected source epoch authorization metadata");
     };
