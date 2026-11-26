@@ -4430,8 +4430,12 @@ mod tests {
     }
 
     async fn test_security_catalog() -> Arc<dyn CatalogStore> {
+        test_security_catalog_with_store(Arc::new(InMemory::new())).await
+    }
+
+    async fn test_security_catalog_with_store(store: Arc<InMemory>) -> Arc<dyn CatalogStore> {
         let catalog = Arc::new(rockstream_storage::catalog::DurableCatalogStore::new(
-            Arc::new(InMemory::new()),
+            store,
             "management-test",
         ));
         let principal = rockstream_types::authorization::SecurityPrincipal {
@@ -5861,7 +5865,8 @@ mod tests {
 
     #[tokio::test]
     async fn principal_deletion_is_revision_checked_idempotent_and_audited() {
-        let security_catalog = test_security_catalog().await;
+        let object_store = Arc::new(InMemory::new());
+        let security_catalog = test_security_catalog_with_store(object_store.clone()).await;
         let service = ManagementService::new(
             TopologyCatalog::new(),
             ShardManager::new(),
@@ -6100,6 +6105,34 @@ mod tests {
         assert_eq!(retry, deleted);
         assert_eq!(
             security_catalog
+                .list_security_audit_records()
+                .await
+                .unwrap(),
+            audit_before_retry
+        );
+
+        let restarted_catalog = Arc::new(rockstream_storage::catalog::DurableCatalogStore::new(
+            object_store,
+            "management-test",
+        ));
+        restarted_catalog.refresh().await.unwrap();
+        let restarted_service = ManagementService::new(
+            TopologyCatalog::new(),
+            ShardManager::new(),
+            ManagementOperationStore::new(Arc::new(InMemory::new())),
+            NodeConfig::default(),
+        )
+        .with_security_catalog(restarted_catalog.clone());
+        let restarted_retry = <ManagementService as v1::management_service_server::ManagementService>::delete_security_principal(
+            &restarted_service,
+            authenticated_request(request.clone()),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(restarted_retry, deleted);
+        assert_eq!(
+            restarted_catalog
                 .list_security_audit_records()
                 .await
                 .unwrap(),
