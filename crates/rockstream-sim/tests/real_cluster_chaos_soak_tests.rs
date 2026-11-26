@@ -1753,7 +1753,8 @@ async fn worker_state_enospc_withholds_source_ack_and_recovers_exactly() {
     save(&artifact_dir.join("enospc-trigger.json"), &enospc_trigger);
     fs::write(root.path().join("release-enospc"), b"ENOSPC confirmed").unwrap();
     let failure_path = root.path().join("enospc-failure.json");
-    let failure_deadline = Instant::now() + Duration::from_secs(60);
+    // S3 retries are bounded at three minutes; leave time for the worker to report the error.
+    let failure_deadline = Instant::now() + Duration::from_secs(240);
     let failure: Value = loop {
         if let Ok(bytes) = fs::read(&failure_path) {
             if let Ok(failure) = serde_json::from_slice(&bytes) {
