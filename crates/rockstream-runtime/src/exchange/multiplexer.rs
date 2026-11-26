@@ -247,6 +247,19 @@ impl WorkerStreamMultiplexer {
         frame: ShuffleFrame,
         context: bytes::Bytes,
     ) -> Result<(), String> {
+        self.send_owned_command(target_worker, frame, context)
+            .await
+            .map(|_| ())
+    }
+
+    /// Executes a bounded, authenticated command on the same fenced transport
+    /// as an owned frame. The response is separate from receiver credits.
+    pub(crate) async fn send_owned_command(
+        &self,
+        target_worker: WorkerId,
+        frame: ShuffleFrame,
+        context: bytes::Bytes,
+    ) -> Result<bytes::Bytes, String> {
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let sender = self.clone();
         self.task_tracker.spawn(async move {
@@ -269,7 +282,7 @@ impl WorkerStreamMultiplexer {
         target_worker: WorkerId,
         frame: ShuffleFrame,
         context: bytes::Bytes,
-    ) -> Result<(), String> {
+    ) -> Result<bytes::Bytes, String> {
         let _permit = self
             .flow_controller
             .acquire_batch_permit(
@@ -348,7 +361,7 @@ impl WorkerStreamMultiplexer {
             return Err("owned shuffle returned mismatched credit".to_owned());
         }
         match stream.next().await {
-            None => Ok(()),
+            None => Ok(ack.owned_result.into()),
             Some(Err(error)) => Err(error.message().to_owned()),
             Some(Ok(_)) => Err("owned shuffle returned unexpected additional credit".to_owned()),
         }
@@ -910,6 +923,7 @@ mod tests {
             epoch: frame.epoch,
             seq: frame.seq,
             credit_grant: frame.row_count.max(1),
+            owned_result: Default::default(),
         });
     }
 

@@ -869,6 +869,7 @@ mod v072_credit_fastpath_tests {
             epoch: 0,
             seq: 0,
             credit_grant: 1,
+            owned_result: Default::default(),
         }
     }
 
@@ -1046,6 +1047,7 @@ mod v072_credit_fastpath_tests {
             epoch: 1,
             seq,
             credit_grant: 1,
+            owned_result: Default::default(),
         };
         let delivered = controller.try_acquire_batch_permit(7, 1, 2, 2, 1).unwrap();
         let cancelled = controller.try_acquire_batch_permit(7, 1, 2, 3, 1).unwrap();

@@ -2077,6 +2077,47 @@ The CLI backup operation selects one committed control checkpoint and must enume
 
 `CheckpointExporter` pins the control-plane SlateDB manifest that was visible when the selected `ClusterCheckpoint` was loaded rather than copying a newer control manifest that commits mid-inventory. This ensures the exported control manifest and shard object inventory represent a single consistent committed checkpoint cut under M3 recovery.
 
+## Durable skew-routing epoch boundary (#403)
+
+The source router now persists the input digest, immutable shard assignment,
+and concrete operand admission before dispatch. A pending routing generation
+cannot be replaced by a different request. The completed generation and its
+point-ledger mutations are one durable batch, published only after every
+participant acknowledges an application commit. Replaying an unfinished epoch
+therefore preserves assignment while the existing M1 execution digests prevent
+double application. These routing decisions do not grant new lease authority;
+M4 storage fencing and the M6 ownership handoff still govern writers.
+
+The additional concrete checks are `prepare_replay_and_finish_preserve_exact_generation_and_point_state`,
+`pending_routing_survives_reopen_and_rejects_a_different_replay`,
+`promotion_uses_four_workers_and_canonical_epoch_output_matches_unsplit_retractions`,
+and `inadmissible_hot_key_stays_on_canonical_owner_and_is_explained` in
+`rockstream-runtime`. These are implementation checks, not a claim that the
+existing FizzBee models include a new routing-journal liveness proof.
+
+Direct gateway capabilities bind each routing mutation to the authorized
+workload, source, request ID, epoch, original input digest, and exact shard
+lease membership. Partial and final batches are transformed subsets, so their
+source/request scope is checked while the journal retains the original input
+digest. A workload admission read guard lasts through the execution receipt;
+replacement installation takes its write guard before checking every local
+execution gate and pending durable journal. Waiting commands revalidate expiry
+after admission. This prevents a pre-expiry queued command from appearing
+after a replacement's idle check.
+
+Completed retries reissue `Finish` so a fresh control reservation can be
+released. Successful completion revokes matching capabilities; a failed grant
+installation revokes only that attempt ID, preserving earlier retry grants.
+Denials use the existing bounded, durably acknowledged security audit transport
+and include only fixed-size frame identifiers. The concrete tests
+`routing_mutations_require_exact_authorized_input_and_membership`,
+`replacement_drains_admitted_commands_and_waiters_revalidate_expiry`,
+`direct_grant_installation_checks_durable_pending_after_draining_execution`,
+`rollback_revokes_only_attempted_grant_and_completion_releases_the_workload`,
+and `direct_epoch_denial_audit_is_bounded_and_waits_for_durable_receipt` cover
+these adapter obligations. No new FizzBee proof of async lock fairness or
+capability transport delivery is claimed.
+
 ## Bounded pgoutput transport and streaming transaction decoding (#349)
 
 `PostgresCdcSource` bounds in-memory binary `COPY OUT` transport frames and decodes active transactions incrementally rather than re-decoding the entire buffered transaction on every event poll. This is a connector transport and memory-bounding optimization that preserves the M1/M3 source checkpoint LSN frontier, transaction boundary atomicity, and restart replay semantics.

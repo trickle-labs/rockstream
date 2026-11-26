@@ -245,6 +245,7 @@ async fn deliver_ticket(
         epoch: ticket.epoch,
         seq: ticket.seq,
         credit_grant: ticket.row_count.max(1),
+        owned_result: Default::default(),
     })
 }
 
