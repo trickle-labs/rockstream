@@ -228,6 +228,7 @@ async fn whole_process_rss_and_multi_shard_cache_budget_stress() {
     // While background memory budget is saturated (with foreground still protected),
     // enqueueing exchange frames must apply backpressure cleanly via the unified ledger!
     let make_frame = |seq: u64| RuntimeExchangeMessage {
+        join_bootstrap: None,
         version: 1,
         request_id: format!("req-{seq}"),
         attempt_id: None,

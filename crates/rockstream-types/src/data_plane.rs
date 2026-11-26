@@ -164,6 +164,19 @@ pub struct OwnedEpochIntent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JoinBootstrap {
+    /// The opposite input whose committed low-cardinality rows must be
+    /// installed before this frame's high-cardinality delta is evaluated.
+    pub source: String,
+    pub rows: Vec<RuntimeRow>,
+    /// Exact final group transitions when executable arithmetic admission
+    /// returns a key to its canonical summary owner. These are part of the
+    /// same replay identity and durable sink commit as the source epoch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub final_rows: Vec<RuntimeRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeExchangeMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt_id: Option<uuid::Uuid>,
@@ -176,6 +189,10 @@ pub struct RuntimeExchangeMessage {
     pub lease_token: LeaseToken,
     pub source: String,
     pub rows: Vec<RuntimeRow>,
+    /// A bounded low-side snapshot installed atomically with the source
+    /// delta, arrangement state, output, and execution replay identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_bootstrap: Option<JoinBootstrap>,
 }
 
 impl RuntimeExchangeMessage {
@@ -346,6 +363,7 @@ mod tests {
             rows: output.rows.clone(),
         };
         let exchange = RuntimeExchangeMessage {
+            join_bootstrap: None,
             attempt_id: None,
             version: output.version,
             request_id: output.request_id.clone(),
@@ -426,6 +444,7 @@ mod tests {
             workers: vec![status.clone()],
         };
         let frame = RuntimeExchangeMessage {
+            join_bootstrap: None,
             attempt_id: None,
             version: 1,
             request_id: "request-9".into(),

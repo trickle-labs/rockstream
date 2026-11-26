@@ -56,6 +56,8 @@ pub enum RoutingOperation {
     Prepare,
     Finish,
     AggregatePartial,
+    JoinExecute,
+    JoinRowStats,
 }
 
 /// Only this small envelope travels in metadata. Bounded command data travels
@@ -300,6 +302,23 @@ pub(crate) async fn handle_command(
                 });
         return Ok(bounded_json(&result)?.into());
     }
+    if matches!(command.operation, RoutingOperation::JoinExecute) {
+        let input: rockstream_types::data_plane::RuntimeExchangeMessage =
+            serde_json::from_slice(&payload)
+                .map_err(|error| format!("invalid join bootstrap frame: {error}"))?;
+        if input.workload_id != command.workload_id
+            || input.shard_id != command.shard_id
+            || input.lease_token != command.lease_token
+            || input.epoch != frame.epoch
+            || input.join_bootstrap.is_none()
+        {
+            return Err("RS-3004: join bootstrap frame does not match routing identity".into());
+        }
+        crate::client::execute_frame(client, deployments, input)
+            .await
+            .map_err(|error| error.to_string())?;
+        return Ok(bounded_json(&Value::Null)?.into());
+    }
     // Serialize CAS and completion with owned application commits on this shard.
     let needs_recovery = deployment.execution_requires_recovery.lock().await;
     if *needs_recovery {
@@ -352,6 +371,50 @@ pub(crate) async fn handle_command(
             }
             bounded_json(&values)?
         }
+        RoutingOperation::JoinRowStats => {
+            let scans: Vec<crate::skew_join::JoinLedgerScan> =
+                serde_json::from_slice(&payload).map_err(|error| error.to_string())?;
+            if scans.len() > MAX_ROUTING_POINT_KEYS {
+                return Err("RS-3006: too many join scalar scans".into());
+            }
+            let mut results = BTreeMap::new();
+            for scan in scans {
+                // The request can only scan versioned join-row ledgers within
+                // this workload, never arbitrary shard data or another owner.
+                if !scan.prefix.starts_with("join/v1/")
+                    || !(scan.prefix.ends_with("/Left/") || scan.prefix.ends_with("/Right/"))
+                {
+                    return Err("RS-1002: invalid join ledger scan prefix".into());
+                }
+                let prefix = point_key(command.workload_id, &scan.prefix)?;
+                let mut continuation = None;
+                let mut stats = crate::skew_join::JoinLedgerStats::default();
+                loop {
+                    let page = deployment
+                        .db
+                        .scan_prefix_page(&prefix, continuation.as_deref(), 128, 1024 * 1024)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    for (_, bytes) in page.rows {
+                        let value: Value =
+                            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+                        stats.observe(&value, scan.value_column)?;
+                    }
+                    if page.is_last_page {
+                        break;
+                    }
+                    continuation = page.next_token;
+                    if continuation.is_none() {
+                        return Err("RS-0001: join ledger scan made no progress".into());
+                    }
+                }
+                results.insert(
+                    scan.result_key(),
+                    serde_json::to_value(stats).map_err(|error| error.to_string())?,
+                );
+            }
+            bounded_json(&results)?
+        }
         RoutingOperation::Prepare => {
             let record: RoutingEpochRecord =
                 serde_json::from_slice(&payload).map_err(|error| error.to_string())?;
@@ -381,7 +444,7 @@ pub(crate) async fn handle_command(
             completed = Some((finish, grant_was_installed));
             bytes
         }
-        RoutingOperation::AggregatePartial => unreachable!(),
+        RoutingOperation::AggregatePartial | RoutingOperation::JoinExecute => unreachable!(),
     };
     deployment
         .db

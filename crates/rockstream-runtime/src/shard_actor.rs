@@ -587,6 +587,7 @@ mod tests {
 
     fn frame(shard_id: u64, request_id: &str) -> RuntimeExchangeMessage {
         RuntimeExchangeMessage {
+            join_bootstrap: None,
             attempt_id: None,
             version: 1,
             request_id: request_id.to_string(),

@@ -209,6 +209,7 @@ impl JoinState {
         join_key: Vec<u8>,
         row_id: u128,
         row_bytes: Vec<u8>,
+        weight: i64,
     ) {
         let arr = match side {
             JoinSide::Left => &mut self.left_arr,
@@ -219,10 +220,7 @@ impl JoinState {
         let inserted = {
             let bucket = arr.entry(join_key.clone()).or_default();
             if let std::collections::hash_map::Entry::Vacant(entry) = bucket.entry(row_id) {
-                entry.insert(ArrRow {
-                    row_bytes,
-                    weight: 1,
-                });
+                entry.insert(ArrRow { row_bytes, weight });
                 true
             } else {
                 false
@@ -735,6 +733,7 @@ impl JoinStateCore {
         for (join_key, row_id) in self.dirty_left.drain() {
             let key =
                 ShardKeyEncoder::join_arr_key(JoinSide::Left, self.op_id.0, &join_key, row_id);
+            let weight_key = join_weight_key(&key);
             if let Some(arr_row) = self
                 .state
                 .left_arr
@@ -743,16 +742,20 @@ impl JoinStateCore {
             {
                 if arr_row.weight > 0 {
                     batch.put(&key, &arr_row.row_bytes);
+                    batch.put(&weight_key, &arr_row.weight.to_be_bytes());
                 } else {
                     batch.delete(&key);
+                    batch.delete(&weight_key);
                 }
             } else {
                 batch.delete(&key);
+                batch.delete(&weight_key);
             }
         }
         for (join_key, row_id) in self.dirty_right.drain() {
             let key =
                 ShardKeyEncoder::join_arr_key(JoinSide::Right, self.op_id.0, &join_key, row_id);
+            let weight_key = join_weight_key(&key);
             if let Some(arr_row) = self
                 .state
                 .right_arr
@@ -761,16 +764,49 @@ impl JoinStateCore {
             {
                 if arr_row.weight > 0 {
                     batch.put(&key, &arr_row.row_bytes);
+                    batch.put(&weight_key, &arr_row.weight.to_be_bytes());
                 } else {
                     batch.delete(&key);
+                    batch.delete(&weight_key);
                 }
             } else {
                 batch.delete(&key);
+                batch.delete(&weight_key);
             }
         }
         target.merge_from(batch);
         Ok(())
     }
+}
+
+// Keep the existing arrangement value encoding readable. The multiplicity is
+// a versioned point sidecar committed in the same WriteBatch as that row.
+// Legacy rows without a sidecar retain their historical unit-weight meaning.
+fn join_weight_key(arrangement_key: &[u8]) -> Vec<u8> {
+    let mut key = ShardKeyEncoder::meta_key(b"join-weight/v1/");
+    key.extend_from_slice(arrangement_key);
+    key
+}
+
+async fn persisted_join_weight(db: &ShardDb, arrangement_key: &[u8]) -> Result<i64, OpError> {
+    let Some(value) = db
+        .get(&join_weight_key(arrangement_key))
+        .await
+        .map_err(OpError::storage)?
+    else {
+        return Ok(1);
+    };
+    let bytes: [u8; 8] = value
+        .as_ref()
+        .try_into()
+        .map_err(|_| OpError::storage_error("invalid persisted join multiplicity"))?;
+    let weight = i64::from_be_bytes(bytes);
+    if weight <= 0 {
+        return Err(OpError::storage_error(
+            "persisted join multiplicity is not positive",
+        ));
+    }
+    Ok(weight)
 }
 
 // ─── JoinOp ───────────────────────────────────────────────────────────────────
@@ -878,9 +914,14 @@ impl JoinOp {
 
         let prefix = ShardKeyEncoder::join_arr_key_prefix(side, self.op_id.0, join_key);
         let entries = db.scan_prefix(&prefix).await.map_err(OpError::storage)?;
+        let mut weighted_entries = Vec::with_capacity(entries.len());
+        for (key, value) in entries {
+            let weight = persisted_join_weight(&db, &key).await?;
+            weighted_entries.push((key, value, weight));
+        }
 
         let mut core = self.core.lock().unwrap();
-        for (key, value) in entries {
+        for (key, value, weight) in weighted_entries {
             if key.len() < 11 + 16 {
                 continue;
             }
@@ -897,7 +938,7 @@ impl JoinOp {
                 continue;
             }
             core.state
-                .insert_persisted(side, join_key.to_vec(), row_id, value.to_vec());
+                .insert_persisted(side, join_key.to_vec(), row_id, value.to_vec(), weight);
         }
         match side {
             JoinSide::Left => {
@@ -1001,9 +1042,16 @@ impl JoinOp {
         left: ArrowZSet,
         right: ArrowZSet,
     ) -> Result<(ArrowZSet, crate::governor::DeltaAmplificationCounters), OpError> {
+        // The modified side must be loaded too: applying a retraction to an
+        // unloaded row would otherwise replace its persisted positive weight
+        // with a negative provisional delta and delete live copies.
+        self.load_arrangement_keys(JoinSide::Left, &left, &self.left_key_cols)
+            .await?;
         self.load_arrangement_keys(JoinSide::Right, &left, &self.left_key_cols)
             .await?;
         self.load_arrangement_keys(JoinSide::Left, &right, &self.right_key_cols)
+            .await?;
+        self.load_arrangement_keys(JoinSide::Right, &right, &self.right_key_cols)
             .await?;
         self.process_epoch_with_counters(left, right)
     }
@@ -1167,13 +1215,11 @@ impl JoinOp {
             let join_key = key[11..key.len() - 16].to_vec();
             let row_id = u128::from_be_bytes(key[key.len() - 16..].try_into().unwrap_or([0u8; 16]));
             let row_bytes = value.to_vec();
-            st.left_arr.entry(join_key).or_default().insert(
-                row_id,
-                ArrRow {
-                    row_bytes,
-                    weight: 1,
-                },
-            );
+            let weight = persisted_join_weight(db, &key).await?;
+            st.left_arr
+                .entry(join_key)
+                .or_default()
+                .insert(row_id, ArrRow { row_bytes, weight });
         }
 
         let right_prefix = ShardKeyEncoder::join_arr_op_prefix(JoinSide::Right, self.op_id.0);
@@ -1188,13 +1234,11 @@ impl JoinOp {
             let join_key = key[11..key.len() - 16].to_vec();
             let row_id = u128::from_be_bytes(key[key.len() - 16..].try_into().unwrap_or([0u8; 16]));
             let row_bytes = value.to_vec();
-            st.right_arr.entry(join_key).or_default().insert(
-                row_id,
-                ArrRow {
-                    row_bytes,
-                    weight: 1,
-                },
-            );
+            let weight = persisted_join_weight(db, &key).await?;
+            st.right_arr
+                .entry(join_key)
+                .or_default()
+                .insert(row_id, ArrRow { row_bytes, weight });
         }
 
         let mut core = self.core.lock().expect("JoinOp mutex poisoned");
@@ -1877,6 +1921,69 @@ mod tests {
         let id1 = stable_row_id(1, b"key1", b"rowdata");
         let id2 = stable_row_id(1, b"key2", b"rowdata");
         assert_ne!(id1, id2);
+    }
+
+    #[tokio::test]
+    async fn weighted_join_restore_preserves_exact_retractions() {
+        let db = Arc::new(
+            ShardDb::builder(
+                "weighted-join-replay",
+                Arc::new(object_store::memory::InMemory::new()),
+            )
+            .build()
+            .await
+            .unwrap(),
+        );
+        let original = JoinOp::new(OperatorId(801), vec![0], vec![0]);
+        assert_eq!(
+            extract_join_output_3col(
+                &original
+                    .process_epoch(make_lr_batch(&[(7, 70, 3)]), make_lr_batch(&[(7, 700, 2)]),)
+                    .unwrap()
+            ),
+            vec![(7, 70, 700, 6)]
+        );
+        original.persist_state(&db).await.unwrap();
+        let recovered = JoinOp::load_from_storage(&db, OperatorId(801))
+            .await
+            .unwrap();
+        assert_eq!(
+            extract_join_output_3col(
+                &recovered
+                    .process_epoch(make_lr_batch(&[(7, 70, -1)]), make_lr_batch(&[]),)
+                    .unwrap()
+            ),
+            vec![(7, 70, 700, -2)]
+        );
+        recovered.persist_state(&db).await.unwrap();
+        // Exercise lazy restoration too: a point-loaded arrangement must use
+        // the same sidecar as a full restored operator.
+        let lazy = JoinOp::new(OperatorId(801), vec![0], vec![0]).with_db(db.clone());
+        let (output, _) = lazy
+            .process_epoch_with_storage(make_lr_batch(&[]), make_lr_batch(&[(7, 700, -1)]))
+            .await
+            .unwrap();
+        assert_eq!(extract_join_output_3col(&output), vec![(7, 70, 700, -2)]);
+        lazy.persist_state(&db).await.unwrap();
+        let recovered = JoinOp::load_from_storage(&db, OperatorId(801))
+            .await
+            .unwrap();
+        assert_eq!(
+            extract_join_output_3col(
+                &recovered
+                    .process_epoch(make_lr_batch(&[(7, 70, -2)]), make_lr_batch(&[]),)
+                    .unwrap()
+            ),
+            vec![(7, 70, 700, -2)]
+        );
+        recovered.persist_state(&db).await.unwrap();
+        assert_eq!(
+            db.scan_prefix(&ShardKeyEncoder::join_arr_op_prefix(JoinSide::Left, 801))
+                .await
+                .unwrap(),
+            vec![]
+        );
+        db.as_ref().clone().close().await.unwrap();
     }
 
     #[test]
