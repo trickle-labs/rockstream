@@ -90,17 +90,24 @@ fn free_port() -> u16 {
         .port()
 }
 
-async fn serve_jwks(listener: TcpListener, requests: usize) {
+async fn serve_jwks(listener: TcpListener, requests: usize, transient_failures: usize) {
     let mut jwks: serde_json::Value = serde_json::from_str(TEST_JWKS).unwrap();
     jwks["keys"]
         .as_array_mut()
         .unwrap()
         .push(serde_json::from_str(EXPIRED_JWK).unwrap());
     let body = serde_json::to_vec(&jwks).unwrap();
-    for _ in 0..requests {
+    for request_index in 0..requests {
         let (mut stream, _) = listener.accept().await.unwrap();
         let mut request = [0; 2048];
         let _ = stream.read(&mut request).await.unwrap();
+        if request_index < transient_failures {
+            stream
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            continue;
+        }
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
@@ -2206,7 +2213,7 @@ async fn delegated_gateway_sql_rechecks_control_policy_and_recovers_lost_grant_r
     let jwks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let jwks_addr = jwks_listener.local_addr().unwrap();
     let jwks_url = format!("http://{jwks_addr}/jwks");
-    let jwks_task = tokio::spawn(serve_jwks(jwks_listener, 1));
+    let jwks_task = tokio::spawn(serve_jwks(jwks_listener, 1, 0));
     let gateway_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
     let mut gateway_process = start_delegated_oidc_gateway_process(
         &gateway_working_dir,
@@ -4985,7 +4992,7 @@ async fn oidc_password_auth_runs_in_release_process_and_audits_after_restart() {
     let jwks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let jwks_addr = jwks_listener.local_addr().unwrap();
     let jwks_url = format!("http://{jwks_addr}/jwks");
-    let jwks_task = tokio::spawn(serve_jwks(jwks_listener, 3));
+    let jwks_task = tokio::spawn(serve_jwks(jwks_listener, 4, 1));
 
     let address: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
     let mut process = start_gateway_process(
