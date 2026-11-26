@@ -31,8 +31,10 @@ use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 
-use rockstream_storage::{keys::ShardKeyEncoder, ShardDb, WriteBatch};
+use rockstream_storage::{keys::ShardKeyEncoder, MergeOperatorRegistry, ShardDb, WriteBatch};
 use rockstream_types::ids::OperatorId;
+use rockstream_types::laws::weight_add::WeightAddV1;
+use rockstream_types::merge_law::LawBundle;
 
 use crate::error::OpError;
 use crate::op::Operator;
@@ -114,6 +116,35 @@ fn build_output(schema: &SchemaRef, rows: Vec<(Vec<i64>, i64)>) -> Result<ArrowZ
 
 // ─── DistinctOp ──────────────────────────────────────────────────────────────
 
+/// Persistence mode for [`DistinctOp`] (Issue #402 R2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DistinctPersistenceMode {
+    /// Legacy full-row `Put`/`Delete` persistence under `[0x01, 'D', 'S']`.
+    #[default]
+    PutDelete,
+    /// ADR 0004 `WeightAdd/v1` law-native `WriteBatch::merge` persistence under
+    /// `[0x01, 'D', 'W'][op_id:8][row_bytes] -> [0x04][weight_delta: i64 BE]`.
+    WeightMerge,
+}
+
+/// Prefix for `WeightAdd/v1` merge-persisted distinct arrangements: `[0x01, 'D', 'W']`.
+const DISTINCT_WEIGHT_MERGE_PREFIX: [u8; 3] = [0x01, 0x44, 0x57];
+
+fn distinct_weight_merge_prefix(op_id: u64) -> Vec<u8> {
+    let mut prefix = Vec::with_capacity(3 + 8);
+    prefix.extend_from_slice(&DISTINCT_WEIGHT_MERGE_PREFIX);
+    prefix.extend_from_slice(&op_id.to_be_bytes());
+    prefix
+}
+
+fn distinct_weight_merge_key(op_id: u64, row_bytes: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(3 + 8 + row_bytes.len());
+    key.extend_from_slice(&DISTINCT_WEIGHT_MERGE_PREFIX);
+    key.extend_from_slice(&op_id.to_be_bytes());
+    key.extend_from_slice(row_bytes);
+    key
+}
+
 /// In-memory distinct arrangement: `row_key → (accumulated_weight, row_vals)`.
 ///
 /// Only rows with non-zero weight are stored; the arrangement is removed from
@@ -121,15 +152,24 @@ fn build_output(schema: &SchemaRef, rows: Vec<(Vec<i64>, i64)>) -> Result<ArrowZ
 #[derive(Debug, Default)]
 pub struct DistinctState {
     entries: HashMap<Vec<u8>, (i64, Vec<i64>)>,
+    dirty: HashMap<Vec<u8>, u64>,
+    appended_dirty: HashMap<Vec<u8>, u64>,
+    pending_deltas: HashMap<Vec<u8>, i128>,
+    appended_deltas: HashMap<Vec<u8>, i128>,
+    persisted_weights: HashMap<Vec<u8>, i64>,
+    deleted: HashMap<Vec<u8>, u64>,
+    appended_deletions: HashMap<Vec<u8>, u64>,
+    deletion_generation: u64,
+    dirty_generation: u64,
+    deleted_bytes: u64,
+    appended_deletion_bytes: u64,
     state_bytes: u64,
+    mode: DistinctPersistenceMode,
 }
 
 impl DistinctState {
     pub fn new() -> Self {
-        Self {
-            entries: HashMap::new(),
-            state_bytes: 0,
-        }
+        Self::default()
     }
 
     /// Number of live distinct rows (fill level metric).
@@ -139,7 +179,75 @@ impl DistinctState {
 
     /// State bytes metric.
     pub fn state_bytes(&self) -> u64 {
-        self.state_bytes
+        self.state_bytes + self.deleted_bytes + self.appended_deletion_bytes
+    }
+
+    fn apply_delta_inner(
+        &mut self,
+        schema: &SchemaRef,
+        delta: ArrowZSet,
+    ) -> Result<ArrowZSet, OpError> {
+        if delta.is_empty() {
+            return Ok(ArrowZSet::empty(schema.clone()));
+        }
+
+        let mut out_rows: Vec<(Vec<i64>, i64)> = Vec::new();
+
+        for row_idx in 0..delta.num_rows() {
+            let delta_w = delta.weights[row_idx];
+            if delta_w == 0 {
+                continue;
+            }
+            let row_vals = extract_row_vals(&delta.data, row_idx);
+            let key = row_key(&row_vals);
+
+            let old_w = self.entries.get(&key).map(|(w, _)| *w).unwrap_or(0);
+            let new_w = old_w
+                .checked_add(delta_w)
+                .ok_or_else(|| OpError::NumericOverflow {
+                    detail: format!("distinct weight overflow ({old_w} + {delta_w})"),
+                    code: rockstream_types::error_code::RS_1002,
+                })?;
+            let is_new = !self.entries.contains_key(&key);
+            let entry_bytes = (key.len() + 8 + row_vals.len() * 8) as u64;
+
+            *self.pending_deltas.entry(key.clone()).or_insert(0) += i128::from(delta_w);
+
+            // Maintain arrangement (no range delete — point writes only).
+            if new_w != 0 {
+                if is_new {
+                    self.state_bytes += entry_bytes;
+                }
+                if self.deleted.remove(&key).is_some() {
+                    let bytes = (key.len() + std::mem::size_of::<u64>()) as u64;
+                    self.deleted_bytes = self.deleted_bytes.saturating_sub(bytes);
+                }
+                self.dirty_generation = self.dirty_generation.wrapping_add(1);
+                let dirty_gen = self.dirty_generation;
+                self.dirty.insert(key.clone(), dirty_gen);
+                self.entries.insert(key, (new_w, row_vals.clone()));
+            } else if !is_new {
+                self.entries.remove(&key);
+                self.dirty.remove(&key);
+                self.pending_deltas.remove(&key);
+                self.deletion_generation = self.deletion_generation.wrapping_add(1);
+                let generation = self.deletion_generation;
+                let bytes = (key.len() + std::mem::size_of::<u64>()) as u64;
+                if self.deleted.insert(key, generation).is_none() {
+                    self.deleted_bytes += bytes;
+                }
+                self.state_bytes = self.state_bytes.saturating_sub(entry_bytes);
+            }
+
+            // Zero-crossing emission.
+            if old_w <= 0 && new_w > 0 {
+                out_rows.push((row_vals, 1));
+            } else if old_w > 0 && new_w <= 0 {
+                out_rows.push((row_vals, -1));
+            }
+        }
+
+        build_output(schema, out_rows)
     }
 }
 
@@ -164,6 +272,22 @@ impl DistinctOp {
         }
     }
 
+    /// Create a [`DistinctOp`] configured for ADR 0004 `WeightAdd/v1` merge persistence.
+    pub fn with_weight_merge(schema: SchemaRef) -> Self {
+        Self::new(schema).with_persistence_mode(DistinctPersistenceMode::WeightMerge)
+    }
+
+    /// Configure persistence mode (`PutDelete` or `WeightMerge`).
+    pub fn with_persistence_mode(self, mode: DistinctPersistenceMode) -> Self {
+        self.state.lock().unwrap().mode = mode;
+        self
+    }
+
+    /// Active persistence mode.
+    pub fn persistence_mode(&self) -> DistinctPersistenceMode {
+        self.state.lock().unwrap().mode
+    }
+
     /// Current arrangement fill level (distinct row count).
     pub fn fill_level(&self) -> usize {
         self.fill_level.load(Ordering::Relaxed)
@@ -172,6 +296,58 @@ impl DistinctOp {
     /// State bytes metric.
     pub fn state_bytes(&self) -> u64 {
         self.state.lock().unwrap().state_bytes()
+    }
+
+    /// Single-owner zero-lock delta processing (`&mut self`).
+    pub fn process_delta_mut(&mut self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
+        let state = self.state.get_mut().unwrap();
+        let out = state.apply_delta_inner(&self.schema, delta)?;
+        self.fill_level
+            .store(state.entry_count(), Ordering::Relaxed);
+        Ok(out)
+    }
+
+    pub fn ack_persisted_state(&self) {
+        let mut state = self.state.lock().unwrap();
+        for (key, generation) in std::mem::take(&mut state.appended_deletions) {
+            if state.deleted.get(&key) == Some(&generation) {
+                state.deleted.remove(&key);
+                state.deleted_bytes = state
+                    .deleted_bytes
+                    .saturating_sub((key.len() + std::mem::size_of::<u64>()) as u64);
+                state.persisted_weights.remove(&key);
+            }
+        }
+        for (key, generation) in std::mem::take(&mut state.appended_dirty) {
+            if state.dirty.get(&key) == Some(&generation) {
+                state.dirty.remove(&key);
+            }
+            if let Some(w) = state.entries.get(&key).map(|(w, _)| *w) {
+                state.persisted_weights.insert(key, w);
+            }
+        }
+        for (key, ack_delta) in std::mem::take(&mut state.appended_deltas) {
+            if let Some(pending) = state.pending_deltas.get_mut(&key) {
+                *pending -= ack_delta;
+                if *pending == 0 {
+                    state.pending_deltas.remove(&key);
+                }
+            }
+        }
+        state.appended_deletion_bytes = 0;
+    }
+
+    pub async fn restore_in_place(&self, db: &ShardDb, op_id: OperatorId) -> Result<(), OpError> {
+        let restored = load_distinct_state(db, self.schema.clone(), op_id).await?;
+        let mut state = restored.state.into_inner().unwrap();
+        let current_mode = self.state.lock().unwrap().mode;
+        if state.entries.is_empty() {
+            state.mode = current_mode;
+        }
+        self.fill_level
+            .store(state.entry_count(), Ordering::Relaxed);
+        *self.state.lock().unwrap() = state;
+        Ok(())
     }
 }
 
@@ -185,50 +361,11 @@ impl Operator for DistinctOp {
     }
 
     fn process_delta(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
-        if delta.is_empty() {
-            return Ok(ArrowZSet::empty(self.schema.clone()));
-        }
-
         let mut state = self.state.lock().unwrap();
-        let mut out_rows: Vec<(Vec<i64>, i64)> = Vec::new();
-
-        for row_idx in 0..delta.num_rows() {
-            let delta_w = delta.weights[row_idx];
-            if delta_w == 0 {
-                continue;
-            }
-            let row_vals = extract_row_vals(&delta.data, row_idx);
-            let key = row_key(&row_vals);
-
-            let old_w = state.entries.get(&key).map(|(w, _)| *w).unwrap_or(0);
-            let new_w = old_w + delta_w;
-            let is_new = !state.entries.contains_key(&key);
-            let entry_bytes = (key.len() + 8 + row_vals.len() * 8) as u64;
-
-            // Maintain arrangement (no range delete — point writes only).
-            if new_w != 0 {
-                if is_new {
-                    state.state_bytes += entry_bytes;
-                }
-                state.entries.insert(key, (new_w, row_vals.clone()));
-            } else if !is_new {
-                state.entries.remove(&key);
-                state.state_bytes = state.state_bytes.saturating_sub(entry_bytes);
-            }
-
-            // Zero-crossing emission.
-            if old_w <= 0 && new_w > 0 {
-                out_rows.push((row_vals, 1));
-            } else if old_w > 0 && new_w <= 0 {
-                out_rows.push((row_vals, -1));
-            }
-        }
-
+        let out = state.apply_delta_inner(&self.schema, delta)?;
         self.fill_level
             .store(state.entry_count(), Ordering::Relaxed);
-        drop(state);
-
-        build_output(&self.schema, out_rows)
+        Ok(out)
     }
 }
 
@@ -522,26 +659,71 @@ fn decode_distinct_value(bytes: &[u8]) -> Option<(i64, Vec<i64>)> {
 
 /// Persist the DistinctOp arrangement to a ShardDb.
 ///
-/// Uses a WriteBatch with only point writes (no range deletion).
-/// All non-zero entries are written; any previously written entries for
-/// rows that now have zero weight must be explicitly deleted.
+/// Uses a WriteBatch with only point writes/merges/deletes (no range deletion)
+/// proportional to changed/deleted keys rather than the full arrangement.
 pub fn append_distinct_state(
     op: &DistinctOp,
     op_id: OperatorId,
     target: &mut WriteBatch,
 ) -> Result<(), OpError> {
     let batch = {
-        let state = op.state.lock().unwrap();
+        let mut state = op.state.lock().unwrap();
         let mut batch = WriteBatch::new();
 
-        for (row_bytes, (weight, vals)) in &state.entries {
-            if *weight == 0 {
-                continue;
+        state.appended_deletions = state.deleted.clone();
+        state.appended_deletion_bytes = state.deleted_bytes;
+        state.appended_dirty = state.dirty.clone();
+        state.appended_deltas = state.pending_deltas.clone();
+
+        match state.mode {
+            DistinctPersistenceMode::PutDelete => {
+                for row_bytes in state.deleted.keys() {
+                    batch.delete(&ShardKeyEncoder::distinct_key(
+                        op_id.0,
+                        row_hash_u128(row_bytes),
+                    ));
+                }
+
+                for row_bytes in state.dirty.keys() {
+                    if let Some((weight, vals)) = state.entries.get(row_bytes) {
+                        if *weight == 0 {
+                            continue;
+                        }
+                        let hash = row_hash_u128(row_bytes);
+                        let key = ShardKeyEncoder::distinct_key(op_id.0, hash);
+                        let value = encode_distinct_value(*weight, vals);
+                        batch.put(&key, &value);
+                    }
+                }
             }
-            let hash = row_hash_u128(row_bytes);
-            let key = ShardKeyEncoder::distinct_key(op_id.0, hash);
-            let value = encode_distinct_value(*weight, vals);
-            batch.put(&key, &value);
+            DistinctPersistenceMode::WeightMerge => {
+                for row_bytes in state.deleted.keys() {
+                    batch.delete(&distinct_weight_merge_key(op_id.0, row_bytes));
+                }
+
+                for row_bytes in state.dirty.keys() {
+                    if let Some((weight, _)) = state.entries.get(row_bytes) {
+                        if *weight == 0 {
+                            continue;
+                        }
+                        let key = distinct_weight_merge_key(op_id.0, row_bytes);
+                        let delta_i128 = state.pending_deltas.get(row_bytes).copied().unwrap_or(0);
+                        let delta_i64 = i64::try_from(delta_i128).ok();
+                        let use_merge = match (state.persisted_weights.get(row_bytes), delta_i64) {
+                            (Some(&persisted_w), Some(d)) if d != 0 => {
+                                WeightAddV1.admits_reassociation(&[persisted_w, d])
+                            }
+                            _ => false,
+                        };
+                        if use_merge {
+                            let d = delta_i64.expect("checked Some");
+                            batch.merge(&key, &MergeOperatorRegistry::encode_pn_counter(d));
+                        } else {
+                            batch.put(&key, &MergeOperatorRegistry::encode_pn_counter(*weight));
+                        }
+                    }
+                }
+            }
         }
         batch
     };
@@ -560,13 +742,14 @@ pub async fn persist_distinct_state(
     if !batch.is_empty() {
         db.write_batch(batch).await.map_err(OpError::storage)?;
     }
+    op.ack_persisted_state();
     Ok(())
 }
 
 /// Load DistinctOp arrangement from a ShardDb, returning a new DistinctOp.
 ///
-/// Scans the `distinct_op_prefix` for the given operator ID and rebuilds
-/// the in-memory arrangement from the stored entries.
+/// Scans both legacy `PutDelete` and ADR 0004 `WeightMerge` prefixes for the
+/// given operator ID and rebuilds the in-memory arrangement.
 pub async fn load_distinct_state(
     db: &ShardDb,
     schema: arrow::datatypes::SchemaRef,
@@ -575,20 +758,54 @@ pub async fn load_distinct_state(
     let prefix = ShardKeyEncoder::distinct_op_prefix(op_id.0);
     let entries = db.scan_prefix(&prefix).await.map_err(OpError::storage)?;
 
-    let op = DistinctOp::new(schema);
-    let mut state = op.state.lock().unwrap();
+    let wm_prefix = distinct_weight_merge_prefix(op_id.0);
+    let wm_entries = db.scan_prefix(&wm_prefix).await.map_err(OpError::storage)?;
+    let header_len = wm_prefix.len();
 
-    for (_, value_bytes) in entries {
-        if let Some((weight, vals)) = decode_distinct_value(&value_bytes) {
-            if weight != 0 {
-                let row_bytes = row_key(&vals);
-                state.entries.insert(row_bytes, (weight, vals));
+    let op = DistinctOp::new(schema);
+    let count = {
+        let mut state = op.state.lock().unwrap();
+
+        for (_, value_bytes) in entries {
+            if let Some((weight, vals)) = decode_distinct_value(&value_bytes) {
+                if weight != 0 {
+                    let row_bytes = row_key(&vals);
+                    state.state_bytes += (row_bytes.len() + 8 + vals.len() * 8) as u64;
+                    state.persisted_weights.insert(row_bytes.clone(), weight);
+                    state.entries.insert(row_bytes, (weight, vals));
+                }
             }
         }
-    }
 
-    let count = state.entry_count();
-    drop(state);
+        for (key_bytes, value_bytes) in wm_entries {
+            if key_bytes.len() <= header_len {
+                continue;
+            }
+            let row_bytes = &key_bytes[header_len..];
+            if !row_bytes.len().is_multiple_of(8) {
+                continue;
+            }
+            let weight =
+                MergeOperatorRegistry::decode_pn_counter(&value_bytes).ok_or_else(|| {
+                    OpError::storage_error("RS-3009: corrupt distinct WeightAdd/v1 record")
+                })?;
+            state.mode = DistinctPersistenceMode::WeightMerge;
+            if weight != 0 {
+                let vals: Vec<i64> = row_bytes
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|chunk| i64::from_be_bytes(*chunk))
+                    .collect();
+                let row_vec = row_bytes.to_vec();
+                state.state_bytes += (row_vec.len() + 8 + vals.len() * 8) as u64;
+                state.persisted_weights.insert(row_vec.clone(), weight);
+                state.entries.insert(row_vec, (weight, vals));
+            }
+        }
+
+        state.entry_count()
+    };
     op.fill_level.store(count, Ordering::Relaxed);
     Ok(op)
 }
@@ -625,6 +842,8 @@ mod tests {
 
     fn kv_pairs(zset: &ArrowZSet) -> Vec<((i64, i64), i64)> {
         let mut out = Vec::new();
+        zset.validate()
+            .expect("distinct output must have aligned row weights");
         if zset.is_empty() {
             return out;
         }
@@ -640,8 +859,8 @@ mod tests {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        for i in 0..zset.num_rows() {
-            out.push(((k_col.value(i), v_col.value(i)), zset.weights[i]));
+        for (i, &weight) in zset.weights.iter().enumerate() {
+            out.push(((k_col.value(i), v_col.value(i)), weight));
         }
         out.sort_by_key(|(k, _)| *k);
         out

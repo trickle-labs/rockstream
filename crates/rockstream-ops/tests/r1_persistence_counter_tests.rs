@@ -8,8 +8,10 @@ use object_store::local::LocalFileSystem;
 use rockstream_ops::aggregate::{append_agg_state, AggregateOp};
 use rockstream_ops::ArrowZSet;
 use rockstream_storage::keys::{ShardKeyEncoder, ShardPrefix};
-use rockstream_storage::{ShardDb, WriteBatch};
+use rockstream_storage::{MergeOperatorRegistry, ShardDb, WriteBatch};
 use rockstream_types::ids::OperatorId;
+use rockstream_types::laws::sum_count::SUM_COUNT_VERSION;
+use rockstream_types::laws::SUM_COUNT_ID;
 use rockstream_types::metrics::{self, R1PersistenceCounters};
 use rockstream_types::state_mutation::StateMutation;
 
@@ -39,16 +41,22 @@ fn state_key(operator_id: OperatorId, key: i64) -> Vec<u8> {
 }
 
 fn state_value(sum: i64, count: i64) -> Bytes {
-    let mut value = Vec::with_capacity(16);
-    value.extend_from_slice(&sum.to_be_bytes());
-    value.extend_from_slice(&count.to_be_bytes());
-    Bytes::from(value)
+    Bytes::from(MergeOperatorRegistry::encode_sum_count(sum, count))
 }
 
 fn put(operator_id: OperatorId, key: i64, sum: i64, count: i64) -> StateMutation {
     StateMutation::Put {
         key: state_key(operator_id, key),
         value: state_value(sum, count),
+    }
+}
+
+fn merge(operator_id: OperatorId, key: i64, delta_sum: i64, delta_count: i64) -> StateMutation {
+    StateMutation::Merge {
+        key: state_key(operator_id, key),
+        law: SUM_COUNT_ID,
+        law_version: SUM_COUNT_VERSION,
+        operand: state_value(delta_sum, delta_count),
     }
 }
 
@@ -117,10 +125,11 @@ async fn persistence_counters_match_mutations_and_full_state_walks() {
             put(operator_id, 3, 4, 1),
         ]
     );
-    assert_eq!(initial.metrics.logical_mutation_bytes, 99);
+    assert_eq!(initial.metrics.logical_mutation_bytes, 102);
     let mut write = WriteBatch::new();
     append_agg_state(&db, &op, &mut write).await.unwrap();
     db.write_batch(write).await.unwrap();
+    op.clear_dirty_keys();
     db.flush().await.unwrap();
 
     let update = op.process_delta_with_result(batch(&[(1, 10, 1)])).unwrap();
@@ -130,11 +139,12 @@ async fn persistence_counters_match_mutations_and_full_state_walks() {
         &[2.0, 6.0],
         &[-1, 1],
     );
-    assert_eq!(update.state_mutations, vec![put(operator_id, 1, 12, 2)]);
-    assert_eq!(update.metrics.logical_mutation_bytes, 33);
+    assert_eq!(update.state_mutations, vec![merge(operator_id, 1, 10, 1)]);
+    assert_eq!(update.metrics.logical_mutation_bytes, 38);
     let mut write = WriteBatch::new();
     append_agg_state(&db, &op, &mut write).await.unwrap();
     db.write_batch(write).await.unwrap();
+    op.clear_dirty_keys();
     db.flush().await.unwrap();
 
     let delete = op.process_delta_with_result(batch(&[(2, 3, -1)])).unwrap();
@@ -154,6 +164,7 @@ async fn persistence_counters_match_mutations_and_full_state_walks() {
     let mut write = WriteBatch::new();
     append_agg_state(&db, &op, &mut write).await.unwrap();
     db.write_batch(write).await.unwrap();
+    op.clear_dirty_keys();
     db.flush().await.unwrap();
 
     assert_eq!(
@@ -162,7 +173,7 @@ async fn persistence_counters_match_mutations_and_full_state_walks() {
             operator_id,
             R1PersistenceCounters {
                 state_mutations: 5,
-                logical_mutation_bytes: 149,
+                logical_mutation_bytes: 157,
                 dirty_keys: 5,
                 full_state_entries_visited: 0,
             },

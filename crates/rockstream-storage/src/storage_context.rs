@@ -5,9 +5,10 @@
 //! with strict multi-tenant isolation.
 
 use rockstream_types::ids::{ArrangementId, TenantId};
+use rockstream_types::state_budget::{StateBudgetError, WorkerBudgetLedger, WorkerCacheBudget};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 /// Partitioned cache key guaranteeing tenant and security policy isolation.
@@ -141,11 +142,13 @@ pub struct NvmeCacheConfig {
 /// Worker-wide shared storage context managing unified block & index caches.
 pub struct WorkerStorageContext {
     budget_bytes: usize,
+    cache_budget: WorkerCacheBudget,
     blocks: Mutex<LruStore>,
     indexes: Mutex<LruStore>,
     hits: AtomicU64,
     misses: AtomicU64,
     evictions: AtomicU64,
+    registered_shards: AtomicUsize,
     db_cache: Arc<dyn slatedb::db_cache::DbCache>,
     nvme_config: Option<NvmeCacheConfig>,
     filter_bits_per_key: Option<u32>,
@@ -175,6 +178,18 @@ impl WorkerStorageContext {
         // Allocate 70% budget for decoded blocks, 30% for indexes
         let block_budget = (budget_bytes * 7) / 10;
         let index_budget = budget_bytes.saturating_sub(block_budget);
+        Self::from_cache_budget(
+            worker_id,
+            WorkerCacheBudget::new(block_budget, index_budget, 0),
+        )
+    }
+
+    /// Create a worker storage context with explicitly separated RAM decoded block/meta
+    /// caches vs. worker-wide raw object-store disk cache budget.
+    pub fn from_cache_budget(worker_id: &str, cache_budget: WorkerCacheBudget) -> Self {
+        let block_budget = cache_budget.decoded_block_cache_bytes;
+        let index_budget = cache_budget.metadata_index_cache_bytes;
+        let budget_bytes = cache_budget.total_ram_bytes();
 
         let db_cache = crate::slatedb_metrics::instrumented_db_cache_with_capacities(
             worker_id,
@@ -186,22 +201,72 @@ impl WorkerStorageContext {
             .or_else(|| std::env::var_os("ROCKSTREAM_DISK_CACHE_DIR"))
             .map(|dir| NvmeCacheConfig {
                 root_folder: PathBuf::from(dir),
-                max_cache_size_bytes: 16 * 1024 * 1024 * 1024,
+                max_cache_size_bytes: if cache_budget.raw_object_cache_bytes > 0 {
+                    cache_budget.raw_object_cache_bytes
+                } else {
+                    16 * 1024 * 1024 * 1024
+                },
                 part_size_bytes: 4 * 1024 * 1024,
                 cache_puts: true,
             });
 
         Self {
             budget_bytes,
+            cache_budget,
             blocks: Mutex::new(LruStore::new(block_budget)),
             indexes: Mutex::new(LruStore::new(index_budget)),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
+            registered_shards: AtomicUsize::new(0),
             db_cache,
             nvme_config,
             filter_bits_per_key: None,
         }
+    }
+
+    /// Charge this worker-wide cache budget ONCE to `ledger` (`MemoryCategory::BlockAndMetadataCaches`),
+    /// ensuring opening N shards never multiplies cache accounting by N.
+    pub fn charge_to_budget_ledger(
+        &self,
+        ledger: &Arc<WorkerBudgetLedger>,
+    ) -> Result<bool, StateBudgetError> {
+        ledger.charge_shared_cache_once(self.budget_bytes as u64)
+    }
+
+    /// Return the configured split between decoded block, metadata/index, and raw object-store caches.
+    pub fn cache_budget(&self) -> WorkerCacheBudget {
+        let raw_bytes = self
+            .nvme_config
+            .as_ref()
+            .map(|cfg| cfg.max_cache_size_bytes)
+            .unwrap_or(self.cache_budget.raw_object_cache_bytes);
+        WorkerCacheBudget {
+            decoded_block_cache_bytes: self.cache_budget.decoded_block_cache_bytes,
+            metadata_index_cache_bytes: self.cache_budget.metadata_index_cache_bytes,
+            raw_object_cache_bytes: raw_bytes,
+        }
+    }
+
+    /// Register a shard sharing this worker storage context and return the new active shard count.
+    pub fn register_shard(&self) -> usize {
+        self.registered_shards.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Number of shards currently registered against this shared worker storage context.
+    pub fn registered_shards(&self) -> usize {
+        self.registered_shards.load(Ordering::Relaxed)
+    }
+
+    /// Worker-wide raw object-store cache cap divided across `expected_shards` (at least 1)
+    /// so per-shard disk caches never exceed the worker-wide raw cache budget.
+    pub fn per_shard_raw_cache_bytes(&self, expected_shards: usize) -> Option<usize> {
+        let cfg = self.nvme_config.as_ref()?;
+        let divisor = expected_shards.max(1);
+        Some(
+            (cfg.max_cache_size_bytes / divisor)
+                .max(cfg.part_size_bytes.min(cfg.max_cache_size_bytes)),
+        )
     }
 
     /// Configure local NVMe block caching tier for hot SSTable blocks.

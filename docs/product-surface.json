@@ -14,17 +14,24 @@
         "subcommands": [
           {
             "name": "backup",
-            "about": "Point-in-time durable backup operations (create, inspect, verify)",
+            "about": "Create backups through authenticated management; inspect or verify local backup files",
             "subcommands": [
               {
                 "name": "create",
-                "about": "Create a full point-in-time backup",
+                "about": "Create a full point-in-time backup through authenticated management",
                 "options": [
                   {
                     "name": "destination",
                     "help": "Destination directory or URI",
                     "required": true,
                     "value_name": "DESTINATION"
+                  },
+                  {
+                    "name": "idempotency_key",
+                    "long": "idempotency-key",
+                    "help": "UUID reused to retry or reconcile this management backup operation",
+                    "required": false,
+                    "value_name": "IDEMPOTENCY_KEY"
                   }
                 ],
                 "exit_codes": [
@@ -152,7 +159,7 @@
           },
           {
             "name": "checkpoint",
-            "about": "Checkpoint administration and manual triggering",
+            "about": "Checkpoint administration (currently unavailable: no authenticated management endpoint)",
             "subcommands": [
               {
                 "name": "export",
@@ -348,6 +355,13 @@
                 "value_name": "CONTROL"
               },
               {
+                "name": "idempotency_key",
+                "long": "idempotency-key",
+                "help": "UUID reused to retry or reconcile this drain",
+                "required": false,
+                "value_name": "IDEMPOTENCY_KEY"
+              },
+              {
                 "name": "worker_id",
                 "long": "worker-id",
                 "help": "Worker ID to drain",
@@ -402,6 +416,13 @@
                 "help": "Control service URL",
                 "required": false,
                 "value_name": "CONTROL"
+              },
+              {
+                "name": "idempotency_key",
+                "long": "idempotency-key",
+                "help": "UUID reused to retry or reconcile this migration",
+                "required": false,
+                "value_name": "IDEMPOTENCY_KEY"
               },
               {
                 "name": "shard_id",
@@ -633,7 +654,7 @@
           },
           {
             "name": "restore",
-            "about": "Restore a database backup into a clean or authorized destination",
+            "about": "Unavailable until the CLI exposes an authenticated backup-restore endpoint",
             "options": [
               {
                 "name": "source",
@@ -715,11 +736,11 @@
       },
       {
         "name": "audit",
-        "about": "Audit log inspection commands",
+        "about": "Local audit-history commands are unavailable; use authenticated `SHOW SECURITY AUDIT`",
         "subcommands": [
           {
             "name": "query",
-            "about": "Query audit log events matching a filter",
+            "about": "Unavailable for local logs; use authenticated `SHOW SECURITY AUDIT`",
             "options": [
               {
                 "name": "filter",
@@ -764,7 +785,7 @@
           },
           {
             "name": "tail",
-            "about": "Tail recent audit log events",
+            "about": "Unavailable for local logs; use authenticated `SHOW SECURITY AUDIT`",
             "options": [
               {
                 "name": "max",
@@ -856,7 +877,7 @@
       },
       {
         "name": "checkpoint",
-        "about": "Checkpoint inspection commands",
+        "about": "Checkpoint commands (currently unavailable: no authenticated management endpoint)",
         "subcommands": [
           {
             "name": "export",
@@ -1114,6 +1135,13 @@
                     "help": "Control-plane worker-facing TCP address",
                     "required": false,
                     "value_name": "CONTROL"
+                  },
+                  {
+                    "name": "idempotency_key",
+                    "long": "idempotency-key",
+                    "help": "UUID reused to retry or reconcile this drain",
+                    "required": false,
+                    "value_name": "IDEMPOTENCY_KEY"
                   },
                   {
                     "name": "worker_id",
@@ -3255,6 +3283,183 @@
         ]
       },
       {
+        "name": "security",
+        "about": "Offline security administration against the durable catalog",
+        "subcommands": [
+          {
+            "name": "preprovision-admin",
+            "about": "Preprovision the first administrator before opening application listeners",
+            "options": [
+              {
+                "name": "layout",
+                "long": "layout",
+                "help": "Select `all` for `--role all`, or `gateway` for `--role gateway`/`control`",
+                "required": true,
+                "value_name": "LAYOUT",
+                "possible_values": [
+                  "all",
+                  "gateway"
+                ]
+              },
+              {
+                "name": "operation_id",
+                "long": "operation-id",
+                "help": "Stable catalog operation ID to reuse if this command must be retried",
+                "required": true,
+                "value_name": "OPERATION_ID"
+              },
+              {
+                "name": "principal_file",
+                "long": "principal-file",
+                "help": "JSON-serialized SecurityPrincipal containing an enabled interactive cluster administrator",
+                "required": true,
+                "value_name": "PRINCIPAL_FILE"
+              },
+              {
+                "name": "storage",
+                "long": "storage",
+                "help": "Node storage directory used by `start --storage` for this deployment",
+                "required": true,
+                "value_name": "STORAGE"
+              },
+              {
+                "name": "yes",
+                "long": "yes",
+                "help": "Confirm the deployment is stopped and the selected durable store is correct",
+                "required": false,
+                "value_name": "YES",
+                "possible_values": [
+                  "true",
+                  "false"
+                ]
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0002",
+              "RS-0003",
+              "RS-0005"
+            ]
+          },
+          {
+            "name": "recover-admin",
+            "about": "Replace login methods for an existing administrator while the deployment is stopped",
+            "options": [
+              {
+                "name": "layout",
+                "long": "layout",
+                "help": "Select `all` for `--role all`, or `gateway` for `--role gateway`/`control`",
+                "required": true,
+                "value_name": "LAYOUT",
+                "possible_values": [
+                  "all",
+                  "gateway"
+                ]
+              },
+              {
+                "name": "login_methods_file",
+                "long": "login-methods-file",
+                "help": "JSON array of replacement `LoginMethod` entries; contains no plaintext password",
+                "required": true,
+                "value_name": "LOGIN_METHODS_FILE"
+              },
+              {
+                "name": "operation_id",
+                "long": "operation-id",
+                "help": "Stable catalog operation ID to reuse if this command must be retried",
+                "required": true,
+                "value_name": "OPERATION_ID"
+              },
+              {
+                "name": "principal_id",
+                "long": "principal-id",
+                "help": "ID of the existing active cluster administrator to recover",
+                "required": true,
+                "value_name": "PRINCIPAL_ID"
+              },
+              {
+                "name": "storage",
+                "long": "storage",
+                "help": "Node storage directory used by `start --storage` for this deployment",
+                "required": true,
+                "value_name": "STORAGE"
+              },
+              {
+                "name": "yes",
+                "long": "yes",
+                "help": "Confirm the deployment is stopped and the selected durable store is correct",
+                "required": false,
+                "value_name": "YES",
+                "possible_values": [
+                  "true",
+                  "false"
+                ]
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0002",
+              "RS-0003",
+              "RS-0005"
+            ]
+          }
+        ],
+        "exit_codes": [
+          {
+            "code": 0,
+            "title": "Success",
+            "description": "Command completed successfully without error"
+          },
+          {
+            "code": 1,
+            "title": "Execution Error",
+            "description": "Runtime failure or operation error during execution"
+          },
+          {
+            "code": 2,
+            "title": "Usage Error",
+            "description": "Invalid arguments, options, or flags provided to CLI"
+          }
+        ],
+        "error_codes": [
+          "RS-0002",
+          "RS-0003",
+          "RS-0005"
+        ]
+      },
+      {
         "name": "shard",
         "about": "Shard inspection commands",
         "subcommands": [
@@ -3290,6 +3495,13 @@
             "name": "migrate",
             "about": "Migrate a shard to another worker",
             "options": [
+              {
+                "name": "idempotency_key",
+                "long": "idempotency-key",
+                "help": "UUID reused to retry or reconcile this migration",
+                "required": false,
+                "value_name": "IDEMPOTENCY_KEY"
+              },
               {
                 "name": "shard_id",
                 "help": "Shard ID",
@@ -3696,7 +3908,7 @@
           {
             "name": "auth",
             "long": "auth",
-            "help": "Authentication mode. Only `off` is available; others fail closed. Omitted uses `[auth].mode`",
+            "help": "Authentication mode. SCRAM requires an enabled durable login; OIDC uses RS256, limits tokens to 16 KiB, and requires its issuer, audience, TLS, and JWKS settings; mTLS requires its gateway credentials. MD5 is rejected. Omitted uses `[auth].mode`",
             "required": false,
             "value_name": "AUTH",
             "possible_values": [
@@ -3724,7 +3936,7 @@
           {
             "name": "control",
             "long": "control",
-            "help": "Control service URL (required for the worker and frontier roles)",
+            "help": "Control service URL (required for the worker, frontier, and compactor roles)",
             "required": false,
             "value_name": "CONTROL"
           },
@@ -3881,7 +4093,8 @@
               "all",
               "gateway",
               "worker",
-              "control"
+              "control",
+              "compactor"
             ]
           },
           {
@@ -3989,11 +4202,128 @@
       },
       {
         "name": "support",
-        "about": "Diagnostic support commands",
+        "about": "Generate actor-bound support artifacts through the authenticated management API",
         "subcommands": [
           {
+            "name": "artifact",
+            "about": "Generate or download an actor-bound management support artifact",
+            "subcommands": [
+              {
+                "name": "create",
+                "about": "Generate a sanitized artifact through the authenticated management API",
+                "options": [
+                  {
+                    "name": "idempotency_key",
+                    "long": "idempotency-key",
+                    "help": "Client-generated identity used to retry or reconcile this request",
+                    "required": false,
+                    "value_name": "IDEMPOTENCY_KEY"
+                  },
+                  {
+                    "name": "node_id",
+                    "long": "node-id",
+                    "help": "Optional node scope; omit to capture cluster metadata",
+                    "required": false,
+                    "value_name": "NODE_ID"
+                  }
+                ],
+                "exit_codes": [
+                  {
+                    "code": 0,
+                    "title": "Success",
+                    "description": "Command completed successfully without error"
+                  },
+                  {
+                    "code": 1,
+                    "title": "Execution Error",
+                    "description": "Runtime failure or operation error during execution"
+                  },
+                  {
+                    "code": 2,
+                    "title": "Usage Error",
+                    "description": "Invalid arguments, options, or flags provided to CLI"
+                  }
+                ],
+                "error_codes": [
+                  "RS-0001",
+                  "RS-1001",
+                  "RS-1012",
+                  "RS-1013",
+                  "RS-2001"
+                ]
+              },
+              {
+                "name": "download",
+                "about": "Download an artifact returned by `support artifact create`",
+                "options": [
+                  {
+                    "name": "opaque_id",
+                    "help": "Opaque artifact UUID returned by the management API",
+                    "required": true,
+                    "value_name": "OPAQUE_ID"
+                  },
+                  {
+                    "name": "out",
+                    "long": "out",
+                    "help": "Local destination for the downloaded bytes",
+                    "required": true,
+                    "value_name": "OUT"
+                  }
+                ],
+                "exit_codes": [
+                  {
+                    "code": 0,
+                    "title": "Success",
+                    "description": "Command completed successfully without error"
+                  },
+                  {
+                    "code": 1,
+                    "title": "Execution Error",
+                    "description": "Runtime failure or operation error during execution"
+                  },
+                  {
+                    "code": 2,
+                    "title": "Usage Error",
+                    "description": "Invalid arguments, options, or flags provided to CLI"
+                  }
+                ],
+                "error_codes": [
+                  "RS-0001",
+                  "RS-1001",
+                  "RS-1012",
+                  "RS-1013",
+                  "RS-2001"
+                ]
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0001",
+              "RS-1001",
+              "RS-1012",
+              "RS-1013",
+              "RS-2001"
+            ]
+          },
+          {
             "name": "bundle",
-            "about": "Generate on-demand diagnostic support bundle",
+            "about": "Unavailable without authenticated support authorization; use `support artifact create`",
             "options": [
               {
                 "name": "out",
@@ -4044,7 +4374,7 @@
           },
           {
             "name": "diagnose",
-            "about": "Look up one runtime diagnostic and write its support bundle",
+            "about": "Unavailable without authenticated diagnostic authorization; use `support artifact create`",
             "options": [
               {
                 "name": "code",
@@ -4744,12 +5074,57 @@
   "config_surface": {
     "options": [
       {
+        "key": "auth.actor_assertion_public_key_path",
+        "data_type": "Option<PathBuf>",
+        "default_value": "None",
+        "description": "Matching single-key RSA RS256 public JWK used by control to verify gateway actor assertions",
+        "deprecated": false,
+        "env_var": "ROCKSTREAM_AUTH_ACTOR_ASSERTION_PUBLIC_KEY_PATH",
+        "source_origin": "rockstream-types::config::AuthSection"
+      },
+      {
+        "key": "auth.actor_assertion_signing_key_path",
+        "data_type": "Option<PathBuf>",
+        "default_value": "None",
+        "description": "Dedicated RSA private key used by an authenticated gateway connected to control; use a distinct key pair from gateway and internal TLS",
+        "deprecated": false,
+        "env_var": "ROCKSTREAM_AUTH_ACTOR_ASSERTION_SIGNING_KEY_PATH",
+        "source_origin": "rockstream-types::config::AuthSection"
+      },
+      {
         "key": "auth.mode",
         "data_type": "String",
         "default_value": "off",
-        "description": "Explicit --auth overrides this mode; omitted uses it. Only off is currently available; other modes return RS-0002 before gateway startup.",
+        "description": "Explicit --auth selects off, SCRAM, OIDC, or gateway mTLS. SCRAM requires an enabled durable login; OIDC uses RS256 with a 16 KiB token limit; gateway mTLS requires its settings. MD5 is rejected.",
         "deprecated": false,
         "env_var": "ROCKSTREAM_AUTH_MODE",
+        "source_origin": "rockstream-types::config::AuthSection"
+      },
+      {
+        "key": "auth.oidc_audience",
+        "data_type": "Option<String>",
+        "default_value": "None",
+        "description": "Expected audience for RS256 OIDC bearer tokens; required when auth.mode is oidc",
+        "deprecated": false,
+        "env_var": "ROCKSTREAM_AUTH_OIDC_AUDIENCE",
+        "source_origin": "rockstream-types::config::AuthSection"
+      },
+      {
+        "key": "auth.oidc_issuer",
+        "data_type": "Option<String>",
+        "default_value": "None",
+        "description": "Expected issuer for RS256 OIDC bearer tokens; required when auth.mode is oidc",
+        "deprecated": false,
+        "env_var": "ROCKSTREAM_AUTH_OIDC_ISSUER",
+        "source_origin": "rockstream-types::config::AuthSection"
+      },
+      {
+        "key": "auth.oidc_jwks_url",
+        "data_type": "Option<String>",
+        "default_value": "None",
+        "description": "HTTPS or loopback HTTP JWKS endpoint for RS256 tokens; response limit 1 MiB and 100 keys, cache TTL at most 60 seconds honoring shorter issuer lifetime, 5-second fetch timeout, and one retry after 250 milliseconds for transient failures; required when auth.mode is oidc",
+        "deprecated": false,
+        "env_var": "ROCKSTREAM_AUTH_OIDC_JWKS_URL",
         "source_origin": "rockstream-types::config::AuthSection"
       },
       {
@@ -4834,6 +5209,15 @@
         "source_origin": "rockstream-types::config::AutotunerConfig"
       },
       {
+        "key": "node.deployment_id",
+        "data_type": "Option<String>",
+        "default_value": "None",
+        "description": "Shared deployment identifier required by gateway actor assertions; configure the same value on gateway and control",
+        "deprecated": false,
+        "env_var": "ROCKSTREAM_NODE_DEPLOYMENT_ID",
+        "source_origin": "rockstream-types::config::NodeSection"
+      },
+      {
         "key": "scatter_pruning.shard_bloom_budget_bytes",
         "data_type": "usize",
         "default_value": "65536",
@@ -4913,6 +5297,22 @@
         "deprecated": false,
         "env_var": "ROCKSTREAM_OBJECT_STORE_URL",
         "source_origin": "rockstream-storage"
+      },
+      {
+        "key": "worker.exchange_advertise_addr",
+        "data_type": "Option<String>",
+        "default_value": "None",
+        "description": "Reachable host:port registered for worker-to-worker shuffle; must not be a wildcard or use port 0",
+        "deprecated": false,
+        "source_origin": "rockstream-types::config::WorkerSection"
+      },
+      {
+        "key": "worker.exchange_bind_addr",
+        "data_type": "Option<String>",
+        "default_value": "None",
+        "description": "Local socket address for the worker-to-worker shuffle listener; configure with worker.exchange_advertise_addr",
+        "deprecated": false,
+        "source_origin": "rockstream-types::config::WorkerSection"
       }
     ]
   },
@@ -6160,6 +6560,54 @@
         ],
         "stability": "stable",
         "description": "Duration of pgwire queries in milliseconds"
+      },
+      {
+        "name": "security_audit_capacity_bytes",
+        "metric_type": "gauge",
+        "unit": "bytes",
+        "labels": [],
+        "stability": "stable",
+        "description": "Configured deployment-wide security audit retention limit"
+      },
+      {
+        "name": "security_audit_degraded",
+        "metric_type": "gauge",
+        "unit": "boolean",
+        "labels": [],
+        "stability": "stable",
+        "description": "Whether required security audit writes are failing"
+      },
+      {
+        "name": "security_audit_retained_bytes",
+        "metric_type": "gauge",
+        "unit": "bytes",
+        "labels": [],
+        "stability": "stable",
+        "description": "JSON-encoded size of retained security audit records"
+      },
+      {
+        "name": "security_audit_retained_records",
+        "metric_type": "gauge",
+        "unit": "count",
+        "labels": [],
+        "stability": "stable",
+        "description": "Number of retained security audit records"
+      },
+      {
+        "name": "security_audit_transport_capacity",
+        "metric_type": "gauge",
+        "unit": "count",
+        "labels": [],
+        "stability": "stable",
+        "description": "Maximum in-flight worker security audit acknowledgements"
+      },
+      {
+        "name": "security_audit_transport_pending",
+        "metric_type": "gauge",
+        "unit": "count",
+        "labels": [],
+        "stability": "stable",
+        "description": "Worker security audit requests awaiting durable acknowledgement"
       },
       {
         "name": "storage_flush_latency_ms",

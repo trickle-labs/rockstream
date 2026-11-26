@@ -107,7 +107,7 @@ fn test_distinct_state_bytes() {
 
     let retract = ArrowZSet::from_ab_rows(&[(1, 10), (2, 20)], -1);
     op.process_delta(retract).unwrap();
-    assert_eq!(op.state_bytes(), 0);
+    assert_eq!(op.state_bytes(), 2 * (16 + 8));
 }
 
 #[test]

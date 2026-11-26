@@ -65,6 +65,34 @@ async fn lfs_put_get_roundtrip() {
 }
 
 #[tokio::test]
+async fn allocated_epochs_are_not_published_before_a_successful_write() {
+    let dir = TempDir::new().unwrap();
+    let db = lfs_shard(&dir).await;
+    let clone = db.clone();
+    assert_eq!(db.try_next_epoch(), Some(1));
+    assert_eq!(clone.last_epoch().load(Ordering::SeqCst), 0);
+
+    let mut failed = WriteBatch::new();
+    failed.put(&ShardKeyEncoder::frontier_key(), &1u64.to_be_bytes());
+    db.set_fail_writes(true);
+    assert!(db.write_batch(failed).await.is_err());
+    db.set_fail_writes(false);
+    assert_eq!(db.last_epoch().load(Ordering::SeqCst), 0);
+    assert_eq!(clone.try_next_epoch(), Some(2));
+
+    let mut committed = WriteBatch::new();
+    committed.put(&ShardKeyEncoder::frontier_key(), &2u64.to_be_bytes());
+    db.write_batch(committed).await.unwrap();
+    assert_eq!(clone.last_epoch().load(Ordering::SeqCst), 2);
+    db.put(&ShardKeyEncoder::frontier_key(), &8u64.to_be_bytes())
+        .await
+        .unwrap();
+    assert_eq!(db.last_epoch().load(Ordering::SeqCst), 8);
+    assert_eq!(clone.try_next_epoch(), Some(9));
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn commit_epoch_boundary_is_rs2060_without_wrap() {
     let dir = TempDir::new().unwrap();
     let db = lfs_shard(&dir).await;
@@ -72,7 +100,7 @@ async fn commit_epoch_boundary_is_rs2060_without_wrap() {
     db.last_epoch().store(u64::MAX - 1, Ordering::SeqCst);
     assert_eq!(db.try_next_epoch(), Some(u64::MAX));
     assert_eq!(db.try_next_epoch(), None);
-    assert_eq!(db.last_epoch().load(Ordering::SeqCst), u64::MAX);
+    assert_eq!(db.last_epoch().load(Ordering::SeqCst), u64::MAX - 1);
 
     db.close().await.unwrap();
 }

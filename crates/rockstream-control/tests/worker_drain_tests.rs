@@ -11,7 +11,7 @@ use rockstream_types::topology::{
     CapacityHeadroom, ControlMessage, NodeRole, WorkerCapabilities, WorkerLifecycleState,
     WorkerMessage, WorkerRegistration,
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 async fn send(addr: std::net::SocketAddr, msg: &WorkerMessage) -> Vec<ControlMessage> {
@@ -57,6 +57,7 @@ async fn register(addr: std::net::SocketAddr, worker_id: u64) -> TcpStream {
     match serde_json::from_str::<ControlMessage>(response.trim()).unwrap() {
         ControlMessage::Registered {
             worker_id: registered,
+            protocol_version: rockstream_types::compatibility::ProtocolVersion::V4,
         } => assert_eq!(registered, WorkerId(worker_id)),
         other => panic!("expected exact registration response, got {other:?}"),
     }
@@ -76,7 +77,11 @@ async fn start_service() -> (
         .with_shard_manager(manager.clone())
         .with_topology_store(Arc::new(TopologyPersistentStore::new(store.clone())))
         .with_migration_store(Arc::new(MigrationPersistentStore::new(store)));
-    let handle = service.start("127.0.0.1:0").await.unwrap();
+    let handle = service
+        .with_insecure_dev_mode()
+        .start("127.0.0.1:0")
+        .await
+        .unwrap();
     (handle, catalog, manager)
 }
 
@@ -193,49 +198,58 @@ async fn decommissioned_worker_removed_from_topology_after_grace_period() {
 }
 
 async fn receive(stream: &mut TcpStream) -> ControlMessage {
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut line))
-        .await
-        .unwrap()
-        .unwrap();
-    serde_json::from_str(line.trim()).unwrap()
+    let mut line = Vec::new();
+    loop {
+        let mut byte = [0];
+        tokio::time::timeout(Duration::from_secs(1), stream.read_exact(&mut byte))
+            .await
+            .unwrap()
+            .unwrap();
+        if byte[0] == b'\n' {
+            break;
+        }
+        line.push(byte[0]);
+    }
+    serde_json::from_slice(&line).unwrap()
 }
 
 async fn wait_for_begin_drain(stream: &mut TcpStream) {
-    for _ in 0..4 {
-        if matches!(receive(stream).await, ControlMessage::BeginDrain(_)) {
-            return;
+    loop {
+        match receive(stream).await {
+            ControlMessage::BeginDrain(_) => return,
+            ControlMessage::TopologyChanged { .. } => {}
+            other => panic!("expected BeginDrain or TopologyChanged, got {other:?}"),
         }
     }
-    panic!("worker did not receive BeginDrain");
 }
 
 async fn acknowledge_next_shard_assignment(stream: &mut TcpStream) -> ShardId {
-    for _ in 0..8 {
-        if let ControlMessage::ShardAssigned {
-            lease,
-            operation_id: Some(operation_id),
-        } = receive(stream).await
-        {
-            let shard_id = lease.shard_id;
-            send_on(
-                stream,
-                &WorkerMessage::ShardTransferAck {
-                    operation_id,
-                    stage: "recipient".to_owned(),
-                    worker_id: lease.worker_id,
-                    shard_id,
-                    lease_token: lease.lease_token,
-                    success: true,
-                    error: None,
-                },
-            )
-            .await;
-            return shard_id;
+    loop {
+        match receive(stream).await {
+            ControlMessage::TopologyChanged { .. } => continue,
+            ControlMessage::ShardAssigned {
+                lease,
+                operation_id: Some(operation_id),
+            } => {
+                let shard_id = lease.shard_id;
+                send_on(
+                    stream,
+                    &WorkerMessage::ShardTransferAck {
+                        operation_id,
+                        stage: "recipient".to_owned(),
+                        worker_id: lease.worker_id,
+                        shard_id,
+                        lease_token: lease.lease_token,
+                        success: true,
+                        error: None,
+                    },
+                )
+                .await;
+                return shard_id;
+            }
+            other => panic!("expected shard assignment or TopologyChanged, got {other:?}"),
         }
     }
-    panic!("recipient did not receive a shard assignment");
 }
 
 async fn send_on(stream: &mut TcpStream, msg: &WorkerMessage) {

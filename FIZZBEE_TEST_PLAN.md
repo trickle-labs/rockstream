@@ -68,6 +68,12 @@ SlateDB `WriteBatch`) and the CALM invariant
 contributing shard's persisted frontier satisfies `frontier ≥ N`, verifiable by
 any reader of the object store with no coordinator).
 
+The durable shuffle catch-up helper currently persists its inbox marker before
+the inlet handoff, outside the operator's epoch commit. The closed-inlet retry
+test covers explicit rejection and retry; it does not establish atomicity with
+operator state or recovery of a marker left before delivery. Concurrent
+catch-up and owning-epoch recovery remain unqualified (issue #321).
+
 Verification targets:
 - `WriteBatch` is **all-or-nothing**: a crash mid-commit leaves the shard at
   epoch `N-1`, never a torn state where the frontier advanced but state did not
@@ -708,6 +714,168 @@ model; no new FizzBee transition or invariant is asserted.
 
 ### 3.6 Cross-Cutting Coverage Assertions
 
+PR #455 (issue #303) changes only malformed control-message diagnostics in
+`crates/rockstream-runtime/src/client.rs`: the read loop still skips invalid
+lines, while logs retain the error code, decoder error, and byte length without
+the raw message. `client::data_plane_tests::invalid_control_message_log_has_exact_redacted_output`
+asserts the complete log record. No coordinator or worker state transitions
+change, so the existing model assumptions remain unchanged.
+
+PR #420 (issue #400) completes the direct distributed execution path across
+`rockstream-control`, `rockstream-runtime`, `rockstream-storage`, and
+`rockstream-sql`. Control-plane `GetWorkloadTopology` exposes a versioned
+`WorkloadTopologySnapshot` (`topology_epoch`, routing columns, schemas, shard
+placements, and worker endpoints) so `DataPlaneClient` partitions rows and
+native `ArrowZSet` batches client-side and streams Arrow IPC `ShuffleFrame`s
+directly to shard owners over `ShuffleClientPool` without routing row payloads
+through `ControlService`. `ConnectorLeaseManager` enforces single-owner
+connector leases (`RS-1701` / `RS-1702`) across gateway replicas.
+`ShardManager::allocate_shard_ids` and `PlacementAlgorithm::assign_shards`
+decouple logical shard counts from worker counts without `workload_id * 16`
+collisions. On the worker hot path, synchronous per-frame `FenceWrite` RPCs are
+replaced by local lease checks plus durable storage-boundary monotonic lease
+fencing (`ShardDb::fence_lease_token` / `ShardDb::verify_lease_token`,
+`RS-1702`), allowing active direct ingestion to continue across control-node
+restarts while rejecting stale-lease writers without mutating committed state.
+Workload deployment also wires bounded application `ExchangeInlet` channels
+into each CLI worker's shared `ExchangeRegistry`.
+
+The corresponding implementation checks are
+`crates/rockstream-control/tests/direct_distributed_execution_400_tests.rs`
+(R1–R6 end-to-end: zero control row payloads, worker exchange inlets,
+single-owner connector leases, distributed SQL planning & `EXPLAIN
+INCREMENTAL`, control-outage ingestion continuity, storage-boundary
+stale-lease fencing, >16-shard collision-free allocation, and stale-topology
+redirect), `crates/rockstream-runtime/tests/worker_heartbeat_and_lease_tests.rs`
+(listener teardown and lease reassignment), and
+`crates/rockstream-cli/tests/r1_real_worker_data_plane_tests.rs` (real CLI
+worker process recovery and dispatch failure boundaries). These extend the
+existing M4 lease fencing and M5/M7 topology assumptions; they are
+implementation-level assertions rather than new FizzBee model transitions.
+
+PR #412 (issue #401) separates shared-object-store read serving and LSM
+compaction from stateful incremental-view-maintenance workers. Control-plane
+`DiscoverShards` exposes each current lease owner, token, object-store prefix,
+and the committed frontier to stateless gateways and dedicated compactors.
+The gateway opens managed-checkpoint SlateDB readers against discovered shard
+stores, refreshes the serving frontier from committed snapshots, and rejects
+queries that cannot satisfy an explicitly requested freshness epoch within a
+bounded wait. Admission limits bound queued and active reads, memory estimates,
+and estimated scanned rows independently of ingestion. In remote-compaction
+mode, workers avoid scheduling inline compaction; the compactor role discovers
+and compacts the same shard stores. Managed checkpoints and
+`CompactionHorizonGuard` are intended to retain SST state needed by serving
+readers, historical queries, backups, and replay dependencies.
+
+The corresponding implementation checks are
+`crates/rockstream-gateway/tests/stateless_serving_tests.rs` (bootstrap,
+frontier freshness, overload, and retention),
+`crates/rockstream-storage/tests/disaggregated_compaction_tests.rs`
+(compaction debt and horizon safeguards),
+`crates/rockstream-cli/tests/compactor_and_gateway_role_tests.rs` (role
+selection and standalone fallback), and
+`crates/rockstream-sim/tests/storage_pressure_admission_tests.rs` (pressure
+behavior). They complement the existing M4 lease fencing and M1/M3 committed
+epoch assumptions; none of M1–M7 currently models asynchronous manifest
+visibility, reader checkpoint renewal, compactor crashes, or SST garbage
+collection. The cited tests are implementation-level assertions, not a
+formal proof that arbitrary reader lag or object-store outages remain safe.
+
+Issue #321 applies M1-S1 to the local SQL path by placing base rows,
+compiled-view output, operator checkpoints, and the shard frontier in one
+write batch. A failed or interrupted commit must restore in-memory operator
+state before later queries or writes proceed. The pgwire durability tests check
+failure, retry, and restart with exact base and view rows; cancellation tests
+exercise the recovery gate. M1 abstracts the batch and does not model compiled
+operators, gateway cancellation, source shuffle ownership, or management
+authentication. Those boundaries require separate qualification.
+
+The gateway records pending source dispatch in the base-row batch and clears it
+after all source requests complete; reads and subsequent writes fail if a
+gateway restarts with that record. Distributed reads also fail when snapshots
+do not contain worker output, rather than report an empty result. The owned
+shuffle path records a source epoch on its anchor before dispatch and
+clears that record only after all target shards report committed execution.
+The process regression stops the gateway with a source request outstanding and
+checks the exact input and post-restart failure.
+Worker execution records distinguish matching committed replays from conflicting
+input. Distributed view reads fail while execution is incomplete or requires
+recovery. The coordinator, gateway, and runtime tests cover ordering, failure,
+restart, closed-inlet delivery, and exact replay. M1 does not model the journal or the
+transport-to-worker handoff; the bare credit-only transport and independent-host
+recovery remain unqualified by these tests.
+
+Issue #303's #309 slice binds control-worker registration to the authenticated
+certificate identity. `control_worker_mtls_tests.rs` covers missing, expired,
+and untrusted certificates, identity mismatch, and role-only rejection; the
+role-only case checks that registration leaves the catalog empty and emits the
+exact denial audit event. `identity.rs::tests::node_identity_worker_matching`
+checks worker-ID matching, and
+`cli/src/lib.rs::tests::default_start_requires_internal_mtls_before_storage_creation`
+checks that default startup rejects plaintext before creating storage. The
+#359 integration also adds versioned RS256 gateway actor assertions bound to a
+60-second expiry, deployment and audience, action and scope, request digest,
+persisted principal revision, and scoped secret-use allowance. Control verifies
+the assertion and rereads the durable principal policy before applying the
+operation. `oidc_release_process_tests.rs` covers policy recheck, delegated SQL,
+and delegated secret use in release processes; `internal_mtls_tests.rs` covers
+current-policy intersection and scoped grants. These authorization transitions
+are not represented by M1–M7, so the concrete tests are not formal proof.
+
+Issue #305 exposes durable security-audit record count, encoded bytes, capacity,
+and write degradation as operational metrics. These are observations of the
+existing audit commit and recovery outcomes; they add no M1–M7 transition or
+authorization rule. `security_audit_metrics_tests.rs::durable_audit_metrics_follow_commit_and_restart`
+and `security_audit_health_tests.rs::audit_storage_degradation_is_visible_without_failing_ready_health`
+check the metric and health surfaces.
+
+PR #445 (issue #305) adds the management `ListSecurityAuditRecords` endpoint
+over the existing durable audit catalog. The handler authorizes
+`SecurityAuditRead` for the requested `AuditRange` and policy revision, binds
+page tokens to that range, and returns bounded versioned-JSON pages. Its
+authorization-denial audit append changes no M1–M7 coordination transition.
+`management.rs::security_audit_history_is_range_authorized_and_paginated`
+checks exact page records, range-bound token rejection, denial status, and the
+normalized denial audit record. This management-query evidence does not
+qualify audit retention, storage-full recovery, or the complete v0.73 audit
+contract.
+
+Issue #304 wires `sasl_plain` references into SQL Kafka sinks. Resolution checks
+the durable consumer grant and secret version; a replacement transactional
+producer is initialized only between sink transactions, before the next view
+delivery. This reuses M3's fencing and durable checkpoint rules without adding
+a sink-state transition. The Docker release test
+`kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_consumers`
+checks pending rows across live rotation, old-credential revocation, exact sink
+results, transaction sequence, and restart recovery. M3 abstracts secret
+authorization and version lookup, so this release test is the concrete evidence
+for that boundary; the remaining #304 policy and bounded-resource criteria stay
+open.
+
+The worker audit append handoff bounds pending acknowledgements by the worker
+message-channel capacity, matches replies to registered request IDs, and clears
+waiters after acknowledgement, enqueue failure, timeout, cancellation, or
+transport shutdown. Only a successful durable acknowledgement lets the append
+return success; capacity exhaustion and other failed outcomes fail closed. The
+runtime tests check the pending/capacity metrics, saturation, and capacity
+recovery after cancellation and acknowledgement. M1–M7 do not model this waiter
+map or channel state, so this is implementation evidence rather than formal
+proof of the append transport or the durable audit store.
+
+`runtime/src/exchange` now provides a worker mTLS listener and client pool.
+`shuffle_mtls_tests.rs` covers invalid peer credentials, worker identity and
+source-shard authorization, audited denial without inlet delivery, and active
+stream continuity while both certificate generations are trusted. Worker
+startup starts the listener, but production does not register `ExchangeInlet`s
+or connect them to compiled pipelines; application result delivery remains
+incomplete. The release-process test covers worker-stream continuity for this
+path. `ExchangeStream` now returns `UNIMPLEMENTED` after identity and protocol
+validation because it has no execution path; `ShuffleStream` is the handler
+that dispatches to registered inlets. This prevents a successful acknowledgment
+for undelivered data, but does not complete production pipeline wiring. M1–M7
+do not model this protocol, so these tests are implementation evidence, not
+formal proof.
+
 Issue #203 replaces the public `aws_kms` provider's ARN/region-derived local
 encryption with signed KMS `Encrypt` and `Decrypt` requests. Both operations
 must send the configured `KeyId`; denied, unavailable, and wrong-key operations
@@ -736,6 +904,13 @@ ACK is not attempted, and observes the new owner commit through frontier 5.
 The token-only model does not represent the numeric report value, Kafka group
 behavior, or the wire response; those details remain in the real-cluster evidence.
 
+PR #367 preserves the empty-snapshot lease-token initialization boundary:
+`ShardManagerSnapshot::default()` starts `next_token` at 1, and the first lease
+after restoring that snapshot must be nonzero. The Rust regression
+`restoring_empty_snapshot_keeps_first_lease_token_nonzero` checks it. M4 models
+token equality and authorization, not numeric token allocation, so this fix does
+not add a coordination transition.
+
 Issue #202 preserves secret readability across failed or interrupted KEK
 rotation in `crates/rockstream-control`. Rotation excludes secret reads and
 mutations, stages every rewrapped envelope, and publishes one atomic SlateDB
@@ -759,14 +934,161 @@ These tests do not claim live KMS or abrupt process-termination qualification.
 Issue #304 persists source/sink secret bindings in `SecretMetadata.source_refs`
 and retains sink bindings in `CatalogSinkEntry.secret_name`. Source/sink DDL
 adds and removes those references; `DROP SECRET` combines persisted and cached
-references and rejects deletion with `RS-2426` while a binding remains. This is
-catalog metadata lifecycle coverage, not a new M1–M7 coordination transition.
-The `test_secret_references_survive_store_reopen` regression in
+references and rejects deletion with `RS-2426` while a binding remains. The
+gateway pgoutput worker rechecks the durable secret version at transaction
+boundaries, resolves a changed value under the consumer's current grant, and
+reconnects only after the epoch result, source checkpoint, and slot ACK commit.
+The worker process and committed result state remain in place. The Docker-backed
+`pgoutput_secret_rotation_keeps_release_worker_alive_and_recovers_results`
+release-process test rotates credentials with an upstream transaction pending,
+checks the complete result multiset including duplicate and NULL rows, drops the
+committed rotation response, and retries with the same client-visible
+`rockstream.idempotency_key`; reuse of that key for a different request is
+rejected. It verifies the post-rotation checkpoint, redacted `SHOW SECRETS`,
+and complete results after gateway restart. The control-store
+`secret_rotation_reconciles_a_committed_audit_after_restart` test separately
+checks operation and audit recovery. Kafka source/sink runtime rotation remains
+unqualified and blocked: SQL `CREATE SINK` does not configure the experimental
+runtime adapter, and there is no supported release-process route for the
+multi-view sink case. The `test_secret_references_survive_store_reopen` regression in
 `crates/rockstream-control/tests/secrets_lifecycle_tests.rs` verifies that a
 reopened store retains the reference and continues to reject secret deletion.
 The `sink_secret_reference_blocks_secret_drop_until_sink_drop` regression in
 `crates/rockstream-gateway/src/server.rs` verifies that a sink binding blocks
 deletion until `DROP SINK` removes it.
+
+PR #450 adds a 1 MiB serialized worker-secret payload cap and a per-worker cache
+cap of 1,024 entries and 64 MiB across active and pending generations.
+`secrets_lifecycle_tests.rs::worker_secret_payload_limit_accepts_exact_bound_and_rejects_overflow`
+and `worker_secret_resolution_tests.rs::worker_accepts_maximum_payload_and_rejects_one_byte_over`
+check exact-bound and overflow rejection without changing the stored secret or
+retained-byte metric. `worker_secret_resolution_tests.rs::worker_resolves_exact_payload_in_memory_and_rejects_wrong_identity`
+checks active/pending promotion, and
+`runtime/src/secrets.rs::cache_byte_admission_counts_active_and_pending_generations`
+checks cache byte-accounting arithmetic, and
+`runtime/src/secrets.rs::expired_cache_entry_does_not_block_replacement_admission`
+verifies that an expired active payload releases its recorded bytes before a
+fresh token is admitted. These worker-local resource bounds add no M1–M7
+coordination transition; the formal models still do not represent cache bytes
+or token admission. This is partial #304 resource-bound evidence, not
+release-process cache-pressure, cancellation/expiry recovery, or complete
+secret-rotation qualification.
+
+Issue #306 keeps release support artifacts sanitized and addresses downloads by
+opaque artifact ID bound to the authenticated principal and scope. The release
+tests compare the complete generated JSON, verify operator-only artifact access
+and denied backup creation, and cover same-key recovery across processes,
+durable operation/audit recovery after process exit, cancellation races, and
+expired-artifact denial and cleanup after restart. The enforced profile is
+10 MiB per artifact, 100 MiB and 2,048 retained artifacts per deployment, and
+10 minutes of availability; a full bound rejects new artifacts without
+eviction. MinIO tests cover shared cross-process budget and request contention.
+These are focused implementation and release-process checks; broader sustained
+pressure qualification and assembled #307 evidence remain outstanding.
+
+The v0.73 principal, grant, and audit changes persist reviewed policy revisions
+with their mutation audit records through the durable catalog. The
+`catalog_security_policy_tests.rs` suite checks exact principal and audit
+recovery through log replay, snapshot recovery, and reopen, along with one-time
+audited bootstrap, stale-revision rejection, last-administrator protection,
+and self-grant denial. `authorization.rs` tests the preset and scoped-grant
+boundaries. The M1–M7 models do not represent principal policy or audit-retention
+state; this change adds no worker, epoch, lease, or sink transition. Release
+endpoint, concurrency, and bounded-retention qualification remains separate
+evidence.
+
+Issue #306 adds the management support-artifact lifecycle. The durable operation
+record binds the client idempotency key to one generation; its reservation and
+payload are persisted before terminal success, and the completion audit must be
+appended before success or artifact bytes are returned. Restart reconciliation
+reuses that operation and pending audit, while bounded cleanup removes expired
+artifacts. If completion loses a transition race to failure or cancellation, the
+request removes its late artifact write; storage-generation checks preserve a
+concurrent replacement. Terminal state and its pending completion audit are
+persisted atomically; retries flush pending audit before returning an artifact.
+`support_artifact_reconciles_durable_boundaries_after_process_exit`,
+`support_artifact_completion_audit_failure_preserves_result_across_processes`,
+and `support_artifact_runs_in_release_process_and_recovers_after_restart` check
+the complete operation, audit, and artifact state across crash and restart
+boundaries. Cleanup runs every second and caps each sweep at 29 seconds, leaving
+time for two passes and a cleanup tick within the 60-second deletion bound;
+`minio_cleanup_at_the_artifact_count_limit_finishes_within_the_bound` exercises
+the maximum count, and `cleanup_rescans_artifacts_that_expire_during_a_sweep`
+checks expiry during cleanup. Each reservation records an object generation in
+ledger format v2; legacy format-v1 entries keep their original object path.
+Retries use a fresh generation path, so expiry and orphan cleanup delete only
+the generation they observed and cannot remove a concurrent retry's object;
+restart cleanup removes unreferenced late writes. M1–M7 do not model this
+management workflow; these tests are implementation evidence, not formal proof.
+Support-artifact fill metrics publish the ledger's retained artifact count and
+recorded bytes alongside their configured limits; `support_artifact_usage_reports_exact_ledger_fill`
+asserts the exact `(2, 18)` count/byte result. This observability adds no
+artifact transition or M1–M7 invariant.
+
+PR #388 (issue #302) hardens the durable catalog audit-append retry
+boundary against concurrent writers. The secret-store rotation audit writer
+and the gateway authentication and authorization audit writers refresh their
+catalog handle after an optimistic-revision conflict, then construct a new
+transaction at the refreshed revision. The shared
+`SECURITY_AUDIT_APPEND_ATTEMPTS` limit remains eight attempts; exhausted
+retries, refresh failures, and other storage errors fail rather than
+acknowledging an audit append that was not committed. Secret-store failures
+also mark the security-audit storage health metric as degraded. The regression
+`secret_rotation_refreshes_catalog_after_a_concurrent_audit_append` in
+`secrets_management_durability_tests.rs` and
+`gateway_security_audit_writers_refresh_after_catalog_conflicts` in
+`crates/rockstream-gateway/src/server.rs` check that a stale writer
+refreshes after another catalog handle commits, preserves earlier audit
+records, and advances the catalog revision. This is a catalog revision/retry
+boundary outside the M1–M7 worker, lease, frontier, and sink state machines;
+the tests do not establish unbounded contention liveness, crash durability,
+or assembled release-process qualification.
+
+Issue #350 (PR #397) qualifies the four shared-slot PostgreSQL `pgoutput`
+recovery boundaries in `crates/rockstream-gateway/tests/cdc_transaction_atomicity_tests.rs`:
+pre-M3 crash (`restart-before-m3`), durable-M3/pre-slot-ACK crash
+(`restart-after-m3-before-slot-ack`), mid-envelope three-table replication
+disconnect/reconnect (`three-table-disconnect-resume`), and incompatible schema
+rejection before commit (`schema-change-before-commit`). When a transport
+disconnect occurs mid-envelope, `SharedPgOutputCoordinator::discard_interrupted_envelope`
+clears both spilled and in-memory uncommitted change buffers before
+`SourceRuntimeCoordinator::reopen_pgoutput_after_disconnect` reconnects under
+the same fenced owner lease. This refines the M3 shared-slot recovery boundary
+without altering the abstract FizzBee state machines.
+
+Issue #348 (PR #396) enforces a coordinator-owned `pending_ack` and
+`blocked_reason` gate in `SourceRuntimeCoordinator`. After a durable M3 source
+commit succeeds, `pending_ack` blocks new snapshot or delta polling and M3
+commits until `acknowledge_recovered` reconciles the committed epoch and offset
+with the upstream source and awaits `resume`. During PostgreSQL `pgoutput`
+recovery, `open_pgoutput`, table validation, confirmed-LSN inspection, and
+credential rotation remain permitted under the active owner lease so the slot
+can be opened and validated before `acknowledge_recovered` clears `pending_ack`.
+This refines the M3 post-commit source-acknowledgement recovery boundary without
+adding new formal transitions.
+
+PR #408 (issue #303) upgrades the control-worker data-plane read protocol to
+`ProtocolVersion::V4` (`WORKLOAD_SNAPSHOT_VERSION = 1`). When the gateway reads
+a distributed workload snapshot, `ControlService` verifies that all deployment
+shards are ready, checks each shard's active `ShardManager` lease owner and
+token, and fans `ControlMessage::ReadWorkload` out to the owning workers. Each
+worker verifies its local deployment and active shard lease before materializing
+the durable SlateDB view rows and returning `WorkerMessage::WorkloadReadReport`.
+Control rejects incomplete or lease-mismatched reports and returns the complete
+snapshot to the gateway, preserving duplicate multiplicities and NULL values.
+This read-path coordination does not alter the M1–M7 commit, frontier, sink, or
+lease state machines.
+
+Issue #305 strengthens the file-backed audit append boundary in
+`crates/rockstream-control/src/audit.rs`. `FileAuditLog::append` writes each
+JSONL event and calls `sync_all` on the file before returning success. On Unix,
+the first append per writer also syncs the containing directory, covering
+creation of the audit-log name. The round-trip test closes and reopens the log
+and compares the complete ordered events. This is an implementation-level file
+durability property, not a new M1–M7 transition. It does not make the audit
+append atomic with the protected mutation, prove recovery after abrupt process
+death, or ensure callers report append errors when they discard them; those
+remain outside this slice.
 
 Issue #276 qualifies the local filesystem object-store durability boundary below
 the M1–M7 coordination state machines. Runtime, migration, and validated-file
@@ -835,6 +1157,39 @@ cluster evidence without a new abstract invariant or a general CDC guarantee
 (`docs/testing/postgres-cdc-kafka-minio-v1.md`). The adjacent spill-governor
 atomic compatibility annotation changes no coordination transition.
 
+Issue #338's partitioned `postgres_cdc` retention contract refines M3's
+external source admission and ACK boundary, not M3's abstract record-level
+transition. A partitioned source published without
+`publish_via_partition_root = true` is rejected with `RS-4013` before the
+gateway accepts child-relation changes as parent-table data. A `pgoutput`
+TRUNCATE frame lacks row images, so the legacy row-only decoder fails closed
+with `RS-4015` before acknowledging the containing transaction. The
+relation-aware gateway instead reconstructs bounded row retractions from local
+committed images, applying them atomically with the slot checkpoint (issue #339).
+Neither path may silently advance the slot LSN or leave stale aggregates
+presented as correct.
+The M3 abstraction still requires durable input/output/checkpoint coupling
+before source acknowledgement, but does not model PostgreSQL relation OIDs,
+publication modes, partition DDL, or historical window state. Source-side
+DETACH/DROP PARTITION emits no row-level retractions, and a fresh snapshot of
+retained partitions cannot reconstruct already-pruned historical aggregates.
+These limitations must remain explicit instead of asserting a new abstract
+exactly-once or historical-resnapshot property.
+
+Concrete evidence: `postgres_cdc::tests::pgoutput_truncate_row_only_paths_fail_closed_and_event_decodes`
+checks row-only rejection and relation-aware frame decoding;
+`postgres_cdc::tests::pgoutput_truncate_decodes_relations_flags_and_rejects_malformed_frames`
+checks strict relation and flag validation;
+`postgres_cdc::tests::partitioned_sources_require_root_publication_identity`
+checks the admission guard; and the real PostgreSQL 16
+`postgres_cdc_partition_retention_tests::partitioned_pgoutput_requires_root_identity_and_truncate_fails_closed`
+checks parent publication identity, exact initial and post-pruning snapshot
+transcripts, the child INSERT delta, unchanged slot acknowledgement on rejected
+TRUNCATE, and missing-slot recovery refusal. It does **not** test preserving
+closed TUMBLE aggregates through resnapshot, reconstructing missing WAL, or
+publication-level DDL replay. Those require a separate durable-state model
+and end-to-end recovery proof before being claimed.
+
 Issue #122 adds a bounded production view-log adapter to Kafka. The M3 model
 still abstracts epochs, not row contents. The adapter persists the full pending
 envelope and view cursor before Kafka commit, then finalizes progress. Restart
@@ -891,10 +1246,10 @@ RSS limits. The fixed-owner capacity/retry behavior in
 `formal/edge_quota_exhaustion.fizz` remains an abstraction, not a model of
 futures or per-channel notifier identity. This documents the formal boundary
 required by DC.2. Linux workers now report `MemAvailable / MemTotal` from
-`/proc/meminfo` when both values parse, falling back to the existing
-`sysconf` ratio otherwise; `linux_memory_headroom_uses_memavailable` checks
-the ratio. Registration and heartbeat reports feed the advisory placement
-tie-break, without reserving memory or changing shard lease transitions.
+`/proc/meminfo` when both fields parse; missing or malformed data is an error.
+`linux_memory_headroom_uses_available_memory` checks the ratio. Registration
+and heartbeat reports feed the advisory placement tie-break, without reserving
+memory or changing shard lease transitions.
 Cgroup limits and absolute memory bounds remain outside this abstraction; the
 v0.72 resource inventory, producer-side pressure and release-process evidence
 remain incomplete.
@@ -1026,6 +1381,33 @@ sequential and both barrier-synchronized concurrent schedules are asserted by
 in `crates/rockstream-control/src/checkpoint.rs`: exactly one complete callback,
 matching latest committed manifest, and zero remaining alignment credits.
 
+Issue #402 aligns worker execution, storage persistence, and resource control
+with O(affected data) work without altering the abstract M1–M7 coordination
+state machines. In `rockstream-storage`, `MergeTag::SumCount` (`0x05`) extends
+the ADR 0004 merge operator across `ShardDb` and every `ShardReader` path so
+aggregate sum/count deltas persist via blind merge operands within the existing
+M1 atomic `WriteBatch` commit boundary, while `MeteredObjectStore` and
+`PhysicalWriteTracker` on `ShardDb` / `StorageContext` measure physical
+object-store bytes without changing durable prefixes or commit ordering. In
+`rockstream-runtime`, `WorkerResourceController` and RSS-calibrated
+`SourcePressureController` account for process RSS, local disk usage, and
+shared SlateDB cache budgets; `FairChunkScheduler` cooperatively schedules
+`ResumableChunkedOp` tasks (such as `ResumableJoinEpoch`, which commits
+arrangement updates atomically only upon completion and leaves arrangements
+unchanged on cancellation); `ShardActorRegistry::register_owned` runs
+single-owner pipelines without per-batch `Mutex` contention; and
+`partition_batch_by_capsule` reuses pre-encoded `BatchKeyCapsule` hashes for
+exchange routing. Exactness, recovery, blind-merge persistence, budget
+calibration, and cancellation rollback are verified by
+`crates/rockstream-storage/tests/issue_402_adr0004_merge_proof_tests.rs`,
+`crates/rockstream-ops/tests/issue_402_scale_invariance_tests.rs`,
+`crates/rockstream-ops/tests/issue_402_fusion_lock_profile_tests.rs`, and
+`crates/rockstream-runtime/tests/issue_402_rss_fairness_stress_tests.rs`.
+These are worker-local storage, execution, and scheduling refinements under the
+DC.2 coupling rule; epoch-commit atomicity, frontier publication, and fencing
+transitions in `formal/m1_epoch_commit.fizz`–`formal/m7_control_plane_ha.fizz`
+remain unchanged.
+
 The v0.59.9 physical-commit-group extension is modeled by M1-S8 in
 `formal/m1_epoch_commit.fizz`: logical epochs may stage independently, but the
 published physical frontier advances only after a complete group is durable.
@@ -1069,6 +1451,49 @@ paired process-level assertion is
 management workflow is outside the M1–M7 FizzBee state machines, but is
 documented here to keep the runtime protocol and verification inventory
 synchronized.
+
+PR #411 (issues #406 and #352) extends the management protocol to operate
+during active workloads without relaxing shard ownership. `MigrateShard` and
+`DrainWorker` use a bounded source-delta handoff barrier while the donor
+flushes/closes its shard, the lease transfers, the recipient reopens the shard
+and redeploys active workloads, and routing is atomically updated to the new
+owner and lease token. Recovery, rollback, and pre-transfer cancellation share
+the handoff path. This preserves M4's single-authority lease fencing and M6's
+cutover/verification obligations; the implementation-level routing barrier and
+workload redeployment add no new abstract M4/M6 FizzBee action or invariant.
+`online_migrate_shard_moves_active_workload_and_updates_routing_atomically`
+and `online_drain_worker_moves_active_workload_to_healthy_recipient` in
+`crates/rockstream-control/tests/online_migration_backup_streaming_tests.rs`
+exercise the concrete live-worker handoffs.
+
+PR #429 (issue #403) adds `ElasticRebalancePolicy` as a deterministic,
+read-only proposal: it considers healthy active workers with finite headroom,
+compatible protocol and storage formats, and the same shared shard store; it
+requires minimum donor residency and either shard-count imbalance or sustained
+headroom pressure. It proposes one move only after distinct increasing
+frontiers within one membership generation, with a stable operation ID. The
+existing migration executor still revalidates ownership and performs the
+handoff. `transfer_if_owner` compares shard, worker, and lease token while
+preserving the latest mutable heat hint and minting a new fencing token, so
+telemetry updates do not stale a valid handoff and stale owners remain fenced.
+`elastic_scale_out_proposes_one_move_after_distinct_committed_frontiers`,
+`elastic_policy_resets_on_membership_change_and_respects_residency`, and
+`heat_updates_do_not_invalidate_a_fenced_handoff` cover these implementation
+boundaries; the proposal adds no M4/M6 ownership action or invariant.
+
+`CreateBackup` now pins each active shard's durable checkpoint snapshot and
+optional workload-specific object prefix without stopping concurrent writes.
+Its export excludes control manifests newer than the selected checkpoint,
+streams large object inventories and object bytes with bounded buffers, and
+validates hashes before restore; durable GC pins protect selected checkpoints
+and compaction horizons until release. These snapshot, object-store, and
+GC-lifetime details remain outside the M1–M7 coordination abstractions.
+`online_backup_succeeds_with_active_workload_and_concurrent_writes`,
+`concurrent_newer_control_manifest_is_excluded_and_rejected_on_tamper`,
+`gc_pin_protects_active_backup_and_compaction_horizon_until_release`, and
+`large_inventory_and_large_object_streaming_export_and_restore` in the same
+integration suite check the implementation boundaries, rather than claiming
+additional FizzBee proof.
 
 Postgres CDC polling consumes one credit for every queued change in a complete
 transaction, including changes at or before the caller's offset that are
@@ -1121,6 +1546,69 @@ guarantee matrix covered by
 `crates/rockstream-connectors/tests/postgres_cdc_guarantee_matrix_tests.rs` and
 `crates/rockstream-gateway/tests/source_ddl_postgres_kafka_tests.rs`.
 
+Issue #347 refines the **PostgreSQL CDC initial snapshot-to-WAL handoff**:
+`capture_source_snapshot` and `capture_pgoutput_snapshot` now create a
+`pgoutput` logical replication slot through a replication-mode connection with
+an exported snapshot. Before scanning any relation, the read-only
+repeatable-read SQL transaction binds that exported MVCC snapshot via
+`SET TRANSACTION SNAPSHOT`, and the source records the slot's atomic
+`consistent_point` as the snapshot LSN. This replaces the non-atomic pairing
+of an independently opened snapshot transaction and
+`pg_current_wal_lsn()`. All imported relations share the same snapshot and
+fence; changes committed before slot creation appear in the snapshot, while
+subsequent commits are consumed from WAL after the fence, rather than being
+missed or replayed twice.
+
+**Safety / recovery boundary:** an active slot is rejected rather than
+replaced (RS-4013), and a missing checkpointed slot remains fail-closed
+(RS-4011). Snapshot capture must complete before normal CDC processing;
+a checkpointed restart resumes from durable source progress rather than
+creating a new bootstrap snapshot. This refines M3's source progress and
+checkpoint-coupled commit assumptions but does not extend the M1–M7 FizzBee
+models to PostgreSQL MVCC snapshots, replication slots, or WAL records.
+The exact-once handoff obligation is checked against real PostgreSQL by
+`postgres_cdc_synchronized_snapshot_handoff_is_exact_across_restart`
+in `crates/rockstream-connectors/tests/postgres_cdc_guarantee_matrix_tests.rs`
+and `pgoutput_gateway_synchronized_snapshot_handoff_multi_relation_and_restart_exact`
+in `crates/rockstream-gateway/tests/cdc_transaction_atomicity_tests.rs`.
+Together they exercise in-flight commits at slot creation, concurrent
+INSERT/UPDATE/DELETE after snapshot binding, multi-relation gateway/view
+materialization, and checkpointed restart without gaps or duplicates.
+
+Issue #339 extends that **external PostgreSQL pgoutput boundary** with
+transactional `TRUNCATE` semantics. A decoded `T` message retains the enclosing
+XID, relation IDs, and CASCADE / RESTART IDENTITY flags; the source-wide gateway
+stages an ordered marker among INSERT / UPDATE / DELETE records, including when
+the transaction spills. Under the shard commit lock, it expands each affected
+relation's locally committed row images into negative deltas, first overlaying
+earlier changes in the same upstream transaction. Thus `INSERT; TRUNCATE;
+INSERT` retracts the preexisting and first inserted rows, while retaining the
+last INSERT. A multi-relation `T` must retract each imported relation and every
+reachable compiled materialized view in the **same M3 durable epoch** as the
+source checkpoint and frontier advancement; no reader may observe a partial
+truncate. An empty relation contributes no retractions.
+
+**Safety / failure boundary:** if a relation route, row image, or complete
+bounded scan is unavailable, or the expanded transaction exceeds the 65,536
+DML-op / 8 MiB bound, the gateway blocks without advancing PostgreSQL's
+confirmed slot LSN. The legacy row-only decoder cannot obtain these preimages,
+so it rejects `T` and retains the failed frame on retry rather than silently
+acknowledging its COMMIT. This is an implementation-level refinement of M1's
+atomic-WriteBatch and M3's checkpoint-coupled epoch assumptions; the abstract
+M1–M7 FizzBee models do **not** model PostgreSQL relation contents, `T` frames,
+or source-slot state, and therefore do not establish this CDC correctness claim.
+Concrete proof obligations are exercised by
+`pgoutput_truncate_decodes_relations_flags_and_rejects_malformed_frames`,
+`truncate_markers_preserve_order_in_a_spilled_envelope`,
+`truncate_expansion_retracts_preexisting_and_pending_rows_in_wire_order`,
+`truncate_preimage_scan_refuses_oversized_state_without_partial_rows`,
+`postgres_cdc_row_only_truncate_retries_same_frame_without_ack`, and the real
+PostgreSQL gateway test
+`pgoutput_truncate_retracts_nonempty_views_and_survives_gateway_restart`.
+The last test covers nonempty tables, flags, same-transaction ordering,
+multi-relation changes, dependent views, later writes and restart replay; see
+`docs/connectors.md` for the documented operating bounds.
+
 The v0.70 Kafka golden connector provides external streaming ingestion with
 partition offset watermark coordination, bounded buffer consumer groups,
 rebalance fence isolation, and schema policy verification in
@@ -1136,6 +1624,18 @@ SQL catalog tables (`rockstream_catalog.*`). While diagnostic inspection and
 metrics export are outside the internal M1–M7 FizzBee consensus models, health
 and status evaluations reflect durable shard/worker state and are verified by
 integration test suites and deterministic simulation tests.
+
+PR #453 (issue #304) bounds KEK rotation staging at 1,000,000 entries and 64
+MiB of serialized values (including the durable audit outbox record), and caps
+secret-store rotation-lock admissions at 64. An over-limit item is rejected
+before it is added to the durable batch or applied to in-memory secrets. The
+`secret_store.rs` tests `kek_rotation_staging_accepts_exact_limits_and_rejects_overflow`,
+`secret_rotation_waiter_overflow_reports_exact_error_and_fill`, and
+`kek_rotation_staging_gauges_clear_after_drop` check the exact boundary and
+error, waiter fill and rejection, and staging-gauge reset. These are
+implementation-level resource-admission assertions: M1–M7 do not model secret
+rotation or store waiters, so this slice adds no FizzBee transition. Connector
+credential-rotation continuity remains open.
 
 A failing `exists` assertion means the fault is not being explored and the
 corresponding `always` proofs are untrustworthy — treated as a build failure.
@@ -1574,3 +2074,15 @@ complete/truncated/row-over-budget responses and v3 logical-key/failure behavior
 ## v0.72 CLI checkpoint export integrity (#221)
 
 The CLI backup operation selects one committed control checkpoint and must enumerate its required immutable shard manifest, WAL and SST objects before exporting. A merely visible-prefix inventory is insufficient: missing referenced shard storage must fail with a checkpoint-integrity error and must not create a terminal success marker. The management and CLI export paths now share the existing checkpoint-aware inventory; this does not alter M3 cluster checkpoint durability, lease fencing or the committed checkpoint itself. Concrete coverage: `cli_prefix_export_rejects_missing_committed_shard_objects_before_success` deletes a real checkpointed shard before CLI export and requires failure without a commit marker; `lfs_export_restore_fresh_cluster_is_bit_identical` preserves the positive committed state recovery contract. Checkpoint-export error-code aliasing has been corrected: RS-3613 identifies export-in-progress and RS-3614 identifies export/restore failure; RS-5035 remains the cataloged skew-SLO error. This is an operator diagnostics change, not a new checkpoint durability claim.
+
+## Raft heartbeat lease age bounding (#351)
+
+`RaftControlGroup` bounds leader authority by the initiation timestamp (`round_started_at`) of each heartbeat round rather than the response completion timestamp. A delayed quorum acknowledgement whose round began more than `ELECTION_TIMEOUT_MIN` ago cannot refresh `last_quorum_ack`, and the leader steps down when no fresh majority proof remains. This tightens local leader self-fencing to match the M4 monotonic fencing contract without changing durable Raft term/vote persistence or shard lease token monotonicity.
+
+## Consistent control manifest selection during checkpoint export (#352)
+
+`CheckpointExporter` pins the control-plane SlateDB manifest that was visible when the selected `ClusterCheckpoint` was loaded rather than copying a newer control manifest that commits mid-inventory. This ensures the exported control manifest and shard object inventory represent a single consistent committed checkpoint cut under M3 recovery.
+
+## Bounded pgoutput transport and streaming transaction decoding (#349)
+
+`PostgresCdcSource` bounds in-memory binary `COPY OUT` transport frames and decodes active transactions incrementally rather than re-decoding the entire buffered transaction on every event poll. This is a connector transport and memory-bounding optimization that preserves the M1/M3 source checkpoint LSN frontier, transaction boundary atomicity, and restart replay semantics.

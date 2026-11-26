@@ -14,28 +14,49 @@ use rockstream_cli::transport::{
     RemoteTopologyClient, StorageClient,
 };
 use rockstream_cli::{
-    run_admin_backup_create, run_admin_backup_inspect, run_admin_backup_verify, run_admin_restore,
-    run_audit_query, run_audit_tail, run_checkpoint_export, run_checkpoint_list,
+    run_admin_backup_inspect, run_admin_backup_verify, run_checkpoint_export, run_checkpoint_list,
     run_checkpoint_restore, run_checkpoint_show, run_cluster_quotas, run_cluster_status,
     run_completions, run_config_print_effective, run_config_validate, run_debug_arrangement,
     run_demo, run_doctor, run_embedded_query, run_explain_view, run_format_migrate, run_init,
     run_interactive_shell, run_manifest_validate, run_project_apply, run_project_verify,
     run_qualify, run_resource_cluster, run_resource_usage, run_schema_create, run_schema_drop,
     run_schema_evolution_history, run_schema_evolution_status, run_schema_list, run_schema_show,
-    run_source_drop, run_source_list, run_source_pause, run_source_resume, run_source_show,
-    run_sql_compile, run_start, run_support_bundle, run_view_list, run_view_pause, run_view_query,
-    run_view_resume, run_view_show, run_view_status, run_view_subscribe, run_workload_alter,
-    run_workload_create, run_workload_drop, run_workload_list, run_workload_show, DemoOptions,
-    DoctorOptions, InitOptions, StartOptions,
+    run_security_preprovision, run_security_recover_admin, run_source_drop, run_source_list,
+    run_source_pause, run_source_resume, run_source_show, run_sql_compile,
+    run_start_with_dev_transport, run_view_list, run_view_pause, run_view_query, run_view_resume,
+    run_view_show, run_view_status, run_view_subscribe, run_workload_alter, run_workload_create,
+    run_workload_drop, run_workload_list, run_workload_show, DemoOptions, DoctorOptions,
+    InitOptions, StartOptions,
 };
 use rockstream_types::acl::Role as AclRole;
 use rockstream_types::config_resolver::CliConfigOverrides;
 use rockstream_types::topology::{WorkerCapabilities, WorkerLocation};
 
 fn selected_auth_mode(cli_mode: Option<AuthMode>, configured_mode: &str) -> String {
-    cli_mode
-        .map(|mode| mode.to_string())
-        .unwrap_or_else(|| configured_mode.to_string())
+    match cli_mode {
+        Some(AuthMode::Off) if !configured_mode.trim().eq_ignore_ascii_case("off") => {
+            configured_mode.to_string()
+        }
+        Some(mode) => mode.to_string(),
+        None => configured_mode.to_string(),
+    }
+}
+
+fn management_idempotency_key(idempotency_key: Option<uuid::Uuid>) -> uuid::Uuid {
+    let key = idempotency_key.unwrap_or_else(uuid::Uuid::new_v4);
+    eprintln!("Idempotency-Key: {key}");
+    key
+}
+
+fn authenticated_cli_endpoint_unavailable(
+    operation: &str,
+    next_steps: &str,
+) -> rockstream_cli::CliError {
+    rockstream_cli::CliError::new(
+        rockstream_types::error_code::RS_2400,
+        format!("{operation} is unavailable without an authenticated endpoint"),
+        next_steps,
+    )
 }
 
 fn main() -> ExitCode {
@@ -76,20 +97,26 @@ fn main() -> ExitCode {
             AdminCommand::Drain {
                 worker_id,
                 control: ref ctrl_addr,
+                idempotency_key,
                 yes,
             } => run_management(&cli, ctrl_addr.as_deref(), format, |client| {
                 rockstream_cli::prompt_confirmation(
                     &format!("Are you sure you want to drain worker {worker_id}?"),
                     *yes,
                 )?;
-                client.drain_worker(*worker_id)
+                client.drain_worker(*worker_id, management_idempotency_key(*idempotency_key))
             }),
             AdminCommand::Migrate {
                 shard_id,
                 target_worker,
                 control: ref ctrl_addr,
+                idempotency_key,
             } => run_management(&cli, ctrl_addr.as_deref(), format, |client| {
-                client.migrate_shard(*shard_id, *target_worker)
+                client.migrate_shard(
+                    *shard_id,
+                    *target_worker,
+                    management_idempotency_key(*idempotency_key),
+                )
             }),
             AdminCommand::Operation { command } => match command {
                 OperationCommand::List => {
@@ -141,44 +168,45 @@ fn main() -> ExitCode {
                 handle_result(res, format)
             }
             AdminCommand::Backup { ref command } => {
-                if let (BackupCommand::Create { destination }, Some(addr)) =
-                    (command, cli.management.as_deref())
+                if let (
+                    BackupCommand::Create {
+                        destination,
+                        idempotency_key,
+                    },
+                    Some(addr),
+                ) = (command, cli.management.as_deref())
                 {
                     return run_management(&cli, Some(addr), format, |client| {
-                        client.create_backup(destination)
+                        client.create_backup(
+                            destination,
+                            management_idempotency_key(*idempotency_key),
+                        )
                     });
                 }
-                let storage = StorageClient::with_identity(identity.clone());
                 let res = match command {
-                    BackupCommand::Create { destination } => {
-                        let storage_path = cli
-                            .storage_dir
-                            .as_deref()
-                            .unwrap_or_else(|| std::path::Path::new("."));
-                        run_admin_backup_create(format, &storage, storage_path, destination)
-                    }
+                    BackupCommand::Create { .. } => Err(authenticated_cli_endpoint_unavailable(
+                        "local backup creation",
+                        "Configure an authenticated --management endpoint; do not use --identity-role as authorization.",
+                    )),
                     BackupCommand::Inspect { destination } => {
+                        let storage = StorageClient::with_identity(identity.clone());
                         run_admin_backup_inspect(format, &storage, destination)
                     }
                     BackupCommand::Verify { destination } => {
+                        let storage = StorageClient::with_identity(identity.clone());
                         run_admin_backup_verify(format, &storage, destination)
                     }
                 };
                 handle_result(res, format)
             }
             AdminCommand::Restore {
-                ref source,
-                ref target,
-                yes,
+                ..
             } => {
-                let storage = StorageClient::with_identity(identity.clone());
-                let target_path = target
-                    .as_ref()
-                    .map(PathBuf::from)
-                    .or_else(|| cli.storage_dir.clone())
-                    .unwrap_or_else(|| PathBuf::from("."));
                 handle_result(
-                    run_admin_restore(format, &storage, source, &target_path, *yes),
+                    Err(authenticated_cli_endpoint_unavailable(
+                        "backup restore",
+                        "The CLI has no authenticated backup-restore endpoint; do not use --identity-role as authorization.",
+                    )),
                     format,
                 )
             }
@@ -369,6 +397,8 @@ fn main() -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 };
+            let worker_shuffle_enabled = node_config.worker.exchange_bind_addr.is_some()
+                && node_config.worker.exchange_advertise_addr.is_some();
 
             let opts = StartOptions {
                 storage,
@@ -385,7 +415,7 @@ fn main() -> ExitCode {
                 ),
                 worker_capabilities: WorkerCapabilities {
                     same_host_arrow_shm_v1: true,
-                    shuffle_codec_v1: true,
+                    shuffle_codec_v1: worker_shuffle_enabled,
                     checkpoint_manifest_codec_v1: true,
                     shared_shard_store_id: None,
                 },
@@ -404,7 +434,7 @@ fn main() -> ExitCode {
                 query_time_shard_dirs,
                 shutdown_timeout_secs,
             };
-            match run_start(&opts) {
+            match run_start_with_dev_transport(&opts, cli.allow_insecure_internal_dev) {
                 Ok(outcome) => {
                     tracing::info!(
                         audit = %outcome.audit_path.display(),
@@ -537,6 +567,7 @@ fn main() -> ExitCode {
                     WorkerCommand::Drain {
                         control: ctrl_addr,
                         worker_id,
+                        idempotency_key,
                         yes,
                     },
             } => run_management(&cli, ctrl_addr.as_deref(), format, |client| {
@@ -544,7 +575,7 @@ fn main() -> ExitCode {
                     &format!("Are you sure you want to drain worker {worker_id}?"),
                     *yes,
                 )?;
-                client.drain_worker(*worker_id)
+                client.drain_worker(*worker_id, management_idempotency_key(*idempotency_key))
             }),
         },
         Command::Shard { ref command } => match command {
@@ -552,20 +583,21 @@ fn main() -> ExitCode {
             ShardCommand::Show { shard_id } => {
                 run_management(&cli, None, format, |client| client.get_shard(*shard_id))
             }
-            ShardCommand::Migrate { shard_id, to, yes } => {
-                run_management(&cli, None, format, |client| {
-                    rockstream_cli::prompt_confirmation(
-                        &format!(
-                            "Are you sure you want to migrate shard {shard_id} to worker {to}?"
-                        ),
-                        *yes,
-                    )?;
-                    client.migrate_shard(*shard_id, *to)
-                })
-            }
+            ShardCommand::Migrate {
+                shard_id,
+                to,
+                yes,
+                idempotency_key,
+            } => run_management(&cli, None, format, |client| {
+                rockstream_cli::prompt_confirmation(
+                    &format!("Are you sure you want to migrate shard {shard_id} to worker {to}?"),
+                    *yes,
+                )?;
+                client.migrate_shard(*shard_id, *to, management_idempotency_key(*idempotency_key))
+            }),
         },
         Command::Checkpoint { command } => {
-            let storage = StorageClient::with_identity(identity.clone());
+            let storage = RemoteStorageAdminClient::with_identity(identity.clone());
             let storage_path = cli
                 .storage_dir
                 .unwrap_or_else(|| std::path::PathBuf::from("."));
@@ -585,35 +617,31 @@ fn main() -> ExitCode {
             };
             handle_result(res, format)
         }
-        Command::Support { command } => {
-            let storage = StorageClient::with_identity(identity.clone());
-            let storage_path = cli
-                .storage_dir
-                .unwrap_or_else(|| std::path::PathBuf::from("."));
-            let res = match command {
-                SupportCommand::Bundle { view, since, out } => run_support_bundle(
-                    format,
-                    &storage,
-                    &storage_path,
-                    view.as_deref(),
-                    since.as_deref(),
-                    out.as_deref(),
-                ),
-                SupportCommand::Diagnose {
-                    code,
-                    correlation_id,
-                    out,
-                } => rockstream_cli::run_support_diagnose(
-                    format,
-                    &storage,
-                    &storage_path,
-                    code.as_deref(),
-                    correlation_id.as_deref(),
-                    out.as_deref(),
-                ),
-            };
-            handle_result(res, format)
-        }
+        Command::Support { command } => match command {
+            SupportCommand::Artifact { command } => match command {
+                SupportArtifactCommand::Create {
+                    node_id,
+                    idempotency_key,
+                } => {
+                    let key = management_idempotency_key(idempotency_key);
+                    run_management(&cli, None, format, |client| {
+                        client.generate_support_artifact(node_id, key)
+                    })
+                }
+                SupportArtifactCommand::Download { opaque_id, out } => {
+                    run_management(&cli, None, format, |client| {
+                        client.download_support_artifact(opaque_id, &out)
+                    })
+                }
+            },
+            SupportCommand::Bundle { .. } | SupportCommand::Diagnose { .. } => handle_result(
+                Err(authenticated_cli_endpoint_unavailable(
+                    "local support bundle and diagnosis",
+                    "Use support artifact create/download through an authenticated management connection; do not use --identity-role as authorization.",
+                )),
+                format,
+            ),
+        },
         Command::Resource { command } => {
             let identity = identity.clone();
             let catalog = make_catalog_client(&cli, identity);
@@ -634,19 +662,57 @@ fn main() -> ExitCode {
             };
             handle_result(res, format)
         }
-        Command::Audit { command } => {
-            let storage = StorageClient::with_identity(identity.clone());
-            let storage_path = cli
-                .storage_dir
-                .unwrap_or_else(|| std::path::PathBuf::from("."));
-            let res = match command {
-                AuditCommand::Tail { max } => run_audit_tail(format, &storage, &storage_path, max),
-                AuditCommand::Query { filter, max } => {
-                    run_audit_query(format, &storage, &storage_path, filter.as_deref(), max)
-                }
-            };
-            handle_result(res, format)
-        }
+        Command::Audit { .. } => handle_result(
+            Err(authenticated_cli_endpoint_unavailable(
+                "local audit history",
+                "Use an authenticated pgwire client with SHOW SECURITY AUDIT; local audit output is not scoped to a durable principal.",
+            )),
+            format,
+        ),
+        Command::Security { command } => match command {
+            SecurityCommand::PreprovisionAdministrator {
+                layout,
+                storage,
+                principal_file,
+                operation_id,
+                yes,
+            } => {
+                let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+                handle_result(
+                    runtime.block_on(run_security_preprovision(
+                        format,
+                        &storage,
+                        layout,
+                        &principal_file,
+                        operation_id,
+                        yes,
+                    )),
+                    format,
+                )
+            }
+            SecurityCommand::RecoverAdministratorCredentials {
+                layout,
+                storage,
+                principal_id,
+                login_methods_file,
+                operation_id,
+                yes,
+            } => {
+                let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+                handle_result(
+                    runtime.block_on(run_security_recover_admin(
+                        format,
+                        &storage,
+                        layout,
+                        principal_id,
+                        &login_methods_file,
+                        operation_id,
+                        yes,
+                    )),
+                    format,
+                )
+            }
+        },
         Command::Explain {
             view,
             estimate,
@@ -832,12 +898,20 @@ fn run_management<T>(
 where
     T: serde::Serialize + Formattable,
 {
-    let result = ManagementCliClient::connect(
-        override_addr
-            .or(cli.management.as_deref())
-            .unwrap_or("127.0.0.1:9201"),
-    )
-    .and_then(|mut client| request(&mut client))
+    let result = match tls_config(cli) {
+        Some(tls) => ManagementCliClient::connect(
+            override_addr
+                .or(cli.management.as_deref())
+                .unwrap_or("127.0.0.1:9201"),
+            tls,
+        )
+        .and_then(|mut client| request(&mut client)),
+        None => Err(rockstream_cli::CliError::new(
+            rockstream_types::error_code::RS_2410,
+            "management API requires client mTLS credentials",
+            "Configure --tls-cert-path, --tls-key-path, and --tls-ca-cert-path for the management client.",
+        )),
+    }
     .map(|output| render_output(&output, format));
     handle_result(result, format)
 }
@@ -919,7 +993,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn auth_flag_overrides_config_only_when_explicit() {
+    fn auth_flag_cannot_disable_configured_auth() {
         let cli = Cli::try_parse_from(["rockstream", "start", "--storage", "unused"])
             .expect("start should parse without an explicit auth flag");
         let Command::Start { auth, .. } = cli.command else {
@@ -927,6 +1001,7 @@ mod tests {
         };
         assert_eq!(auth, None);
         assert_eq!(selected_auth_mode(None, "scram"), "scram");
-        assert_eq!(selected_auth_mode(Some(AuthMode::Off), "scram"), "off");
+        assert_eq!(selected_auth_mode(Some(AuthMode::Off), "scram"), "scram");
+        assert_eq!(selected_auth_mode(Some(AuthMode::Scram), "off"), "scram");
     }
 }

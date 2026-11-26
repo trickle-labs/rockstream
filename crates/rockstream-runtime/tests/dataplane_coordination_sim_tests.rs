@@ -118,7 +118,9 @@ async fn test_dataplane_sim_control_node_restart_during_traffic_is_safe() {
     catalog.register(&reg);
 
     let shard_manager = ShardManager::new();
-    let service = ControlService::new(catalog.clone()).with_shard_manager(shard_manager.clone());
+    let service = ControlService::new(catalog.clone())
+        .with_shard_manager(shard_manager.clone())
+        .with_insecure_dev_mode();
     let control_handle = service.start("127.0.0.1:0").await.unwrap();
     let control_addr = control_handle.addr;
 
@@ -163,8 +165,9 @@ async fn test_dataplane_sim_control_node_restart_during_traffic_is_safe() {
     // Phase 3: Control node comes back online
     let new_catalog = TopologyCatalog::new();
     new_catalog.register(&reg);
-    let new_service =
-        ControlService::new(new_catalog.clone()).with_shard_manager(ShardManager::new());
+    let new_service = ControlService::new(new_catalog.clone())
+        .with_shard_manager(ShardManager::new())
+        .with_insecure_dev_mode();
     let restarted_handle = new_service.start(&control_addr.to_string()).await;
 
     // Direct data plane reads worker durable state directly

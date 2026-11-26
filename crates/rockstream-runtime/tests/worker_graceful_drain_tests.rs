@@ -60,6 +60,7 @@ async fn register_worker(addr: std::net::SocketAddr, worker_id: u64) -> TcpStrea
     match serde_json::from_str::<ControlMessage>(response.trim()).unwrap() {
         ControlMessage::Registered {
             worker_id: registered,
+            protocol_version: rockstream_types::compatibility::ProtocolVersion::V4,
         } => {
             assert_eq!(registered, WorkerId(worker_id));
         }
@@ -87,7 +88,9 @@ async fn test_worker_epoch_flush_lease_release_durability() {
     // 2. Start Control Plane and register Worker 1 & Worker 2
     let catalog = TopologyCatalog::new();
     let manager = ShardManager::new();
-    let service = ControlService::new(catalog.clone()).with_shard_manager(manager.clone());
+    let service = ControlService::new(catalog.clone())
+        .with_shard_manager(manager.clone())
+        .with_insecure_dev_mode();
     let handle = service.start("127.0.0.1:0").await.unwrap();
 
     let mut w1_conn = register_worker(handle.addr, 1).await;

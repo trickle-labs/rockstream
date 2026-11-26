@@ -7,7 +7,10 @@ use tokio_postgres::NoTls;
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
 use rockstream_gateway::{
-    catalog_stubs::{CatalogCheckpointEntry, CatalogNodeEntry, CatalogStubs, CatalogView},
+    catalog_stubs::{
+        CatalogCheckpointEntry, CatalogColumn, CatalogNodeEntry, CatalogStubs, CatalogTable,
+        CatalogView,
+    },
     view_reader::{ViewReadStrategy, ViewReader},
     GatewayError, GatewayServer,
 };
@@ -89,6 +92,13 @@ async fn test_catalog_stable_identifiers_survive_restart_lfs() {
 
     // Phase 1: Create catalog state and query system tables
     let catalog1 = Arc::new(CatalogStubs::new());
+    catalog1.add_table(CatalogTable::new(
+        "catalog_source",
+        vec![CatalogColumn {
+            name: "id".to_string(),
+            data_type: "Int64".to_string(),
+        }],
+    ));
     catalog1.add_node(CatalogNodeEntry {
         node_id: "node-lfs-1".to_string(),
         worker_id: "worker-lfs-100".to_string(),
@@ -101,8 +111,11 @@ async fn test_catalog_stable_identifiers_survive_restart_lfs() {
     });
     catalog1.add_view(CatalogView {
         name: "persistent_view".to_string(),
-        sql: "SELECT 1".to_string(),
-        columns: vec![],
+        sql: "SELECT id FROM catalog_source".to_string(),
+        columns: vec![CatalogColumn {
+            name: "id".to_string(),
+            data_type: "Int64".to_string(),
+        }],
         namespace: "public".to_string(),
         op_id: Some(999),
     });
@@ -147,6 +160,13 @@ async fn test_catalog_stable_identifiers_survive_restart_lfs() {
 
     // Phase 2: Start new gateway instance with recreated catalog pointing to same identifiers
     let catalog2 = Arc::new(CatalogStubs::new());
+    catalog2.add_table(CatalogTable::new(
+        "catalog_source",
+        vec![CatalogColumn {
+            name: "id".to_string(),
+            data_type: "Int64".to_string(),
+        }],
+    ));
     catalog2.add_node(CatalogNodeEntry {
         node_id: "node-lfs-1".to_string(),
         worker_id: "worker-lfs-100".to_string(),
@@ -159,8 +179,11 @@ async fn test_catalog_stable_identifiers_survive_restart_lfs() {
     });
     catalog2.add_view(CatalogView {
         name: "persistent_view".to_string(),
-        sql: "SELECT 1".to_string(),
-        columns: vec![],
+        sql: "SELECT id FROM catalog_source".to_string(),
+        columns: vec![CatalogColumn {
+            name: "id".to_string(),
+            data_type: "Int64".to_string(),
+        }],
         namespace: "public".to_string(),
         op_id: Some(999),
     });

@@ -206,6 +206,10 @@ pub struct BackfillProgress {
     pub estimated_rows: u64,
     pub budget_state: String,
     pub blocked_reason: Option<String>,
+    /// True when a zero-downtime `CREATE OR REPLACE MATERIALIZED VIEW`
+    /// backfill is running in the background while the live view remains
+    /// published and continuously queryable.
+    pub replacing: bool,
 }
 
 impl BackfillProgress {
@@ -217,6 +221,7 @@ impl BackfillProgress {
             estimated_rows: 0,
             budget_state: "ADMITTED".to_string(),
             blocked_reason: None,
+            replacing: false,
         }
     }
 }
@@ -294,6 +299,12 @@ pub struct CatalogSinkEntry {
     pub catalog: String,
     #[serde(default)]
     pub secret_name: Option<String>,
+    #[serde(default)]
+    pub security_protocol: Option<String>,
+    #[serde(default)]
+    pub secret_consumer: Option<rockstream_types::ids::PrincipalId>,
+    #[serde(default)]
+    pub secret_namespace: Option<String>,
     /// Last epoch whose snapshot was committed through this sink (v0.44
     /// slice 10, `EXPLAIN` annotation). `None` until the first snapshot
     /// commits.
@@ -302,6 +313,25 @@ pub struct CatalogSinkEntry {
     /// registrar (glue/hive/rest/ducklake) failed to register the latest
     /// snapshot without failing the sink's commit (DESIGN.md §13.6.5).
     pub state: String,
+}
+
+fn sink_storage_options(entry: &CatalogSinkEntry) -> HashMap<String, String> {
+    let mut options = HashMap::new();
+    if entry.format.eq_ignore_ascii_case("KAFKA") {
+        options.insert("view".to_string(), entry.view.clone());
+        options.insert("brokers".to_string(), entry.path.clone());
+        options.insert("topic".to_string(), entry.catalog.clone());
+        if let Some(max_bytes) = entry.parquet_row_group_bytes {
+            options.insert("max_envelope_bytes".to_string(), max_bytes.to_string());
+        }
+        if let Some(protocol) = &entry.security_protocol {
+            options.insert("security.protocol".to_string(), protocol.clone());
+        }
+    }
+    if let Some(reference) = &entry.secret_name {
+        options.insert("secret".to_string(), reference.clone());
+    }
+    options
 }
 
 /// A source entry registered via `CREATE SOURCE` through the pgwire layer.
@@ -317,6 +347,10 @@ pub struct CatalogSourceEntry {
     pub status: String,
     pub live_offset: String,
     pub live_lag: u64,
+    #[serde(default)]
+    pub secret_consumer: Option<rockstream_types::ids::PrincipalId>,
+    #[serde(default)]
+    pub secret_namespace: Option<String>,
 }
 
 /// Live source registration kept with the catalog under the same lock.  This
@@ -525,6 +559,8 @@ pub struct CatalogStubs {
     /// Serializes producer-side async workload mutations, including durable writes.
     workload_edit_lock: tokio::sync::Mutex<()>,
     table_edit_lock: tokio::sync::Mutex<()>,
+    /// Serializes durable source and sink catalog transactions.
+    connector_edit_lock: tokio::sync::Mutex<()>,
     // Naturally bounded by the number of catalog-defined workloads.
     workload_budgets: RwLock<HashMap<String, Arc<WorkloadBudget>>>,
     view_budgets: RwLock<HashMap<String, Arc<StateBudget>>>,
@@ -605,6 +641,7 @@ impl CatalogStubs {
             workload_catalog: None,
             workload_edit_lock: tokio::sync::Mutex::new(()),
             table_edit_lock: tokio::sync::Mutex::new(()),
+            connector_edit_lock: tokio::sync::Mutex::new(()),
             workload_budgets: RwLock::new(HashMap::new()),
             view_budgets: RwLock::new(HashMap::new()),
             view_states: RwLock::new(HashMap::new()),
@@ -626,6 +663,7 @@ impl CatalogStubs {
             workload_catalog: Some(Arc::clone(&workload_catalog)),
             workload_edit_lock: tokio::sync::Mutex::new(()),
             table_edit_lock: tokio::sync::Mutex::new(()),
+            connector_edit_lock: tokio::sync::Mutex::new(()),
             workload_budgets: RwLock::new(HashMap::new()),
             view_budgets: RwLock::new(HashMap::new()),
             view_states: RwLock::new(HashMap::new()),
@@ -677,6 +715,8 @@ impl CatalogStubs {
     }
 
     /// Reconstruct gateway catalog state from the attached durable catalog store.
+    // Clippy misses the map mutations and explicit guard drops before async persistence.
+    #[allow(clippy::await_holding_lock, clippy::readonly_write_lock)]
     pub async fn sync_from_durable_store(&self) -> Result<(), String> {
         let Some(store) = self.get_durable_store() else {
             return Ok(());
@@ -692,6 +732,7 @@ impl CatalogStubs {
         let workloads = store.list_workloads().await.map_err(|e| e.to_string())?;
         let sources = store.list_sources().await.map_err(|e| e.to_string())?;
         let sinks = store.list_sinks().await.map_err(|e| e.to_string())?;
+        let mut reference_migrations = Vec::new();
 
         let view_deps = store
             .list_view_dependencies()
@@ -798,7 +839,22 @@ impl CatalogStubs {
         }
         inner.sources.clear();
         inner.source_runtime.clear();
-        for s in sources {
+        for mut s in sources {
+            if let Some(reference) = s.options.get_mut("secret") {
+                let Some(canonical) =
+                    rockstream_types::secret::canonical_secret_reference(reference)
+                else {
+                    return Err(
+                        "[RS-4008] durable source has an unsupported secret reference".to_string(),
+                    );
+                };
+                if *reference != canonical {
+                    *reference = canonical;
+                    reference_migrations.push(
+                        rockstream_storage::catalog::CatalogMutation::PutSource(s.clone()),
+                    );
+                }
+            }
             inner.sources.insert(
                 s.name.clone(),
                 CatalogSourceEntry {
@@ -806,10 +862,12 @@ impl CatalogStubs {
                     table_name: s.table_name,
                     source_type: s.connector_type,
                     options: s.options,
-                    format: "json".to_string(),
+                    format: s.format,
                     status: "RUNNING".to_string(),
                     live_offset: "0".to_string(),
                     live_lag: 0,
+                    secret_consumer: s.secret_consumer,
+                    secret_namespace: s.secret_namespace,
                 },
             );
             inner.source_runtime.insert(
@@ -834,27 +892,102 @@ impl CatalogStubs {
             );
         }
         inner.sinks.clear();
-        for s in sinks {
+        for mut s in sinks {
+            let secret_reference = s
+                .secret_reference
+                .clone()
+                .or_else(|| s.options.get("secret").cloned())
+                .map(|reference| {
+                    rockstream_types::secret::canonical_secret_reference(&reference).ok_or_else(
+                        || "durable sink has an unsupported secret reference".to_string(),
+                    )
+                })
+                .transpose()?;
+            if let Some(reference) = secret_reference.as_ref() {
+                let reference_is_current = s.secret_reference.as_ref() == Some(reference)
+                    && s.options.get("secret") == Some(reference);
+                if !reference_is_current {
+                    s.secret_reference = Some(reference.clone());
+                    s.options.insert("secret".to_string(), reference.clone());
+                    reference_migrations.push(
+                        rockstream_storage::catalog::CatalogMutation::PutSink(s.clone()),
+                    );
+                }
+            }
+            let is_kafka = s.sink_type.eq_ignore_ascii_case("KAFKA");
             inner.sinks.insert(
                 s.name.clone(),
                 CatalogSinkEntry {
                     name: s.name.clone(),
-                    view: s.target.clone(),
-                    format: "parquet".to_string(),
-                    path: s.target,
+                    view: if is_kafka {
+                        s.options
+                            .get("view")
+                            .cloned()
+                            .unwrap_or_else(|| s.target.clone())
+                    } else {
+                        s.target.clone()
+                    },
+                    format: if is_kafka { "KAFKA" } else { "parquet" }.to_string(),
+                    path: if is_kafka {
+                        s.options
+                            .get("brokers")
+                            .cloned()
+                            .unwrap_or_else(|| s.target.clone())
+                    } else {
+                        s.target.clone()
+                    },
                     snapshot_interval_epochs: None,
                     snapshot_interval_ms: None,
-                    parquet_row_group_bytes: None,
+                    parquet_row_group_bytes: if is_kafka {
+                        s.options
+                            .get("max_envelope_bytes")
+                            .and_then(|value| value.parse().ok())
+                    } else {
+                        None
+                    },
                     format_version: None,
                     partition_by: vec![],
-                    catalog: "memory".to_string(),
-                    secret_name: None,
+                    catalog: if is_kafka {
+                        s.options
+                            .get("topic")
+                            .cloned()
+                            .unwrap_or_else(|| "memory".to_string())
+                    } else {
+                        "memory".to_string()
+                    },
+                    secret_name: secret_reference,
+                    security_protocol: if is_kafka {
+                        s.options.get("security.protocol").cloned()
+                    } else {
+                        None
+                    },
+                    secret_consumer: s.secret_consumer,
+                    secret_namespace: s.secret_namespace,
                     last_snapshot_epoch: None,
                     state: "OK".to_string(),
                 },
             );
         }
         drop(inner);
+        if !reference_migrations.is_empty() {
+            let revision = store
+                .get_revision()
+                .await
+                .checked_add(1)
+                .ok_or_else(|| "durable catalog revision exhausted".to_string())?;
+            let transaction = rockstream_storage::catalog::CatalogTxn::new(
+                revision,
+                rand::random::<u64>().max(1),
+                reference_migrations,
+            )
+            .map_err(|error| error.to_string())?;
+            store
+                .commit_txn(transaction)
+                .await
+                .map_err(|error| error.to_string())?;
+            self.catalog_revision
+                .store(revision, std::sync::atomic::Ordering::SeqCst);
+        }
         self.projection_cache.write().unwrap().clear();
         Ok(())
     }
@@ -1638,6 +1771,42 @@ impl CatalogStubs {
         removed
     }
 
+    /// Persist a table deletion before removing its SQL-visible definition.
+    pub async fn remove_table_durably(&self, name: &str) -> Result<bool, String> {
+        let _edit = self.table_edit_lock.lock().await;
+        if !self.inner.read().unwrap().tables.contains_key(name) {
+            return Ok(false);
+        }
+        let Some(store) = self.get_durable_store() else {
+            return Ok(self.remove_table(name));
+        };
+
+        use rockstream_storage::catalog::CatalogStore;
+        let revision = store
+            .get_revision()
+            .await
+            .checked_add(1)
+            .ok_or_else(|| "durable catalog revision exhausted".to_string())?;
+        let tid = rockstream_types::ids::TableId(rockstream_storage::catalog::stable_name_id(
+            "table", name,
+        ));
+        let txn = rockstream_storage::catalog::CatalogTxn::new(
+            revision,
+            revision,
+            vec![rockstream_storage::catalog::CatalogMutation::DeleteTable(
+                tid,
+            )],
+        )
+        .map_err(|error| error.to_string())?;
+        let committed_revision = store
+            .commit_txn(txn)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.inner.write().unwrap().tables.remove(name);
+        self.set_revision(committed_revision);
+        Ok(true)
+    }
+
     /// Add a schema to the catalog (CREATE SCHEMA).
     pub fn add_schema(&self, name: &str) -> bool {
         let mut inner = self.inner.write().unwrap();
@@ -1836,17 +2005,121 @@ impl CatalogStubs {
             .unwrap_or_default()
     }
 
+    async fn commit_connector_mutation_locked(
+        &self,
+        mutation: rockstream_storage::catalog::CatalogMutation,
+    ) -> Result<u64, String> {
+        use rockstream_storage::catalog::CatalogStore;
+
+        let store = self
+            .get_durable_store()
+            .ok_or_else(|| "durable connector catalog is unavailable".to_string())?;
+        let revision = store
+            .get_revision()
+            .await
+            .checked_add(1)
+            .ok_or_else(|| "durable catalog revision exhausted".to_string())?;
+        let transaction = rockstream_storage::catalog::CatalogTxn::new(
+            revision,
+            rand::random::<u64>().max(1),
+            vec![mutation],
+        )
+        .map_err(|error| error.to_string())?;
+        let committed_revision = store
+            .commit_txn(transaction)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.catalog_revision
+            .store(committed_revision, std::sync::atomic::Ordering::SeqCst);
+        Ok(committed_revision)
+    }
+
     /// Register a new sink. Returns `false` if a sink with the same name and a
     /// different view already exists.
     pub fn add_sink(&self, entry: CatalogSinkEntry) -> bool {
+        self.add_sink_inner(entry, true)
+    }
+
+    fn add_sink_inner(&self, mut entry: CatalogSinkEntry, persist: bool) -> bool {
+        if let Some(reference) = entry.secret_name.as_deref() {
+            let Some(canonical) = rockstream_types::secret::canonical_secret_reference(reference)
+            else {
+                return false;
+            };
+            entry.secret_name = Some(canonical);
+        }
         let mut inner = self.inner.write().unwrap();
         if let Some(existing) = inner.sinks.get(&entry.name) {
             if existing.view != entry.view {
                 return false;
             }
         }
+        let storage_entry = rockstream_storage::catalog::CatalogSinkEntry {
+            id: rockstream_types::ids::SinkId(rockstream_storage::catalog::stable_name_id(
+                "sink",
+                &entry.name,
+            )),
+            name: entry.name.clone(),
+            sink_type: entry.format.clone(),
+            target: entry.path.clone(),
+            options: sink_storage_options(&entry),
+            status: entry.state.clone(),
+            secret_reference: entry.secret_name.clone(),
+            secret_consumer: entry.secret_consumer,
+            secret_namespace: entry.secret_namespace.clone(),
+        };
         inner.sinks.insert(entry.name.clone(), entry);
+        drop(inner);
+        if persist {
+            self.persist_mutations(vec![rockstream_storage::catalog::CatalogMutation::PutSink(
+                storage_entry,
+            )]);
+        }
         true
+    }
+
+    /// Persist a sink binding before exposing it in the gateway catalog.
+    pub async fn add_sink_durable(&self, entry: CatalogSinkEntry) -> Result<bool, String> {
+        let _guard = self.connector_edit_lock.lock().await;
+        if let Some(existing) = self.inner.read().unwrap().sinks.get(&entry.name) {
+            if existing.view != entry.view {
+                return Ok(false);
+            }
+        }
+
+        let mut persisted_entry = entry.clone();
+        if let Some(reference) = persisted_entry.secret_name.as_deref() {
+            let Some(canonical) = rockstream_types::secret::canonical_secret_reference(reference)
+            else {
+                return Err("[RS-4007] sink has an unsupported secret reference".to_string());
+            };
+            persisted_entry.secret_name = Some(canonical);
+        }
+        let storage_entry = rockstream_storage::catalog::CatalogSinkEntry {
+            id: rockstream_types::ids::SinkId(rockstream_storage::catalog::stable_name_id(
+                "sink",
+                &persisted_entry.name,
+            )),
+            name: persisted_entry.name.clone(),
+            sink_type: persisted_entry.format.clone(),
+            target: persisted_entry.path.clone(),
+            options: sink_storage_options(&persisted_entry),
+            status: persisted_entry.state.clone(),
+            secret_reference: persisted_entry.secret_name.clone(),
+            secret_consumer: persisted_entry.secret_consumer,
+            secret_namespace: persisted_entry.secret_namespace.clone(),
+        };
+        let committed_revision = self
+            .commit_connector_mutation_locked(
+                rockstream_storage::catalog::CatalogMutation::PutSink(storage_entry),
+            )
+            .await?;
+        if !self.add_sink_inner(persisted_entry, false) {
+            return Err("[RS-0001] sink catalog changed during durable insertion".to_string());
+        }
+        self.catalog_revision
+            .store(committed_revision, std::sync::atomic::Ordering::SeqCst);
+        Ok(true)
     }
 
     /// Look up a sink by name.
@@ -1857,8 +2130,43 @@ impl CatalogStubs {
 
     /// Remove a sink entry (DROP SINK in a later slice).
     pub fn remove_sink(&self, name: &str) {
+        self.remove_sink_inner(name, true);
+    }
+
+    fn remove_sink_inner(&self, name: &str, persist: bool) -> bool {
         let mut inner = self.inner.write().unwrap();
-        inner.sinks.remove(name);
+        let removed = inner.sinks.remove(name).is_some();
+        drop(inner);
+        if removed && persist {
+            self.persist_mutations(vec![
+                rockstream_storage::catalog::CatalogMutation::DeleteSink(
+                    rockstream_types::ids::SinkId(rockstream_storage::catalog::stable_name_id(
+                        "sink", name,
+                    )),
+                ),
+            ]);
+        }
+        removed
+    }
+
+    /// Durably remove a sink before acknowledging DROP SINK.
+    pub async fn remove_sink_durable(&self, name: &str) -> Result<bool, String> {
+        let _guard = self.connector_edit_lock.lock().await;
+        if !self.inner.read().unwrap().sinks.contains_key(name) {
+            return Ok(false);
+        }
+        let sink_id = rockstream_types::ids::SinkId(rockstream_storage::catalog::stable_name_id(
+            "sink", name,
+        ));
+        let revision = self
+            .commit_connector_mutation_locked(
+                rockstream_storage::catalog::CatalogMutation::DeleteSink(sink_id),
+            )
+            .await?;
+        self.remove_sink_inner(name, false);
+        self.catalog_revision
+            .store(revision, std::sync::atomic::Ordering::SeqCst);
+        Ok(true)
     }
 
     /// List all registered sinks.
@@ -1873,6 +2181,17 @@ impl CatalogStubs {
 
     /// Register a new source. Returns `false` if a source with the same name already exists.
     pub fn add_source(&self, entry: CatalogSourceEntry) -> bool {
+        self.add_source_inner(entry, true)
+    }
+
+    fn add_source_inner(&self, mut entry: CatalogSourceEntry, persist: bool) -> bool {
+        if let Some(reference) = entry.options.get_mut("secret") {
+            let Some(canonical) = rockstream_types::secret::canonical_secret_reference(reference)
+            else {
+                return false;
+            };
+            *reference = canonical;
+        }
         let mut inner = self.inner.write().unwrap();
         if inner.sources.contains_key(&entry.name) {
             return false;
@@ -1910,12 +2229,58 @@ impl CatalogStubs {
             name: entry.name.clone(),
             connector_type: entry.source_type.clone(),
             table_name: entry.table_name.clone(),
+            format: entry.format.clone(),
             options: entry.options.clone(),
+            secret_consumer: entry.secret_consumer,
+            secret_namespace: entry.secret_namespace.clone(),
         };
-        self.persist_mutations(vec![
-            rockstream_storage::catalog::CatalogMutation::PutSource(cat_source),
-        ]);
+        if persist {
+            self.persist_mutations(vec![
+                rockstream_storage::catalog::CatalogMutation::PutSource(cat_source),
+            ]);
+        }
         true
+    }
+
+    /// Persist a source and its secret-consumer scope before exposing it.
+    pub async fn add_source_durable(&self, entry: CatalogSourceEntry) -> Result<bool, String> {
+        let _guard = self.connector_edit_lock.lock().await;
+        if self.inner.read().unwrap().sources.contains_key(&entry.name) {
+            return Ok(false);
+        }
+
+        let mut persisted_entry = entry;
+        if let Some(reference) = persisted_entry.options.get_mut("secret") {
+            let Some(canonical) = rockstream_types::secret::canonical_secret_reference(reference)
+            else {
+                return Err("[RS-4008] source has an unsupported secret reference".to_string());
+            };
+            *reference = canonical;
+        }
+        let source_id = rockstream_types::ids::SourceId(
+            rockstream_storage::catalog::stable_name_id("source", &persisted_entry.name),
+        );
+        let storage_entry = rockstream_storage::catalog::CatalogSourceEntry {
+            id: source_id,
+            name: persisted_entry.name.clone(),
+            connector_type: persisted_entry.source_type.clone(),
+            table_name: persisted_entry.table_name.clone(),
+            format: persisted_entry.format.clone(),
+            options: persisted_entry.options.clone(),
+            secret_consumer: persisted_entry.secret_consumer,
+            secret_namespace: persisted_entry.secret_namespace.clone(),
+        };
+        let committed_revision = self
+            .commit_connector_mutation_locked(
+                rockstream_storage::catalog::CatalogMutation::PutSource(storage_entry),
+            )
+            .await?;
+        if !self.add_source_inner(persisted_entry, false) {
+            return Err("[RS-0001] source catalog changed during durable insertion".to_string());
+        }
+        self.catalog_revision
+            .store(committed_revision, std::sync::atomic::Ordering::SeqCst);
+        Ok(true)
     }
 
     /// Look up a source by name.
@@ -2018,6 +2383,10 @@ impl CatalogStubs {
 
     /// Remove a source entry (DROP SOURCE).
     pub fn remove_source(&self, name: &str) -> bool {
+        self.remove_source_inner(name, true)
+    }
+
+    fn remove_source_inner(&self, name: &str, persist: bool) -> bool {
         let mut inner = self.inner.write().unwrap();
         let removed = inner.sources.remove(name).is_some();
         let runtime_removed = inner.source_runtime.remove(name).is_some();
@@ -2028,14 +2397,36 @@ impl CatalogStubs {
         drop(inner);
         if removed {
             self.invalidate_projection_caches();
-            let sid = rockstream_types::ids::SourceId(rockstream_storage::catalog::stable_name_id(
-                "source", name,
-            ));
-            self.persist_mutations(vec![
-                rockstream_storage::catalog::CatalogMutation::DeleteSource(sid),
-            ]);
+            if persist {
+                let sid = rockstream_types::ids::SourceId(
+                    rockstream_storage::catalog::stable_name_id("source", name),
+                );
+                self.persist_mutations(vec![
+                    rockstream_storage::catalog::CatalogMutation::DeleteSource(sid),
+                ]);
+            }
         }
         removed
+    }
+
+    /// Durably remove a source before acknowledging DROP SOURCE.
+    pub async fn remove_source_durable(&self, name: &str) -> Result<bool, String> {
+        let _guard = self.connector_edit_lock.lock().await;
+        if !self.inner.read().unwrap().sources.contains_key(name) {
+            return Ok(false);
+        }
+        let source_id = rockstream_types::ids::SourceId(
+            rockstream_storage::catalog::stable_name_id("source", name),
+        );
+        let revision = self
+            .commit_connector_mutation_locked(
+                rockstream_storage::catalog::CatalogMutation::DeleteSource(source_id),
+            )
+            .await?;
+        self.remove_source_inner(name, false);
+        self.catalog_revision
+            .store(revision, std::sync::atomic::Ordering::SeqCst);
+        Ok(true)
     }
 
     /// List all registered sources.
@@ -2423,6 +2814,7 @@ impl CatalogStubs {
                 estimated_rows: 0,
                 budget_state: "ADMITTED".to_string(),
                 blocked_reason: None,
+                replacing: false,
             });
         CatalogResponse::rows(
             vec![
@@ -2443,6 +2835,52 @@ impl CatalogStubs {
                 Some(progress.budget_state),
                 progress.blocked_reason,
             ]],
+        )
+    }
+
+    /// Return backfill status rows for all registered views (`SHOW BACKFILL STATUS`
+    /// and `SELECT * FROM rockstream_catalog.backfill_status`).
+    pub fn backfill_status_all_response(&self) -> CatalogResponse {
+        let mut views = self.list_views();
+        views.sort_by(|a, b| a.name.cmp(&b.name));
+        let backfills = self.backfills.read().unwrap();
+        let rows = views
+            .into_iter()
+            .map(|view| {
+                let progress = backfills
+                    .get(&view.name)
+                    .cloned()
+                    .unwrap_or(BackfillProgress {
+                        phase: "RUNNING",
+                        cursor_position: None,
+                        rows_remaining: 0,
+                        estimated_rows: 0,
+                        budget_state: "ADMITTED".to_string(),
+                        blocked_reason: None,
+                        replacing: false,
+                    });
+                vec![
+                    Some(view.name),
+                    Some(progress.phase.to_string()),
+                    progress.cursor_position,
+                    Some(progress.rows_remaining.to_string()),
+                    Some(progress.estimated_rows.to_string()),
+                    Some(progress.budget_state),
+                    progress.blocked_reason,
+                ]
+            })
+            .collect();
+        CatalogResponse::rows(
+            vec![
+                "view_name".to_string(),
+                "phase".to_string(),
+                "cursor_position".to_string(),
+                "rows_remaining".to_string(),
+                "estimated_rows".to_string(),
+                "budget_state".to_string(),
+                "blocked_reason".to_string(),
+            ],
+            rows,
         )
     }
 
@@ -2555,6 +2993,9 @@ impl CatalogStubs {
         }
         if ql.contains("rockstream_catalog.views") {
             return Some(self.catalog_views_response(query, &requested_cols));
+        }
+        if ql.contains("rockstream_catalog.backfill_status") {
+            return Some(self.backfill_status_all_response());
         }
         if ql.contains("rockstream_catalog.operators") {
             return Some(self.catalog_operators_response(query, &requested_cols));
@@ -3125,6 +3566,28 @@ impl CatalogStubs {
             .is_some_and(|progress| progress.cursor_position.is_some())
     }
 
+    /// Start a zero-downtime replacement backfill while keeping the live view
+    /// published and continuously queryable.
+    pub fn begin_replacement_backfill(&self, view_name: &str, estimated_rows: u64) {
+        let mut progress = BackfillProgress::snapshotting();
+        progress.phase = "BACKFILLING";
+        progress.estimated_rows = estimated_rows;
+        progress.rows_remaining = estimated_rows;
+        progress.replacing = true;
+        self.backfills
+            .write()
+            .unwrap()
+            .insert(view_name.to_string(), progress);
+    }
+
+    /// Mark a replacement backfill as catching up prior to atomic cutover.
+    pub fn catch_up_replacement_backfill(&self, view_name: &str) {
+        if let Some(progress) = self.backfills.write().unwrap().get_mut(view_name) {
+            progress.phase = "CATCHING_UP";
+            progress.rows_remaining = 0;
+        }
+    }
+
     /// Publish only after the snapshot/output commit reaches its frontier.
     pub fn publish_backfill(&self, view_name: &str) {
         self.set_view_state(view_name, ViewState::Running);
@@ -3132,16 +3595,18 @@ impl CatalogStubs {
             progress.phase = "RUNNING";
             progress.rows_remaining = 0;
             progress.blocked_reason = None;
+            progress.replacing = false;
         }
     }
 
     /// A view without a tracked materialized backfill is legacy-published.
+    /// Views undergoing a zero-downtime replacement remain published until cutover.
     pub fn is_backfill_published(&self, view_name: &str) -> bool {
         self.backfills
             .read()
             .unwrap()
             .get(view_name)
-            .is_none_or(|progress| progress.phase == "RUNNING")
+            .is_none_or(|progress| progress.phase == "RUNNING" || progress.replacing)
     }
 
     pub fn workload_status_entries(&self) -> Vec<CatalogWorkloadStatusEntry> {
@@ -6362,6 +6827,8 @@ mod tests {
             status: "OK".to_string(),
             live_offset: "0".to_string(),
             live_lag: 0,
+            secret_consumer: None,
+            secret_namespace: None,
         };
 
         assert!(catalog.add_source(source.clone()));

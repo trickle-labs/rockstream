@@ -4,7 +4,7 @@
 //! for integration and unit testing.
 
 use rcgen::{CertificateParams, DnType, IsCa, KeyPair};
-use rockstream_types::identity::{InternalTlsConfig, NodeIdentity};
+use rockstream_types::identity::{InternalTlsConfig, NodeIdentity, NodeRole};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
@@ -19,9 +19,15 @@ pub struct TestPki {
     pub ca_cert_path: PathBuf,
     pub control_cert_path: PathBuf,
     pub control_key_path: PathBuf,
+    pub gateway_cert_path: PathBuf,
+    pub gateway_key_path: PathBuf,
     pub worker_certs: HashMap<u64, (PathBuf, PathBuf)>,
     pub cli_cert_path: PathBuf,
     pub cli_key_path: PathBuf,
+    pub secondary_cli_cert_path: PathBuf,
+    pub secondary_cli_key_path: PathBuf,
+    pub cli_reader_cert_path: PathBuf,
+    pub cli_reader_key_path: PathBuf,
     pub untrusted_ca_cert_path: PathBuf,
     pub untrusted_cert_path: PathBuf,
     pub untrusted_key_path: PathBuf,
@@ -29,11 +35,18 @@ pub struct TestPki {
     pub expired_key_path: PathBuf,
     pub mismatched_cert_path: PathBuf,
     pub mismatched_key_path: PathBuf,
+    pub role_only_worker_cert_path: PathBuf,
+    pub role_only_worker_key_path: PathBuf,
 }
 
 impl TestPki {
     /// Generate a fresh test PKI fixture with all certificates configured.
     pub fn generate() -> Self {
+        Self::generate_with_worker_ids(1..=5)
+    }
+
+    /// Generate a test PKI fixture with certificates for the supplied worker IDs.
+    pub fn generate_with_worker_ids(worker_ids: impl IntoIterator<Item = u64>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let (ca_cert, ca_key) = make_ca("RockStream Test Cluster CA");
         let ca_cert_pem = ca_cert.pem();
@@ -54,9 +67,18 @@ impl TestPki {
         let control_cert_path = write_file(dir.path(), "control.pem", &ctrl_cert_pem);
         let control_key_path = write_file(dir.path(), "control-key.pem", &ctrl_key_pem);
 
+        let (gateway_cert_pem, gateway_key_pem) = make_leaf(
+            &ca_cert,
+            &ca_key,
+            &NodeIdentity::new(NodeRole::Gateway, "gateway-1", None::<String>).to_cn(),
+            vec!["localhost".to_string(), "127.0.0.1".to_string()],
+        );
+        let gateway_cert_path = write_file(dir.path(), "gateway.pem", &gateway_cert_pem);
+        let gateway_key_path = write_file(dir.path(), "gateway-key.pem", &gateway_key_pem);
+
         // Worker certs (workers 1..=5)
         let mut worker_certs = HashMap::new();
-        for id in 1..=5 {
+        for id in worker_ids {
             let (w_cert_pem, w_key_pem) = make_leaf(
                 &ca_cert,
                 &ca_key,
@@ -81,6 +103,25 @@ impl TestPki {
         );
         let cli_cert_path = write_file(dir.path(), "cli.pem", &cli_cert_pem);
         let cli_key_path = write_file(dir.path(), "cli-key.pem", &cli_key_pem);
+
+        let (secondary_cli_cert_pem, secondary_cli_key_pem) = make_leaf(
+            &ca_cert,
+            &ca_key,
+            &NodeIdentity::cli("operator").to_cn(),
+            vec!["localhost".to_string(), "127.0.0.1".to_string()],
+        );
+        let secondary_cli_cert_path =
+            write_file(dir.path(), "secondary-cli.pem", &secondary_cli_cert_pem);
+        let secondary_cli_key_path =
+            write_file(dir.path(), "secondary-cli-key.pem", &secondary_cli_key_pem);
+        let (reader_cert_pem, reader_key_pem) = make_leaf(
+            &ca_cert,
+            &ca_key,
+            &NodeIdentity::cli("reader").to_cn(),
+            vec!["localhost".to_string(), "127.0.0.1".to_string()],
+        );
+        let cli_reader_cert_path = write_file(dir.path(), "cli-reader.pem", &reader_cert_pem);
+        let cli_reader_key_path = write_file(dir.path(), "cli-reader-key.pem", &reader_key_pem);
 
         // Untrusted CA and leaf
         let (untrusted_ca, untrusted_ca_key) = make_ca("Rogue Untrusted CA");
@@ -116,6 +157,23 @@ impl TestPki {
         let mismatched_key_path =
             write_file(dir.path(), "mismatched-worker-key.pem", &mismatched_key_pem);
 
+        let (role_only_worker_cert_pem, role_only_worker_key_pem) = make_leaf(
+            &ca_cert,
+            &ca_key,
+            &NodeIdentity::worker("worker").to_cn(),
+            vec!["localhost".to_string(), "127.0.0.1".to_string()],
+        );
+        let role_only_worker_cert_path = write_file(
+            dir.path(),
+            "role-only-worker.pem",
+            &role_only_worker_cert_pem,
+        );
+        let role_only_worker_key_path = write_file(
+            dir.path(),
+            "role-only-worker-key.pem",
+            &role_only_worker_key_pem,
+        );
+
         Self {
             _dir: dir,
             ca_cert_pem,
@@ -123,9 +181,15 @@ impl TestPki {
             ca_cert_path,
             control_cert_path,
             control_key_path,
+            gateway_cert_path,
+            gateway_key_path,
             worker_certs,
             cli_cert_path,
             cli_key_path,
+            secondary_cli_cert_path,
+            secondary_cli_key_path,
+            cli_reader_cert_path,
+            cli_reader_key_path,
             untrusted_ca_cert_path,
             untrusted_cert_path,
             untrusted_key_path,
@@ -133,6 +197,8 @@ impl TestPki {
             expired_key_path,
             mismatched_cert_path,
             mismatched_key_path,
+            role_only_worker_cert_path,
+            role_only_worker_key_path,
         }
     }
 
@@ -159,6 +225,17 @@ impl TestPki {
         InternalTlsConfig {
             cert_path: Some(cert),
             key_path: Some(key),
+            ca_cert_path: Some(self.ca_cert_path.clone()),
+            client_auth_required: true,
+            reload_enabled: true,
+        }
+    }
+
+    /// Internal TLS configuration for an authenticated gateway peer.
+    pub fn gateway_tls_config(&self) -> InternalTlsConfig {
+        InternalTlsConfig {
+            cert_path: Some(self.gateway_cert_path.clone()),
+            key_path: Some(self.gateway_key_path.clone()),
             ca_cert_path: Some(self.ca_cert_path.clone()),
             client_auth_required: true,
             reload_enabled: true,
@@ -203,6 +280,17 @@ impl TestPki {
         InternalTlsConfig {
             cert_path: Some(self.mismatched_cert_path.clone()),
             key_path: Some(self.mismatched_key_path.clone()),
+            ca_cert_path: Some(self.ca_cert_path.clone()),
+            client_auth_required: true,
+            reload_enabled: true,
+        }
+    }
+
+    /// Internal TLS configuration for a worker certificate without a unique node ID.
+    pub fn role_only_worker_tls_config(&self) -> InternalTlsConfig {
+        InternalTlsConfig {
+            cert_path: Some(self.role_only_worker_cert_path.clone()),
+            key_path: Some(self.role_only_worker_key_path.clone()),
             ca_cert_path: Some(self.ca_cert_path.clone()),
             client_auth_required: true,
             reload_enabled: true,

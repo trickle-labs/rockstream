@@ -14,6 +14,14 @@ pub enum Role {
     Gateway,
     Worker,
     Control,
+    Compactor,
+}
+
+/// Durable catalog layout used by offline security administration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SecurityCatalogLayout {
+    All,
+    Gateway,
 }
 
 impl std::fmt::Display for Role {
@@ -26,6 +34,7 @@ impl std::fmt::Display for Role {
                 Self::Gateway => "gateway",
                 Self::Worker => "worker",
                 Self::Control => "control",
+                Self::Compactor => "compactor",
             }
         )
     }
@@ -92,11 +101,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub storage_dir: Option<PathBuf>,
 
-    /// Principal presented to control-plane and catalog mutations.
+    /// Identity label used by legacy local CLI adapters; not the management API identity.
     #[arg(long, global = true, default_value = "rockstream")]
     pub identity_user: String,
 
-    /// RBAC role presented to control-plane and catalog mutations.
+    /// Legacy local role request; not an authenticated grant.
     #[arg(long, global = true, value_parser = ["viewer", "pipeline-owner", "admin"], default_value = "viewer")]
     pub identity_role: String,
 
@@ -123,6 +132,10 @@ pub struct Cli {
     /// Path to the PEM-encoded CA certificate for internal cluster mTLS.
     #[arg(long = "internal-tls-ca-cert-path", global = true)]
     pub internal_tls_ca_cert_path: Option<PathBuf>,
+
+    /// Allow plaintext internal control traffic for loopback-only development.
+    #[arg(long, global = true)]
+    pub allow_insecure_internal_dev: bool,
 
     #[command(subcommand)]
     pub command: Command,
@@ -181,6 +194,11 @@ pub enum Command {
         #[command(subcommand)]
         command: AdminCommand,
     },
+    /// Offline security administration against the durable catalog.
+    Security {
+        #[command(subcommand)]
+        command: SecurityCommand,
+    },
     /// Developer and offline development tooling.
     Dev {
         #[command(subcommand)]
@@ -213,11 +231,11 @@ pub enum Command {
         #[arg(long, value_enum, default_value_t = Role::All)]
         role: Role,
 
-        /// Control service URL (required for the worker and frontier roles).
+        /// Control service URL (required for the worker, frontier, and compactor roles).
         #[arg(long)]
         control: Option<String>,
 
-        /// Authentication mode. Only `off` is available; others fail closed. Omitted uses `[auth].mode`.
+        /// Authentication mode. SCRAM requires an enabled durable login; OIDC uses RS256, limits tokens to 16 KiB, and requires its issuer, audience, TLS, and JWKS settings; mTLS requires its gateway credentials. MD5 is rejected. Omitted uses `[auth].mode`.
         #[arg(long, value_enum)]
         auth: Option<AuthMode>,
 
@@ -335,7 +353,7 @@ pub enum Command {
         #[command(subcommand)]
         command: ShardCommand,
     },
-    /// Checkpoint inspection commands.
+    /// Checkpoint commands (currently unavailable: no authenticated management endpoint).
     Checkpoint {
         #[command(subcommand)]
         command: CheckpointCommand,
@@ -351,12 +369,12 @@ pub enum Command {
         #[command(subcommand)]
         command: SchemaEvolutionCommand,
     },
-    /// Audit log inspection commands.
+    /// Local audit-history commands are unavailable; use authenticated `SHOW SECURITY AUDIT`.
     Audit {
         #[command(subcommand)]
         command: AuditCommand,
     },
-    /// Diagnostic support commands.
+    /// Generate actor-bound support artifacts through the authenticated management API.
     Support {
         #[command(subcommand)]
         command: SupportCommand,
@@ -729,6 +747,9 @@ pub enum ShardCommand {
         /// Target worker ID.
         #[arg(long)]
         to: u64,
+        /// UUID reused to retry or reconcile this migration.
+        #[arg(long)]
+        idempotency_key: Option<uuid::Uuid>,
         /// Confirm destructive action without interactive prompt.
         #[arg(long)]
         yes: bool,
@@ -766,7 +787,12 @@ pub enum CheckpointCommand {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum SupportCommand {
-    /// Generate on-demand diagnostic support bundle.
+    /// Generate or download an actor-bound management support artifact.
+    Artifact {
+        #[command(subcommand)]
+        command: SupportArtifactCommand,
+    },
+    /// Unavailable without authenticated support authorization; use `support artifact create`.
     Bundle {
         /// Optional view name filter.
         #[arg(long)]
@@ -778,7 +804,7 @@ pub enum SupportCommand {
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// Look up one runtime diagnostic and write its support bundle.
+    /// Unavailable without authenticated diagnostic authorization; use `support artifact create`.
     Diagnose {
         /// Look up the most recent occurrence for this catalog code.
         #[arg(long, conflicts_with = "correlation_id")]
@@ -789,6 +815,27 @@ pub enum SupportCommand {
         /// Output file path for the support bundle.
         #[arg(long)]
         out: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum SupportArtifactCommand {
+    /// Generate a sanitized artifact through the authenticated management API.
+    Create {
+        /// Optional node scope; omit to capture cluster metadata.
+        #[arg(long)]
+        node_id: Option<u64>,
+        /// Client-generated identity used to retry or reconcile this request.
+        #[arg(long)]
+        idempotency_key: Option<uuid::Uuid>,
+    },
+    /// Download an artifact returned by `support artifact create`.
+    Download {
+        /// Opaque artifact UUID returned by the management API.
+        opaque_id: uuid::Uuid,
+        /// Local destination for the downloaded bytes.
+        #[arg(long)]
+        out: PathBuf,
     },
 }
 
@@ -814,13 +861,13 @@ pub enum SchemaEvolutionCommand {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum AuditCommand {
-    /// Tail recent audit log events.
+    /// Unavailable for local logs; use authenticated `SHOW SECURITY AUDIT`.
     Tail {
         /// Maximum events to return (max 1000).
         #[arg(long, default_value_t = 100)]
         max: usize,
     },
-    /// Query audit log events matching a filter.
+    /// Unavailable for local logs; use authenticated `SHOW SECURITY AUDIT`.
     Query {
         /// Substring filter for actor, action, or resource.
         #[arg(long)]
@@ -860,6 +907,9 @@ pub enum WorkerCommand {
         control: Option<String>,
         /// Worker ID to drain.
         worker_id: u64,
+        /// UUID reused to retry or reconcile this drain.
+        #[arg(long)]
+        idempotency_key: Option<uuid::Uuid>,
         /// Confirm destructive action without interactive prompt.
         #[arg(long)]
         yes: bool,
@@ -873,6 +923,9 @@ pub enum AdminCommand {
         /// Worker ID to drain.
         #[arg(long)]
         worker_id: u64,
+        /// UUID reused to retry or reconcile this drain.
+        #[arg(long)]
+        idempotency_key: Option<uuid::Uuid>,
         /// Control service URL.
         #[arg(long)]
         control: Option<String>,
@@ -888,6 +941,9 @@ pub enum AdminCommand {
         /// Target worker ID.
         #[arg(long)]
         target_worker: u64,
+        /// UUID reused to retry or reconcile this migration.
+        #[arg(long)]
+        idempotency_key: Option<uuid::Uuid>,
         /// Control service URL.
         #[arg(long)]
         control: Option<String>,
@@ -902,17 +958,17 @@ pub enum AdminCommand {
         #[command(subcommand)]
         command: RaftAdminCommand,
     },
-    /// Checkpoint administration and manual triggering.
+    /// Checkpoint administration (currently unavailable: no authenticated management endpoint).
     Checkpoint {
         #[command(subcommand)]
         command: CheckpointCommand,
     },
-    /// Point-in-time durable backup operations (create, inspect, verify).
+    /// Create backups through authenticated management; inspect or verify local backup files.
     Backup {
         #[command(subcommand)]
         command: BackupCommand,
     },
-    /// Restore a database backup into a clean or authorized destination.
+    /// Unavailable until the CLI exposes an authenticated backup-restore endpoint.
     Restore {
         /// Source backup directory or object-store URI.
         source: String,
@@ -921,6 +977,51 @@ pub enum AdminCommand {
         target: Option<String>,
         /// Force overwrite of existing non-empty destination.
         #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum SecurityCommand {
+    /// Preprovision the first administrator before opening application listeners.
+    #[command(name = "preprovision-admin")]
+    PreprovisionAdministrator {
+        /// Select `all` for `--role all`, or `gateway` for `--role gateway`/`control`.
+        #[arg(long, value_enum)]
+        layout: SecurityCatalogLayout,
+        /// Node storage directory used by `start --storage` for this deployment.
+        #[arg(long)]
+        storage: PathBuf,
+        /// JSON-serialized SecurityPrincipal containing an enabled interactive cluster administrator.
+        #[arg(long)]
+        principal_file: PathBuf,
+        /// Stable catalog operation ID to reuse if this command must be retried.
+        #[arg(long)]
+        operation_id: u64,
+        /// Confirm the deployment is stopped and the selected durable store is correct.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Replace login methods for an existing administrator while the deployment is stopped.
+    #[command(name = "recover-admin")]
+    RecoverAdministratorCredentials {
+        /// Select `all` for `--role all`, or `gateway` for `--role gateway`/`control`.
+        #[arg(long, value_enum)]
+        layout: SecurityCatalogLayout,
+        /// Node storage directory used by `start --storage` for this deployment.
+        #[arg(long)]
+        storage: PathBuf,
+        /// ID of the existing active cluster administrator to recover.
+        #[arg(long)]
+        principal_id: u64,
+        /// JSON array of replacement `LoginMethod` entries; contains no plaintext password.
+        #[arg(long)]
+        login_methods_file: PathBuf,
+        /// Stable catalog operation ID to reuse if this command must be retried.
+        #[arg(long)]
+        operation_id: u64,
+        /// Confirm the deployment is stopped and the selected durable store is correct.
+        #[arg(long)]
         yes: bool,
     },
 }
@@ -937,10 +1038,13 @@ pub enum OperationCommand {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum BackupCommand {
-    /// Create a full point-in-time backup.
+    /// Create a full point-in-time backup through authenticated management.
     Create {
         /// Destination directory or URI.
         destination: String,
+        /// UUID reused to retry or reconcile this management backup operation.
+        #[arg(long, requires = "management")]
+        idempotency_key: Option<uuid::Uuid>,
     },
     /// Inspect a backup manifest and point-in-time consistency metadata.
     Inspect {

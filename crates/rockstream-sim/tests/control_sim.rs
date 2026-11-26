@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use rockstream_control::{ControlService, FrontierAggregator, ShardManager, TopologyCatalog};
-use rockstream_runtime::start_worker_client;
+use rockstream_runtime::client::start_worker_client_with_insecure_internal_dev_and_metadata as start_test_worker_client;
 use rockstream_sim::buggify;
 use rockstream_sim::buggify::{buggify_disable, buggify_init};
 use rockstream_types::frontier::ShardFrontierReport;
@@ -22,7 +22,9 @@ async fn sim_control_plane_leases() {
     // 2. Setup the control service catalog and manager.
     let catalog = TopologyCatalog::new();
     let manager = ShardManager::new();
-    let service = ControlService::new(catalog.clone()).with_shard_manager(manager.clone());
+    let service = ControlService::new(catalog.clone())
+        .with_shard_manager(manager.clone())
+        .with_insecure_dev_mode();
 
     let handle = service.start("127.0.0.1:0").await.unwrap();
     let control_url = handle.addr.to_string();
@@ -31,14 +33,26 @@ async fn sim_control_plane_leases() {
     let storage_dir2 = tempfile::tempdir().unwrap();
 
     // 3. Start worker 1
-    let (client1, worker_handle1) = start_worker_client(1, &control_url, storage_dir1.path())
-        .await
-        .unwrap();
+    let (client1, worker_handle1) = start_test_worker_client(
+        1,
+        &control_url,
+        storage_dir1.path(),
+        Default::default(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
 
     // 4. Start worker 2
-    let (client2, worker_handle2) = start_worker_client(2, &control_url, storage_dir2.path())
-        .await
-        .unwrap();
+    let (client2, worker_handle2) = start_test_worker_client(
+        2,
+        &control_url,
+        storage_dir2.path(),
+        Default::default(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
 
     // Wait for registration
     tokio::time::timeout(Duration::from_secs(5), async {

@@ -122,6 +122,8 @@ async fn test_invalid_source_worker_returns_error_not_panic() {
         status: "OK".to_string(),
         live_offset: "0".to_string(),
         live_lag: 0,
+        secret_consumer: None,
+        secret_namespace: None,
     });
 
     // Attempting to create a materialized view referencing the unsupported source should fail gracefully

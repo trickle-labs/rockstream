@@ -9,7 +9,12 @@ description = "Deterministic simulation harness for RockStream (SimRuntime, bugg
 [features]
 default = []
 simulation = ["rockstream-control/simulation", "rockstream-runtime/simulation"]
-docker_tests = ["rockstream-ops/test-hooks"]
+docker_tests = ["rockstream-ops/test-hooks", "current_worker_api"]
+current_worker_api = []
+
+[[example]]
+name = "upgrade_worker"
+required-features = ["docker_tests"]
 
 [dependencies]
 rockstream-types = { workspace = true }
@@ -46,6 +51,9 @@ reqwest = { workspace = true }
 serde_json = { workspace = true }
 tonic = { workspace = true }
 tokio-postgres = { workspace = true }
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
 futures = { workspace = true }
 rockstream-cli = { workspace = true }
 rockstream-docgen = { workspace = true }

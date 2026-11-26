@@ -239,7 +239,10 @@ async fn test_explain_analyze_uses_distributed_stats_for_each_view_and_operator(
         catalog,
         Arc::new(DummyViewReader),
     )
-    .with_distributed_data_plane(DataPlaneClient::new(control_addr), "/tmp/operator-stats");
+    .with_distributed_data_plane(
+        DataPlaneClient::new(control_addr).with_insecure_internal_dev(),
+        "/tmp/operator-stats",
+    );
     let (addr, _handle) = server.serve_background().await.unwrap();
     let client = connect_port(addr.port()).await;
     let mut outputs = Vec::new();

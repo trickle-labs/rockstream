@@ -31,16 +31,22 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex};
 
+use rockstream_storage::catalog::CatalogStore;
+use rockstream_types::authorization::{
+    AuditCorrelation, AuditField, AuditIdentity, PolicyScope, SecurityAction, SecurityAuditClass,
+    SecurityAuditOutcome, SecurityAuditRecord, SECURITY_AUDIT_FORMAT_VERSION,
+};
 use rockstream_types::checkpoint::{CheckpointId, ClusterCheckpoint, PerShardCheckpoint};
 use rockstream_types::data_plane::{
     DeploymentDescriptor, DeploymentRequest, RuntimeExchangeMessage, RuntimeRow, ShardOutput,
     SourceDeltaRequest, WorkerExecutionStatus, WorkloadSnapshot,
 };
 use rockstream_types::error_code::{
-    RS_0001, RS_2410, RS_2411, RS_2412, RS_3604, RS_3610, RS_3611, RS_3612, RS_8004,
+    ErrorCode, RS_0001, RS_0003, RS_2400, RS_2401, RS_2410, RS_2411, RS_2412, RS_3604, RS_3610,
+    RS_3611, RS_3612, RS_8004,
 };
 use rockstream_types::identity::{InternalTlsConfig, NodeIdentity, NodeRole};
-use rockstream_types::ids::{ShardId, WorkerId, WorkloadId};
+use rockstream_types::ids::{LeaseToken, PrincipalId, ShardId, WorkerId, WorkloadId};
 use rockstream_types::lease::ShardRevokeReason;
 use rockstream_types::rendezvous::{fnv1a_64, rendezvous_hash};
 use rockstream_types::topology::{
@@ -122,10 +128,6 @@ fn error_code_for_secret_error(error: &SecretStoreError) -> String {
     secret_error_code(error).to_string()
 }
 
-fn secret_error_next_steps(error: &SecretStoreError) -> String {
-    rockstream_types::error_code::next_steps(secret_error_code(error)).to_string()
-}
-
 #[derive(Debug, Clone)]
 struct DrainTask {
     donor_worker_id: WorkerId,
@@ -168,21 +170,132 @@ struct DataPlaneState {
     deployments: HashMap<WorkloadId, DeploymentState>,
     source_waiters: HashMap<String, SourceWaiter>,
     operator_stats_waiters: HashMap<String, OperatorStatsWaiter>,
+    workload_read_waiters: HashMap<String, WorkloadReadWaiter>,
+    owned_shuffle_workers: HashSet<WorkerId>,
+    /// Shards currently paused in the brief donor-to-recipient handoff window.
+    handoff_shards: HashSet<ShardId>,
+    /// Notifies waiting `submit_source_delta` callers when a shard handoff ends.
+    handoff_notify: Arc<tokio::sync::Notify>,
+    /// One-shot waiters notified when a recipient worker confirms
+    /// `DeploymentReady` during an online migration or drain handoff.
+    handoff_ready_waiters: HashMap<(WorkloadId, ShardId, WorkerId), oneshot::Sender<()>>,
+    /// Monotonically increasing placement/topology epoch for direct data-plane
+    /// clients (Issue #400 R1/R6).
+    topology_epoch: u64,
+    /// Explicit single-owner connector lease manager (Issue #400 R1).
+    connector_leases: crate::shard::ConnectorLeaseManager,
+    /// Total row payloads submitted through the legacy control-mediated
+    /// `SubmitSourceDelta` path (must remain 0 on the direct Arrow IPC path).
+    row_payloads_received: Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[derive(Clone)]
+struct DelegatedActor {
+    principal_id: PrincipalId,
+    secret_use_scopes: Vec<PolicyScope>,
 }
 
 struct DeploymentState {
     request: DeploymentRequest,
+    actor: Option<DelegatedActor>,
+    secret_names: Vec<String>,
     descriptors: HashMap<ShardId, DeploymentDescriptor>,
     workers: HashMap<WorkerId, WorkerExecutionStatus>,
     ready_shards: HashSet<ShardId>,
     ready_waiter: Option<mpsc::Sender<ControlMessage>>,
+    // shortcut: recovery state is in memory; persist it before restart-safe admission.
+    recovery_required: bool,
+}
+
+struct AuthorizedWorkerSecret {
+    namespace_id: u128,
+    scope: PolicyScope,
+    actor_principal_id: Option<PrincipalId>,
+    policy_revision: AuditField<u64>,
+}
+
+#[derive(Debug)]
+enum WorkerSecretAuthorizationError {
+    Denied(&'static str),
+    DeniedForActor {
+        message: &'static str,
+        actor: PrincipalId,
+        scope: PolicyScope,
+        policy_revision: AuditField<u64>,
+    },
+    Unavailable(&'static str),
 }
 
 struct SourceWaiter {
+    attempt_id: Option<uuid::Uuid>,
     sender: mpsc::Sender<ControlMessage>,
-    expected: usize,
-    received: usize,
+    workload_id: WorkloadId,
+    version: u32,
+    source: String,
+    expected: HashSet<ShardId>,
+    received: HashSet<ShardId>,
+    dispatchers: HashMap<ShardId, WorkerId>,
+    owned_intent: Option<rockstream_types::data_plane::OwnedEpochIntent>,
+    prepare_reply: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    finish_reply: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    finishing: bool,
     epoch: u64,
+}
+
+enum SourceCompletion {
+    Immediate(mpsc::Sender<ControlMessage>, String, u64),
+    Owned(
+        WorkerId,
+        rockstream_types::data_plane::OwnedEpochIntent,
+        tokio::sync::oneshot::Receiver<Result<(), String>>,
+    ),
+    MissingAnchor(String, WorkloadId),
+}
+
+impl SourceWaiter {
+    fn record_progress(
+        &mut self,
+        output: &rockstream_types::data_plane::RuntimeOutputDelta,
+    ) -> bool {
+        if self.attempt_id != output.attempt_id
+            || self.workload_id != output.workload_id
+            || self.epoch != output.epoch
+            || self.version != output.version
+            || self.source != output.source
+            || !self.expected.contains(&output.shard_id)
+            || !self.received.insert(output.shard_id)
+        {
+            return false;
+        }
+        self.received == self.expected
+    }
+}
+
+fn take_owned_epoch_reply(
+    state: &mut DataPlaneState,
+    connected_worker: Option<WorkerId>,
+    worker_id: WorkerId,
+    intent: &rockstream_types::data_plane::OwnedEpochIntent,
+    finishing: bool,
+) -> Option<tokio::sync::oneshot::Sender<Result<(), String>>> {
+    if connected_worker != Some(worker_id)
+        || state
+            .deployments
+            .get(&intent.workload_id)
+            .and_then(|deployment| deployment.descriptors.get(&intent.anchor_shard))
+            .is_none_or(|descriptor| descriptor.shard.worker_id != worker_id)
+    {
+        return None;
+    }
+    let waiter = state.source_waiters.get_mut(&intent.request_id)?;
+    if waiter.owned_intent.as_ref() != Some(intent) || waiter.finishing != finishing {
+        return None;
+    }
+    if finishing {
+        waiter.finish_reply.take()
+    } else {
+        waiter.prepare_reply.take()
+    }
 }
 
 struct OperatorStatsWaiter {
@@ -194,6 +307,13 @@ struct OperatorStatsWaiter {
         WorkerId,
         Vec<rockstream_types::explain::IdentifiedOperatorStats>,
     )>,
+}
+
+struct WorkloadReadWaiter {
+    workload_id: WorkloadId,
+    expected_shards: HashMap<WorkerId, HashMap<ShardId, LeaseToken>>,
+    received_workers: HashSet<WorkerId>,
+    sender: mpsc::Sender<(WorkerId, bool, Vec<ShardOutput>)>,
 }
 
 /// Convert the internal [`RaftRole`] to its wire-serializable mirror.
@@ -259,9 +379,18 @@ pub struct ControlServiceHandle {
     pub migration_recovery: Vec<MigrationStartupOutcome>,
     /// TLS certificate reloader (if internal mTLS is enabled).
     pub reloader: Option<Arc<crate::tls::TlsCertificateReloader>>,
+    management_reloader: Option<Arc<crate::tls::TlsCertificateReloader>>,
+    row_payloads_received: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ControlServiceHandle {
+    /// Total row payloads received via legacy control-mediated `SubmitSourceDelta`.
+    /// Must remain `0` when all ingestion flows over the direct Arrow IPC path.
+    pub fn row_payloads_received(&self) -> u64 {
+        self.row_payloads_received
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Signal the service to shut down.
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(());
@@ -276,6 +405,15 @@ impl ControlServiceHandle {
             r.reload(new_config)
         } else {
             Err("RS-2410: internal TLS is not enabled on this control service".to_string())
+        }
+    }
+
+    /// Reload a separately configured management listener certificate in place.
+    pub fn reload_management_tls(&self, new_config: InternalTlsConfig) -> Result<(), String> {
+        if let Some(reloader) = &self.management_reloader {
+            reloader.reload(new_config)
+        } else {
+            Err("RS-2410: management TLS is not enabled on this control service".to_owned())
         }
     }
 }
@@ -320,6 +458,9 @@ pub struct ControlService {
     drain_state: Arc<AsyncMutex<DrainState>>,
     /// Optional internal TLS configuration for control plane mTLS.
     internal_tls: Option<InternalTlsConfig>,
+    management_tls: Option<InternalTlsConfig>,
+    /// Explicit loopback-only plaintext transport for local development.
+    insecure_dev_mode: bool,
     secret_store: Arc<SecretStore>,
     worker_senders: Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
     data_plane: Arc<AsyncMutex<DataPlaneState>>,
@@ -328,6 +469,8 @@ pub struct ControlService {
         Arc<dyn object_store::ObjectStore>,
         rockstream_types::config::NodeConfig,
     )>,
+    security_catalog: Option<Arc<dyn CatalogStore>>,
+    actor_assertion_verifier: Option<Arc<crate::delegation::ActorAssertionVerifier>>,
     backup_source: Option<BackupSource>,
 }
 
@@ -346,15 +489,17 @@ impl ControlService {
             migration_recovery_donors: BTreeMap::new(),
             drain_state: Arc::new(AsyncMutex::new(DrainState::default())),
             internal_tls: None,
+            management_tls: None,
+            insecure_dev_mode: false,
             secret_store: Arc::new(SecretStore::new(
                 None,
-                Arc::new(crate::kek::EnvKekProvider::from_env_or_default(
-                    "rockstream-default-kek",
-                )),
+                Arc::new(crate::kek::EnvKekProvider::from_env()),
             )),
             worker_senders: Arc::new(AsyncMutex::new(HashMap::new())),
             data_plane: Arc::new(AsyncMutex::new(DataPlaneState::default())),
             management: None,
+            security_catalog: None,
+            actor_assertion_verifier: None,
             backup_source: None,
         }
     }
@@ -413,8 +558,24 @@ impl ControlService {
     }
 
     /// Attach an [`InternalTlsConfig`] for internal mTLS mutual authentication.
+    /// Enabled mTLS also requires the durable security catalog before startup.
     pub fn with_internal_tls(mut self, config: InternalTlsConfig) -> Self {
         self.internal_tls = Some(config);
+        self
+    }
+
+    /// Configure a separate mTLS identity for the management listener.
+    pub fn with_management_tls(mut self, config: InternalTlsConfig) -> Self {
+        self.management_tls = Some(config);
+        self
+    }
+
+    /// Allow plaintext control traffic only when the listener binds to loopback.
+    ///
+    /// This is intended for local development and tests. Production callers
+    /// must configure internal mTLS instead.
+    pub fn with_insecure_dev_mode(mut self) -> Self {
+        self.insecure_dev_mode = true;
         self
     }
 
@@ -432,6 +593,21 @@ impl ControlService {
         config: rockstream_types::config::NodeConfig,
     ) -> Self {
         self.management = Some((bind_addr.into(), operation_store, config));
+        self
+    }
+
+    /// Attach the durable principals, policy revisions, and audit catalog used by management and internal mTLS.
+    pub fn with_security_catalog(mut self, catalog: Arc<dyn CatalogStore>) -> Self {
+        self.security_catalog = Some(catalog);
+        self
+    }
+
+    /// Trust the deployment-managed RS256 key used by gateway actor assertions.
+    pub fn with_actor_assertion_verifier(
+        mut self,
+        verifier: crate::delegation::ActorAssertionVerifier,
+    ) -> Self {
+        self.actor_assertion_verifier = Some(Arc::new(verifier));
         self
     }
 
@@ -460,6 +636,73 @@ impl ControlService {
     /// Returns a [`ControlServiceHandle`] which can be used to query the
     /// bound address and send a shutdown signal.
     pub async fn start(self, bind_addr: &str) -> io::Result<ControlServiceHandle> {
+        let reloader = match self.internal_tls.as_ref() {
+            Some(tls_cfg) if tls_cfg.is_enabled() => {
+                if !tls_cfg.client_auth_required {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "RS-2405: control service requires client certificate authentication",
+                    ));
+                }
+                Some(Arc::new(
+                    crate::tls::TlsCertificateReloader::new(tls_cfg.clone()).map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("RS-2405: failed to initialize internal mTLS: {error}"),
+                        )
+                    })?,
+                ))
+            }
+            tls_cfg => {
+                let tls_material_configured = tls_cfg.is_some_and(|cfg| {
+                    cfg.cert_path.is_some() || cfg.key_path.is_some() || cfg.ca_cert_path.is_some()
+                });
+                if tls_material_configured {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "RS-2405: internal mTLS requires a certificate, private key, and trust roots",
+                    ));
+                }
+                let addr = bind_addr.parse::<SocketAddr>().ok();
+                if !self.insecure_dev_mode || !addr.is_some_and(|addr| addr.ip().is_loopback()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "RS-2405: control service requires internal mTLS; plaintext development mode must be explicitly enabled on a loopback address",
+                    ));
+                }
+                tracing::warn!(
+                    bind_addr,
+                    "control service is using explicitly enabled loopback-only plaintext development transport"
+                );
+                None
+            }
+        };
+        if reloader.is_some() && self.security_catalog.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "RS-2405: internal mTLS requires the durable security audit catalog",
+            ));
+        }
+        let management_reloader = match self.management_tls.as_ref() {
+            Some(config) => {
+                if !config.client_auth_required {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "RS-2405: management API requires client certificate authentication",
+                    ));
+                }
+                Some(Arc::new(
+                    crate::tls::TlsCertificateReloader::new(config.clone()).map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("RS-2405: failed to initialize management mTLS: {error}"),
+                        )
+                    })?,
+                ))
+            }
+            None => reloader.clone(),
+        };
+
         if self.raft.is_none() && self.shard_manager.is_empty() {
             if let Some(store) = &self.shard_store {
                 self.shard_manager.restore(store.load().await);
@@ -513,7 +756,8 @@ impl ControlService {
             .map(|(_, store, _)| ManagementOperationStore::new(store.clone()));
         let migration_waiters = Arc::new(AsyncMutex::new(HashMap::new()));
         let backup_waiters = Arc::new(AsyncMutex::new(HashMap::new()));
-        let management = if let Some((management_addr, _, config)) = &self.management {
+        let management = if let Some((management_addr, management_store, config)) = &self.management
+        {
             let operations = operation_store
                 .as_ref()
                 .expect("management config has an operation store")
@@ -539,6 +783,7 @@ impl ControlService {
                 worker_senders: self.worker_senders.clone(),
                 waiters: migration_waiters.clone(),
                 operations: operations.clone(),
+                gc_pins: crate::checkpoint_store::GcPinStore::new(management_store.clone()),
                 started: Arc::new(AsyncMutex::new(HashSet::new())),
             };
             let backup_source = self.backup_source.clone().or_else(|| {
@@ -554,6 +799,12 @@ impl ControlService {
                 operations,
                 config.clone(),
             )
+            .with_security_catalog(self.security_catalog.clone().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "RS-2405: management API requires the durable security catalog",
+                )
+            })?)
             .with_drain_runtime(drain_runtime)
             .with_migration_runtime(migration_runtime);
             let management = if let Some((source, shared_store_id, local_worker_id)) = backup_source
@@ -571,14 +822,23 @@ impl ControlService {
                     source: source.clone(),
                     source_store_id: shared_store_id,
                     local_worker_id,
-                    manifests: crate::checkpoint_store::CheckpointManifestStore::new(source),
+                    manifests: crate::checkpoint_store::CheckpointManifestStore::new(
+                        source.clone(),
+                    ),
+                    gc_pins: crate::checkpoint_store::GcPinStore::new(source),
                     started: Arc::new(AsyncMutex::new(HashSet::new())),
                     serial: Arc::new(AsyncMutex::new(())),
                 })
             } else {
                 management
             };
-            Some(management.start(management_addr).await?)
+            let management_tls = management_reloader.clone().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "RS-2405: management API requires internal mTLS",
+                )
+            })?;
+            Some(management.start(management_addr, management_tls).await?)
         } else {
             None
         };
@@ -602,29 +862,14 @@ impl ControlService {
             operation_store,
             drain_state: self.drain_state.clone(),
             secret_store: self.secret_store.clone(),
+            security_catalog: self.security_catalog.clone(),
+            actor_assertion_verifier: self.actor_assertion_verifier.clone(),
             worker_senders: self.worker_senders.clone(),
             migration_waiters,
             backup_waiters,
             data_plane: self.data_plane.clone(),
         };
 
-        let reloader = if let Some(tls_cfg) = &self.internal_tls {
-            if tls_cfg.is_enabled() {
-                match crate::tls::TlsCertificateReloader::new(tls_cfg.clone()) {
-                    Ok(r) => Some(Arc::new(r)),
-                    Err(e) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!("RS-2405: failed to initialize internal TLS: {e}"),
-                        ));
-                    }
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
         let reloader_for_handle = reloader.clone();
 
         tokio::spawn(async move {
@@ -675,12 +920,15 @@ impl ControlService {
             }
         });
 
+        let row_payloads_received = self.data_plane.lock().await.row_payloads_received.clone();
         Ok(ControlServiceHandle {
             addr,
             shutdown_tx,
             management,
             migration_recovery,
             reloader: reloader_for_handle,
+            management_reloader,
+            row_payloads_received,
         })
     }
 
@@ -713,6 +961,8 @@ struct ConnectionContext {
     operation_store: Option<ManagementOperationStore>,
     drain_state: Arc<AsyncMutex<DrainState>>,
     secret_store: Arc<SecretStore>,
+    security_catalog: Option<Arc<dyn CatalogStore>>,
+    actor_assertion_verifier: Option<Arc<crate::delegation::ActorAssertionVerifier>>,
     worker_senders: Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
     migration_waiters: Arc<AsyncMutex<HashMap<String, oneshot::Sender<WorkerMessage>>>>,
     backup_waiters: Arc<AsyncMutex<HashMap<String, oneshot::Sender<WorkerMessage>>>>,
@@ -782,29 +1032,6 @@ impl ManagementDrainRuntime {
             return;
         }
 
-        let active_workload = self
-            .data_plane
-            .lock()
-            .await
-            .deployments
-            .values()
-            .any(|deployment| {
-                deployment
-                    .descriptors
-                    .values()
-                    .any(|descriptor| descriptor.shard.worker_id == worker_id)
-            });
-        if active_workload {
-            self.fail(
-                operation_id,
-                "RS-3604",
-                "worker has active workloads; stop them before draining in v0.66",
-                "Retry after the worker has no active workload deployments.",
-            )
-            .await;
-            return;
-        }
-
         let worker_sender = self.worker_senders.lock().await.get(&worker_id).cloned();
         let Some(worker_sender) = worker_sender.filter(|sender| !sender.is_closed()) else {
             self.wait(
@@ -856,6 +1083,7 @@ impl ManagementDrainRuntime {
                     process_drain_queue(
                         &self.catalog,
                         &self.shard_manager,
+                        &self.data_plane,
                         self.audit.as_ref(),
                         self.shard_store.as_ref(),
                         self.topology_store.as_ref(),
@@ -964,6 +1192,7 @@ pub(crate) struct ManagementMigrationRuntime {
     worker_senders: Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
     pub(crate) waiters: ManagementAckWaiters,
     operations: ManagementOperationStore,
+    gc_pins: crate::checkpoint_store::GcPinStore,
     started: Arc<AsyncMutex<HashSet<String>>>,
 }
 
@@ -977,6 +1206,27 @@ impl ManagementMigrationRuntime {
             runtime.execute(shard_id, target, &operation_id).await;
             runtime.started.lock().await.remove(&operation_id);
         });
+    }
+
+    async fn acquire_migration_pin(&self, operation_id: &str) {
+        let pin = crate::checkpoint_store::GcPin {
+            pin_id: format!("migration-{operation_id}"),
+            kind: crate::checkpoint_store::GcPinKind::Migration,
+            checkpoint_id: None,
+            min_epoch: None,
+            shard_snapshots: Vec::new(),
+            created_at_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        if let Err(error) = self.gc_pins.acquire_pin(&pin).await {
+            tracing::warn!(%operation_id, %error, "failed to persist migration GC pin");
+        }
+    }
+
+    async fn release_migration_pin(&self, operation_id: &str) {
+        let pin_id = format!("migration-{operation_id}");
+        if let Err(error) = self.gc_pins.release_pin(&pin_id).await {
+            tracing::warn!(%operation_id, %error, "failed to release migration GC pin");
+        }
     }
 
     async fn execute(&self, shard_id: ShardId, target: WorkerId, operation_id: &str) {
@@ -1014,25 +1264,6 @@ impl ManagementMigrationRuntime {
         {
             return;
         }
-        if matches!(
-            previous.phase(),
-            None | Some("validating_lease_and_workers")
-        ) && self
-            .data_plane
-            .lock()
-            .await
-            .deployments
-            .values()
-            .any(|deployment| deployment.descriptors.contains_key(&shard_id))
-        {
-            self.fail(
-                operation_id,
-                "RS-3604",
-                "shard has active workloads; stop them before migrating in v0.66",
-            )
-            .await;
-            return;
-        }
         if let Some(lease) = self.shard_manager.get(shard_id) {
             if lease.worker_id == target
                 && matches!(
@@ -1063,6 +1294,14 @@ impl ManagementMigrationRuntime {
                         .await
                         .is_ok()
                     {
+                        if let Err(error) =
+                            redeploy_shard_workloads(&self.data_plane, &self.worker_senders, &lease)
+                                .await
+                        {
+                            self.wait(operation_id, &error).await;
+                            return;
+                        }
+                        self.release_migration_pin(operation_id).await;
                         let _ = self
                             .operations
                             .transition(
@@ -1124,6 +1363,9 @@ impl ManagementMigrationRuntime {
                         .await;
                         return;
                     }
+                    let _ =
+                        redeploy_shard_workloads(&self.data_plane, &self.worker_senders, &lease)
+                            .await;
                 } else {
                     self.wait(
                         operation_id,
@@ -1241,6 +1483,8 @@ impl ManagementMigrationRuntime {
         {
             return;
         }
+        self.acquire_migration_pin(operation_id).await;
+        begin_shard_handoff(&self.data_plane, shard_id).await;
         if let Err(error) = self
             .send_and_wait(
                 donor_sender,
@@ -1265,6 +1509,8 @@ impl ManagementMigrationRuntime {
             } else {
                 self.fail(operation_id, "RS-3610", &error).await;
             }
+            end_shard_handoff(&self.data_plane, shard_id).await;
+            self.release_migration_pin(operation_id).await;
             return;
         }
         if self
@@ -1288,9 +1534,17 @@ impl ManagementMigrationRuntime {
             if self.operation_cancelled(operation_id).await {
                 self.reopen_donor(operation_id, &lease).await;
             }
+            end_shard_handoff(&self.data_plane, shard_id).await;
+            self.release_migration_pin(operation_id).await;
             return;
         }
-        if self.shard_manager.get(shard_id) != Some(lease.clone()) {
+        if !self
+            .shard_manager
+            .get(shard_id)
+            .is_some_and(|current| current.same_owner(&lease))
+        {
+            end_shard_handoff(&self.data_plane, shard_id).await;
+            self.release_migration_pin(operation_id).await;
             self.fail(
                 operation_id,
                 "RS-3604",
@@ -1318,9 +1572,13 @@ impl ManagementMigrationRuntime {
             .is_err()
         {
             self.reopen_donor(operation_id, &lease).await;
+            end_shard_handoff(&self.data_plane, shard_id).await;
+            self.release_migration_pin(operation_id).await;
             return;
         }
         let Some(new_lease) = self.shard_manager.transfer_if_owner(&lease, target) else {
+            end_shard_handoff(&self.data_plane, shard_id).await;
+            self.release_migration_pin(operation_id).await;
             self.fail(
                 operation_id,
                 "RS-3604",
@@ -1332,6 +1590,11 @@ impl ManagementMigrationRuntime {
         if let Some(store) = &self.shard_store {
             store.save(&self.shard_manager.snapshot()).await;
         }
+        broadcast_message(
+            &self.worker_senders,
+            topology_changed_message(&self.catalog, &self.shard_manager),
+        )
+        .await;
         if self
             .operations
             .transition(
@@ -1349,6 +1612,8 @@ impl ManagementMigrationRuntime {
             .is_err()
         {
             self.rollback(operation_id, &lease, &new_lease).await;
+            end_shard_handoff(&self.data_plane, shard_id).await;
+            self.release_migration_pin(operation_id).await;
             return;
         }
         if let Err(error) = self
@@ -1366,6 +1631,8 @@ impl ManagementMigrationRuntime {
             .await
         {
             self.rollback(operation_id, &lease, &new_lease).await;
+            end_shard_handoff(&self.data_plane, shard_id).await;
+            self.release_migration_pin(operation_id).await;
             let message = format!("target failed to open shard; transfer rolled back: {error}");
             if error.contains("connection closed")
                 || error.contains("timed out")
@@ -1377,6 +1644,19 @@ impl ManagementMigrationRuntime {
             }
             return;
         }
+        if let Err(error) =
+            redeploy_shard_workloads(&self.data_plane, &self.worker_senders, &new_lease).await
+        {
+            self.rollback(operation_id, &lease, &new_lease).await;
+            end_shard_handoff(&self.data_plane, shard_id).await;
+            self.release_migration_pin(operation_id).await;
+            let message =
+                format!("target failed to activate active workload; transfer rolled back: {error}");
+            self.wait(operation_id, &message).await;
+            return;
+        }
+        end_shard_handoff(&self.data_plane, shard_id).await;
+        self.release_migration_pin(operation_id).await;
         if let Err(error) = self
             .operations
             .transition(
@@ -1460,6 +1740,11 @@ impl ManagementMigrationRuntime {
         if let Some(store) = &self.shard_store {
             store.save(&self.shard_manager.snapshot()).await;
         }
+        broadcast_message(
+            &self.worker_senders,
+            topology_changed_message(&self.catalog, &self.shard_manager),
+        )
+        .await;
         let sender = self
             .worker_senders
             .lock()
@@ -1481,6 +1766,7 @@ impl ManagementMigrationRuntime {
                     &lease,
                 )
                 .await;
+            let _ = redeploy_shard_workloads(&self.data_plane, &self.worker_senders, &lease).await;
         }
     }
 
@@ -1515,6 +1801,7 @@ impl ManagementMigrationRuntime {
                     lease,
                 )
                 .await;
+            let _ = redeploy_shard_workloads(&self.data_plane, &self.worker_senders, lease).await;
         }
     }
 
@@ -1579,6 +1866,7 @@ pub(crate) struct ManagementBackupRuntime {
     source_store_id: Option<[u8; 32]>,
     local_worker_id: Option<WorkerId>,
     manifests: crate::checkpoint_store::CheckpointManifestStore,
+    gc_pins: crate::checkpoint_store::GcPinStore,
     started: Arc<AsyncMutex<HashSet<String>>>,
     serial: Arc<AsyncMutex<()>>,
 }
@@ -1685,6 +1973,31 @@ impl ManagementBackupRuntime {
             }
         };
 
+        let pin_id = format!("backup-{operation_id}");
+        let shard_snapshots: Vec<(ShardId, String)> = checkpoint
+            .shards
+            .iter()
+            .filter_map(|(shard_id, entry)| {
+                entry
+                    .snapshot_id
+                    .as_ref()
+                    .map(|snap| (*shard_id, snap.clone()))
+            })
+            .collect();
+        let backup_pin = crate::checkpoint_store::GcPin {
+            pin_id: pin_id.clone(),
+            kind: crate::checkpoint_store::GcPinKind::Backup,
+            checkpoint_id: Some(checkpoint_id),
+            min_epoch: None,
+            shard_snapshots,
+            created_at_ms: now_ms() as i64,
+        };
+        if let Err(error) = self.gc_pins.acquire_pin(&backup_pin).await {
+            self.wait(operation_id, &format!("acquire backup GC pin: {error}"))
+                .await;
+            return;
+        }
+
         let export_phase = format!("backup_exporting:{}", checkpoint_id.0);
         if self
             .operations
@@ -1702,6 +2015,7 @@ impl ManagementBackupRuntime {
             .await
             .is_err()
         {
+            let _ = self.gc_pins.release_pin(&pin_id).await;
             return;
         }
         let generation = format!("management-{operation_id}");
@@ -1724,19 +2038,22 @@ impl ManagementBackupRuntime {
                     )
                     .await
                 {
+                    let _ = self.gc_pins.release_pin(&pin_id).await;
                     self.handle_export_error(operation_id, error).await;
                     return;
                 }
             }
             Err(error) => {
+                let _ = self.gc_pins.release_pin(&pin_id).await;
                 self.handle_export_error(operation_id, error).await;
                 return;
             }
         }
-        match exporter
+        let validation = exporter
             .validate_generation(destination_store, &generation)
-            .await
-        {
+            .await;
+        let _ = self.gc_pins.release_pin(&pin_id).await;
+        match validation {
             Ok(outcome)
                 if outcome.checkpoint_id == checkpoint_id.0
                     && outcome.generation == generation
@@ -1777,14 +2094,29 @@ impl ManagementBackupRuntime {
         operation_id: &str,
         checkpoint_id: CheckpointId,
     ) -> Result<ClusterCheckpoint, BackupFailure> {
-        let state = self.data_plane.lock().await;
-        if !state.deployments.is_empty() || !state.source_waiters.is_empty() {
-            return Err(BackupFailure::Failed(
-                "RS-3604",
-                "CreateBackup requires an idle cluster with no active workloads or source writes"
-                    .to_owned(),
-            ));
-        }
+        // Snapshot any active workload relative shard paths without holding
+        // `data_plane` across worker RPCs so foreground ingestion and reads
+        // continue unblocked during online backup.
+        let workload_shard_paths: HashMap<ShardId, String> = {
+            let state = self.data_plane.lock().await;
+            let mut paths = HashMap::new();
+            for deployment in state.deployments.values() {
+                let root_prefix =
+                    format!("{}/", deployment.request.storage_root.trim_end_matches('/'));
+                for (shard_id, descriptor) in &deployment.descriptors {
+                    let identity = descriptor
+                        .storage_identity
+                        .strip_prefix("lfs:")
+                        .unwrap_or(&descriptor.storage_identity);
+                    if let Some(rel) = identity.strip_prefix(&root_prefix) {
+                        if !rel.is_empty() {
+                            paths.insert(*shard_id, rel.to_owned());
+                        }
+                    }
+                }
+            }
+            paths
+        };
         let leases = self.shard_manager.snapshot().leases;
         if let Some(local_worker_id) = self.local_worker_id {
             let workers = self.catalog.all_workers();
@@ -1869,11 +2201,12 @@ impl ManagementBackupRuntime {
                     && shard_id == lease.shard_id
                     && lease_token == lease.lease_token =>
                 {
-                    checkpoint.record_shard(
-                        lease.shard_id,
-                        PerShardCheckpoint::new(checkpoint_id, shard_checkpoint_id)
-                            .with_snapshot_id(snapshot_id),
-                    );
+                    let mut per_shard = PerShardCheckpoint::new(checkpoint_id, shard_checkpoint_id)
+                        .with_snapshot_id(snapshot_id);
+                    if let Some(shard_path) = workload_shard_paths.get(&lease.shard_id) {
+                        per_shard = per_shard.with_shard_path(shard_path.clone());
+                    }
+                    checkpoint.record_shard(lease.shard_id, per_shard);
                 }
                 Ok(Ok(WorkerMessage::ShardCheckpointAck {
                     error: Some(error), ..
@@ -1917,7 +2250,6 @@ impl ManagementBackupRuntime {
         if let Err(error) = self.manifests.save_manifest(&checkpoint, false, None).await {
             return Err(BackupFailure::Failed("RS-3022", error));
         }
-        drop(state);
         Ok(checkpoint)
     }
 
@@ -2022,6 +2354,18 @@ fn data_plane_failure(message: impl Into<String>) -> ControlMessage {
     }
 }
 
+fn workload_recovery_failure() -> ControlMessage {
+    workload_failure("workload requires recovery after failed execution")
+}
+
+fn workload_failure(message: impl Into<String>) -> ControlMessage {
+    ControlMessage::OperationFailed {
+        code: rockstream_types::error_code::RS_0001.to_string(),
+        message: message.into(),
+        next_steps: "Preserve the source input and shard storage; automatic recovery is unavailable. Contact the operator before retrying.".to_owned(),
+    }
+}
+
 #[allow(dead_code)]
 fn stable_route(value: &str, shard_count: usize) -> usize {
     let hash = value
@@ -2033,16 +2377,50 @@ fn stable_route(value: &str, shard_count: usize) -> usize {
     hash as usize % shard_count
 }
 
+#[derive(Clone, Copy)]
+struct WorkloadDeploymentContext<'a> {
+    secret_catalog: Option<&'a Arc<dyn CatalogStore>>,
+    sender: &'a mpsc::Sender<ControlMessage>,
+    catalog: &'a TopologyCatalog,
+    shard_manager: &'a ShardManager,
+    worker_senders: &'a Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
+    data_plane: &'a Arc<AsyncMutex<DataPlaneState>>,
+}
 async fn deploy_workload(
     request: DeploymentRequest,
-    sender: &mpsc::Sender<ControlMessage>,
-    catalog: &TopologyCatalog,
-    shard_manager: &ShardManager,
-    worker_senders: &Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
-    data_plane: &Arc<AsyncMutex<DataPlaneState>>,
+    requested_shard_count: Option<usize>,
+    actor: Option<DelegatedActor>,
+    context: WorkloadDeploymentContext<'_>,
 ) {
+    let WorkloadDeploymentContext {
+        secret_catalog,
+        sender,
+        catalog,
+        shard_manager,
+        worker_senders,
+        data_plane,
+    } = context;
+    let secret_names = match secret_catalog {
+        Some(catalog) => match secret_names_for_deployment(Some(catalog), &request.schemas).await {
+            Ok(secret_names) => secret_names,
+            Err(error) => {
+                send_message(
+                    sender,
+                    &ControlMessage::OperationFailed {
+                        code: RS_0003.to_string(),
+                        message: format!("workload secret metadata is unavailable: {error:?}"),
+                        next_steps: rockstream_types::error_code::next_steps(RS_0003).to_string(),
+                    },
+                )
+                .await;
+                return;
+            }
+        },
+        None => Vec::new(),
+    };
     let healthy = catalog.healthy_workers();
-    let workers = PlacementAlgorithm::assign_n(&healthy, healthy.len());
+    let shard_count = requested_shard_count.unwrap_or(healthy.len()).max(1);
+    let workers = PlacementAlgorithm::assign_shards(&healthy, shard_count);
     if workers.is_empty() {
         send_message(sender, &data_plane_failure("no healthy workers available")).await;
         return;
@@ -2058,36 +2436,87 @@ async fn deploy_workload(
         return;
     }
 
+    let mut state = data_plane.lock().await;
+    let admission_failure = if state
+        .deployments
+        .get(&request.workload_id)
+        .is_some_and(|deployment| deployment.recovery_required)
+    {
+        Some(workload_recovery_failure())
+    } else if state
+        .source_waiters
+        .values()
+        .any(|waiter| waiter.workload_id == request.workload_id)
+    {
+        Some(data_plane_failure(
+            "another source delta is already in flight for this workload",
+        ))
+    } else {
+        None
+    };
+    if let Some(failure) = admission_failure {
+        drop(state);
+        send_message(sender, &failure).await;
+        return;
+    }
+
     let mut descriptors = HashMap::new();
-    for (index, worker_id) in workers.into_iter().enumerate() {
-        let shard_id = ShardId(
-            request
-                .workload_id
-                .0
-                .wrapping_mul(16)
-                .wrapping_add(index as u64),
-        );
+    let workload_id = request.workload_id;
+    // Reuse previously allocated shard IDs if redeploying the exact same
+    // workload with the same shard count; otherwise allocate fresh globally
+    // unique, collision-free shard IDs from `ShardManager` (Issue #400 R5).
+    let allocated_shard_ids: Vec<ShardId> = state
+        .deployments
+        .get(&workload_id)
+        .filter(|existing| existing.descriptors.len() == workers.len())
+        .map(|existing| {
+            let mut ordered: Vec<_> = existing.descriptors.values().collect();
+            ordered.sort_by_key(|d| (d.shard_index, d.shard.shard_id));
+            ordered.into_iter().map(|d| d.shard.shard_id).collect()
+        })
+        .unwrap_or_else(|| shard_manager.allocate_shard_ids(workers.len()));
+
+    for (index, (worker_id, shard_id)) in workers.into_iter().zip(allocated_shard_ids).enumerate() {
         let (lease, _) = shard_manager.force_acquire(shard_id, worker_id);
         let storage_identity = format!(
             "{}/workload-{}/shard-{}",
-            request.storage_root, request.workload_id.0, index
+            request.storage_root, request.workload_id.0, shard_id.0
         );
         descriptors.insert(
             shard_id,
-            DeploymentDescriptor::new(request.clone(), lease, storage_identity),
+            DeploymentDescriptor::with_shard_index(
+                request.clone(),
+                lease,
+                storage_identity,
+                index as u32,
+            ),
         );
     }
 
-    data_plane.lock().await.deployments.insert(
+    state.topology_epoch = state.topology_epoch.saturating_add(1);
+    state.deployments.insert(
         request.workload_id,
         DeploymentState {
             request,
+            actor,
+            secret_names: secret_names.clone(),
             descriptors: descriptors.clone(),
             workers: HashMap::new(),
             ready_shards: HashSet::new(),
             ready_waiter: Some(sender.clone()),
+            recovery_required: false,
         },
     );
+    drop(state);
+    broadcast_message(
+        worker_senders,
+        topology_changed_message(catalog, shard_manager),
+    )
+    .await;
+    let assigned_workers: HashSet<_> = descriptors
+        .values()
+        .map(|descriptor| descriptor.shard.worker_id)
+        .collect();
     for descriptor in descriptors.into_values() {
         if let Some(target) = senders.get(&descriptor.shard.worker_id) {
             send_message(
@@ -2099,6 +2528,20 @@ async fn deploy_workload(
             )
             .await;
             send_message(target, &ControlMessage::Deploy { descriptor }).await;
+        }
+    }
+    for worker_id in assigned_workers {
+        if let Some(target) = senders.get(&worker_id) {
+            for secret_name in &secret_names {
+                send_message(
+                    target,
+                    &ControlMessage::SecretRefreshRequired {
+                        workload_id,
+                        secret_name: secret_name.clone(),
+                    },
+                )
+                .await;
+            }
         }
     }
 }
@@ -2165,6 +2608,7 @@ fn route_source_delta(
             (
                 descriptor.shard.worker_id,
                 RuntimeExchangeMessage {
+                    attempt_id: None,
                     version: request.version,
                     request_id: request.request_id.clone(),
                     workload_id: request.workload_id,
@@ -2180,12 +2624,287 @@ fn route_source_delta(
         .collect())
 }
 
+async fn fail_source_request(
+    data_plane: &Arc<AsyncMutex<DataPlaneState>>,
+    request_id: &str,
+    workload_id: WorkloadId,
+    message: impl Into<String>,
+) {
+    let waiter = {
+        let mut state = data_plane.lock().await;
+        let waiter = state.source_waiters.remove(request_id);
+        if waiter.is_some() {
+            if let Some(deployment) = state.deployments.get_mut(&workload_id) {
+                deployment.recovery_required = true;
+            }
+        }
+        waiter
+    };
+    if let Some(waiter) = waiter {
+        send_message(&waiter.sender, &workload_failure(message)).await;
+    }
+}
+
+async fn finish_owned_source(
+    data_plane: Arc<AsyncMutex<DataPlaneState>>,
+    worker_senders: Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
+    anchor_worker: WorkerId,
+    intent: rockstream_types::data_plane::OwnedEpochIntent,
+    reply: tokio::sync::oneshot::Receiver<Result<(), String>>,
+) {
+    let sender = worker_senders.lock().await.get(&anchor_worker).cloned();
+    let permit = match &sender {
+        Some(sender) => sender.reserve().await.ok(),
+        None => None,
+    };
+    let Some(permit) = permit else {
+        fail_source_request(
+            &data_plane,
+            &intent.request_id,
+            intent.workload_id,
+            "owned epoch anchor disconnected before completion",
+        )
+        .await;
+        return;
+    };
+    {
+        let state = data_plane.lock().await;
+        let valid = state
+            .source_waiters
+            .get(&intent.request_id)
+            .is_some_and(|waiter| {
+                waiter.finishing && waiter.owned_intent.as_ref() == Some(&intent)
+            });
+        if !valid {
+            return;
+        }
+        permit.send(ControlMessage::FinishOwnedEpoch {
+            intent: intent.clone(),
+        });
+    }
+    match tokio::time::timeout(Duration::from_secs(60), reply).await {
+        Ok(Ok(Ok(()))) => {
+            let waiter = {
+                let mut state = data_plane.lock().await;
+                if state
+                    .source_waiters
+                    .get(&intent.request_id)
+                    .is_some_and(|waiter| {
+                        waiter.finishing && waiter.owned_intent.as_ref() == Some(&intent)
+                    })
+                {
+                    state.source_waiters.remove(&intent.request_id)
+                } else {
+                    None
+                }
+            };
+            if let Some(waiter) = waiter {
+                send_message(
+                    &waiter.sender,
+                    &ControlMessage::SourceDeltaCommitted {
+                        request_id: intent.request_id,
+                        epoch: intent.epoch,
+                    },
+                )
+                .await;
+            }
+        }
+        Ok(Ok(Err(error))) => {
+            fail_source_request(
+                &data_plane,
+                &intent.request_id,
+                intent.workload_id,
+                format!("owned epoch completion failed: {error}"),
+            )
+            .await;
+        }
+        Ok(Err(_)) | Err(_) => {
+            fail_source_request(
+                &data_plane,
+                &intent.request_id,
+                intent.workload_id,
+                "owned epoch completion did not finish",
+            )
+            .await;
+        }
+    }
+}
+
+async fn begin_shard_handoff(data_plane: &Arc<AsyncMutex<DataPlaneState>>, shard_id: ShardId) {
+    data_plane.lock().await.handoff_shards.insert(shard_id);
+}
+
+async fn end_shard_handoff(data_plane: &Arc<AsyncMutex<DataPlaneState>>, shard_id: ShardId) {
+    let notify = {
+        let mut state = data_plane.lock().await;
+        state.handoff_shards.remove(&shard_id);
+        state.handoff_notify.clone()
+    };
+    notify.notify_waiters();
+}
+
+/// Canonical online active-workload handoff helper shared by `MigrateShard` and
+/// `DrainWorker`. Re-deploys every active workload descriptor referencing
+/// `lease.shard_id` onto `lease.worker_id`, waits for the recipient worker to
+/// restore durable state and emit `DeploymentReady`, and atomically updates
+/// routing descriptors and worker status.
+async fn redeploy_shard_workloads(
+    data_plane: &Arc<AsyncMutex<DataPlaneState>>,
+    worker_senders: &Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
+    lease: &rockstream_types::lease::ShardLease,
+) -> Result<(), String> {
+    let affected: Vec<(WorkloadId, DeploymentDescriptor, Vec<String>)> = {
+        let state = data_plane.lock().await;
+        state
+            .deployments
+            .iter()
+            .filter_map(|(workload_id, deployment)| {
+                let mut descriptor = deployment.descriptors.get(&lease.shard_id)?.clone();
+                descriptor.shard = lease.clone();
+                let secret_names = deployment.secret_names.clone();
+                Some((*workload_id, descriptor, secret_names))
+            })
+            .collect()
+    };
+    if affected.is_empty() {
+        return Ok(());
+    }
+    let sender = worker_senders
+        .lock()
+        .await
+        .get(&lease.worker_id)
+        .filter(|sender| !sender.is_closed())
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "RS-3610: worker {} has no active control connection for workload activation",
+                lease.worker_id.0
+            )
+        })?;
+
+    for (workload_id, descriptor, secret_names) in affected {
+        let waiter_key = (workload_id, lease.shard_id, lease.worker_id);
+        let (tx, rx) = oneshot::channel();
+        data_plane
+            .lock()
+            .await
+            .handoff_ready_waiters
+            .insert(waiter_key, tx);
+        send_message(
+            &sender,
+            &ControlMessage::Deploy {
+                descriptor: descriptor.clone(),
+            },
+        )
+        .await;
+        for secret_name in &secret_names {
+            send_message(
+                &sender,
+                &ControlMessage::SecretRefreshRequired {
+                    workload_id,
+                    secret_name: secret_name.clone(),
+                },
+            )
+            .await;
+        }
+        let ready = tokio::time::timeout(Duration::from_secs(30), rx).await;
+        data_plane
+            .lock()
+            .await
+            .handoff_ready_waiters
+            .remove(&waiter_key);
+        match ready {
+            Ok(Ok(())) => {
+                let mut state = data_plane.lock().await;
+                if let Some(deployment) = state.deployments.get_mut(&workload_id) {
+                    let old_worker = deployment
+                        .descriptors
+                        .get(&lease.shard_id)
+                        .map(|existing| existing.shard.worker_id);
+                    deployment
+                        .descriptors
+                        .insert(lease.shard_id, descriptor.clone());
+                    if let Some(old_worker_id) = old_worker {
+                        if old_worker_id != lease.worker_id {
+                            if let Some(old_status) = deployment.workers.get_mut(&old_worker_id) {
+                                old_status
+                                    .shard_ids
+                                    .retain(|shard_id| *shard_id != lease.shard_id);
+                            }
+                        }
+                    }
+                    let status = deployment.workers.entry(lease.worker_id).or_insert(
+                        WorkerExecutionStatus {
+                            worker_id: lease.worker_id,
+                            process_id: 0,
+                            shard_ids: Vec::new(),
+                            input_rows: 0,
+                            output_rows: 0,
+                            frontier: descriptor.frontier,
+                            ready: true,
+                        },
+                    );
+                    status.ready = true;
+                    status.shard_ids.push(lease.shard_id);
+                    status.shard_ids.sort();
+                    status.shard_ids.dedup();
+                }
+            }
+            Ok(Err(_)) => {
+                return Err(format!(
+                    "RS-3610: worker {} disconnected before confirming DeploymentReady for shard {}",
+                    lease.worker_id.0, lease.shard_id.0
+                ));
+            }
+            Err(_) => {
+                return Err(format!(
+                    "RS-3610: worker {} timed out waiting for DeploymentReady on shard {}",
+                    lease.worker_id.0, lease.shard_id.0
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn submit_source_delta(
     request: SourceDeltaRequest,
     sender: &mpsc::Sender<ControlMessage>,
+    catalog: &TopologyCatalog,
     worker_senders: &Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
     data_plane: &Arc<AsyncMutex<DataPlaneState>>,
 ) {
+    let early_failure = {
+        let state = data_plane.lock().await;
+        if state
+            .deployments
+            .get(&request.workload_id)
+            .is_some_and(|deployment| deployment.recovery_required)
+        {
+            Some(workload_recovery_failure())
+        } else if state
+            .deployments
+            .get(&request.workload_id)
+            .is_some_and(|deployment| deployment.ready_waiter.is_some())
+        {
+            Some(data_plane_failure("workload deployment is not ready"))
+        } else if request.rows.is_empty()
+            && state
+                .source_waiters
+                .values()
+                .any(|waiter| waiter.workload_id == request.workload_id)
+        {
+            Some(data_plane_failure(
+                "another source delta is already in flight for this workload",
+            ))
+        } else {
+            None
+        }
+    };
+    if let Some(failure) = early_failure {
+        send_message(sender, &failure).await;
+        return;
+    }
     if request.rows.is_empty() {
         send_message(
             sender,
@@ -2196,6 +2915,39 @@ async fn submit_source_delta(
         )
         .await;
         return;
+    }
+
+    // If any shard belonging to this workload is in the brief donor-to-recipient
+    // handoff window, wait for the atomic routing update to complete before
+    // routing so foreground writes continue seamlessly without dropped deltas.
+    let handoff_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let notify = {
+            let state = data_plane.lock().await;
+            let blocked = state
+                .deployments
+                .get(&request.workload_id)
+                .is_some_and(|deployment| {
+                    deployment
+                        .descriptors
+                        .keys()
+                        .any(|shard_id| state.handoff_shards.contains(shard_id))
+                });
+            if blocked {
+                Some(state.handoff_notify.clone())
+            } else {
+                None
+            }
+        };
+        let Some(notify) = notify else {
+            break;
+        };
+        if tokio::time::timeout_at(handoff_deadline, notify.notified())
+            .await
+            .is_err()
+        {
+            break;
+        }
     }
 
     let routed = {
@@ -2209,7 +2961,7 @@ async fn submit_source_delta(
             None => Err(format!("{}: workload is not deployed", RS_0001)),
         }
     };
-    let routed = match routed {
+    let mut routed = match routed {
         Ok(routed) => routed,
         Err(error) => {
             send_message(sender, &data_plane_failure(error)).await;
@@ -2230,63 +2982,244 @@ async fn submit_source_delta(
         return;
     }
 
-    let duplicate_request = {
+    let mut preparation = None;
+    let admission_failure = {
         let mut state = data_plane.lock().await;
-        if state.source_waiters.contains_key(&request.request_id) {
-            true
+        if state
+            .deployments
+            .get(&request.workload_id)
+            .is_some_and(|deployment| deployment.recovery_required)
+        {
+            Some(workload_recovery_failure())
+        } else if state
+            .deployments
+            .get(&request.workload_id)
+            .is_some_and(|deployment| deployment.ready_waiter.is_some())
+        {
+            Some(data_plane_failure("workload deployment is not ready"))
+        } else if state.source_waiters.contains_key(&request.request_id) {
+            Some(data_plane_failure(
+                "source delta request id is already in flight",
+            ))
+        } else if state
+            .source_waiters
+            .values()
+            .any(|waiter| waiter.workload_id == request.workload_id)
+        {
+            Some(data_plane_failure(
+                "another source delta is already in flight for this workload",
+            ))
+        } else if !state
+            .deployments
+            .get(&request.workload_id)
+            .is_some_and(|deployment| {
+                routed.iter().all(|(worker_id, frame)| {
+                    deployment
+                        .descriptors
+                        .get(&frame.shard_id)
+                        .is_some_and(|descriptor| {
+                            descriptor.shard.worker_id == *worker_id
+                                && descriptor.sink_operator_id == frame.operator_id
+                                && frame.lease_token == descriptor.shard.lease_token
+                        })
+                })
+            })
+        {
+            Some(data_plane_failure(
+                "workload deployment changed while routing the source delta",
+            ))
         } else {
+            let mut candidates: Vec<_> = state.deployments[&request.workload_id]
+                .descriptors
+                .values()
+                .map(|descriptor| descriptor.shard.worker_id)
+                .collect();
+            candidates.sort();
+            candidates.dedup();
+            let mut dispatchers: HashMap<_, _> = routed
+                .iter()
+                .filter_map(|(target, frame)| {
+                    if !state.owned_shuffle_workers.contains(target) {
+                        return None;
+                    }
+                    let target_info = catalog.get(*target)?;
+                    let source = candidates
+                        .iter()
+                        .copied()
+                        .find(|candidate| {
+                            if candidate == target
+                                || !state.owned_shuffle_workers.contains(candidate)
+                                || !senders.contains_key(candidate)
+                            {
+                                return false;
+                            }
+                            catalog.get(*candidate).is_some_and(|source_info| {
+                                let same_zone =
+                                    source_info.location.has_same_az_as(&target_info.location);
+                                let reachable =
+                                    source_info.location.has_same_host_as(&target_info.location)
+                                        || target_info
+                                            .address
+                                            .parse::<std::net::SocketAddr>()
+                                            .is_ok_and(|addr| !addr.ip().is_loopback());
+                                same_zone && reachable
+                            })
+                        })
+                        .unwrap_or(*target);
+                    Some((frame.shard_id, source))
+                })
+                .collect();
+            if dispatchers.len() != routed.len() {
+                dispatchers.clear();
+            }
+            let attempt_id = (!dispatchers.is_empty()).then(uuid::Uuid::new_v4);
+            for (_, frame) in &mut routed {
+                frame.attempt_id = attempt_id;
+            }
+            let mut target_shards: Vec<_> =
+                routed.iter().map(|(_, frame)| frame.shard_id).collect();
+            target_shards.sort();
+            target_shards.dedup();
+            let owned_intent = dispatchers.keys().min().copied().map(|anchor_shard| {
+                rockstream_types::data_plane::OwnedEpochIntent {
+                    attempt_id: attempt_id.expect("owned dispatch has an attempt"),
+                    version: request.version,
+                    request_id: request.request_id.clone(),
+                    workload_id: request.workload_id,
+                    epoch: request.epoch,
+                    source: request.source.clone(),
+                    anchor_shard,
+                    target_shards,
+                }
+            });
+            let prepare_reply = owned_intent.as_ref().map(|intent| {
+                let (reply, receiver) = tokio::sync::oneshot::channel();
+                let anchor_worker = state.deployments[&request.workload_id].descriptors
+                    [&intent.anchor_shard]
+                    .shard
+                    .worker_id;
+                preparation = Some((anchor_worker, intent.clone(), receiver));
+                reply
+            });
             state.source_waiters.insert(
                 request.request_id.clone(),
                 SourceWaiter {
+                    attempt_id,
                     sender: sender.clone(),
-                    expected: routed.len(),
-                    received: 0,
+                    workload_id: request.workload_id,
+                    version: request.version,
+                    source: request.source.clone(),
+                    expected: routed.iter().map(|(_, frame)| frame.shard_id).collect(),
+                    received: HashSet::new(),
+                    dispatchers,
+                    owned_intent,
+                    prepare_reply,
+                    finish_reply: None,
+                    finishing: false,
                     epoch: request.epoch,
                 },
             );
-            false
+            None
         }
     };
-    if duplicate_request {
-        send_message(
-            sender,
-            &data_plane_failure("source delta request id is already in flight"),
-        )
-        .await;
+    if let Some(failure) = admission_failure {
+        send_message(sender, &failure).await;
         return;
     }
 
-    for (worker_id, frame) in routed {
-        let Some(target) = senders.get(&worker_id) else {
-            data_plane
-                .lock()
-                .await
-                .source_waiters
-                .remove(&request.request_id);
-            send_message(
-                sender,
-                &data_plane_failure("routed shard owner disconnected before ingest"),
+    if let Some((anchor_worker, intent, reply)) = preparation {
+        let permit = match senders.get(&anchor_worker) {
+            Some(anchor) => anchor.reserve().await.ok(),
+            None => None,
+        };
+        let Some(permit) = permit else {
+            fail_source_request(
+                data_plane,
+                &request.request_id,
+                request.workload_id,
+                "owned epoch anchor disconnected before preparation",
             )
             .await;
             return;
         };
-        if target
-            .send(ControlMessage::Execute { frame })
-            .await
-            .is_err()
         {
-            data_plane
-                .lock()
-                .await
-                .source_waiters
-                .remove(&request.request_id);
-            send_message(
-                sender,
-                &data_plane_failure("routed shard owner disconnected before ingest"),
-            )
-            .await;
+            let state = data_plane.lock().await;
+            if !state.source_waiters.contains_key(&request.request_id) {
+                return;
+            }
+            permit.send(ControlMessage::PrepareOwnedEpoch { intent });
+        }
+        match tokio::time::timeout(Duration::from_secs(60), reply).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => {
+                fail_source_request(
+                    data_plane,
+                    &request.request_id,
+                    request.workload_id,
+                    format!("owned epoch preparation failed: {error}"),
+                )
+                .await;
+                return;
+            }
+            Ok(Err(_)) | Err(_) => {
+                fail_source_request(
+                    data_plane,
+                    &request.request_id,
+                    request.workload_id,
+                    "owned epoch preparation did not complete",
+                )
+                .await;
+                return;
+            }
+        }
+    }
+
+    for (target_worker, frame) in routed {
+        let dispatcher = {
+            let state = data_plane.lock().await;
+            let Some(waiter) = state.source_waiters.get(&request.request_id) else {
+                return;
+            };
+            waiter.dispatchers.get(&frame.shard_id).copied()
+        };
+        let target_info = dispatcher.and_then(|_| catalog.get(target_worker));
+        let destination = dispatcher.unwrap_or(target_worker);
+        let permit = match (
+            senders.get(&destination),
+            dispatcher.is_some() && target_info.is_none(),
+        ) {
+            (Some(target), false) => target.reserve().await.ok(),
+            _ => None,
+        };
+        let Some(permit) = permit else {
+            let removed = {
+                let mut state = data_plane.lock().await;
+                let removed = state.source_waiters.remove(&request.request_id).is_some();
+                if removed {
+                    if let Some(deployment) = state.deployments.get_mut(&request.workload_id) {
+                        deployment.recovery_required = true;
+                    }
+                }
+                removed
+            };
+            if removed {
+                send_message(
+                    sender,
+                    &workload_failure("routed shard owner disconnected before ingest"),
+                )
+                .await;
+            }
+            return;
+        };
+        let state = data_plane.lock().await;
+        if !state.source_waiters.contains_key(&request.request_id) {
             return;
         }
+        let message = match target_info {
+            Some(target) => ControlMessage::DispatchOwnedShuffle { target, frame },
+            None => ControlMessage::Execute { frame },
+        };
+        permit.send(message);
     }
 }
 
@@ -2460,6 +3393,7 @@ async fn request_worker_drain(
 async fn process_drain_queue(
     catalog: &TopologyCatalog,
     shard_manager: &ShardManager,
+    data_plane: &Arc<AsyncMutex<DataPlaneState>>,
     audit: Option<&Arc<FileAuditLog>>,
     shard_store: Option<&Arc<ShardPersistentStore>>,
     topology_store: Option<&Arc<TopologyPersistentStore>>,
@@ -2552,9 +3486,12 @@ async fn process_drain_queue(
             retry.push(task);
             continue;
         }
+        let task_shard_id = task.shard_id;
+        begin_shard_handoff(data_plane, task_shard_id).await;
         let lease = if current_lease.worker_id == task.donor_worker_id {
             let (lease, evicted) = shard_manager.force_acquire(task.shard_id, recipient.worker_id);
             if evicted != Some(task.donor_worker_id) {
+                end_shard_handoff(data_plane, task_shard_id).await;
                 migration_waiters.lock().await.remove(&key);
                 retry.push(task);
                 continue;
@@ -2566,6 +3503,11 @@ async fn process_drain_queue(
         } else {
             current_lease
         };
+        broadcast_message(
+            worker_senders,
+            topology_changed_message(catalog, shard_manager),
+        )
+        .await;
         if donor_sender
             .send(ControlMessage::ShardRevoked {
                 shard_id: task.shard_id,
@@ -2574,6 +3516,7 @@ async fn process_drain_queue(
             .await
             .is_err()
         {
+            end_shard_handoff(data_plane, task_shard_id).await;
             migration_waiters.lock().await.remove(&key);
             retry.push(task);
             continue;
@@ -2586,6 +3529,7 @@ async fn process_drain_queue(
             .await
             .is_err()
         {
+            end_shard_handoff(data_plane, task_shard_id).await;
             migration_waiters.lock().await.remove(&key);
             retry.push(task);
             continue;
@@ -2608,7 +3552,19 @@ async fn process_drain_queue(
                 && lease_token == lease.lease_token
                 && success =>
             {
-                moved += 1
+                if let Err(error) =
+                    redeploy_shard_workloads(data_plane, worker_senders, &lease).await
+                {
+                    tracing::warn!(
+                        shard = %task.shard_id,
+                        recipient = %recipient.worker_id,
+                        %error,
+                        "drain recipient failed to activate active workload"
+                    );
+                    retry.push(task);
+                } else {
+                    moved += 1;
+                }
             }
             Ok(Ok(WorkerMessage::ShardTransferAck { error, .. })) => {
                 tracing::warn!(
@@ -2624,6 +3580,7 @@ async fn process_drain_queue(
             }
             Ok(Ok(_)) => retry.push(task),
         }
+        end_shard_handoff(data_plane, task_shard_id).await;
     }
     let remaining = shard_manager
         .leases()
@@ -2738,6 +3695,756 @@ async fn cleanup_decommissioned_workers(
     }
 }
 
+fn append_required_security_audit(
+    audit: Option<&Arc<FileAuditLog>>,
+    event: &AuditEvent,
+    context: &'static str,
+) -> bool {
+    let Some(audit) = audit else {
+        tracing::error!(code = %rockstream_types::error_code::RS_0003, context, "required security audit log is unavailable");
+        return false;
+    };
+    match audit.append(event) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::error!(code = %rockstream_types::error_code::RS_0003, %error, context, "required security audit append failed");
+            false
+        }
+    }
+}
+
+async fn append_node_identity_rejection(
+    catalog: Option<&Arc<dyn CatalogStore>>,
+    identity: &NodeIdentity,
+    connected_worker_id: Option<WorkerId>,
+    claimed_worker_id: WorkerId,
+) -> bool {
+    let Some(catalog) = catalog else {
+        tracing::error!(code = %RS_0003, "required node identity audit catalog is unavailable");
+        return false;
+    };
+    let actor = connected_worker_id.map_or_else(
+        || AuditIdentity::Unverified(identity.to_cn()),
+        |_| AuditIdentity::Verified(identity.to_cn()),
+    );
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    let record = SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: format!("node-identity-rejection:{}", uuid::Uuid::new_v4()),
+        timestamp_ms: timestamp_ms.max(1),
+        actor,
+        target: AuditField::Unverified(claimed_worker_id.to_string()),
+        scope: AuditField::Known("cluster".to_owned()),
+        action: SecurityAuditClass::NodeIdentityRejection,
+        outcome: SecurityAuditOutcome::Denied,
+        correlation: AuditCorrelation::Unknown,
+        operation_id: AuditField::NotApplicable,
+        policy_revision: AuditField::NotApplicable,
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::NotApplicable,
+    };
+    if let Err(error) = crate::management::append_security_audit(catalog.as_ref(), record).await {
+        tracing::error!(code = %RS_0003, %error, "required node identity audit append failed");
+        return false;
+    }
+    true
+}
+
+async fn append_validated_security_audit(
+    catalog: Option<&Arc<dyn CatalogStore>>,
+    request_id: &str,
+    record: SecurityAuditRecord,
+) -> bool {
+    if request_id != record.event_id
+        || record.validate().is_err()
+        || !matches!(
+            record.action,
+            SecurityAuditClass::AuthorizationDenial | SecurityAuditClass::NodeIdentityRejection
+        )
+        || record.outcome != SecurityAuditOutcome::Denied
+    {
+        tracing::error!(code = %RS_0003, "worker reported an invalid security audit record");
+        return false;
+    }
+    let Some(catalog) = catalog else {
+        tracing::error!(code = %RS_0003, "required worker security audit catalog is unavailable");
+        return false;
+    };
+    if let Err(error) = crate::management::append_security_audit(catalog.as_ref(), record).await {
+        tracing::error!(code = %RS_0003, %error, "required worker security audit append failed");
+        return false;
+    }
+    true
+}
+
+async fn allow_gateway_data_plane_peer(
+    sender: &mpsc::Sender<ControlMessage>,
+    catalog: Option<&Arc<dyn CatalogStore>>,
+    identity: Option<&NodeIdentity>,
+    operation: &str,
+) -> bool {
+    let Some(identity) = identity else {
+        // The listener permits no identity only in explicitly enabled loopback development mode.
+        return true;
+    };
+    if identity.role == NodeRole::Gateway {
+        return true;
+    }
+
+    let timestamp_ms = now_ms().max(1);
+    let record = SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: format!("node-identity-rejection:{}", uuid::Uuid::new_v4()),
+        timestamp_ms,
+        actor: AuditIdentity::Unverified(identity.to_cn()),
+        target: AuditField::Known(operation.to_owned()),
+        scope: AuditField::Known("cluster".to_owned()),
+        action: SecurityAuditClass::NodeIdentityRejection,
+        outcome: SecurityAuditOutcome::Denied,
+        correlation: AuditCorrelation::Unknown,
+        operation_id: AuditField::NotApplicable,
+        policy_revision: AuditField::NotApplicable,
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::NotApplicable,
+    };
+    let Some(catalog) = catalog else {
+        tracing::error!(code = %RS_0003, "required node identity audit catalog is unavailable");
+        return false;
+    };
+    if let Err(error) = crate::management::append_security_audit(catalog.as_ref(), record).await {
+        tracing::error!(code = %RS_0003, %error, "required node identity audit append failed");
+        return false;
+    }
+    send_message(
+        sender,
+        &ControlMessage::OperationFailed {
+            code: RS_2412.to_string(),
+            message: "certificate identity is not authorized for the gateway data plane".to_owned(),
+            next_steps: rockstream_types::error_code::next_steps(RS_2412).to_string(),
+        },
+    )
+    .await;
+    false
+}
+
+fn is_gateway_data_plane_message(message: &WorkerMessage) -> bool {
+    matches!(
+        message,
+        WorkerMessage::DeployWorkload(_)
+            | WorkerMessage::DeployWorkloadSharded { .. }
+            | WorkerMessage::SubmitSourceDelta(_)
+            | WorkerMessage::ReadOperatorStats { .. }
+            | WorkerMessage::ReadWorkload { .. }
+            | WorkerMessage::GetWorkloadTopology { .. }
+    )
+}
+
+async fn gateway_data_plane_scope(
+    request: &WorkerMessage,
+    data_plane: &Arc<AsyncMutex<DataPlaneState>>,
+) -> Option<(SecurityAction, PolicyScope)> {
+    use rockstream_types::authorization::ResourceKind;
+
+    match request {
+        WorkerMessage::DeployWorkload(deployment)
+        | WorkerMessage::DeployWorkloadSharded {
+            request: deployment,
+            ..
+        } => Some((
+            SecurityAction::ViewAuthor,
+            PolicyScope::Resource {
+                namespace: deployment.namespace.clone(),
+                kind: ResourceKind::View,
+                name: deployment.workload_name.clone(),
+            },
+        )),
+        WorkerMessage::SubmitSourceDelta(delta) => {
+            let state = data_plane.lock().await;
+            let deployment = state.deployments.get(&delta.workload_id)?;
+            if !deployment
+                .request
+                .schemas
+                .iter()
+                .any(|schema| schema.relation.eq_ignore_ascii_case(&delta.source))
+            {
+                return None;
+            }
+            Some((
+                SecurityAction::DataWrite,
+                PolicyScope::Resource {
+                    namespace: deployment.request.namespace.clone(),
+                    kind: ResourceKind::Table,
+                    name: delta.source.clone(),
+                },
+            ))
+        }
+        WorkerMessage::ReadWorkload { workload_id, .. }
+        | WorkerMessage::ReadOperatorStats { workload_id, .. }
+        | WorkerMessage::GetWorkloadTopology { workload_id } => {
+            let state = data_plane.lock().await;
+            let deployment = state.deployments.get(workload_id)?;
+            Some((
+                SecurityAction::DataRead,
+                PolicyScope::Resource {
+                    namespace: deployment.request.namespace.clone(),
+                    kind: ResourceKind::View,
+                    name: deployment.request.workload_name.clone(),
+                },
+            ))
+        }
+        _ => None,
+    }
+}
+
+async fn append_gateway_delegation_audit(
+    catalog: Option<&Arc<dyn CatalogStore>>,
+    actor: AuditIdentity,
+    target: AuditField<String>,
+    scope: AuditField<String>,
+    action: SecurityAuditClass,
+    outcome: SecurityAuditOutcome,
+    policy_revision: AuditField<u64>,
+) -> bool {
+    let record = SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: format!("gateway-delegation:{}", uuid::Uuid::new_v4()),
+        timestamp_ms: now_ms().max(1),
+        actor,
+        target,
+        scope,
+        action,
+        outcome,
+        correlation: AuditCorrelation::Unknown,
+        operation_id: AuditField::NotApplicable,
+        policy_revision,
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::NotApplicable,
+    };
+    let Some(catalog) = catalog else {
+        tracing::error!(code = %RS_0003, "required gateway delegation audit catalog is unavailable");
+        return false;
+    };
+    if let Err(error) = crate::management::append_security_audit(catalog.as_ref(), record).await {
+        tracing::error!(code = %RS_0003, %error, "required gateway delegation audit append failed");
+        return false;
+    }
+    true
+}
+
+#[derive(Clone, Copy)]
+struct GatewayActorAuthorizationContext<'a> {
+    sender: &'a mpsc::Sender<ControlMessage>,
+    catalog: Option<&'a Arc<dyn CatalogStore>>,
+    verifier: Option<&'a crate::delegation::ActorAssertionVerifier>,
+    identity: &'a NodeIdentity,
+    data_plane: &'a Arc<AsyncMutex<DataPlaneState>>,
+}
+
+struct GatewayActorRejectionAudit {
+    target: AuditField<String>,
+    scope: AuditField<String>,
+    action: SecurityAuditClass,
+    actor: AuditIdentity,
+    policy_revision: AuditField<u64>,
+}
+
+impl GatewayActorRejectionAudit {
+    fn authentication(scope: AuditField<String>, actor: AuditIdentity) -> Self {
+        Self {
+            target: AuditField::Known("gateway_data_plane".to_owned()),
+            scope,
+            action: SecurityAuditClass::AuthenticationFailure,
+            actor,
+            policy_revision: AuditField::NotApplicable,
+        }
+    }
+
+    fn unknown_target_authentication(actor: AuditIdentity) -> Self {
+        Self {
+            target: AuditField::Unknown,
+            scope: AuditField::Unknown,
+            action: SecurityAuditClass::AuthenticationFailure,
+            actor,
+            policy_revision: AuditField::NotApplicable,
+        }
+    }
+
+    fn authorization(
+        target: AuditField<String>,
+        scope: AuditField<String>,
+        actor: AuditIdentity,
+        policy_revision: AuditField<u64>,
+    ) -> Self {
+        Self {
+            target,
+            scope,
+            action: SecurityAuditClass::AuthorizationDenial,
+            actor,
+            policy_revision,
+        }
+    }
+}
+
+async fn reject_gateway_actor_assertion(
+    context: &GatewayActorAuthorizationContext<'_>,
+    code: ErrorCode,
+    message: &str,
+    audit: GatewayActorRejectionAudit,
+) -> bool {
+    if !append_gateway_delegation_audit(
+        context.catalog,
+        audit.actor,
+        audit.target,
+        audit.scope,
+        audit.action,
+        SecurityAuditOutcome::Denied,
+        audit.policy_revision,
+    )
+    .await
+    {
+        return false;
+    }
+    let next_steps = if code == RS_2400 {
+        rockstream_types::error_code::next_steps(RS_2400)
+    } else {
+        rockstream_types::error_code::next_steps(RS_2401)
+    };
+    tracing::warn!(peer = %context.identity.to_cn(), %code, "gateway actor assertion rejected");
+    send_message(
+        context.sender,
+        &ControlMessage::OperationFailed {
+            code: code.to_string(),
+            message: message.to_owned(),
+            next_steps: next_steps.to_string(),
+        },
+    )
+    .await;
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn authorize_gateway_actor_assertion(
+    context: &GatewayActorAuthorizationContext<'_>,
+    assertion: Option<&str>,
+    request: &WorkerMessage,
+    authorized_actor: &mut Option<DelegatedActor>,
+) -> bool {
+    let Some(assertion) = assertion else {
+        return reject_gateway_actor_assertion(
+            context,
+            RS_2400,
+            "a valid user actor assertion is required for gateway data-plane requests",
+            GatewayActorRejectionAudit::authentication(
+                AuditField::Unknown,
+                AuditIdentity::Unverified(context.identity.to_cn()),
+            ),
+        )
+        .await;
+    };
+    let Some(verifier) = context.verifier else {
+        return reject_gateway_actor_assertion(
+            context,
+            RS_2400,
+            "gateway actor assertion verification is not configured",
+            GatewayActorRejectionAudit::authentication(
+                AuditField::Unknown,
+                AuditIdentity::Unverified(context.identity.to_cn()),
+            ),
+        )
+        .await;
+    };
+    let expected = gateway_data_plane_scope(request, context.data_plane).await;
+    let digest = match crate::delegation::request_digest(request) {
+        Ok(digest) => digest,
+        Err(_) => {
+            return reject_gateway_actor_assertion(
+                context,
+                RS_2400,
+                "gateway actor assertion could not be bound to this request",
+                GatewayActorRejectionAudit::authentication(
+                    AuditField::Unknown,
+                    AuditIdentity::Unverified(context.identity.to_cn()),
+                ),
+            )
+            .await;
+        }
+    };
+    let now = now_ms().max(1) / 1_000;
+    let claims = match verifier.verify(assertion, digest, now) {
+        Ok(claims) => claims,
+        Err(_) => {
+            return reject_gateway_actor_assertion(
+                context,
+                RS_2400,
+                "gateway actor assertion is invalid, expired, or bound to another deployment/request",
+                GatewayActorRejectionAudit::authentication(
+                    AuditField::Unknown,
+                    AuditIdentity::Unverified(context.identity.to_cn()),
+                ),
+            )
+            .await;
+        }
+    };
+    let (expected_action, expected_scope) = match expected {
+        Some(expected) => expected,
+        None => {
+            return reject_gateway_actor_assertion(
+                context,
+                RS_2401,
+                "gateway actor assertion does not identify an active scoped workload request",
+                GatewayActorRejectionAudit::authorization(
+                    AuditField::Known("gateway_data_plane".to_owned()),
+                    AuditField::Known(format!("{:?}", claims.scope())),
+                    AuditIdentity::Verified(claims.principal_id().to_string()),
+                    AuditField::NotApplicable,
+                ),
+            )
+            .await;
+        }
+    };
+    if claims.action() != expected_action || claims.scope() != &expected_scope {
+        return reject_gateway_actor_assertion(
+            context,
+            RS_2401,
+            "gateway actor assertion allowance does not match the requested operation and scope",
+            GatewayActorRejectionAudit::authorization(
+                AuditField::Known(format!("{expected_action:?}")),
+                AuditField::Known(format!("{expected_scope:?}")),
+                AuditIdentity::Verified(claims.principal_id().to_string()),
+                AuditField::Known(claims.policy_revision()),
+            ),
+        )
+        .await;
+    }
+    let Some(catalog_store) = context.catalog else {
+        tracing::error!(code = %RS_0003, "durable actor policy is unavailable");
+        return false;
+    };
+    let principals = match catalog_store.list_security_principals().await {
+        Ok(principals) => principals,
+        Err(_) => {
+            return reject_gateway_actor_assertion(
+                context,
+                RS_2400,
+                "durable actor policy is unavailable",
+                GatewayActorRejectionAudit::unknown_target_authentication(AuditIdentity::Verified(
+                    claims.principal_id().to_string(),
+                )),
+            )
+            .await;
+        }
+    };
+    let Some(principal) = principals
+        .into_iter()
+        .find(|principal| principal.id == claims.principal_id() && principal.enabled)
+    else {
+        return reject_gateway_actor_assertion(
+            context,
+            RS_2400,
+            "asserted user actor is no longer enabled",
+            GatewayActorRejectionAudit::unknown_target_authentication(AuditIdentity::Verified(
+                claims.principal_id().to_string(),
+            )),
+        )
+        .await;
+    };
+    if !crate::authorization::allows(&principal, expected_action, &expected_scope) {
+        return reject_gateway_actor_assertion(
+            context,
+            RS_2401,
+            "asserted user actor is no longer authorized for this operation and scope",
+            GatewayActorRejectionAudit::authorization(
+                AuditField::Known(format!("{expected_action:?}")),
+                AuditField::Known(format!("{expected_scope:?}")),
+                AuditIdentity::Verified(principal.id.to_string()),
+                AuditField::Known(principal.revision),
+            ),
+        )
+        .await;
+    }
+    let audited = append_gateway_delegation_audit(
+        Some(catalog_store),
+        AuditIdentity::Verified(principal.id.to_string()),
+        AuditField::Known(format!("{expected_action:?}")),
+        AuditField::Known(format!("{expected_scope:?}")),
+        SecurityAuditClass::AuthenticationSuccess,
+        SecurityAuditOutcome::Success,
+        AuditField::Known(principal.revision),
+    )
+    .await;
+    if audited && matches!(request, WorkerMessage::DeployWorkload(_)) {
+        *authorized_actor = Some(DelegatedActor {
+            principal_id: principal.id,
+            secret_use_scopes: claims.secret_use_scopes().to_vec(),
+        });
+    }
+    audited
+}
+
+async fn authorize_worker_secret_request(
+    catalog: Option<&Arc<dyn CatalogStore>>,
+    data_plane: &Arc<AsyncMutex<DataPlaneState>>,
+    worker_id: WorkerId,
+    workload_id: WorkloadId,
+    secret_name: &str,
+) -> Result<AuthorizedWorkerSecret, WorkerSecretAuthorizationError> {
+    let Some(catalog) = catalog else {
+        return Err(WorkerSecretAuthorizationError::Unavailable(
+            "durable secret authorization catalog is unavailable",
+        ));
+    };
+    let (request, delegated_actor) = {
+        let state = data_plane.lock().await;
+        let Some(deployment) = state.deployments.get(&workload_id) else {
+            return Err(WorkerSecretAuthorizationError::Denied(
+                "workload is not active",
+            ));
+        };
+        if !deployment
+            .descriptors
+            .values()
+            .any(|descriptor| descriptor.shard.worker_id == worker_id)
+        {
+            return Err(WorkerSecretAuthorizationError::Denied(
+                "worker is not assigned to this workload",
+            ));
+        }
+        (deployment.request.clone(), deployment.actor.clone())
+    };
+    let sources = catalog.list_sources().await.map_err(|_| {
+        WorkerSecretAuthorizationError::Unavailable("durable source catalog is unavailable")
+    })?;
+    let mut matches = Vec::new();
+    for source in sources {
+        if !source.table_name.as_ref().is_some_and(|table| {
+            request
+                .schemas
+                .iter()
+                .any(|schema| schema.relation.eq_ignore_ascii_case(table))
+        }) {
+            continue;
+        }
+        let Some(reference) = source.options.get("secret") else {
+            continue;
+        };
+        if rockstream_types::secret::secret_name_from_reference(reference) != Some(secret_name) {
+            continue;
+        }
+        let (Some(namespace), Some(consumer)) = (source.secret_namespace, source.secret_consumer)
+        else {
+            return Err(WorkerSecretAuthorizationError::Denied(
+                "source secret scope is incomplete",
+            ));
+        };
+        matches.push((namespace, consumer));
+    }
+    let Some((namespace, consumer_id)) = matches.first().cloned() else {
+        return Err(WorkerSecretAuthorizationError::Denied(
+            "secret is not referenced by this workload",
+        ));
+    };
+    if matches.iter().any(|(other_namespace, other_consumer)| {
+        other_namespace != &namespace || *other_consumer != consumer_id
+    }) {
+        return Err(WorkerSecretAuthorizationError::Denied(
+            "secret name is ambiguous within this workload",
+        ));
+    }
+    let scope = PolicyScope::Secret {
+        namespace: namespace.clone(),
+        name: secret_name.to_owned(),
+        consumer: Some(consumer_id),
+    };
+    let namespace_id = catalog
+        .get_namespace_by_name(&namespace)
+        .await
+        .map_err(|_| {
+            WorkerSecretAuthorizationError::Unavailable("durable namespace catalog is unavailable")
+        })?
+        .map(|namespace| u128::from(namespace.id.0))
+        .ok_or(WorkerSecretAuthorizationError::Denied(
+            "secret namespace is no longer present",
+        ))?;
+    let principals = catalog.list_security_principals().await.map_err(|_| {
+        WorkerSecretAuthorizationError::Unavailable("durable principal catalog is unavailable")
+    })?;
+    let Some(consumer) = principals
+        .iter()
+        .find(|principal| principal.id == consumer_id && principal.enabled)
+    else {
+        return Err(WorkerSecretAuthorizationError::Denied(
+            "source consumer is no longer enabled",
+        ));
+    };
+    if !crate::authorization::allows(consumer, SecurityAction::SecretUse, &scope) {
+        return Err(WorkerSecretAuthorizationError::Denied(
+            "source consumer is no longer authorized for secret use",
+        ));
+    }
+    let mut policy_revision = AuditField::NotApplicable;
+    let actor_principal_id = delegated_actor.as_ref().map(|actor| actor.principal_id);
+    if let Some(delegated_actor) = delegated_actor {
+        let actor_id = delegated_actor.principal_id;
+        let Some(actor) = principals
+            .iter()
+            .find(|principal| principal.id == actor_id && principal.enabled)
+        else {
+            return Err(WorkerSecretAuthorizationError::DeniedForActor {
+                message: "delegated actor is no longer enabled",
+                actor: actor_id,
+                scope,
+                policy_revision: AuditField::NotApplicable,
+            });
+        };
+        if !crate::authorization::allows(actor, SecurityAction::SecretUse, &scope) {
+            return Err(WorkerSecretAuthorizationError::DeniedForActor {
+                message: "delegated actor is no longer authorized for secret use",
+                actor: actor_id,
+                scope,
+                policy_revision: AuditField::Known(actor.revision),
+            });
+        }
+        if !delegated_actor.secret_use_scopes.contains(&scope) {
+            return Err(WorkerSecretAuthorizationError::DeniedForActor {
+                message: "delegation assertion does not allow secret use for this scope",
+                actor: actor_id,
+                scope,
+                policy_revision: AuditField::Known(actor.revision),
+            });
+        }
+        policy_revision = AuditField::Known(actor.revision);
+    }
+    Ok(AuthorizedWorkerSecret {
+        namespace_id,
+        scope,
+        actor_principal_id,
+        policy_revision,
+    })
+}
+
+async fn workloads_for_secret_rotation(
+    catalog: Option<&Arc<dyn CatalogStore>>,
+    data_plane: &Arc<AsyncMutex<DataPlaneState>>,
+    worker_id: WorkerId,
+    secret_name: &str,
+) -> Result<Vec<WorkloadId>, WorkerSecretAuthorizationError> {
+    let Some(catalog) = catalog else {
+        return Err(WorkerSecretAuthorizationError::Unavailable(
+            "durable source catalog is unavailable",
+        ));
+    };
+    let sources = catalog.list_sources().await.map_err(|_| {
+        WorkerSecretAuthorizationError::Unavailable("durable source catalog is unavailable")
+    })?;
+    let source_tables: HashSet<_> = sources
+        .into_iter()
+        .filter(|source| {
+            source.options.get("secret").and_then(|reference| {
+                rockstream_types::secret::secret_name_from_reference(reference)
+            }) == Some(secret_name)
+        })
+        .filter_map(|source| source.table_name.map(|name| name.to_lowercase()))
+        .collect();
+    let state = data_plane.lock().await;
+    Ok(state
+        .deployments
+        .iter()
+        .filter(|(_, deployment)| {
+            deployment
+                .descriptors
+                .values()
+                .any(|descriptor| descriptor.shard.worker_id == worker_id)
+                && deployment
+                    .request
+                    .schemas
+                    .iter()
+                    .any(|schema| source_tables.contains(&schema.relation.to_lowercase()))
+        })
+        .map(|(workload_id, _)| *workload_id)
+        .collect())
+}
+
+async fn secret_names_for_deployment(
+    catalog: Option<&Arc<dyn CatalogStore>>,
+    schemas: &[rockstream_types::data_plane::DeploymentSchema],
+) -> Result<Vec<String>, WorkerSecretAuthorizationError> {
+    let Some(catalog) = catalog else {
+        return Err(WorkerSecretAuthorizationError::Unavailable(
+            "durable source catalog is unavailable",
+        ));
+    };
+    let sources = catalog.list_sources().await.map_err(|_| {
+        WorkerSecretAuthorizationError::Unavailable("durable source catalog is unavailable")
+    })?;
+    let mut secret_names = HashSet::new();
+    for source in sources {
+        if !source.table_name.as_ref().is_some_and(|table| {
+            schemas
+                .iter()
+                .any(|schema| schema.relation.eq_ignore_ascii_case(table))
+        }) {
+            continue;
+        }
+        if let Some(reference) = source.options.get("secret") {
+            let Some(secret_name) = rockstream_types::secret::secret_name_from_reference(reference)
+            else {
+                return Err(WorkerSecretAuthorizationError::Denied(
+                    "source secret reference is invalid",
+                ));
+            };
+            secret_names.insert(secret_name.to_owned());
+        }
+    }
+    let mut secret_names: Vec<_> = secret_names.into_iter().collect();
+    secret_names.sort();
+    Ok(secret_names)
+}
+
+fn claimed_worker_id(message: &WorkerMessage) -> Option<WorkerId> {
+    match message {
+        WorkerMessage::DeploymentReady { worker_id, .. }
+        | WorkerMessage::OperatorStatsReport { worker_id, .. }
+        | WorkerMessage::Heartbeat { worker_id, .. }
+        | WorkerMessage::Deregister { worker_id }
+        | WorkerMessage::RequestShard { worker_id, .. }
+        | WorkerMessage::DrainAck { worker_id, .. }
+        | WorkerMessage::ShardTransferAck { worker_id, .. }
+        | WorkerMessage::ShardCheckpointAck { worker_id, .. }
+        | WorkerMessage::LifecycleState { worker_id, .. }
+        | WorkerMessage::ShardLoadReport { worker_id, .. }
+        | WorkerMessage::RequestDrain { worker_id } => Some(*worker_id),
+        _ => None,
+    }
+}
+
+async fn deny_authenticated_worker_action(
+    sender: &mpsc::Sender<ControlMessage>,
+    audit: Option<&Arc<FileAuditLog>>,
+    identity: &NodeIdentity,
+    resource: String,
+    detail: String,
+) -> bool {
+    let event = AuditEvent::now(identity.to_cn(), "security.authorization_denied", resource)
+        .with_detail(detail);
+    if !append_required_security_audit(audit, &event, "worker identity claim denial") {
+        return false;
+    }
+    send_message(
+        sender,
+        &ControlMessage::OperationFailed {
+            code: RS_2401.to_string(),
+            message: "worker identity claim is not authorized for this connection".to_owned(),
+            next_steps: rockstream_types::error_code::next_steps(RS_2401).to_string(),
+        },
+    )
+    .await;
+    true
+}
+
 /// Accept a connection and perform TLS handshake if configured.
 async fn accept_and_handle(
     stream: TcpStream,
@@ -2752,29 +4459,36 @@ async fn accept_and_handle(
                     Ok(id) => Some(id),
                     Err(e) => {
                         tracing::warn!(%peer, error = %e, "control: mTLS identity extraction failed");
-                        if let Some(aud) = &ctx.audit {
-                            let event = AuditEvent::now(
-                                "control",
-                                "security.internal_mtls_denied",
-                                format!("peer={peer}"),
-                            )
-                            .with_detail(format!(
-                                "identity extraction failed: {e}, error_code=RS-2411"
-                            ));
-                            let _ = aud.append(&event);
-                        }
+                        let event = AuditEvent::now(
+                            "unknown",
+                            "security.internal_mtls_denied",
+                            format!("peer={peer}"),
+                        )
+                        .with_error_code(rockstream_types::error_code::RS_2411.to_string())
+                        .with_detail(format!(
+                            "identity extraction failed: {e}, error_code=RS-2411"
+                        ));
+                        append_required_security_audit(
+                            ctx.audit.as_ref(),
+                            &event,
+                            "internal mTLS identity extraction failure",
+                        );
                         return;
                     }
                 };
                 if let Some(ref id) = identity {
                     if id.role == NodeRole::Cli {
-                        if let Some(aud) = &ctx.audit {
-                            let event = AuditEvent::now(
-                                id.to_cn(),
-                                "cli.authenticated",
-                                format!("peer={peer}"),
-                            );
-                            let _ = aud.append(&event);
+                        let event = AuditEvent::now(
+                            id.to_cn(),
+                            "cli.authenticated",
+                            format!("peer={peer}"),
+                        );
+                        if !append_required_security_audit(
+                            ctx.audit.as_ref(),
+                            &event,
+                            "internal CLI authentication",
+                        ) {
+                            return;
                         }
                     }
                 }
@@ -2789,15 +4503,18 @@ async fn accept_and_handle(
                     RS_2411
                 };
                 tracing::warn!(%peer, error = %e, %code, "control: mTLS handshake rejected");
-                if let Some(aud) = &ctx.audit {
-                    let event = AuditEvent::now(
-                        "control",
-                        "security.internal_mtls_denied",
-                        format!("peer={peer}"),
-                    )
-                    .with_detail(format!("TLS handshake failed: {e}, error_code={code}"));
-                    let _ = aud.append(&event);
-                }
+                let event = AuditEvent::now(
+                    "unknown",
+                    "security.internal_mtls_denied",
+                    format!("peer={peer}"),
+                )
+                .with_error_code(code.to_string())
+                .with_detail(format!("TLS handshake failed: {e}, error_code={code}"));
+                append_required_security_audit(
+                    ctx.audit.as_ref(),
+                    &event,
+                    "internal mTLS handshake rejection",
+                );
             }
         }
     } else {
@@ -2983,6 +4700,185 @@ async fn request_operator_stats(
     }
 }
 
+async fn request_workload_snapshot(
+    workload_id: WorkloadId,
+    data_plane: &Arc<AsyncMutex<DataPlaneState>>,
+    worker_senders: &Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
+    catalog: &TopologyCatalog,
+    shard_manager: &ShardManager,
+) -> ControlMessage {
+    let unavailable = || data_plane_failure("complete workload output is unavailable");
+    let (deployment_request, workers, expected_shards) = {
+        let state = data_plane.lock().await;
+        let Some(deployment) = state.deployments.get(&workload_id) else {
+            return unavailable();
+        };
+        if deployment.recovery_required {
+            return workload_recovery_failure();
+        }
+        if deployment.ready_waiter.is_some()
+            || state
+                .source_waiters
+                .values()
+                .any(|waiter| waiter.workload_id == workload_id)
+        {
+            return data_plane_failure("workload has an incomplete execution");
+        }
+        let descriptor_shards = deployment
+            .descriptors
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>();
+        if descriptor_shards.is_empty() || deployment.ready_shards != descriptor_shards {
+            return unavailable();
+        }
+        let mut expected_shards = HashMap::<WorkerId, HashMap<ShardId, LeaseToken>>::new();
+        for (shard_id, descriptor) in &deployment.descriptors {
+            if descriptor.shard.shard_id != *shard_id
+                || !shard_manager.get(*shard_id).is_some_and(|lease| {
+                    lease.worker_id == descriptor.shard.worker_id
+                        && lease.lease_token == descriptor.shard.lease_token
+                })
+            {
+                return unavailable();
+            }
+            expected_shards
+                .entry(descriptor.shard.worker_id)
+                .or_default()
+                .insert(*shard_id, descriptor.shard.lease_token);
+        }
+        for worker_id in expected_shards.keys() {
+            let Some(worker) = catalog.get(*worker_id) else {
+                return unavailable();
+            };
+            if !worker.healthy
+                || !worker.lifecycle.is_active()
+                || !worker
+                    .protocol_range
+                    .contains(rockstream_types::compatibility::ProtocolVersion::V4)
+                || !deployment
+                    .workers
+                    .get(worker_id)
+                    .is_some_and(|status| status.ready)
+            {
+                return unavailable();
+            }
+        }
+        let mut workers: Vec<_> = deployment.workers.values().cloned().collect();
+        workers.sort_by_key(|status| status.worker_id);
+        (deployment.request.clone(), workers, expected_shards)
+    };
+    let request_id = format!("workload-read:{}", uuid::Uuid::new_v4());
+    let mut worker_targets = {
+        let senders = worker_senders.lock().await;
+        let mut targets = Vec::with_capacity(expected_shards.len());
+        for (worker_id, shard_leases) in &expected_shards {
+            let Some(sender) = senders.get(worker_id).cloned() else {
+                return unavailable();
+            };
+            let mut shard_ids: Vec<_> = shard_leases.keys().copied().collect();
+            shard_ids.sort();
+            targets.push((*worker_id, sender, shard_ids));
+        }
+        targets
+    };
+    worker_targets.sort_by_key(|(worker_id, _, _)| *worker_id);
+
+    let (report_tx, mut report_rx) = mpsc::channel(expected_shards.len());
+    {
+        let mut state = data_plane.lock().await;
+        if state.workload_read_waiters.contains_key(&request_id) {
+            return unavailable();
+        }
+        state.workload_read_waiters.insert(
+            request_id.clone(),
+            WorkloadReadWaiter {
+                workload_id,
+                expected_shards: expected_shards.clone(),
+                received_workers: HashSet::new(),
+                sender: report_tx,
+            },
+        );
+    }
+    for (_, worker_sender, shard_ids) in worker_targets {
+        if worker_sender
+            .send(ControlMessage::ReadWorkload {
+                version: rockstream_types::data_plane::WORKLOAD_SNAPSHOT_VERSION,
+                request_id: request_id.clone(),
+                workload_id,
+                shard_ids,
+            })
+            .await
+            .is_err()
+        {
+            data_plane
+                .lock()
+                .await
+                .workload_read_waiters
+                .remove(&request_id);
+            return unavailable();
+        }
+    }
+
+    let expected_shard_count = expected_shards.values().map(HashMap::len).sum::<usize>();
+    let reports = tokio::time::timeout(Duration::from_secs(5), async {
+        let expected_workers = expected_shards.keys().copied().collect::<HashSet<_>>();
+        let mut received_workers = HashSet::new();
+        let mut outputs = HashMap::<ShardId, ShardOutput>::new();
+        while received_workers.len() < expected_workers.len() {
+            let (worker_id, available, shards) = report_rx.recv().await?;
+            if !expected_workers.contains(&worker_id) || !received_workers.insert(worker_id) {
+                continue;
+            }
+            if !available {
+                return None;
+            }
+            let expected = expected_shards.get(&worker_id)?;
+            if shards.len() != expected.len() {
+                return None;
+            }
+            for shard in shards {
+                if expected.get(&shard.shard_id).copied() != shard.lease_token
+                    || outputs.insert(shard.shard_id, shard).is_some()
+                {
+                    return None;
+                }
+            }
+        }
+        (received_workers == expected_workers && outputs.len() == expected_shard_count)
+            .then_some(outputs)
+    })
+    .await;
+    data_plane
+        .lock()
+        .await
+        .workload_read_waiters
+        .remove(&request_id);
+    let Ok(Some(mut outputs)) = reports else {
+        return unavailable();
+    };
+    for (worker_id, shard_leases) in &expected_shards {
+        for (shard_id, lease_token) in shard_leases {
+            if !shard_manager.get(*shard_id).is_some_and(|lease| {
+                lease.worker_id == *worker_id && lease.lease_token == *lease_token
+            }) {
+                return unavailable();
+            }
+        }
+    }
+    let mut shards: Vec<_> = outputs.drain().map(|(_, output)| output).collect();
+    shards.sort_by_key(|shard| shard.shard_id);
+    ControlMessage::WorkloadSnapshot {
+        snapshot: WorkloadSnapshot {
+            version: rockstream_types::data_plane::WORKLOAD_SNAPSHOT_VERSION,
+            complete: true,
+            deployment: deployment_request,
+            shards,
+            workers,
+        },
+    }
+}
+
 /// Handle a single worker connection over an arbitrary stream.
 async fn handle_connection_stream<R, W>(
     reader: R,
@@ -3006,6 +4902,8 @@ async fn handle_connection_stream<R, W>(
         operation_store,
         drain_state,
         secret_store,
+        security_catalog,
+        actor_assertion_verifier,
         worker_senders,
         migration_waiters,
         backup_waiters,
@@ -3023,6 +4921,7 @@ async fn handle_connection_stream<R, W>(
                 break;
             }
         }
+        let _ = writer.shutdown().await;
     });
     let mut lines = BufReader::new(reader).lines();
     let mut connected_worker_id: Option<rockstream_types::ids::WorkerId> = None;
@@ -3040,31 +4939,194 @@ async fn handle_connection_stream<R, W>(
             }
         };
 
+        let (msg, actor_assertion) = match msg {
+            WorkerMessage::DelegatedDataPlane {
+                version,
+                actor_assertion,
+                request,
+            } if version == rockstream_types::topology::DATA_PLANE_DELEGATION_VERSION
+                && is_gateway_data_plane_message(&request) =>
+            {
+                (*request, Some(actor_assertion))
+            }
+            WorkerMessage::DelegatedDataPlane { .. } => {
+                let actor = peer_identity
+                    .as_ref()
+                    .map_or(AuditIdentity::Unknown, |identity| {
+                        AuditIdentity::Unverified(identity.to_cn())
+                    });
+                if !append_gateway_delegation_audit(
+                    security_catalog.as_ref(),
+                    actor,
+                    AuditField::Known("gateway_data_plane".to_owned()),
+                    AuditField::Unknown,
+                    SecurityAuditClass::AuthenticationFailure,
+                    SecurityAuditOutcome::Denied,
+                    AuditField::NotApplicable,
+                )
+                .await
+                {
+                    break;
+                }
+                send_message(
+                    &sender,
+                    &ControlMessage::OperationFailed {
+                        code: RS_2400.to_string(),
+                        message: "gateway data-plane delegation envelope is invalid".to_owned(),
+                        next_steps: rockstream_types::error_code::next_steps(RS_2400).to_string(),
+                    },
+                )
+                .await;
+                break;
+            }
+            request => (request, None),
+        };
+
+        if let (Some(identity), Some(claimed_id)) = (&peer_identity, claimed_worker_id(&msg)) {
+            if identity.role != NodeRole::Worker
+                || !identity.matches_worker_id(claimed_id.0)
+                || connected_worker_id != Some(claimed_id)
+            {
+                let registered_id = connected_worker_id
+                    .map(|worker_id| worker_id.to_string())
+                    .unwrap_or_else(|| "unknown".to_owned());
+                if append_node_identity_rejection(
+                    security_catalog.as_ref(),
+                    identity,
+                    connected_worker_id,
+                    claimed_id,
+                )
+                .await
+                {
+                    let event = AuditEvent::now(
+                        identity.to_cn(),
+                        "security.authorization_denied",
+                        claimed_id.to_string(),
+                    )
+                    .with_error_code(RS_2401.to_string())
+                    .with_detail(format!(
+                        "registered_worker_id={registered_id}, claimed_worker_id={claimed_id}, error_code={RS_2401}"
+                    ));
+                    if append_required_security_audit(
+                        audit.as_ref(),
+                        &event,
+                        "worker node identity rejection",
+                    ) {
+                        send_message(
+                            &sender,
+                            &ControlMessage::OperationFailed {
+                                code: RS_2401.to_string(),
+                                message:
+                                    "worker identity claim is not authorized for this connection"
+                                        .to_owned(),
+                                next_steps: rockstream_types::error_code::next_steps(RS_2401)
+                                    .to_string(),
+                            },
+                        )
+                        .await;
+                    }
+                }
+                break;
+            }
+        }
+
+        let mut delegated_actor = None;
+        if is_gateway_data_plane_message(&msg) {
+            if !allow_gateway_data_plane_peer(
+                &sender,
+                security_catalog.as_ref(),
+                peer_identity.as_ref(),
+                "gateway_data_plane",
+            )
+            .await
+            {
+                break;
+            }
+            if let Some(identity) = peer_identity.as_ref() {
+                let authorization_context = GatewayActorAuthorizationContext {
+                    sender: &sender,
+                    catalog: security_catalog.as_ref(),
+                    verifier: actor_assertion_verifier.as_deref(),
+                    identity,
+                    data_plane: &data_plane,
+                };
+                if !authorize_gateway_actor_assertion(
+                    &authorization_context,
+                    actor_assertion.as_deref(),
+                    &msg,
+                    &mut delegated_actor,
+                )
+                .await
+                {
+                    break;
+                }
+            } else if actor_assertion.is_some() {
+                if !append_gateway_delegation_audit(
+                    security_catalog.as_ref(),
+                    AuditIdentity::Unknown,
+                    AuditField::Known("gateway_data_plane".to_owned()),
+                    AuditField::Unknown,
+                    SecurityAuditClass::AuthenticationFailure,
+                    SecurityAuditOutcome::Denied,
+                    AuditField::NotApplicable,
+                )
+                .await
+                {
+                    break;
+                }
+                send_message(
+                    &sender,
+                    &ControlMessage::OperationFailed {
+                        code: RS_2400.to_string(),
+                        message:
+                            "gateway actor assertions require an authenticated node connection"
+                                .to_owned(),
+                        next_steps: rockstream_types::error_code::next_steps(RS_2400).to_string(),
+                    },
+                )
+                .await;
+                break;
+            }
+        }
+
         match msg {
+            WorkerMessage::DelegatedDataPlane { .. } => break,
             WorkerMessage::Register(reg) => {
                 if let Some(id) = &peer_identity {
-                    if id.role != NodeRole::Worker
-                        || (!id.matches_worker_id(reg.worker_id.0)
-                            && !id.matches_worker_str(&reg.address))
-                    {
+                    if id.role != NodeRole::Worker || !id.matches_worker_id(reg.worker_id.0) {
                         tracing::warn!(
                             %peer,
                             cert_identity = %id.to_cn(),
                             registered_id = %reg.worker_id,
                             "control: worker mTLS identity mismatch rejected"
                         );
-                        if let Some(aud) = &audit {
-                            let event = AuditEvent::now(
-                                "control",
-                                "security.internal_mtls_denied",
-                                format!("worker_id={}, peer={peer}", reg.worker_id),
-                            )
-                            .with_detail(format!(
-                                "node identity mismatch: cert={}, requested_worker_id={}, error_code=RS-2412",
-                                id.to_cn(),
-                                reg.worker_id
-                            ));
-                            let _ = aud.append(&event);
+                        if !append_node_identity_rejection(
+                            security_catalog.as_ref(),
+                            id,
+                            connected_worker_id,
+                            reg.worker_id,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        let event = AuditEvent::now(
+                            id.to_cn(),
+                            "security.internal_mtls_denied",
+                            format!("worker_id={}, peer={peer}", reg.worker_id),
+                        )
+                        .with_error_code(rockstream_types::error_code::RS_2412.to_string())
+                        .with_detail(format!(
+                            "node identity mismatch: cert={}, requested_worker_id={}, error_code=RS-2412",
+                            id.to_cn(),
+                            reg.worker_id
+                        ));
+                        if !append_required_security_audit(
+                            audit.as_ref(),
+                            &event,
+                            "worker node identity rejection",
+                        ) {
+                            return;
                         }
                         let reply = ControlMessage::OperationFailed {
                             code: RS_2412.to_string(),
@@ -3077,6 +5139,68 @@ async fn handle_connection_stream<R, W>(
                                 .to_string(),
                         };
                         send_message(&sender, &reply).await;
+                        return;
+                    }
+                    if !reg
+                        .protocol_range
+                        .contains(rockstream_types::compatibility::ProtocolVersion::V4)
+                    {
+                        let record = SecurityAuditRecord {
+                            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                            event_id: format!("worker-protocol-denial:{}", uuid::Uuid::new_v4()),
+                            timestamp_ms: now_ms().max(1),
+                            actor: AuditIdentity::Verified(id.to_cn()),
+                            target: AuditField::Known(reg.worker_id.to_string()),
+                            scope: AuditField::Known("worker_control".to_owned()),
+                            action: SecurityAuditClass::AuthorizationDenial,
+                            outcome: SecurityAuditOutcome::Denied,
+                            correlation: AuditCorrelation::Unknown,
+                            operation_id: AuditField::NotApplicable,
+                            policy_revision: AuditField::NotApplicable,
+                            before_state: AuditField::NotApplicable,
+                            after_state: AuditField::NotApplicable,
+                        };
+                        let request_id = record.event_id.clone();
+                        if !append_validated_security_audit(
+                            security_catalog.as_ref(),
+                            &request_id,
+                            record,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        let event = AuditEvent::now(
+                            id.to_cn(),
+                            "security.internal_mtls_denied",
+                            format!("worker_id={}, peer={peer}", reg.worker_id),
+                        )
+                        .with_error_code(rockstream_types::error_code::RS_5021.to_string())
+                        .with_detail(format!(
+                            "worker protocol range {:?} does not include v4 required for complete workload reads",
+                            reg.protocol_range
+                        ));
+                        if !append_required_security_audit(
+                            audit.as_ref(),
+                            &event,
+                            "worker protocol version rejection",
+                        ) {
+                            return;
+                        }
+                        send_message(
+                            &sender,
+                            &ControlMessage::OperationFailed {
+                                code: rockstream_types::error_code::RS_5021.to_string(),
+                                message:
+                                    "RS-5021: authenticated worker shuffle requires protocol v4"
+                                        .to_owned(),
+                                next_steps: rockstream_types::error_code::next_steps(
+                                    rockstream_types::error_code::RS_5021,
+                                )
+                                .to_string(),
+                            },
+                        )
+                        .await;
                         return;
                     }
                 }
@@ -3114,13 +5238,14 @@ async fn handle_connection_stream<R, W>(
                 if let Some(worker) = catalog.get(worker_id) {
                     persist_worker_if_needed(topology_store.as_ref(), &worker).await;
                 }
-                let reply = ControlMessage::Registered { worker_id };
+                let reply = ControlMessage::Registered {
+                    worker_id,
+                    protocol_version: rockstream_types::compatibility::ProtocolVersion::V4,
+                };
                 send_message(&sender, &reply).await;
                 broadcast_message(
                     &worker_senders,
-                    ControlMessage::TopologyChanged {
-                        workers: catalog.healthy_workers(),
-                    },
+                    topology_changed_message(&catalog, &shard_manager),
                 )
                 .await;
                 let acked = drain_state
@@ -3134,6 +5259,7 @@ async fn handle_connection_stream<R, W>(
                     process_drain_queue(
                         &catalog,
                         &shard_manager,
+                        &data_plane,
                         audit.as_ref(),
                         shard_store.as_ref(),
                         topology_store.as_ref(),
@@ -3146,14 +5272,122 @@ async fn handle_connection_stream<R, W>(
                     .await;
                 }
             }
+            WorkerMessage::OwnedShuffleReady { worker_id } => {
+                if connected_worker_id == Some(worker_id) {
+                    data_plane
+                        .lock()
+                        .await
+                        .owned_shuffle_workers
+                        .insert(worker_id);
+                }
+            }
+            WorkerMessage::OwnedEpochRecoveryRequired {
+                worker_id,
+                workload_id,
+                shard_id,
+            } => {
+                if connected_worker_id == Some(worker_id) {
+                    let mut state = data_plane.lock().await;
+                    if let Some(deployment) = state.deployments.get_mut(&workload_id) {
+                        if deployment
+                            .descriptors
+                            .get(&shard_id)
+                            .is_some_and(|descriptor| descriptor.shard.worker_id == worker_id)
+                        {
+                            deployment.recovery_required = true;
+                        }
+                    }
+                }
+            }
+            WorkerMessage::OwnedEpochPrepared {
+                worker_id,
+                intent,
+                error,
+            } => {
+                let reply = take_owned_epoch_reply(
+                    &mut *data_plane.lock().await,
+                    connected_worker_id,
+                    worker_id,
+                    &intent,
+                    false,
+                );
+                if let Some(reply) = reply {
+                    let _ = reply.send(error.map_or(Ok(()), Err));
+                }
+            }
+            WorkerMessage::OwnedEpochFinished {
+                worker_id,
+                intent,
+                error,
+            } => {
+                let reply = take_owned_epoch_reply(
+                    &mut *data_plane.lock().await,
+                    connected_worker_id,
+                    worker_id,
+                    &intent,
+                    true,
+                );
+                if let Some(reply) = reply {
+                    let _ = reply.send(error.map_or(Ok(()), Err));
+                }
+            }
+            WorkerMessage::ReportSecurityAudit { request_id, record } => {
+                let authenticated_reporter = peer_identity.as_ref().is_some_and(|identity| {
+                    connected_worker_id.is_some_and(|worker_id| {
+                        identity.role == NodeRole::Worker && identity.matches_worker_id(worker_id.0)
+                    })
+                });
+                let persisted = authenticated_reporter
+                    && append_validated_security_audit(
+                        security_catalog.as_ref(),
+                        &request_id,
+                        record,
+                    )
+                    .await;
+                send_message(
+                    &sender,
+                    &ControlMessage::SecurityAuditRecorded {
+                        request_id,
+                        persisted,
+                    },
+                )
+                .await;
+            }
             WorkerMessage::DeployWorkload(request) => {
                 deploy_workload(
                     request,
-                    &sender,
-                    &catalog,
-                    &shard_manager,
-                    &worker_senders,
-                    &data_plane,
+                    None,
+                    delegated_actor,
+                    WorkloadDeploymentContext {
+                        secret_catalog: security_catalog.as_ref(),
+                        sender: &sender,
+                        catalog: &catalog,
+                        shard_manager: &shard_manager,
+                        worker_senders: &worker_senders,
+                        data_plane: &data_plane,
+                    },
+                )
+                .await;
+                if let Some(store) = &shard_store {
+                    persist_shard_state(&shard_manager, store).await;
+                }
+            }
+            WorkerMessage::DeployWorkloadSharded {
+                request,
+                shard_count,
+            } => {
+                deploy_workload(
+                    request,
+                    Some(shard_count),
+                    delegated_actor,
+                    WorkloadDeploymentContext {
+                        secret_catalog: security_catalog.as_ref(),
+                        sender: &sender,
+                        catalog: &catalog,
+                        shard_manager: &shard_manager,
+                        worker_senders: &worker_senders,
+                        data_plane: &data_plane,
+                    },
                 )
                 .await;
                 if let Some(store) = &shard_store {
@@ -3169,20 +5403,27 @@ async fn handle_connection_stream<R, W>(
                 frontier: worker_frontier,
                 ..
             } => {
-                let reply =
-                    {
-                        let mut state = data_plane.lock().await;
-                        let Some(deployment) = state.deployments.get_mut(&workload_id) else {
-                            continue;
-                        };
-                        let valid = deployment
-                            .descriptors
-                            .get(&shard_id)
-                            .map(|descriptor| {
-                                descriptor.shard.worker_id == worker_id
-                                    && operator_ids.contains(&descriptor.sink_operator_id)
-                            })
-                            .unwrap_or(false);
+                let (reply, handoff_waiter) = {
+                    let mut state = data_plane.lock().await;
+                    let handoff_waiter =
+                        state
+                            .handoff_ready_waiters
+                            .remove(&(workload_id, shard_id, worker_id));
+                    let Some(deployment) = state.deployments.get_mut(&workload_id) else {
+                        if let Some(waiter) = handoff_waiter {
+                            let _ = waiter.send(());
+                        }
+                        continue;
+                    };
+                    let valid = deployment
+                        .descriptors
+                        .get(&shard_id)
+                        .map(|descriptor| {
+                            (descriptor.shard.worker_id == worker_id || handoff_waiter.is_some())
+                                && operator_ids.contains(&descriptor.sink_operator_id)
+                        })
+                        .unwrap_or(false);
+                    let reply =
                         if !valid {
                             None
                         } else {
@@ -3208,32 +5449,210 @@ async fn handle_connection_stream<R, W>(
                                 let mut workers: Vec<_> =
                                     deployment.workers.values().cloned().collect();
                                 workers.sort_by_key(|status| status.worker_id);
-                                deployment.ready_waiter.take().map(|waiter| {
-                                    (
-                                        waiter,
-                                        ControlMessage::DeploymentReady {
-                                            workload_id,
-                                            workers,
-                                        },
-                                    )
-                                })
+                                let reply = if deployment.recovery_required {
+                                    workload_recovery_failure()
+                                } else {
+                                    ControlMessage::DeploymentReady {
+                                        workload_id,
+                                        workers,
+                                    }
+                                };
+                                deployment.ready_waiter.take().map(|waiter| (waiter, reply))
                             } else {
                                 None
                             }
-                        }
-                    };
+                        };
+                    (reply, if valid { handoff_waiter } else { None })
+                };
+                if let Some(waiter) = handoff_waiter {
+                    let _ = waiter.send(());
+                }
                 if let Some((waiter, reply)) = reply {
                     send_message(&waiter, &reply).await;
                 }
             }
             WorkerMessage::SubmitSourceDelta(request) => {
-                submit_source_delta(request, &sender, &worker_senders, &data_plane).await;
+                {
+                    let state = data_plane.lock().await;
+                    state.row_payloads_received.fetch_add(
+                        request.rows.len() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+                if connected_worker_id.is_some() {
+                    let sender = sender.clone();
+                    let catalog = catalog.clone();
+                    let worker_senders = worker_senders.clone();
+                    let data_plane = data_plane.clone();
+                    tokio::spawn(async move {
+                        submit_source_delta(
+                            request,
+                            &sender,
+                            &catalog,
+                            &worker_senders,
+                            &data_plane,
+                        )
+                        .await;
+                    });
+                } else {
+                    submit_source_delta(request, &sender, &catalog, &worker_senders, &data_plane)
+                        .await;
+                }
             }
+            WorkerMessage::ShuffleDispatchFailed { output, message } => {
+                let waiter = {
+                    let mut state = data_plane.lock().await;
+                    let valid_target = state
+                        .deployments
+                        .get(&output.workload_id)
+                        .and_then(|deployment| deployment.descriptors.get(&output.shard_id))
+                        .is_some_and(|descriptor| {
+                            descriptor.sink_operator_id == output.operator_id
+                                && descriptor.shard.lease_token == output.lease_token
+                        });
+                    let valid_request =
+                        state
+                            .source_waiters
+                            .get(&output.request_id)
+                            .is_some_and(|waiter| {
+                                waiter.attempt_id == output.attempt_id
+                                    && waiter.workload_id == output.workload_id
+                                    && waiter.version == output.version
+                                    && waiter.epoch == output.epoch
+                                    && waiter.source == output.source
+                                    && waiter.expected.contains(&output.shard_id)
+                                    && !waiter.received.contains(&output.shard_id)
+                                    && connected_worker_id.is_some_and(|worker| {
+                                        waiter.dispatchers.get(&output.shard_id) == Some(&worker)
+                                    })
+                            });
+                    if valid_target && valid_request && output.rows.is_empty() {
+                        if let Some(deployment) = state.deployments.get_mut(&output.workload_id) {
+                            deployment.recovery_required = true;
+                        }
+                        state.source_waiters.remove(&output.request_id)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(waiter) = waiter {
+                    send_message(
+                        &waiter.sender,
+                        &workload_failure(format!("shuffle dispatch failed: {message}")),
+                    )
+                    .await;
+                }
+            }
+            WorkerMessage::ExecutionFailed { output, message } => {
+                let assigned_worker = data_plane
+                    .lock()
+                    .await
+                    .deployments
+                    .get(&output.workload_id)
+                    .and_then(|deployment| deployment.descriptors.get(&output.shard_id))
+                    .map(|descriptor| descriptor.shard.worker_id);
+                if let (Some(identity), Some(assigned_worker)) = (&peer_identity, assigned_worker) {
+                    if identity.role != NodeRole::Worker
+                        || connected_worker_id != Some(assigned_worker)
+                        || !identity.matches_worker_id(assigned_worker.0)
+                    {
+                        let registered_id = connected_worker_id
+                            .map(|worker_id| worker_id.to_string())
+                            .unwrap_or_else(|| "unknown".to_owned());
+                        if !deny_authenticated_worker_action(
+                            &sender,
+                            audit.as_ref(),
+                            identity,
+                            format!("{}/{}", output.workload_id, output.shard_id),
+                            format!(
+                                "operation=execution_progress, registered_worker_id={registered_id}, assigned_worker_id={assigned_worker}, error_code={RS_2401}"
+                            ),
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        continue;
+                    }
+                }
+                let waiter = {
+                    let mut state = data_plane.lock().await;
+                    let valid_owner = state
+                        .deployments
+                        .get(&output.workload_id)
+                        .and_then(|deployment| deployment.descriptors.get(&output.shard_id))
+                        .is_some_and(|descriptor| {
+                            connected_worker_id == Some(descriptor.shard.worker_id)
+                                && descriptor.shard.lease_token == output.lease_token
+                                && descriptor.sink_operator_id == output.operator_id
+                        });
+                    let valid_request =
+                        state
+                            .source_waiters
+                            .get(&output.request_id)
+                            .is_some_and(|waiter| {
+                                waiter.attempt_id == output.attempt_id
+                                    && waiter.workload_id == output.workload_id
+                                    && waiter.version == output.version
+                                    && waiter.epoch == output.epoch
+                                    && waiter.source == output.source
+                                    && waiter.expected.contains(&output.shard_id)
+                                    && !waiter.received.contains(&output.shard_id)
+                            });
+                    if valid_owner && valid_request && output.rows.is_empty() {
+                        if let Some(deployment) = state.deployments.get_mut(&output.workload_id) {
+                            deployment.recovery_required = true;
+                        }
+                        state.source_waiters.remove(&output.request_id)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(waiter) = waiter {
+                    send_message(
+                        &waiter.sender,
+                        &workload_failure(format!("worker execution failed: {message}")),
+                    )
+                    .await;
+                }
+            }
+
             WorkerMessage::ExecutionProgress {
                 output,
                 input_rows,
                 output_rows,
             } => {
+                let assigned_worker = data_plane
+                    .lock()
+                    .await
+                    .deployments
+                    .get(&output.workload_id)
+                    .and_then(|deployment| deployment.descriptors.get(&output.shard_id))
+                    .map(|descriptor| descriptor.shard.worker_id);
+                if let (Some(identity), Some(assigned_worker)) = (&peer_identity, assigned_worker) {
+                    if identity.role != NodeRole::Worker
+                        || connected_worker_id != Some(assigned_worker)
+                        || !identity.matches_worker_id(assigned_worker.0)
+                    {
+                        let registered_id = connected_worker_id
+                            .map(|worker_id| worker_id.to_string())
+                            .unwrap_or_else(|| "unknown".to_owned());
+                        if !deny_authenticated_worker_action(
+                            &sender,
+                            audit.as_ref(),
+                            identity,
+                            format!("{}/{}", output.workload_id, output.shard_id),
+                            format!(
+                                "operation=execution_progress, registered_worker_id={registered_id}, assigned_worker_id={assigned_worker}, error_code={RS_2401}"
+                            ),
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        continue;
+                    }
+                }
                 let valid = data_plane
                     .lock()
                     .await
@@ -3256,31 +5675,125 @@ async fn handle_connection_stream<R, W>(
                 let completion = {
                     let mut state = data_plane.lock().await;
                     let deployment = state.deployments.get_mut(&output.workload_id).unwrap();
+                    if deployment.recovery_required {
+                        continue;
+                    }
                     let worker_id = deployment.descriptors[&output.shard_id].shard.worker_id;
                     if let Some(status) = deployment.workers.get_mut(&worker_id) {
                         status.input_rows += input_rows;
                         status.output_rows += output_rows;
                         status.frontier = status.frontier.max(output.epoch);
                     }
-                    let waiter = state.source_waiters.get_mut(&output.request_id);
-                    waiter.and_then(|waiter| {
-                        waiter.received += 1;
-                        (waiter.received == waiter.expected).then(|| {
-                            (
-                                waiter.sender.clone(),
+                    let completed = state
+                        .source_waiters
+                        .get_mut(&output.request_id)
+                        .is_some_and(|waiter| waiter.record_progress(&output));
+                    if !completed {
+                        None
+                    } else if let Some(intent) = state.source_waiters[&output.request_id]
+                        .owned_intent
+                        .clone()
+                    {
+                        let anchor = state
+                            .deployments
+                            .get(&intent.workload_id)
+                            .and_then(|deployment| deployment.descriptors.get(&intent.anchor_shard))
+                            .map(|descriptor| descriptor.shard.worker_id);
+                        if let Some(anchor) = anchor {
+                            let (sender, receiver) = tokio::sync::oneshot::channel();
+                            let waiter = state.source_waiters.get_mut(&output.request_id).unwrap();
+                            waiter.finishing = true;
+                            waiter.finish_reply = Some(sender);
+                            Some(SourceCompletion::Owned(anchor, intent, receiver))
+                        } else {
+                            Some(SourceCompletion::MissingAnchor(
                                 output.request_id.clone(),
-                                waiter.epoch,
-                            )
-                        })
-                    })
+                                output.workload_id,
+                            ))
+                        }
+                    } else {
+                        state
+                            .source_waiters
+                            .remove(&output.request_id)
+                            .map(|waiter| {
+                                SourceCompletion::Immediate(
+                                    waiter.sender,
+                                    output.request_id.clone(),
+                                    waiter.epoch,
+                                )
+                            })
+                    }
                 };
-                if let Some((waiter, request_id, epoch)) = completion {
-                    data_plane.lock().await.source_waiters.remove(&request_id);
-                    send_message(
-                        &waiter,
-                        &ControlMessage::SourceDeltaCommitted { request_id, epoch },
-                    )
-                    .await;
+                match completion {
+                    Some(SourceCompletion::Immediate(waiter, request_id, epoch)) => {
+                        send_message(
+                            &waiter,
+                            &ControlMessage::SourceDeltaCommitted { request_id, epoch },
+                        )
+                        .await;
+                    }
+                    Some(SourceCompletion::Owned(anchor, intent, reply)) => {
+                        tokio::spawn(finish_owned_source(
+                            data_plane.clone(),
+                            worker_senders.clone(),
+                            anchor,
+                            intent,
+                            reply,
+                        ));
+                    }
+                    Some(SourceCompletion::MissingAnchor(request_id, workload_id)) => {
+                        fail_source_request(
+                            &data_plane,
+                            &request_id,
+                            workload_id,
+                            "owned epoch anchor is unavailable",
+                        )
+                        .await;
+                    }
+                    None => {}
+                }
+            }
+            WorkerMessage::WorkloadReadReport {
+                version,
+                request_id,
+                workload_id,
+                worker_id,
+                available,
+                shards,
+            } => {
+                if version == rockstream_types::data_plane::WORKLOAD_SNAPSHOT_VERSION
+                    && connected_worker_id == Some(worker_id)
+                {
+                    let report_target = {
+                        let mut state = data_plane.lock().await;
+                        state
+                            .workload_read_waiters
+                            .get_mut(&request_id)
+                            .and_then(|waiter| {
+                                if waiter.workload_id != workload_id
+                                    || waiter.received_workers.contains(&worker_id)
+                                {
+                                    return None;
+                                }
+                                let expected = waiter.expected_shards.get(&worker_id)?;
+                                let valid = if available {
+                                    shards.len() == expected.len()
+                                        && shards.iter().all(|shard| {
+                                            expected.get(&shard.shard_id).copied()
+                                                == shard.lease_token
+                                        })
+                                } else {
+                                    shards.is_empty()
+                                };
+                                if !valid || !waiter.received_workers.insert(worker_id) {
+                                    return None;
+                                }
+                                Some(waiter.sender.clone())
+                            })
+                    };
+                    if let Some(report_sender) = report_target {
+                        let _ = report_sender.send((worker_id, available, shards)).await;
+                    }
                 }
             }
             WorkerMessage::OperatorStatsReport {
@@ -3335,32 +5848,164 @@ async fn handle_connection_stream<R, W>(
                 };
                 send_message(&sender, &reply).await;
             }
-            WorkerMessage::ReadWorkload { workload_id } => {
-                let snapshot = {
-                    let state = data_plane.lock().await;
-                    state.deployments.get(&workload_id).map(|deployment| {
-                        let mut shards: Vec<_> = deployment
-                            .descriptors
-                            .keys()
-                            .map(|shard_id| ShardOutput {
-                                shard_id: *shard_id,
-                                deltas: Vec::new(),
-                            })
-                            .collect();
-                        shards.sort_by_key(|shard| shard.shard_id);
-                        let mut workers: Vec<_> = deployment.workers.values().cloned().collect();
-                        workers.sort_by_key(|status| status.worker_id);
-                        WorkloadSnapshot {
-                            deployment: deployment.request.clone(),
-                            shards,
-                            workers,
-                        }
-                    })
+            WorkerMessage::ReadWorkload {
+                version,
+                workload_id,
+            } => {
+                let reply = if connected_worker_id.is_none()
+                    && version == rockstream_types::data_plane::WORKLOAD_SNAPSHOT_VERSION
+                {
+                    request_workload_snapshot(
+                        workload_id,
+                        &data_plane,
+                        &worker_senders,
+                        &catalog,
+                        &shard_manager,
+                    )
+                    .await
+                } else {
+                    data_plane_failure("workload read protocol is unavailable")
                 };
-                let reply = snapshot
-                    .map(|snapshot| ControlMessage::WorkloadSnapshot { snapshot })
-                    .unwrap_or_else(|| data_plane_failure("workload is not deployed"));
                 send_message(&sender, &reply).await;
+            }
+            WorkerMessage::DiscoverShards => {
+                let cluster_frontier = frontier.as_ref().and_then(|f| f.cluster_frontier().epoch);
+                let shards = shard_manager
+                    .leases()
+                    .into_iter()
+                    .map(|lease| rockstream_types::topology::ShardServingInfo {
+                        shard_id: lease.shard_id,
+                        remote_prefix: format!("shards/{}", lease.shard_id.0),
+                        db_path: "db".to_owned(),
+                        worker_id: lease.worker_id,
+                        lease_token: lease.lease_token,
+                        published_frontier: cluster_frontier,
+                    })
+                    .collect();
+                send_message(
+                    &sender,
+                    &ControlMessage::ServingTopology {
+                        shards,
+                        cluster_frontier,
+                    },
+                )
+                .await;
+            }
+            WorkerMessage::GetWorkloadTopology { workload_id } => {
+                let reply = {
+                    let state = data_plane.lock().await;
+                    match state.deployments.get(&workload_id) {
+                        Some(deployment) => {
+                            let workers = catalog.all_workers();
+                            let worker_addrs: HashMap<WorkerId, String> = workers
+                                .iter()
+                                .map(|w| (w.worker_id, w.address.clone()))
+                                .collect();
+                            let mut shards: Vec<_> = deployment
+                                .descriptors
+                                .values()
+                                .map(|descriptor| {
+                                    let active_lease = shard_manager
+                                        .get(descriptor.shard.shard_id)
+                                        .unwrap_or_else(|| descriptor.shard.clone());
+                                    let worker_address = worker_addrs
+                                        .get(&active_lease.worker_id)
+                                        .cloned()
+                                        .unwrap_or_default();
+                                    rockstream_types::data_plane::WorkloadShardPlacement {
+                                        shard_id: active_lease.shard_id,
+                                        shard_index: descriptor.shard_index,
+                                        worker_id: active_lease.worker_id,
+                                        worker_address,
+                                        lease_token: active_lease.lease_token,
+                                        operator_id: descriptor.sink_operator_id,
+                                        storage_identity: descriptor.storage_identity.clone(),
+                                        frontier: descriptor.frontier,
+                                    }
+                                })
+                                .collect();
+                            shards.sort_by_key(|s| (s.shard_index, s.shard_id));
+                            ControlMessage::WorkloadTopology {
+                                snapshot: rockstream_types::data_plane::WorkloadTopologySnapshot {
+                                    topology_epoch: state.topology_epoch.max(1),
+                                    workload_id,
+                                    routing_columns: deployment.request.routing_columns.clone(),
+                                    schemas: deployment.request.schemas.clone(),
+                                    shards,
+                                    workers,
+                                },
+                            }
+                        }
+                        None => data_plane_failure("workload is not deployed"),
+                    }
+                };
+                send_message(&sender, &reply).await;
+            }
+            WorkerMessage::AcquireConnectorLease {
+                connector_id,
+                owner_id,
+                ttl_ms,
+            } => {
+                let leases = data_plane.lock().await.connector_leases.clone();
+                let reply = match leases.acquire(connector_id, &owner_id, ttl_ms, now_ms()) {
+                    Ok(lease) => ControlMessage::ConnectorLeaseGranted { lease },
+                    Err((current_owner, message)) => {
+                        let code = if message.starts_with("RS-1701") {
+                            "RS-1701"
+                        } else {
+                            "RS-1703"
+                        };
+                        ControlMessage::ConnectorLeaseDenied {
+                            connector_id,
+                            current_owner,
+                            code: code.to_owned(),
+                            message,
+                        }
+                    }
+                };
+                send_message(&sender, &reply).await;
+            }
+            WorkerMessage::RenewConnectorLease {
+                connector_id,
+                owner_id,
+                lease_token,
+                ttl_ms,
+            } => {
+                let leases = data_plane.lock().await.connector_leases.clone();
+                let reply =
+                    match leases.renew(connector_id, &owner_id, lease_token, ttl_ms, now_ms()) {
+                        Ok(lease) => ControlMessage::ConnectorLeaseGranted { lease },
+                        Err((current_owner, message)) => {
+                            let code = if message.starts_with("RS-1702") {
+                                "RS-1702"
+                            } else {
+                                "RS-1703"
+                            };
+                            ControlMessage::ConnectorLeaseDenied {
+                                connector_id,
+                                current_owner,
+                                code: code.to_owned(),
+                                message,
+                            }
+                        }
+                    };
+                send_message(&sender, &reply).await;
+            }
+            WorkerMessage::ReleaseConnectorLease {
+                connector_id,
+                owner_id,
+                lease_token,
+            } => {
+                let leases = data_plane.lock().await.connector_leases.clone();
+                let released = leases.release(connector_id, &owner_id, lease_token);
+                send_message(
+                    &sender,
+                    &ControlMessage::ConnectorLeaseReleased {
+                        connector_id,
+                        released,
+                    },
+                )
+                .await;
             }
             WorkerMessage::Heartbeat {
                 worker_id,
@@ -3425,8 +6070,7 @@ async fn handle_connection_stream<R, W>(
                     }
                 }
                 // Notify remaining workers about topology change.
-                let workers = catalog.healthy_workers();
-                let notify = ControlMessage::TopologyChanged { workers };
+                let notify = topology_changed_message(&catalog, &shard_manager);
                 broadcast_message(&worker_senders, notify).await;
             }
             WorkerMessage::RequestShard {
@@ -3551,6 +6195,11 @@ async fn handle_connection_stream<R, W>(
                         if let Some(store) = &shard_store {
                             persist_shard_state(&shard_manager, store).await;
                         }
+                        broadcast_message(
+                            &worker_senders,
+                            topology_changed_message(&catalog, &shard_manager),
+                        )
+                        .await;
                         let reply = ControlMessage::ShardAssigned {
                             lease,
                             operation_id: None,
@@ -3582,11 +6231,43 @@ async fn handle_connection_stream<R, W>(
                             .await;
                     }
                 }
+                let connection_owns_shard = peer_identity.as_ref().is_none_or(|identity| {
+                    identity.role == NodeRole::Worker
+                        && connected_worker_id.is_some_and(|worker_id| {
+                            identity.matches_worker_id(worker_id.0)
+                                && shard_manager
+                                    .get(shard_id)
+                                    .is_some_and(|lease| lease.worker_id == worker_id)
+                        })
+                });
+                if !connection_owns_shard {
+                    if let Some(identity) = &peer_identity {
+                        let registered_id = connected_worker_id
+                            .map(|worker_id| worker_id.to_string())
+                            .unwrap_or_else(|| "unknown".to_owned());
+                        let event = AuditEvent::now(
+                            identity.to_cn(),
+                            "security.authorization_denied",
+                            shard_id.to_string(),
+                        )
+                        .with_detail(format!(
+                            "operation=fence_write, registered_worker_id={registered_id}, error_code={RS_2401}"
+                        ));
+                        if !append_required_security_audit(
+                            audit.as_ref(),
+                            &event,
+                            "fence check identity denial",
+                        ) {
+                            return;
+                        }
+                    }
+                }
                 // A partitioned former leader must never certify a stale
                 // lease. Only a live Raft quorum authority may fence writes.
-                let valid = raft
-                    .as_ref()
-                    .is_none_or(|node| node.require_leader().is_ok())
+                let valid = connection_owns_shard
+                    && raft
+                        .as_ref()
+                        .is_none_or(|node| node.require_leader().is_ok())
                     && shard_manager.is_valid_writer(shard_id, lease_token);
                 tracing::debug!(
                     %shard_id,
@@ -3623,6 +6304,7 @@ async fn handle_connection_stream<R, W>(
                     process_drain_queue(
                         &catalog,
                         &shard_manager,
+                        &data_plane,
                         audit.as_ref(),
                         shard_store.as_ref(),
                         topology_store.as_ref(),
@@ -3762,32 +6444,204 @@ async fn handle_connection_stream<R, W>(
                 );
             }
             WorkerMessage::ResolveSecretToken { secret_name } => {
-                let Some(identity) = peer_identity
+                let actor = peer_identity
                     .as_ref()
-                    .filter(|id| id.role == NodeRole::Worker)
-                else {
-                    let reply = ControlMessage::OperationFailed {
-                        code: RS_2410.to_string(),
-                        message:
-                            "secret token requests require an authenticated worker certificate"
-                                .to_string(),
-                        next_steps: rockstream_types::error_code::next_steps(RS_2410).to_string(),
-                    };
-                    send_message(&sender, &reply).await;
+                    .map_or(AuditIdentity::Unknown, |identity| {
+                        AuditIdentity::Verified(identity.to_cn())
+                    });
+                let audited = append_gateway_delegation_audit(
+                    security_catalog.as_ref(),
+                    actor,
+                    AuditField::Known(secret_name),
+                    AuditField::Unknown,
+                    SecurityAuditClass::AuthorizationDenial,
+                    SecurityAuditOutcome::Denied,
+                    AuditField::NotApplicable,
+                )
+                .await;
+                let code = if audited { RS_2401 } else { RS_0003 };
+                send_message(
+                    &sender,
+                    &ControlMessage::OperationFailed {
+                        code: code.to_string(),
+                        message: "unscoped worker secret requests are disabled".to_owned(),
+                        next_steps: rockstream_types::error_code::next_steps(code).to_string(),
+                    },
+                )
+                .await;
+            }
+            WorkerMessage::ResolveWorkloadSecretToken {
+                workload_id,
+                secret_name,
+            } => {
+                let Some(identity) = peer_identity.as_ref().filter(|id| {
+                    id.role == NodeRole::Worker
+                        && connected_worker_id
+                            .is_some_and(|worker_id| id.matches_worker_id(worker_id.0))
+                }) else {
+                    let actor = peer_identity
+                        .as_ref()
+                        .map_or(AuditIdentity::Unknown, |identity| {
+                            AuditIdentity::Verified(identity.to_cn())
+                        });
+                    let audited = append_gateway_delegation_audit(
+                        security_catalog.as_ref(),
+                        actor,
+                        AuditField::Known(secret_name),
+                        AuditField::Known(format!("workload:{}", workload_id.0)),
+                        SecurityAuditClass::AuthenticationFailure,
+                        SecurityAuditOutcome::Denied,
+                        AuditField::NotApplicable,
+                    )
+                    .await;
+                    let code = if audited { RS_2410 } else { RS_0003 };
+                    send_message(
+                        &sender,
+                        &ControlMessage::OperationFailed {
+                            code: code.to_string(),
+                            message:
+                                "secret token requests require the assigned worker certificate"
+                                    .to_string(),
+                            next_steps: rockstream_types::error_code::next_steps(code).to_string(),
+                        },
+                    )
+                    .await;
                     continue;
                 };
+                let Some(worker_id) = connected_worker_id else {
+                    send_message(
+                        &sender,
+                        &ControlMessage::OperationFailed {
+                            code: RS_2410.to_string(),
+                            message: "worker registration is not complete".to_owned(),
+                            next_steps: rockstream_types::error_code::next_steps(RS_2410)
+                                .to_string(),
+                        },
+                    )
+                    .await;
+                    continue;
+                };
+                let authorized = match authorize_worker_secret_request(
+                    security_catalog.as_ref(),
+                    &data_plane,
+                    worker_id,
+                    workload_id,
+                    &secret_name,
+                )
+                .await
+                {
+                    Ok(authorized) => authorized,
+                    Err(error) => {
+                        let (code, message, action, retry, audit_actor, audit_scope, revision) =
+                            match error {
+                                WorkerSecretAuthorizationError::Denied(message) => (
+                                    RS_2401,
+                                    message,
+                                    SecurityAuditClass::AuthorizationDenial,
+                                    false,
+                                    AuditIdentity::Verified(identity.to_cn()),
+                                    AuditField::Known(format!("workload:{}", workload_id.0)),
+                                    AuditField::NotApplicable,
+                                ),
+                                WorkerSecretAuthorizationError::DeniedForActor {
+                                    message,
+                                    actor,
+                                    scope,
+                                    policy_revision,
+                                } => (
+                                    RS_2401,
+                                    message,
+                                    SecurityAuditClass::AuthorizationDenial,
+                                    false,
+                                    AuditIdentity::Verified(actor.to_string()),
+                                    AuditField::Known(format!("{scope:?}")),
+                                    policy_revision,
+                                ),
+                                WorkerSecretAuthorizationError::Unavailable(message) => (
+                                    RS_0003,
+                                    message,
+                                    SecurityAuditClass::AuthenticationFailure,
+                                    true,
+                                    AuditIdentity::Verified(identity.to_cn()),
+                                    AuditField::Known(format!("workload:{}", workload_id.0)),
+                                    AuditField::NotApplicable,
+                                ),
+                            };
+                        let audited = append_gateway_delegation_audit(
+                            security_catalog.as_ref(),
+                            audit_actor,
+                            AuditField::Known(secret_name.clone()),
+                            audit_scope,
+                            action,
+                            SecurityAuditOutcome::Denied,
+                            revision,
+                        )
+                        .await;
+                        let code = if audited { code } else { RS_0003 };
+                        send_message(
+                            &sender,
+                            &ControlMessage::SecretTokenRejected {
+                                workload_id,
+                                secret_name: secret_name.clone(),
+                                code: code.to_string(),
+                                message: message.to_owned(),
+                                retry: retry || !audited,
+                            },
+                        )
+                        .await;
+                        continue;
+                    }
+                };
                 match secret_store
-                    .issue_worker_token(0, &secret_name, &identity.node_id, 300, &identity.to_cn())
+                    .issue_worker_token(
+                        authorized.namespace_id,
+                        workload_id,
+                        &secret_name,
+                        &identity.node_id,
+                        300,
+                        &identity.to_cn(),
+                    )
                     .await
                 {
                     Ok(token) => {
-                        send_message(&sender, &ControlMessage::SecretTokenIssued { token }).await
+                        let actor = authorized.actor_principal_id.map_or_else(
+                            || AuditIdentity::Verified(identity.to_cn()),
+                            |principal| AuditIdentity::Verified(principal.to_string()),
+                        );
+                        if append_gateway_delegation_audit(
+                            security_catalog.as_ref(),
+                            actor,
+                            AuditField::Known(secret_name.clone()),
+                            AuditField::Known(format!("{:?}", authorized.scope)),
+                            SecurityAuditClass::AuthenticationSuccess,
+                            SecurityAuditOutcome::Success,
+                            authorized.policy_revision,
+                        )
+                        .await
+                        {
+                            send_message(&sender, &ControlMessage::SecretTokenIssued { token })
+                                .await;
+                        } else {
+                            send_message(
+                                &sender,
+                                &ControlMessage::SecretTokenRejected {
+                                    workload_id,
+                                    secret_name: secret_name.clone(),
+                                    code: RS_0003.to_string(),
+                                    message: "secret authorization audit is unavailable".into(),
+                                    retry: true,
+                                },
+                            )
+                            .await;
+                        }
                     }
                     Err(error) => {
-                        let reply = ControlMessage::OperationFailed {
+                        let reply = ControlMessage::SecretTokenRejected {
+                            workload_id,
+                            secret_name: secret_name.clone(),
                             code: error_code_for_secret_error(&error),
                             message: error.to_string(),
-                            next_steps: secret_error_next_steps(&error),
+                            retry: true,
                         };
                         send_message(&sender, &reply).await;
                     }
@@ -4018,7 +6872,36 @@ async fn handle_connection_stream<R, W>(
                 current.clone()
             };
             if let Some(rotation) = rotation {
-                send_message(&sender, &ControlMessage::SecretRotated { rotation }).await;
+                if let Some(worker_id) = connected_worker_id {
+                    match workloads_for_secret_rotation(
+                        security_catalog.as_ref(),
+                        &data_plane,
+                        worker_id,
+                        &rotation.secret_name,
+                    )
+                    .await
+                    {
+                        Ok(workloads) => {
+                            for workload_id in workloads {
+                                send_message(
+                                    &sender,
+                                    &ControlMessage::SecretRefreshRequired {
+                                        workload_id,
+                                        secret_name: rotation.secret_name.clone(),
+                                    },
+                                )
+                                .await;
+                            }
+                        }
+                        Err(error) => tracing::error!(
+                            code = %rockstream_types::error_code::RS_2425,
+                            worker_id = %worker_id,
+                            secret_name = %rotation.secret_name,
+                            ?error,
+                            "secret rotation could not be scoped to active workloads"
+                        ),
+                    }
+                }
             }
         }
     }
@@ -4034,6 +6917,48 @@ async fn handle_connection_stream<R, W>(
             ));
         }
         worker_senders.lock().await.remove(&worker_id);
+        let interrupted = {
+            let mut state = data_plane.lock().await;
+            state.owned_shuffle_workers.remove(&worker_id);
+            let requests: Vec<_> = state
+                .source_waiters
+                .iter()
+                .filter(|(_, waiter)| {
+                    waiter
+                        .dispatchers
+                        .values()
+                        .any(|source| *source == worker_id)
+                        || state
+                            .deployments
+                            .get(&waiter.workload_id)
+                            .is_some_and(|deployment| {
+                                waiter.expected.iter().any(|shard| {
+                                    deployment.descriptors.get(shard).is_some_and(|descriptor| {
+                                        descriptor.shard.worker_id == worker_id
+                                    })
+                                })
+                            })
+                })
+                .map(|(request_id, _)| request_id.clone())
+                .collect();
+            let mut interrupted = Vec::new();
+            for request_id in requests {
+                if let Some(waiter) = state.source_waiters.remove(&request_id) {
+                    if let Some(deployment) = state.deployments.get_mut(&waiter.workload_id) {
+                        deployment.recovery_required = true;
+                    }
+                    interrupted.push(waiter.sender);
+                }
+            }
+            interrupted
+        };
+        for recipient in interrupted {
+            send_message(
+                &recipient,
+                &workload_failure("worker disconnected before source delta completed"),
+            )
+            .await;
+        }
         let scheduler = ShardScheduler::new(catalog.clone(), shard_manager.clone());
         catalog.deregister(worker_id);
         let assignments = scheduler.on_worker_dead(worker_id).unwrap_or_default();
@@ -4092,9 +7017,7 @@ async fn handle_connection_stream<R, W>(
         }
         broadcast_message(
             &worker_senders,
-            ControlMessage::TopologyChanged {
-                workers: catalog.healthy_workers(),
-            },
+            topology_changed_message(&catalog, &shard_manager),
         )
         .await;
     }
@@ -4107,6 +7030,16 @@ async fn handle_connection_stream<R, W>(
 async fn send_message(sender: &mpsc::Sender<ControlMessage>, msg: &ControlMessage) {
     if sender.send(msg.clone()).await.is_err() {
         tracing::warn!("control: connection writer closed");
+    }
+}
+
+fn topology_changed_message(
+    catalog: &TopologyCatalog,
+    shard_manager: &ShardManager,
+) -> ControlMessage {
+    ControlMessage::TopologyChanged {
+        workers: catalog.healthy_workers(),
+        shard_leases: shard_manager.leases(),
     }
 }
 
@@ -4132,6 +7065,61 @@ mod tests {
     };
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpStream;
+
+    #[test]
+    fn source_waiter_completes_only_after_each_expected_shard_reports() {
+        use rockstream_types::data_plane::RuntimeOutputDelta;
+        use rockstream_types::ids::OperatorId;
+
+        let (sender, _receiver) = mpsc::channel(1);
+        let mut waiter = SourceWaiter {
+            attempt_id: None,
+            sender,
+            workload_id: WorkloadId(7),
+            version: 1,
+            source: "input".to_owned(),
+            expected: HashSet::from([ShardId(1), ShardId(2)]),
+            received: HashSet::new(),
+            dispatchers: HashMap::new(),
+            owned_intent: None,
+            prepare_reply: None,
+            finish_reply: None,
+            finishing: false,
+            epoch: 9,
+        };
+        let mut output = RuntimeOutputDelta {
+            attempt_id: None,
+            version: 1,
+            request_id: "request".to_owned(),
+            workload_id: WorkloadId(7),
+            shard_id: ShardId(1),
+            epoch: 9,
+            operator_id: OperatorId(3),
+            lease_token: LeaseToken(4),
+            source: "input".to_owned(),
+            rows: Vec::new(),
+        };
+        let mut transcript = Vec::new();
+        output.workload_id = WorkloadId(8);
+        transcript.push(waiter.record_progress(&output));
+        output.workload_id = WorkloadId(7);
+        output.epoch = 10;
+        transcript.push(waiter.record_progress(&output));
+        output.epoch = 9;
+        output.shard_id = ShardId(3);
+        transcript.push(waiter.record_progress(&output));
+        output.shard_id = ShardId(1);
+        transcript.push(waiter.record_progress(&output));
+        transcript.push(waiter.record_progress(&output));
+        output.shard_id = ShardId(2);
+        transcript.push(waiter.record_progress(&output));
+        transcript.push(waiter.record_progress(&output));
+        assert_eq!(
+            transcript,
+            vec![false, false, false, false, false, true, false]
+        );
+        assert_eq!(waiter.received, HashSet::from([ShardId(1), ShardId(2)]));
+    }
 
     #[test]
     fn management_ack_waiters_reject_overflow_without_replacing_entries() {
@@ -4176,6 +7164,9 @@ mod tests {
             worker_senders: Arc::new(AsyncMutex::new(HashMap::new())),
             waiters: waiters.clone(),
             operations: ManagementOperationStore::new(Arc::new(
+                object_store::memory::InMemory::new(),
+            )),
+            gc_pins: crate::checkpoint_store::GcPinStore::new(Arc::new(
                 object_store::memory::InMemory::new(),
             )),
             started: Arc::new(AsyncMutex::new(HashSet::new())),
@@ -4302,9 +7293,35 @@ mod tests {
         assert_eq!(drain_state.lock().await.queue.len(), MAX_DRAIN_QUEUE);
     }
 
+    #[tokio::test]
+    async fn control_listener_requires_mtls_or_loopback_dev_opt_in() {
+        let error = ControlService::new(TopologyCatalog::new())
+            .start("127.0.0.1:0")
+            .await
+            .err()
+            .expect("plaintext listener must fail closed by default");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "RS-2405: control service requires internal mTLS; plaintext development mode must be explicitly enabled on a loopback address"
+        );
+
+        let error = ControlService::new(TopologyCatalog::new())
+            .with_insecure_dev_mode()
+            .start("0.0.0.0:0")
+            .await
+            .err()
+            .expect("plaintext development mode must reject non-loopback listeners");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "RS-2405: control service requires internal mTLS; plaintext development mode must be explicitly enabled on a loopback address"
+        );
+    }
+
     async fn start_test_service() -> (ControlServiceHandle, TopologyCatalog) {
         let catalog = TopologyCatalog::new();
-        let svc = ControlService::new(catalog.clone());
+        let svc = ControlService::new(catalog.clone()).with_insecure_dev_mode();
         let handle = svc.start("127.0.0.1:0").await.unwrap();
         (handle, catalog)
     }
@@ -4360,7 +7377,7 @@ mod tests {
         let resp = send_and_recv(&mut stream, &WorkerMessage::Register(reg)).await;
         let reply: ControlMessage = serde_json::from_str(resp.trim()).unwrap();
         match reply {
-            ControlMessage::Registered { worker_id } => {
+            ControlMessage::Registered { worker_id, .. } => {
                 assert_eq!(worker_id, WorkerId(1));
             }
             _ => panic!("expected Registered reply"),
@@ -4405,7 +7422,7 @@ mod tests {
         // Tier 2: --role=all means control + worker start in the same process.
         // Verify the control service starts and a worker can self-register.
         let catalog = TopologyCatalog::new();
-        let svc = ControlService::new(catalog.clone());
+        let svc = ControlService::new(catalog.clone()).with_insecure_dev_mode();
         let handle = svc.start("127.0.0.1:0").await.unwrap();
         let addr = handle.addr.to_string();
 
@@ -4438,7 +7455,9 @@ mod tests {
     ) -> (ControlServiceHandle, TopologyCatalog, ShardManager) {
         let catalog = TopologyCatalog::new();
         let manager = ShardManager::new();
-        let svc = ControlService::new(catalog.clone()).with_shard_manager(manager.clone());
+        let svc = ControlService::new(catalog.clone())
+            .with_shard_manager(manager.clone())
+            .with_insecure_dev_mode();
         let handle = svc.start("127.0.0.1:0").await.unwrap();
         (handle, catalog, manager)
     }
@@ -4504,7 +7523,8 @@ mod tests {
         let manager = ShardManager::new();
         let svc = ControlService::new(catalog.clone())
             .with_shard_manager(manager.clone())
-            .with_raft(node.handle.clone());
+            .with_raft(node.handle.clone())
+            .with_insecure_dev_mode();
         let handle = svc.start("127.0.0.1:0").await.unwrap();
 
         let mut stream = TcpStream::connect(handle.addr).await.unwrap();
@@ -4725,7 +7745,9 @@ mod tests {
         assert!(node.handle.is_leader());
 
         let catalog = TopologyCatalog::new();
-        let svc = ControlService::new(catalog).with_raft(node.handle.clone());
+        let svc = ControlService::new(catalog)
+            .with_raft(node.handle.clone())
+            .with_insecure_dev_mode();
         let handle = svc.start("127.0.0.1:0").await.unwrap();
 
         let mut stream = TcpStream::connect(handle.addr).await.unwrap();
@@ -4789,7 +7811,8 @@ mod tests {
         let frontier = Arc::new(FrontierAggregator::new());
         let svc = ControlService::new(catalog)
             .with_shard_manager(manager)
-            .with_frontier(frontier.clone());
+            .with_frontier(frontier.clone())
+            .with_insecure_dev_mode();
         let handle = svc.start("127.0.0.1:0").await.unwrap();
 
         let mut stream = TcpStream::connect(handle.addr).await.unwrap();
@@ -4834,7 +7857,8 @@ mod tests {
         let frontier = Arc::new(FrontierAggregator::new());
         let svc = ControlService::new(TopologyCatalog::new())
             .with_shard_manager(manager)
-            .with_frontier(frontier.clone());
+            .with_frontier(frontier.clone())
+            .with_insecure_dev_mode();
         let handle = svc.start("127.0.0.1:0").await.unwrap();
 
         let mut stream = TcpStream::connect(handle.addr).await.unwrap();
@@ -4878,7 +7902,8 @@ mod tests {
         let frontier = Arc::new(FrontierAggregator::with_membership(membership));
         let svc = ControlService::new(TopologyCatalog::new())
             .with_shard_manager(manager.clone())
-            .with_frontier(frontier.clone());
+            .with_frontier(frontier.clone())
+            .with_insecure_dev_mode();
         let handle = svc.start("127.0.0.1:0").await.unwrap();
 
         let mut stream = TcpStream::connect(handle.addr).await.unwrap();
@@ -4990,7 +8015,8 @@ mod tests {
         let svc = ControlService::new(catalog)
             .with_shard_manager(manager)
             .with_raft(node.handle.clone())
-            .with_frontier(frontier.clone());
+            .with_frontier(frontier.clone())
+            .with_insecure_dev_mode();
         let handle = svc.start("127.0.0.1:0").await.unwrap();
 
         let mut stream = TcpStream::connect(handle.addr).await.unwrap();
@@ -5051,7 +8077,8 @@ mod tests {
         let svc_a = ControlService::new(catalog_a)
             .with_shard_manager(manager_a.clone())
             .with_raft(node_a.handle.clone())
-            .with_shard_store(Arc::new(ShardPersistentStore::new(shared_store.clone())));
+            .with_shard_store(Arc::new(ShardPersistentStore::new(shared_store.clone())))
+            .with_insecure_dev_mode();
         let handle_a = svc_a.start("127.0.0.1:0").await.unwrap();
 
         let mut stream_a = TcpStream::connect(handle_a.addr).await.unwrap();
@@ -5096,7 +8123,8 @@ mod tests {
         let svc_b = ControlService::new(catalog_b)
             .with_shard_manager(manager_b.clone())
             .with_raft(node_b.handle.clone())
-            .with_shard_store(Arc::new(ShardPersistentStore::new(shared_store)));
+            .with_shard_store(Arc::new(ShardPersistentStore::new(shared_store)))
+            .with_insecure_dev_mode();
         let handle_b = svc_b.start("127.0.0.1:0").await.unwrap();
 
         // A different worker (worker 20) tries to grab the SAME shard that
@@ -5216,7 +8244,8 @@ mod tests {
         let svc = ControlService::new(catalog)
             .with_shard_manager(manager.clone())
             .with_raft(node_leader.handle.clone())
-            .with_shard_store(store.clone());
+            .with_shard_store(store.clone())
+            .with_insecure_dev_mode();
         let handle = svc.start("127.0.0.1:0").await.unwrap();
 
         let mut stream = TcpStream::connect(handle.addr).await.unwrap();

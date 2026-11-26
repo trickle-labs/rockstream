@@ -15,6 +15,7 @@ pub mod client;
 pub mod compaction;
 pub mod data_plane;
 pub mod epoch_compaction;
+mod owned_epoch;
 pub use epoch_compaction::{
     EpochCompactionConfig, EpochCompactionError, EpochCompactionFilter, EpochCompactionMetrics,
     EpochCompactionMetricsSnapshot, EpochCompactor, InFlightZSetAccumulator, KeyExtractionStrategy,
@@ -25,15 +26,17 @@ pub mod shard_actor;
 pub mod tls;
 pub use client::{
     execute_frame, setup_test_deployment, start_worker_client,
-    start_worker_client_with_compaction_config, start_worker_client_with_metadata,
-    start_worker_client_with_tls, start_worker_client_with_tls_and_metadata,
+    start_worker_client_with_compaction_config, start_worker_client_with_exchange_endpoint,
+    start_worker_client_with_metadata, start_worker_client_with_tls,
+    start_worker_client_with_tls_and_metadata,
     start_worker_client_with_tls_metadata_and_compaction, ShardState, WorkerClientHandle,
-    WorkerDeployment, WorkerDeployments,
+    WorkerDeployment, WorkerDeployments, WorkerExchangeEndpoint,
 };
 pub use compaction::{CompactionBudget, CompactionPermit, CompactionWorker};
 pub use data_plane::DataPlaneClient;
 pub use secrets::{
-    ResolvedSecret, SecretManagerError, WorkerSecretManager, MAX_WORKER_SECRET_TOKENS,
+    ResolvedSecret, SecretManagerError, WorkerSecretManager, MAX_WORKER_SECRET_CACHE_BYTES,
+    MAX_WORKER_SECRET_TOKENS,
 };
 pub use shard_actor::{
     CreditError, ExchangeCredit, ExchangeCredits, ExecutionMorsel, FrameExecutor, MailboxFillLevel,
@@ -42,6 +45,12 @@ pub use shard_actor::{
 };
 
 pub mod exchange;
+pub use exchange::capsule_partition::partition_batch_by_capsule;
+pub mod fair_scheduler;
+pub use fair_scheduler::{
+    ChunkedTaskOutcome, FairChunkScheduler, FairSchedulerHandle, WorkloadFreshnessStats,
+    WorkloadPriority,
+};
 pub mod migration;
 pub use migration::{DualWriteRouter, RoutedWrite, RoutingError};
 
@@ -57,6 +66,9 @@ pub use recovery::{
 
 pub mod quota;
 pub use quota::WorkerQuotaManager;
+
+pub mod resource_controller;
+pub use resource_controller::{WorkerResourceConfig, WorkerResourceController};
 
 pub mod source_pressure;
 pub use source_pressure::{SourcePressureController, SourcePressureState};
@@ -79,15 +91,23 @@ mod tests {
     async fn test_worker_registration_and_heartbeats() {
         let catalog = rockstream_control::TopologyCatalog::new();
         let manager = rockstream_control::ShardManager::new();
-        let svc =
-            rockstream_control::ControlService::new(catalog.clone()).with_shard_manager(manager);
+        let svc = rockstream_control::ControlService::new(catalog.clone())
+            .with_shard_manager(manager)
+            .with_insecure_dev_mode();
 
         let handle = svc.start("127.0.0.1:0").await.unwrap();
         let control_url = handle.addr.to_string();
 
         let storage_dir = tempfile::tempdir().unwrap();
 
-        let (client, worker_handle) = start_worker_client(42, &control_url, storage_dir.path())
+        let (client, worker_handle) =
+            client::start_worker_client_with_insecure_internal_dev_and_metadata(
+                42,
+                &control_url,
+                storage_dir.path(),
+                Default::default(),
+                Default::default(),
+            )
             .await
             .unwrap();
 

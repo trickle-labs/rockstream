@@ -372,19 +372,30 @@ async fn leader_crash_composed_with_shard_fence_no_split_brain() {
 // gracefully (rather than failing, and rather than `#[ignore]`, which has
 // no precedent anywhere in this codebase) when Docker is not present.
 mod tc {
+    use super::management_security::preprovision_management_catalog;
     use std::net::SocketAddr;
+    use std::path::Path;
     use std::time::{Duration, Instant};
 
+    use sha2::Digest;
     use testcontainers::core::{ContainerPort, Mount, WaitFor};
     use testcontainers::runners::AsyncRunner;
     use testcontainers::{ContainerAsync, GenericImage, ImageExt};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
     use tokio::net::TcpStream;
+    use tokio_rustls::client::TlsStream;
 
-    use rockstream_types::ids::{ShardId, WorkerId};
+    use rockstream_test_support::pki::TestPki;
+    use rockstream_types::authorization::{
+        LoginMethod, PermissionPreset, PolicyScope, ScopedPresetGrant, SecurityPrincipal,
+        SECURITY_PRINCIPAL_FORMAT_VERSION,
+    };
+    use rockstream_types::ids::{PrincipalId, ShardId, WorkerId};
     use rockstream_types::topology::{
         CapacityHeadroom, ControlMessage, NodeRole, RaftRoleWire, WorkerMessage, WorkerRegistration,
     };
+
+    pub(super) type WorkerStream = TlsStream<TcpStream>;
 
     pub const IMAGE_NAME: &str = "rockstream-tc-test";
     pub const IMAGE_TAG: &str = "latest";
@@ -413,6 +424,7 @@ mod tc {
     pub struct TcCluster {
         pub nodes: Vec<TcNode>,
         pub network: String,
+        pub pki: TestPki,
         /// Host directory bind-mounted into every node at `/shared` as
         /// `--control-shared-storage=/shared` — the real, shared, durable
         /// control-plane backing store every node in the group reads/writes
@@ -420,10 +432,80 @@ mod tc {
         pub shared_dir: tempfile::TempDir,
     }
 
+    fn certificate_sha256(path: &Path) -> [u8; 32] {
+        let mut reader = std::io::BufReader::new(std::fs::File::open(path).unwrap());
+        let certificate = rustls_pemfile::certs(&mut reader)
+            .next()
+            .expect("test PKI must include an administrator certificate")
+            .unwrap();
+        sha2::Sha256::digest(certificate.as_ref()).into()
+    }
+
+    fn preprovision_admin(storage_dir: &Path, shared_dir: &Path, operation_id: u64) {
+        let storage_mount = format!("{}:/data", storage_dir.display());
+        let shared_mount = format!("{}:/shared", shared_dir.display());
+        let output = std::process::Command::new("docker")
+            .args(["run", "--rm", "--volume"])
+            .arg(storage_mount)
+            .args(["--volume"])
+            .arg(shared_mount)
+            .arg(format!("{IMAGE_NAME}:{IMAGE_TAG}"))
+            .args([
+                "security",
+                "preprovision-admin",
+                "--layout",
+                "gateway",
+                "--storage",
+                "/data",
+                "--principal-file",
+                "/shared/ha-administrator.json",
+                "--operation-id",
+            ])
+            .arg(operation_id.to_string())
+            .arg("--yes")
+            .output()
+            .expect("failed to invoke the supported administrator preprovisioning CLI");
+        assert!(
+            output.status.success(),
+            "administrator preprovisioning failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     impl TcCluster {
         pub async fn boot(test_id: &str) -> Self {
             let network = format!("rs-net-{test_id}");
             let shared_dir = tempfile::tempdir().unwrap();
+            let pki = TestPki::generate_with_worker_ids([1, 2, 3, 4, 5, 10, 20, 99]);
+            for (source, name) in [
+                (&pki.ca_cert_path, "cluster-ca.pem"),
+                (&pki.control_cert_path, "control.pem"),
+                (&pki.control_key_path, "control-key.pem"),
+            ] {
+                std::fs::copy(source, shared_dir.path().join(name))
+                    .unwrap_or_else(|error| panic!("copy test TLS file {name}: {error}"));
+            }
+            for i in 0..3 {
+                let node_storage = shared_dir.path().join(format!("node-storage-{i}"));
+                preprovision_management_catalog(&node_storage, &pki).await;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+
+                    let catalog_root = node_storage.join("gateway-shard");
+                    for path in [
+                        node_storage.clone(),
+                        catalog_root.clone(),
+                        catalog_root.join("gateway"),
+                        catalog_root.join("gateway/catalog"),
+                        catalog_root.join("gateway/catalog/log"),
+                    ] {
+                        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777))
+                            .unwrap();
+                    }
+                }
+            }
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -432,10 +514,42 @@ mod tc {
                     std::fs::Permissions::from_mode(0o777),
                 );
             }
+            let principal = SecurityPrincipal {
+                format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+                id: PrincipalId(1),
+                display_name: "HA smoke administrator".to_owned(),
+                enabled: true,
+                revision: 1,
+                login_methods: vec![LoginMethod::Mtls {
+                    certificate_sha256: certificate_sha256(&pki.cli_cert_path),
+                }],
+                preset_grants: vec![ScopedPresetGrant {
+                    preset: PermissionPreset::Administrator,
+                    scope: PolicyScope::Cluster,
+                }],
+                scoped_grants: Vec::new(),
+            };
+            std::fs::write(
+                shared_dir.path().join("ha-administrator.json"),
+                serde_json::to_vec(&principal).unwrap(),
+            )
+            .expect("write HA smoke administrator preprovisioning record");
             let names: Vec<String> = (0..3).map(|i| format!("rs-ctl-{test_id}-{i}")).collect();
 
             let mut nodes = Vec::new();
             for i in 0..3u64 {
+                let storage_dir = shared_dir.path().join(format!("node-{i}-data"));
+                std::fs::create_dir_all(&storage_dir)
+                    .expect("create per-node durable catalog directory");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&storage_dir, std::fs::Permissions::from_mode(0o777))
+                        .expect(
+                            "make per-node durable catalog directory writable in the container",
+                        );
+                }
+                preprovision_admin(&storage_dir, shared_dir.path(), i + 1);
                 let peers: Vec<String> = (0..3u64)
                     .filter(|&j| j != i)
                     .map(|j| format!("{j}@{}:7000", names[j as usize]))
@@ -450,6 +564,9 @@ mod tc {
                     "--raft-bind=0.0.0.0:7000".to_string(),
                     "--control-bind=0.0.0.0:8000".to_string(),
                     "--control-shared-storage=/shared".to_string(),
+                    "--internal-tls-cert-path=/shared/control.pem".to_string(),
+                    "--internal-tls-key-path=/shared/control-key.pem".to_string(),
+                    "--internal-tls-ca-cert-path=/shared/cluster-ca.pem".to_string(),
                 ];
                 if i == 0 {
                     cmd.push("--raft-bootstrap".to_string());
@@ -460,6 +577,10 @@ mod tc {
                     .with_cmd(cmd)
                     .with_container_name(names[i as usize].clone())
                     .with_network(network.clone())
+                    .with_mount(Mount::bind_mount(
+                        storage_dir.to_str().unwrap().to_string(),
+                        "/data".to_string(),
+                    ))
                     .with_mount(Mount::bind_mount(
                         shared_dir.path().to_str().unwrap().to_string(),
                         "/shared".to_string(),
@@ -481,19 +602,24 @@ mod tc {
             Self {
                 nodes,
                 network,
+                pki,
                 shared_dir,
             }
         }
 
         /// Query one node's cluster-status; `None` if the node is
         /// unreachable (e.g. it was just killed).
-        pub async fn query_status(addr: SocketAddr) -> Option<(Option<u64>, RaftRoleWire, u64)> {
-            let connect =
-                tokio::time::timeout(Duration::from_millis(800), TcpStream::connect(addr))
-                    .await
-                    .ok()?
-                    .ok()?;
-            let mut stream = connect;
+        pub async fn query_status(
+            addr: SocketAddr,
+            pki: &TestPki,
+        ) -> Option<(Option<u64>, RaftRoleWire, u64)> {
+            let mut stream = tokio::time::timeout(
+                Duration::from_millis(800),
+                connect_tls(addr, pki.control_tls_config()),
+            )
+            .await
+            .ok()?
+            .ok()?;
             let line = serde_json::to_string(&WorkerMessage::ClusterStatusQuery).unwrap() + "\n";
             stream.write_all(line.as_bytes()).await.ok()?;
             let mut reader = BufReader::new(&mut stream);
@@ -512,18 +638,19 @@ mod tc {
             }
         }
 
-        /// Poll every node (skipping unreachable ones) until exactly one
-        /// reachable node reports itself as `Leader`, or `timeout` elapses.
-        /// Panics if at any observed instant *more than one* node reports
-        /// `Leader` (split-brain — must never happen, checked on every
-        /// poll, not just the final one).
+        /// Poll every node (skipping unreachable ones) until the same node
+        /// and term remain the sole reported leader for three election windows,
+        /// or `timeout` elapses. Panics if at any observed instant *more than
+        /// one* node reports `Leader` (split-brain — checked on every poll).
         pub async fn wait_for_single_leader(&self, timeout: Duration) -> (usize, u64) {
             let deadline = Instant::now() + timeout;
             let mut stable_leader = None;
+            let mut stable_since = None;
+            let stability_window = rockstream_control::raft::DEFAULT_ELECTION_TIMEOUT_MAX * 3;
             loop {
                 let mut statuses = Vec::new();
                 for node in &self.nodes {
-                    statuses.push(Self::query_status(node.control_addr).await);
+                    statuses.push(Self::query_status(node.control_addr, &self.pki).await);
                 }
                 let leaders: Vec<usize> = statuses
                     .iter()
@@ -542,11 +669,18 @@ mod tc {
                         None => unreachable!(),
                     };
                     if stable_leader == Some((idx, term)) {
-                        return (idx, term);
+                        if stable_since
+                            .is_some_and(|since: Instant| since.elapsed() >= stability_window)
+                        {
+                            return (idx, term);
+                        }
+                    } else {
+                        stable_leader = Some((idx, term));
+                        stable_since = Some(Instant::now());
                     }
-                    stable_leader = Some((idx, term));
                 } else {
                     stable_leader = None;
+                    stable_since = None;
                 }
                 if Instant::now() > deadline {
                     if std::env::var("RS_TC_DEBUG").is_ok() {
@@ -642,15 +776,77 @@ mod tc {
         }
     }
 
-    pub async fn register_worker(addr: SocketAddr, worker_id: u64) -> TcpStream {
-        let mut stream = TcpStream::connect(addr).await.unwrap();
+    fn tls_connector(
+        tls: rockstream_types::identity::InternalTlsConfig,
+    ) -> tokio_rustls::TlsConnector {
+        use std::io::BufReader;
+
+        use rustls::pki_types::CertificateDer;
+        use rustls::{ClientConfig, RootCertStore};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let ca_path = tls.ca_cert_path.expect("test PKI has a CA path");
+        let mut ca_reader = BufReader::new(std::fs::File::open(ca_path).unwrap());
+        let mut roots = RootCertStore::empty();
+        for cert in rustls_pemfile::certs(&mut ca_reader) {
+            roots.add(cert.unwrap()).unwrap();
+        }
+
+        let cert_path = tls.cert_path.expect("worker test certificate path");
+        let mut cert_reader = BufReader::new(std::fs::File::open(cert_path).unwrap());
+        let certificates: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let key_path = tls.key_path.expect("worker test private key path");
+        let mut key_reader = BufReader::new(std::fs::File::open(key_path).unwrap());
+        let key = rustls_pemfile::private_key(&mut key_reader)
+            .unwrap()
+            .expect("worker test private key");
+        let config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(certificates, key)
+            .unwrap();
+        tokio_rustls::TlsConnector::from(std::sync::Arc::new(config))
+    }
+
+    async fn connect_tls(
+        addr: SocketAddr,
+        tls: rockstream_types::identity::InternalTlsConfig,
+    ) -> std::io::Result<WorkerStream> {
+        let connector = tls_connector(tls);
+        let server_name = rustls::pki_types::ServerName::IpAddress(addr.ip().into());
+        connector
+            .connect(server_name, TcpStream::connect(addr).await?)
+            .await
+    }
+
+    pub async fn connect_worker(
+        addr: SocketAddr,
+        worker_id: u64,
+        pki: &TestPki,
+    ) -> std::io::Result<WorkerStream> {
+        connect_tls(addr, pki.worker_tls_config(worker_id)).await
+    }
+
+    pub async fn register_worker(addr: SocketAddr, worker_id: u64, pki: &TestPki) -> WorkerStream {
+        let mut stream = connect_worker(addr, worker_id, pki)
+            .await
+            .expect("TLS worker connection");
         let reg = WorkerRegistration::new(
             WorkerId(worker_id),
             NodeRole::Worker,
             format!("127.0.0.1:{}", 9000 + worker_id),
             CapacityHeadroom::FULL,
         );
-        send_and_recv(&mut stream, &WorkerMessage::Register(reg)).await;
+        let response = send_and_recv(&mut stream, &WorkerMessage::Register(reg)).await;
+        assert!(
+            matches!(
+                serde_json::from_str::<ControlMessage>(response.trim()),
+                Ok(ControlMessage::Registered { worker_id: registered, .. })
+                    if registered == WorkerId(worker_id)
+            ),
+            "worker registration was rejected; response: {response:?}"
+        );
         stream
     }
 
@@ -665,7 +861,7 @@ mod tc {
         let (leader_idx, _) = cluster.wait_for_single_leader(Duration::from_secs(5)).await;
         let mut addr = cluster.nodes[leader_idx].control_addr;
         for _ in 0..50 {
-            let Ok(mut stream) = TcpStream::connect(addr).await else {
+            let Ok(mut stream) = connect_worker(addr, worker_id, &cluster.pki).await else {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             };
@@ -714,13 +910,13 @@ mod tc {
         cluster: &TcCluster,
         worker_id: u64,
         shard_id: u64,
-    ) -> (usize, rockstream_types::lease::ShardLease, TcpStream) {
+    ) -> (usize, rockstream_types::lease::ShardLease, WorkerStream) {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let (leader_idx, _) = cluster.wait_for_single_leader(Duration::from_secs(5)).await;
             let addr = cluster.nodes[leader_idx].control_addr;
-            let mut worker_stream = register_worker(addr, worker_id).await;
-            let response = send_and_recv(
+            let mut worker_stream = register_worker(addr, worker_id, &cluster.pki).await;
+            let response = send_and_recv_ignoring_topology(
                 &mut worker_stream,
                 &WorkerMessage::RequestShard {
                     worker_id: WorkerId(worker_id),
@@ -735,7 +931,7 @@ mod tc {
             }
             assert!(
                 Instant::now() < deadline,
-                "shard-lease request did not converge"
+                "shard-lease request did not converge; last response: {response:?}"
             );
         }
     }
@@ -745,7 +941,7 @@ mod tc {
     /// node is currently leader), `false` for `NotLeader` or no reply within
     /// the timeout.
     pub async fn report_shard_frontier(
-        mut stream: &mut TcpStream,
+        mut stream: &mut WorkerStream,
         shard_id: u64,
         epoch: u64,
     ) -> bool {
@@ -777,7 +973,10 @@ mod tc {
         }
     }
 
-    async fn send_and_recv(stream: &mut TcpStream, msg: &WorkerMessage) -> String {
+    async fn send_and_recv<S>(stream: &mut S, msg: &WorkerMessage) -> String
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         let line = serde_json::to_string(msg).unwrap() + "\n";
         stream.write_all(line.as_bytes()).await.unwrap();
         let mut reader = BufReader::new(&mut *stream);
@@ -785,7 +984,45 @@ mod tc {
         reader.read_line(&mut resp).await.unwrap();
         resp
     }
+
+    async fn send_and_recv_ignoring_topology<S>(stream: &mut S, msg: &WorkerMessage) -> String
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let line = serde_json::to_string(msg).unwrap() + "\n";
+        stream.write_all(line.as_bytes()).await.unwrap();
+        loop {
+            let response = read_message_line(stream).await.unwrap();
+            if matches!(
+                serde_json::from_str::<ControlMessage>(response.trim()),
+                Ok(ControlMessage::TopologyChanged { .. })
+            ) {
+                continue;
+            }
+            return response;
+        }
+    }
+
+    pub(super) async fn read_message_line<S>(stream: &mut S) -> std::io::Result<String>
+    where
+        S: AsyncRead + Unpin,
+    {
+        use tokio::io::AsyncReadExt;
+
+        let mut bytes = Vec::new();
+        loop {
+            let mut byte = [0; 1];
+            if stream.read(&mut byte).await? == 0 || byte[0] == b'\n' {
+                break;
+            }
+            bytes.push(byte[0]);
+        }
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
 }
+
+#[path = "common/management_security.rs"]
+mod management_security;
 
 /// **S1 (closing the item deferred from Phase 3a) / S4 precondition** —
 /// `three_node_tc_cluster_boots_and_elects_leader`: a real 3-container
@@ -915,8 +1152,12 @@ async fn leader_kill_recovers_within_budget_tc() {
     // (c): frontier publication resumes against the new leader, within the
     // pipeline-freshness-recovery budget.
     let (report_leader_idx, _) = cluster.wait_for_single_leader(Duration::from_secs(5)).await;
-    let mut worker_10_reconnected =
-        tc::register_worker(cluster.nodes[report_leader_idx].control_addr, 10).await;
+    let mut worker_10_reconnected = tc::register_worker(
+        cluster.nodes[report_leader_idx].control_addr,
+        10,
+        &cluster.pki,
+    )
+    .await;
     let freshness_start = Instant::now();
     assert!(
         tc::report_shard_frontier(&mut worker_10_reconnected, 7, 101).await,
@@ -1199,17 +1440,10 @@ mod real_leader_fencing_108 {
     use rockstream_storage::ShardDb;
     use rockstream_types::ids::{LeaseToken, ShardId, WorkerId};
     use rockstream_types::topology::{ControlMessage, WorkerMessage};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::TcpStream;
+    use tokio::io::AsyncWriteExt;
 
-    /// A real worker authorization round trip against an actual control
-    /// process. Never infer an acceptance from a local ShardManager.
-    async fn fence(addr: std::net::SocketAddr, token: LeaseToken) -> bool {
-        let Ok(Ok(mut stream)) =
-            tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(addr)).await
-        else {
-            return false;
-        };
+    /// A real worker authorization round trip on its registered control session.
+    async fn fence(stream: &mut tc::WorkerStream, token: LeaseToken) -> bool {
         let request = WorkerMessage::FenceWrite {
             shard_id: ShardId(108),
             lease_token: token,
@@ -1218,36 +1452,37 @@ mod real_leader_fencing_108 {
         if stream.write_all(wire.as_bytes()).await.is_err() {
             return false;
         }
-        let mut line = String::new();
-        let mut reader = BufReader::new(&mut stream);
-        let Ok(Ok(read)) =
-            tokio::time::timeout(Duration::from_secs(3), reader.read_line(&mut line)).await
-        else {
-            return false;
-        };
-        if read == 0 {
-            return false;
-        }
-        match serde_json::from_str::<ControlMessage>(line.trim()).unwrap() {
-            ControlMessage::FenceAck { shard_id, valid } => {
-                assert_eq!(shard_id, ShardId(108));
-                valid
+        loop {
+            let Ok(Ok(line)) =
+                tokio::time::timeout(Duration::from_secs(3), tc::read_message_line(stream)).await
+            else {
+                return false;
+            };
+            if line.is_empty() {
+                return false;
             }
-            other => panic!("unexpected fencing reply: {other:?}"),
+            match serde_json::from_str::<ControlMessage>(line.trim()).unwrap() {
+                ControlMessage::TopologyChanged { .. } => continue,
+                ControlMessage::FenceAck { shard_id, valid } => {
+                    assert_eq!(shard_id, ShardId(108));
+                    return valid;
+                }
+                other => panic!("unexpected fencing reply: {other:?}"),
+            }
         }
     }
 
     /// The test's storage writer only commits on a successful production
     /// FenceWrite reply. Keep an independent acknowledged-history oracle.
     async fn attempt(
-        addr: std::net::SocketAddr,
+        stream: &mut tc::WorkerStream,
         token: LeaseToken,
         db: &ShardDb,
         key: &'static [u8],
         value: &'static [u8],
         committed: &mut Vec<(Vec<u8>, Vec<u8>)>,
     ) -> bool {
-        let accepted = fence(addr, token).await;
+        let accepted = fence(stream, token).await;
         if accepted {
             db.put(key, value).await.unwrap();
             db.flush().await.unwrap();
@@ -1265,8 +1500,8 @@ mod real_leader_fencing_108 {
         let (old_idx, old_term) = cluster
             .wait_for_single_leader(Duration::from_secs(15))
             .await;
-        let old_addr = cluster.nodes[old_idx].control_addr;
-        let (_, old_lease, old_worker) = tc::register_and_request_shard(&cluster, 10, 108).await;
+        let (_, old_lease, mut old_worker) =
+            tc::register_and_request_shard(&cluster, 10, 108).await;
         assert_eq!(old_lease.worker_id, WorkerId(10));
 
         let dir = tempfile::tempdir().unwrap();
@@ -1279,7 +1514,7 @@ mod real_leader_fencing_108 {
         let mut outcomes = Vec::new();
         outcomes.push(
             attempt(
-                old_addr,
+                &mut old_worker,
                 old_lease.lease_token,
                 &db,
                 b"row/01",
@@ -1326,38 +1561,23 @@ mod real_leader_fencing_108 {
             .await;
         assert_ne!(old_idx, new_idx);
         assert!(new_term > old_term);
-        let new_addr = cluster.nodes[new_idx].control_addr;
 
-        // Keep original socket alive for isolation: avoid a synthetic worker
-        // disconnect that would release the original lease.
-        let _old_worker = old_worker;
-        let mut new_worker = tc::register_worker(new_addr, 10).await;
-        let wire = serde_json::to_string(&WorkerMessage::RequestShard {
-            worker_id: WorkerId(10),
-            shard_id: ShardId(108),
-        })
-        .unwrap()
-            + "\n";
-        new_worker.write_all(wire.as_bytes()).await.unwrap();
-        let mut reader = BufReader::new(&mut new_worker);
-        let new_lease = loop {
-            let mut line = String::new();
-            tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
-                .await
-                .unwrap()
-                .unwrap();
-            match serde_json::from_str::<ControlMessage>(line.trim()).unwrap() {
-                ControlMessage::ShardAssigned { lease, .. } => break lease,
-                ControlMessage::TopologyChanged { .. } => continue,
-                other => panic!("replacement leader did not renew ownership: {other:?}"),
-            }
-        };
+        // Keep the original socket alive for isolation: disconnecting it
+        // would synthetically release the old lease. A status probe can observe
+        // a leader just before its short quorum lease expires, so a safe
+        // NotLeader response is transient and must trigger leader rediscovery.
+        // The existing bounded helper retries, but still requires a real
+        // ShardAssigned response; the stale/new fencing assertions below remain
+        // mandatory.
+        let (lease_leader_idx, new_lease, mut new_worker) =
+            tc::register_and_request_shard(&cluster, 10, 108).await;
+        assert_ne!(lease_leader_idx, old_idx);
         assert_eq!(new_lease.worker_id, WorkerId(10));
         assert!(new_lease.lease_token.0 > old_lease.lease_token.0);
 
         outcomes.push(
             attempt(
-                new_addr,
+                &mut new_worker,
                 old_lease.lease_token,
                 &db,
                 b"row/stale",
@@ -1368,7 +1588,7 @@ mod real_leader_fencing_108 {
         );
         outcomes.push(
             attempt(
-                new_addr,
+                &mut new_worker,
                 new_lease.lease_token,
                 &db,
                 b"row/02",
@@ -1381,7 +1601,7 @@ mod real_leader_fencing_108 {
             // Old process is still alive and must reject its own old token.
             outcomes.push(
                 attempt(
-                    old_addr,
+                    &mut old_worker,
                     old_lease.lease_token,
                     &db,
                     b"row/isolated",
@@ -1415,7 +1635,6 @@ mod real_leader_fencing_108 {
             .collect();
         assert_eq!(rows, committed);
         recovered.close().await.unwrap();
-        drop(reader);
         drop(new_worker);
         cluster.cleanup().await;
     }

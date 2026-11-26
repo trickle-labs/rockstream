@@ -61,7 +61,11 @@ async fn test_orderly_shutdown_then_fresh_bootstrap_lease_continuity() {
         .with_shard_manager(manager_a.clone())
         .with_raft(node_a.handle.clone())
         .with_shard_store(store_a);
-    let handle_a = svc_a.start("127.0.0.1:0").await.unwrap();
+    let handle_a = svc_a
+        .with_insecure_dev_mode()
+        .start("127.0.0.1:0")
+        .await
+        .unwrap();
 
     let mut stream_a = TcpStream::connect(handle_a.addr).await.unwrap();
     let reg1 = WorkerRegistration::new(
@@ -107,7 +111,11 @@ async fn test_orderly_shutdown_then_fresh_bootstrap_lease_continuity() {
         .with_shard_manager(manager_b.clone())
         .with_raft(node_b.handle.clone())
         .with_shard_store(store_b);
-    let handle_b = svc_b.start("127.0.0.1:0").await.unwrap();
+    let handle_b = svc_b
+        .with_insecure_dev_mode()
+        .start("127.0.0.1:0")
+        .await
+        .unwrap();
 
     let mut stream_b = TcpStream::connect(handle_b.addr).await.unwrap();
     let reg1_b = WorkerRegistration::new(
@@ -187,7 +195,11 @@ async fn test_forced_demotion_rejects_lease_request() {
         .with_shard_manager(manager_a.clone())
         .with_raft(node_a.handle.clone())
         .with_shard_store(store_a);
-    let handle_a = svc_a.start("127.0.0.1:0").await.unwrap();
+    let handle_a = svc_a
+        .with_insecure_dev_mode()
+        .start("127.0.0.1:0")
+        .await
+        .unwrap();
 
     let catalog_b = TopologyCatalog::new();
     let manager_b = ShardManager::new();
@@ -196,7 +208,11 @@ async fn test_forced_demotion_rejects_lease_request() {
         .with_shard_manager(manager_b.clone())
         .with_raft(node_b.handle.clone())
         .with_shard_store(store_b);
-    let handle_b = svc_b.start("127.0.0.1:0").await.unwrap();
+    let handle_b = svc_b
+        .with_insecure_dev_mode()
+        .start("127.0.0.1:0")
+        .await
+        .unwrap();
 
     // 2. Node B (follower) rejects lease request with NotLeader
     let mut stream_b = TcpStream::connect(handle_b.addr).await.unwrap();

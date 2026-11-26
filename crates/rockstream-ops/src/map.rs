@@ -41,15 +41,36 @@ impl MapOp {
         }
     }
 
+    /// Borrow the underlying map expression (used by stateless operator fusion).
+    pub fn expr(&self) -> &Expr {
+        &self.expr
+    }
+
+    /// Output column name of this map operator.
+    pub fn output_name(&self) -> &str {
+        self.output_schema.field(0).name()
+    }
+
     /// Apply the map to a single delta batch.
     pub fn apply(&self, input: ArrowZSet) -> Result<ArrowZSet, OpError> {
         if input.is_empty() {
-            return Ok(ArrowZSet::empty(self.output_schema.clone()));
+            let mut empty = ArrowZSet::empty(self.output_schema.clone());
+            empty.frontier = input.frontier;
+            return Ok(empty);
         }
         let col = eval_to_array(&self.expr, &input.data)?;
         let new_data =
             RecordBatch::try_new(self.output_schema.clone(), vec![col]).map_err(OpError::arrow)?;
-        Ok(ArrowZSet::new(new_data, input.weights))
+        let mut out = ArrowZSet::new(new_data, input.weights);
+        out.frontier = input.frontier;
+        if let Expr::Column(src_col) = self.expr {
+            for capsule in &input.key_capsules {
+                if capsule.spec.columns.as_slice() == [src_col] {
+                    out.push_key_capsule(Arc::new(capsule.with_remapped_columns(vec![0])));
+                }
+            }
+        }
+        Ok(out)
     }
 }
 

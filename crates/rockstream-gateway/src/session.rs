@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use rockstream_types::diagnostic::DiagnosticOccurrence;
+use rockstream_types::ids::PrincipalId;
 
 /// Maximum GUC parameters stored per connection.
 /// Fill-level metric: `guc_params.len()`.
@@ -18,8 +19,13 @@ pub enum ScramAuthState {
     Idle,
     /// Server-first message has been sent; waiting for client-final.
     ServerFirstSent {
-        /// SaltedPassword from the RoleCatalog.
-        salted_password: Vec<u8>,
+        /// Persisted SCRAM client verifier.
+        stored_key: Vec<u8>,
+        /// Persisted SCRAM server verifier.
+        server_key: Vec<u8>,
+        /// Principal and policy revision used to begin this exchange.
+        principal_id: PrincipalId,
+        policy_revision: u64,
         /// Full nonce (client_nonce + server_nonce).
         server_nonce: String,
         /// Partial auth-message: `client_first_bare + "," + server_first`.
@@ -125,6 +131,8 @@ pub struct SessionState {
     /// First 16 bytes of SHA-256 of user-supplied idempotency key string.
     /// Set via `SET rockstream.idempotency_key = 'str'`.
     pub idempotency_key: Option<[u8; 16]>,
+    /// Canonical client UUID used to reconcile security mutations.
+    pub idempotency_operation_id: Option<String>,
     /// Explicit source epoch envelope for this write.
     /// Set via `SET rockstream.source_epoch = N`.
     pub source_epoch_envelope: Option<u64>,
@@ -187,6 +195,7 @@ impl SessionState {
             isolation_level: IsolationLevel::ReadCommitted,
             search_path: "public".to_string(),
             idempotency_key: None,
+            idempotency_operation_id: None,
             source_epoch_envelope: None,
             last_written_epoch: None,
             wait_for_token: None,

@@ -185,6 +185,8 @@ fn join_left_only(join: &JoinOp, left_delta: ArrowZSet) -> ArrowZSet {
 /// each), preserving row order. This models the sender-side rechunking that
 /// keeps every shuffle frame within `worker.max_rows_per_quantum`.
 fn rechunk(zset: &ArrowZSet, max_rows: usize) -> Vec<ArrowZSet> {
+    zset.validate()
+        .expect("rechunk input must have aligned row weights");
     if zset.is_empty() {
         return Vec::new();
     }
@@ -200,9 +202,9 @@ fn rechunk(zset: &ArrowZSet, max_rows: usize) -> Vec<ArrowZSet> {
         .collect();
     let mut chunks = Vec::new();
     let mut rows = Vec::new();
-    for i in 0..zset.num_rows() {
+    for (i, &weight) in zset.weights.iter().enumerate() {
         let mut row: Vec<i64> = cols.iter().map(|c| c.value(i)).collect();
-        row.push(zset.weights[i]);
+        row.push(weight);
         rows.push((row[0], row[1], row[2]));
         if rows.len() == max_rows {
             chunks.push(ArrowZSet::from_ab_weighted(&rows));
@@ -507,6 +509,24 @@ async fn durable_fallback_after_fast_path_failure_incremental_equals_batch() {
         let agg_out = aggregate.process_delta(received).unwrap();
         accumulate_full_rows(&agg_out, &mut incremental_agg);
     }
+
+    let committed_output = serde_json::to_vec(&incremental_agg.iter().collect::<Vec<_>>()).unwrap();
+    let mut batch = rockstream_storage::WriteBatch::new();
+    batch.put(b"oracle-aggregate-output", &committed_output);
+    batch.put(
+        &rockstream_storage::keys::ShardKeyEncoder::frontier_key(),
+        &sent_epochs.last().unwrap().to_be_bytes(),
+    );
+    target_db.write_batch(batch).await.unwrap();
+    assert_eq!(
+        target_db
+            .get(b"oracle-aggregate-output")
+            .await
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        committed_output.as_slice()
+    );
 
     // A repeat catch-up must not re-deliver (idempotent durable replay).
     for &epoch in &sent_epochs {

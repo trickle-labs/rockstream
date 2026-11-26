@@ -1,11 +1,121 @@
+use rockstream_runtime::client::start_worker_client_with_insecure_internal_dev_and_metadata as start_worker_client_for_test;
 use std::sync::Arc;
 use std::time::Duration;
 
 use rockstream_control::audit::FileAuditLog;
 use rockstream_control::{ControlService, ShardManager, TopologyCatalog};
-use rockstream_runtime::client::{start_worker_client, start_worker_client_with_tls};
+use rockstream_runtime::client::start_worker_client_with_tls;
+use rockstream_storage::catalog::{CatalogStore, DurableCatalogStore};
 use rockstream_test_support::pki::TestPki;
-use rockstream_types::ids::WorkerId;
+use rockstream_types::authorization::{
+    AuditCorrelation, AuditField, AuditIdentity, SecurityAuditClass, SecurityAuditOutcome,
+    SecurityAuditRecord, SECURITY_AUDIT_FORMAT_VERSION,
+};
+use rockstream_types::error_code::RS_2401;
+use rockstream_types::ids::{ShardId, WorkerId};
+use rockstream_types::topology::{
+    CapacityHeadroom, ControlMessage, NodeRole, WorkerMessage, WorkerRegistration,
+};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
+
+type TlsWorkerStream = BufReader<tokio_rustls::client::TlsStream<TcpStream>>;
+
+fn security_audit_catalog() -> Arc<DurableCatalogStore> {
+    Arc::new(DurableCatalogStore::new(
+        Arc::new(object_store::memory::InMemory::new()),
+        "node-identity-audit",
+    ))
+}
+
+fn worker_shuffle_denial_record() -> SecurityAuditRecord {
+    SecurityAuditRecord {
+        format_version: SECURITY_AUDIT_FORMAT_VERSION,
+        event_id: "shuffle-authorization:test-1".to_owned(),
+        timestamp_ms: 1_800_000_000_000,
+        actor: AuditIdentity::Verified("worker-2".to_owned()),
+        target: AuditField::Known("source_shard:10".to_owned()),
+        scope: AuditField::Known("worker_shuffle".to_owned()),
+        action: SecurityAuditClass::AuthorizationDenial,
+        outcome: SecurityAuditOutcome::Denied,
+        correlation: AuditCorrelation::Observed(
+            "exchange:100:source:10:target:20:epoch:1:sequence:1".to_owned(),
+        ),
+        operation_id: AuditField::NotApplicable,
+        policy_revision: AuditField::NotApplicable,
+        before_state: AuditField::NotApplicable,
+        after_state: AuditField::NotApplicable,
+    }
+}
+
+fn assert_control_message(actual: &str, expected: ControlMessage) {
+    assert_eq!(actual, serde_json::to_string(&expected).unwrap());
+}
+
+fn assert_node_identity_rejection(
+    record: &SecurityAuditRecord,
+    actor: AuditIdentity,
+    target: AuditField<String>,
+) {
+    assert_eq!(record.format_version, SECURITY_AUDIT_FORMAT_VERSION);
+    assert!(record.event_id.starts_with("node-identity-rejection:"));
+    assert!(record.timestamp_ms > 0);
+    assert_eq!(record.actor, actor);
+    assert_eq!(record.target, target);
+    assert_eq!(record.scope, AuditField::Known("cluster".to_owned()));
+    assert_eq!(record.action, SecurityAuditClass::NodeIdentityRejection);
+    assert_eq!(record.outcome, SecurityAuditOutcome::Denied);
+    assert_eq!(record.correlation, AuditCorrelation::Unknown);
+    assert_eq!(record.operation_id, AuditField::NotApplicable);
+    assert_eq!(record.policy_revision, AuditField::NotApplicable);
+    assert_eq!(record.before_state, AuditField::NotApplicable);
+    assert_eq!(record.after_state, AuditField::NotApplicable);
+}
+
+async fn connect_registered_worker(
+    pki: &TestPki,
+    addr: std::net::SocketAddr,
+    worker_id: u64,
+) -> TlsWorkerStream {
+    let connector =
+        rockstream_runtime::tls::build_client_tls_connector(&pki.worker_tls_config(worker_id))
+            .unwrap();
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let server_name = rustls::pki_types::ServerName::try_from("localhost".to_owned()).unwrap();
+    let stream = connector.connect(server_name, stream).await.unwrap();
+    let mut reader = BufReader::new(stream);
+    let registration = WorkerRegistration::new(
+        WorkerId(worker_id),
+        NodeRole::Worker,
+        format!("127.0.0.1:{}", 7000 + worker_id),
+        CapacityHeadroom::FULL,
+    );
+    let line = serde_json::to_string(&WorkerMessage::Register(registration)).unwrap() + "\n";
+    reader.get_mut().write_all(line.as_bytes()).await.unwrap();
+    let mut response = String::new();
+    reader.read_line(&mut response).await.unwrap();
+    assert_control_message(
+        response.trim(),
+        ControlMessage::Registered {
+            worker_id: WorkerId(worker_id),
+            protocol_version: rockstream_types::compatibility::ProtocolVersion::V4,
+        },
+    );
+    reader
+}
+
+async fn send_and_read(reader: &mut TlsWorkerStream, message: &WorkerMessage) -> String {
+    let line = serde_json::to_string(message).unwrap() + "\n";
+    reader.get_mut().write_all(line.as_bytes()).await.unwrap();
+    loop {
+        let mut response = String::new();
+        reader.read_line(&mut response).await.unwrap();
+        let decoded = serde_json::from_str(response.trim()).unwrap();
+        if !matches!(decoded, ControlMessage::TopologyChanged { .. }) {
+            return response.trim().to_owned();
+        }
+    }
+}
 
 #[tokio::test]
 async fn test_control_worker_mtls_valid_cert_admitted() {
@@ -18,6 +128,7 @@ async fn test_control_worker_mtls_valid_cert_admitted() {
     let svc = ControlService::new(catalog.clone())
         .with_shard_manager(manager)
         .with_audit(audit.clone())
+        .with_security_catalog(security_audit_catalog())
         .with_internal_tls(pki.control_tls_config());
 
     let handle = svc.start("127.0.0.1:0").await.unwrap();
@@ -47,6 +158,187 @@ async fn test_control_worker_mtls_valid_cert_admitted() {
 }
 
 #[tokio::test]
+async fn control_worker_mtls_rejects_protocol_without_audited_shuffle_support() {
+    let pki = TestPki::generate();
+    let audit_dir = tempfile::tempdir().unwrap();
+    let audit = Arc::new(FileAuditLog::open(audit_dir.path().join("audit.jsonl")).unwrap());
+    let catalog = TopologyCatalog::new();
+    let security_catalog = security_audit_catalog();
+    let svc = ControlService::new(catalog.clone())
+        .with_audit(audit.clone())
+        .with_security_catalog(security_catalog.clone())
+        .with_internal_tls(pki.control_tls_config());
+    let handle = svc.start("127.0.0.1:0").await.unwrap();
+    let connector =
+        rockstream_runtime::tls::build_client_tls_connector(&pki.worker_tls_config(1)).unwrap();
+    let stream = TcpStream::connect(handle.addr).await.unwrap();
+    let server_name = rustls::pki_types::ServerName::try_from("localhost".to_owned()).unwrap();
+    let mut reader = BufReader::new(connector.connect(server_name, stream).await.unwrap());
+    let registration = WorkerRegistration::new(
+        WorkerId(1),
+        NodeRole::Worker,
+        "127.0.0.1:7001",
+        CapacityHeadroom::FULL,
+    )
+    .with_compatibility(
+        rockstream_types::compatibility::SupportedVersionRange::v1_through_v2(),
+        rockstream_types::compatibility::SupportedStorageFormatRange::v1_through_v2(),
+    );
+    let request = WorkerMessage::Register(registration);
+    reader
+        .get_mut()
+        .write_all((serde_json::to_string(&request).unwrap() + "\n").as_bytes())
+        .await
+        .unwrap();
+    let mut response = String::new();
+    reader.read_line(&mut response).await.unwrap();
+    assert_control_message(
+        response.trim(),
+        ControlMessage::OperationFailed {
+            code: "RS-5021".to_owned(),
+            message: "RS-5021: authenticated worker shuffle requires protocol v4".to_owned(),
+            next_steps: rockstream_types::error_code::next_steps(
+                rockstream_types::error_code::RS_5021,
+            )
+            .to_string(),
+        },
+    );
+    assert_eq!(catalog.len(), 0);
+    assert!(audit.read_all().unwrap().iter().any(|event| {
+        event.action == "security.internal_mtls_denied"
+            && event.error_code.as_deref() == Some("RS-5021")
+    }));
+    let records = security_catalog
+        .list_security_audit_records()
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].actor,
+        AuditIdentity::Verified("worker:worker-1".to_owned())
+    );
+    assert_eq!(records[0].target, AuditField::Known("worker-1".to_owned()));
+    assert_eq!(
+        records[0].scope,
+        AuditField::Known("worker_control".to_owned())
+    );
+    assert_eq!(records[0].action, SecurityAuditClass::AuthorizationDenial);
+    assert_eq!(records[0].outcome, SecurityAuditOutcome::Denied);
+    assert_eq!(records[0].correlation, AuditCorrelation::Unknown);
+    handle.shutdown();
+}
+
+#[tokio::test]
+async fn worker_security_audit_is_durable_before_acknowledgement() {
+    let pki = TestPki::generate();
+    let audit_dir = tempfile::tempdir().unwrap();
+    let audit = Arc::new(FileAuditLog::open(audit_dir.path().join("audit.jsonl")).unwrap());
+    let security_catalog = security_audit_catalog();
+    let svc = ControlService::new(TopologyCatalog::new())
+        .with_audit(audit)
+        .with_security_catalog(security_catalog.clone())
+        .with_internal_tls(pki.control_tls_config());
+    let handle = svc.start("127.0.0.1:0").await.unwrap();
+    let mut worker = connect_registered_worker(&pki, handle.addr, 1).await;
+    let record = worker_shuffle_denial_record();
+    let request_id = record.event_id.clone();
+    let response = send_and_read(
+        &mut worker,
+        &WorkerMessage::ReportSecurityAudit {
+            request_id,
+            record: record.clone(),
+        },
+    )
+    .await;
+    assert_control_message(
+        &response,
+        ControlMessage::SecurityAuditRecorded {
+            request_id: record.event_id.clone(),
+            persisted: true,
+        },
+    );
+    assert_eq!(
+        security_catalog
+            .list_security_audit_records()
+            .await
+            .unwrap(),
+        vec![record]
+    );
+    handle.shutdown();
+}
+
+#[tokio::test]
+async fn worker_security_audit_requires_an_authenticated_peer() {
+    let security_catalog = security_audit_catalog();
+    let svc = ControlService::new(TopologyCatalog::new())
+        .with_security_catalog(security_catalog.clone())
+        .with_insecure_dev_mode();
+    let handle = svc.start("127.0.0.1:0").await.unwrap();
+    let mut worker = BufReader::new(TcpStream::connect(handle.addr).await.unwrap());
+    let registration = WorkerRegistration::new(
+        WorkerId(2),
+        NodeRole::Worker,
+        "127.0.0.1:7002".to_owned(),
+        CapacityHeadroom::FULL,
+    );
+    worker
+        .get_mut()
+        .write_all(
+            (serde_json::to_string(&WorkerMessage::Register(registration)).unwrap() + "\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = String::new();
+    worker.read_line(&mut response).await.unwrap();
+    assert_control_message(
+        response.trim(),
+        ControlMessage::Registered {
+            worker_id: WorkerId(2),
+            protocol_version: rockstream_types::compatibility::ProtocolVersion::V4,
+        },
+    );
+
+    let record = worker_shuffle_denial_record();
+    worker
+        .get_mut()
+        .write_all(
+            (serde_json::to_string(&WorkerMessage::ReportSecurityAudit {
+                request_id: record.event_id.clone(),
+                record,
+            })
+            .unwrap()
+                + "\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    loop {
+        response.clear();
+        worker.read_line(&mut response).await.unwrap();
+        if matches!(
+            serde_json::from_str::<ControlMessage>(response.trim()).unwrap(),
+            ControlMessage::SecurityAuditRecorded { .. }
+        ) {
+            assert_control_message(
+                response.trim(),
+                ControlMessage::SecurityAuditRecorded {
+                    request_id: "shuffle-authorization:test-1".to_owned(),
+                    persisted: false,
+                },
+            );
+            break;
+        }
+    }
+    assert!(security_catalog
+        .list_security_audit_records()
+        .await
+        .unwrap()
+        .is_empty());
+    handle.shutdown();
+}
+
+#[tokio::test]
 async fn test_control_worker_mtls_missing_cert_rejected() {
     let pki = TestPki::generate();
     let audit_dir = tempfile::tempdir().unwrap();
@@ -57,6 +349,7 @@ async fn test_control_worker_mtls_missing_cert_rejected() {
     let svc = ControlService::new(catalog.clone())
         .with_shard_manager(manager)
         .with_audit(audit.clone())
+        .with_security_catalog(security_audit_catalog())
         .with_internal_tls(pki.control_tls_config());
 
     let handle = svc.start("127.0.0.1:0").await.unwrap();
@@ -65,9 +358,15 @@ async fn test_control_worker_mtls_missing_cert_rejected() {
     let storage_dir = tempfile::tempdir().unwrap();
 
     // Plaintext client connection without certificate
-    let (client, worker_handle) = start_worker_client(1, &control_url, storage_dir.path())
-        .await
-        .unwrap();
+    let (client, worker_handle) = start_worker_client_for_test(
+        1,
+        &control_url,
+        storage_dir.path(),
+        Default::default(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -82,6 +381,10 @@ async fn test_control_worker_mtls_missing_cert_rejected() {
             && (e.detail.as_deref().unwrap_or("").contains("RS-2410")
                 || e.detail.as_deref().unwrap_or("").contains("RS-2411"))
     }));
+    assert!(events
+        .iter()
+        .filter(|event| event.action == "security.internal_mtls_denied")
+        .all(|event| event.actor == "unknown"));
 
     worker_handle.abort();
     handle.shutdown();
@@ -98,6 +401,7 @@ async fn test_control_worker_mtls_expired_cert_rejected() {
     let svc = ControlService::new(catalog.clone())
         .with_shard_manager(manager)
         .with_audit(audit.clone())
+        .with_security_catalog(security_audit_catalog())
         .with_internal_tls(pki.control_tls_config());
 
     let handle = svc.start("127.0.0.1:0").await.unwrap();
@@ -117,6 +421,10 @@ async fn test_control_worker_mtls_expired_cert_rejected() {
         e.action == "security.internal_mtls_denied"
             && e.detail.as_deref().unwrap_or("").contains("RS-2411")
     }));
+    assert!(events
+        .iter()
+        .filter(|event| event.action == "security.internal_mtls_denied")
+        .all(|event| event.actor == "unknown"));
 
     handle.shutdown();
 }
@@ -132,6 +440,7 @@ async fn test_control_worker_mtls_untrusted_ca_rejected() {
     let svc = ControlService::new(catalog.clone())
         .with_shard_manager(manager)
         .with_audit(audit.clone())
+        .with_security_catalog(security_audit_catalog())
         .with_internal_tls(pki.control_tls_config());
 
     let handle = svc.start("127.0.0.1:0").await.unwrap();
@@ -151,6 +460,10 @@ async fn test_control_worker_mtls_untrusted_ca_rejected() {
         e.action == "security.internal_mtls_denied"
             && e.detail.as_deref().unwrap_or("").contains("RS-2411")
     }));
+    assert!(events
+        .iter()
+        .filter(|event| event.action == "security.internal_mtls_denied")
+        .all(|event| event.actor == "unknown"));
 
     handle.shutdown();
 }
@@ -160,12 +473,14 @@ async fn test_control_worker_mtls_identity_mismatch_rejected() {
     let pki = TestPki::generate();
     let audit_dir = tempfile::tempdir().unwrap();
     let audit = Arc::new(FileAuditLog::open(audit_dir.path().join("audit.jsonl")).unwrap());
+    let security_catalog = security_audit_catalog();
 
     let catalog = TopologyCatalog::new();
     let manager = ShardManager::new();
     let svc = ControlService::new(catalog.clone())
         .with_shard_manager(manager)
         .with_audit(audit.clone())
+        .with_security_catalog(security_catalog.clone())
         .with_internal_tls(pki.control_tls_config());
 
     let handle = svc.start("127.0.0.1:0").await.unwrap();
@@ -192,7 +507,186 @@ async fn test_control_worker_mtls_identity_mismatch_rejected() {
         e.action == "security.internal_mtls_denied"
             && e.detail.as_deref().unwrap_or("").contains("RS-2412")
     }));
+    let records = security_catalog
+        .list_security_audit_records()
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_node_identity_rejection(
+        &records[0],
+        AuditIdentity::Unverified("worker:worker-999".to_owned()),
+        AuditField::Unverified("worker-1".to_owned()),
+    );
 
     worker_handle.abort();
+    handle.shutdown();
+}
+
+#[tokio::test]
+async fn test_control_worker_mtls_role_only_certificate_cannot_register() {
+    let pki = TestPki::generate();
+    let audit_dir = tempfile::tempdir().unwrap();
+    let audit = Arc::new(FileAuditLog::open(audit_dir.path().join("audit.jsonl")).unwrap());
+    let security_catalog = security_audit_catalog();
+
+    let catalog = TopologyCatalog::new();
+    let svc = ControlService::new(catalog.clone())
+        .with_audit(audit.clone())
+        .with_security_catalog(security_catalog.clone())
+        .with_internal_tls(pki.control_tls_config());
+    let handle = svc.start("127.0.0.1:0").await.unwrap();
+    let storage_dir = tempfile::tempdir().unwrap();
+    let (client, worker_handle) = start_worker_client_with_tls(
+        1,
+        &handle.addr.to_string(),
+        storage_dir.path(),
+        pki.role_only_worker_tls_config(),
+    )
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(client.worker_id(), None);
+    assert_eq!(catalog.len(), 0);
+    let expected_detail = "node identity mismatch: cert=worker:worker, requested_worker_id=worker-1, error_code=RS-2412";
+    let events = audit.read_all().unwrap();
+    assert!(
+        events.iter().any(|event| {
+            event.action == "security.internal_mtls_denied"
+                && event.detail.as_deref() == Some(expected_detail)
+        }),
+        "unexpected audit events: {events:?}"
+    );
+    let denial = events
+        .iter()
+        .find(|event| {
+            event.action == "security.internal_mtls_denied"
+                && event.detail.as_deref() == Some(expected_detail)
+        })
+        .expect("node identity rejection audit event");
+    assert_eq!(denial.actor, "worker:worker");
+    let records = security_catalog
+        .list_security_audit_records()
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_node_identity_rejection(
+        &records[0],
+        AuditIdentity::Unverified("worker:worker".to_owned()),
+        AuditField::Unverified("worker-1".to_owned()),
+    );
+
+    worker_handle.abort();
+    handle.shutdown();
+}
+
+#[tokio::test]
+async fn test_control_worker_mtls_cannot_claim_another_registered_worker() {
+    let pki = TestPki::generate();
+    let audit_dir = tempfile::tempdir().unwrap();
+    let audit = Arc::new(FileAuditLog::open(audit_dir.path().join("audit.jsonl")).unwrap());
+    let security_catalog = security_audit_catalog();
+    let catalog = TopologyCatalog::new();
+    let manager = ShardManager::new();
+    let service = ControlService::new(catalog.clone())
+        .with_shard_manager(manager.clone())
+        .with_audit(audit.clone())
+        .with_security_catalog(security_catalog.clone())
+        .with_internal_tls(pki.control_tls_config());
+    let handle = service.start("127.0.0.1:0").await.unwrap();
+    let mut worker_1 = connect_registered_worker(&pki, handle.addr, 1).await;
+    let _worker_2 = connect_registered_worker(&pki, handle.addr, 2).await;
+    let worker_2_lease = manager.acquire(ShardId(78), WorkerId(2)).unwrap();
+
+    // An action-level denial for an authenticated worker preserves its session.
+    assert_control_message(
+        &send_and_read(
+            &mut worker_1,
+            &WorkerMessage::FenceWrite {
+                shard_id: ShardId(78),
+                lease_token: worker_2_lease.lease_token,
+            },
+        )
+        .await,
+        ControlMessage::FenceAck {
+            shard_id: ShardId(78),
+            valid: false,
+        },
+    );
+    assert_control_message(
+        &send_and_read(&mut worker_1, &WorkerMessage::ClusterStatusQuery).await,
+        ControlMessage::ClusterStatusReport {
+            node_id: None,
+            role: rockstream_types::topology::RaftRoleWire::NoRaft,
+            term: 0,
+        },
+    );
+
+    // A forged worker ID is an identity rejection and closes the connection.
+    let response = send_and_read(
+        &mut worker_1,
+        &WorkerMessage::RequestShard {
+            worker_id: WorkerId(2),
+            shard_id: ShardId(77),
+        },
+    )
+    .await;
+    assert_control_message(
+        &response,
+        ControlMessage::OperationFailed {
+            code: RS_2401.to_string(),
+            message: "worker identity claim is not authorized for this connection".to_owned(),
+            next_steps: rockstream_types::error_code::next_steps(RS_2401).to_string(),
+        },
+    );
+    let mut closed = String::new();
+    let close_result =
+        tokio::time::timeout(Duration::from_secs(1), worker_1.read_line(&mut closed))
+            .await
+            .unwrap();
+    assert!(
+        matches!(close_result, Ok(0))
+            || matches!(
+                close_result,
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof
+            )
+    );
+    assert_eq!(catalog.len(), 1);
+    assert_eq!(manager.get(ShardId(77)), None);
+    assert_eq!(manager.get(ShardId(78)), Some(worker_2_lease.clone()));
+
+    let events = audit.read_all().unwrap();
+    let denials: Vec<_> = events
+        .iter()
+        .filter(|event| event.action == "security.authorization_denied")
+        .collect();
+    assert_eq!(denials.len(), 2);
+    assert_eq!(denials[0].actor, "worker:worker-1");
+    assert_eq!(denials[0].resource, "shard-78");
+    assert_eq!(
+        denials[0].detail.as_deref(),
+        Some("operation=fence_write, registered_worker_id=worker-1, error_code=RS-2401")
+    );
+    assert_eq!(denials[1].actor, "worker:worker-1");
+    assert_eq!(denials[1].resource, "worker-2");
+    assert_eq!(
+        denials[1].detail.as_deref(),
+        Some("registered_worker_id=worker-1, claimed_worker_id=worker-2, error_code=RS-2401")
+    );
+    assert!(!events
+        .iter()
+        .any(|event| { event.action == "worker.deregistered" && event.resource == "worker-2" }));
+    let records = security_catalog
+        .list_security_audit_records()
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_node_identity_rejection(
+        &records[0],
+        AuditIdentity::Verified("worker:worker-1".to_owned()),
+        AuditField::Unverified("worker-2".to_owned()),
+    );
+
     handle.shutdown();
 }

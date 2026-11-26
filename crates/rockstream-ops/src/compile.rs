@@ -49,7 +49,7 @@ use crate::distinct::DistinctOp;
 use crate::error::OpError;
 use crate::expr::lit;
 use crate::factorized::{FactorizedAggregateKind, FactorizedJoinAggregateOp};
-use crate::filter::FilterOp;
+use crate::fused::{FusedStatelessKernel, StatelessStep};
 use crate::governor::{
     DeltaAmplificationCounters, DeltaAmplificationGovernor, PlanStrategy,
     DEFAULT_FACTORIZED_DELTA_BUDGET,
@@ -59,9 +59,8 @@ use crate::live_exec::{
     int64_schema, next_stateful_op_id, with_view_id_scope, GroupKeyPacker, JoinKind, JoinPipeline,
     Stage, StatefulPipeline, Utf8ColumnPacker, Utf8KeyPacker,
 };
-use crate::map::MapOp;
 use crate::outer_join::OuterJoinOp;
-use crate::project::{NamedExpr, ProjectOp};
+use crate::project::NamedExpr;
 use crate::sink::ViewSinkOp;
 use crate::time_window::{HopWindowOp, SessionWindowOp, TumbleWindowOp};
 use crate::topk::TopKOp;
@@ -202,6 +201,70 @@ pub fn compile_plan_with_sink_id_and_strategy(
     })
 }
 
+fn stateless_step_stage(step: StatelessStep) -> Stage {
+    Stage::FusedStateless(Arc::new(FusedStatelessKernel::compile(vec![step])))
+}
+
+/// Collapse adjacent stateless (`Filter` / `Project` / `Map`) stages into a
+/// single [`FusedStatelessKernel`] and pre-pack canonical `BatchKeyCapsule`s
+/// when a fused stateless stage feeds directly into an [`AggregateOp`] (Issue #402 R3).
+pub fn fuse_stateless_stages(stages: Vec<Stage>) -> Vec<Stage> {
+    let mut out: Vec<Stage> = Vec::with_capacity(stages.len());
+    let mut pending_steps: Vec<StatelessStep> = Vec::new();
+    let mut pending_prepack: Option<Vec<usize>> = None;
+
+    let flush = |steps: &mut Vec<StatelessStep>,
+                 prepack: &mut Option<Vec<usize>>,
+                 next_is_aggregate: bool,
+                 out: &mut Vec<Stage>| {
+        if steps.is_empty() {
+            return;
+        }
+        let mut kernel = FusedStatelessKernel::compile(std::mem::take(steps));
+        let prepack_cols = prepack
+            .take()
+            .or_else(|| next_is_aggregate.then(|| vec![0]));
+        if let Some(cols) = prepack_cols {
+            kernel = kernel.with_prepack_key_cols(cols);
+        }
+        out.push(Stage::FusedStateless(Arc::new(kernel)));
+    };
+
+    for stage in stages {
+        match stage {
+            Stage::FusedStateless(kernel) => {
+                pending_steps.extend(kernel.steps().iter().cloned());
+                if let Some(cols) = kernel.prepack_key_cols() {
+                    pending_prepack = Some(cols.to_vec());
+                }
+            }
+            other => {
+                let next_is_agg = matches!(other, Stage::Aggregate(_));
+                flush(
+                    &mut pending_steps,
+                    &mut pending_prepack,
+                    next_is_agg,
+                    &mut out,
+                );
+                out.push(other);
+            }
+        }
+    }
+    flush(&mut pending_steps, &mut pending_prepack, false, &mut out);
+    out
+}
+
+fn attach_prepack_to_tail(stages: &mut [Stage], key_cols: Vec<usize>) {
+    if key_cols.is_empty() {
+        return;
+    }
+    if let Some(Stage::FusedStateless(kernel)) = stages.last_mut() {
+        let updated =
+            FusedStatelessKernel::compile(kernel.steps().to_vec()).with_prepack_key_cols(key_cols);
+        *kernel = Arc::new(updated);
+    }
+}
+
 fn compile_plan_body(
     view_name: &str,
     pk: &[usize],
@@ -223,8 +286,12 @@ fn compile_plan_body(
             ));
         }
         let sink = ViewSinkOp::new(Arc::clone(&db), sink_op_id);
-        let join_pipeline =
-            JoinPipeline::new(shape.left_pre, shape.right_pre, shape.join, shape.post);
+        let mut left_pre = fuse_stateless_stages(shape.left_pre);
+        let mut right_pre = fuse_stateless_stages(shape.right_pre);
+        attach_prepack_to_tail(&mut left_pre, shape.left_keys);
+        attach_prepack_to_tail(&mut right_pre, shape.right_keys);
+        let post = fuse_stateless_stages(shape.post);
+        let join_pipeline = JoinPipeline::new(left_pre, right_pre, shape.join, post);
         join_pipeline.set_db(db);
         return Ok(CompiledView {
             pipeline: StatefulPipeline::new(),
@@ -251,6 +318,7 @@ fn compile_plan_body(
         .cloned()
         .unwrap_or_else(|| Arc::new(Schema::empty()));
     let (stages, _out_schema) = compile_node(child, &source_schema)?;
+    let stages = fuse_stateless_stages(stages);
     let mut pipeline = StatefulPipeline::new();
     for stage in stages {
         pipeline = pipeline.push(stage);
@@ -313,6 +381,13 @@ fn static_expr_type(expr: &Expr, schema: &Schema) -> Option<DataType> {
 
 fn expr_is_int64(expr: &Expr, schema: &Schema) -> bool {
     static_expr_type(expr, schema) == Some(DataType::Int64)
+}
+
+fn legacy_group_key_type(expr: &Expr, schema: &Schema) -> Option<DataType> {
+    let batch = arrow::record_batch::RecordBatch::new_empty(Arc::new(schema.clone()));
+    crate::expr::eval_to_array(expr, &batch)
+        .ok()
+        .map(|array| array.data_type().clone())
 }
 
 #[allow(dead_code)]
@@ -378,6 +453,7 @@ pub(crate) fn find_source_name(node: &PlanNode) -> Option<String> {
         PlanNode::Window { input, .. } => find_source_name(input),
         PlanNode::TopK { input, .. } => find_source_name(input),
         PlanNode::Distinct { input, .. } => find_source_name(input),
+        PlanNode::Exchange { child, .. } => find_source_name(child),
         _ => None,
     }
 }
@@ -396,6 +472,8 @@ pub(crate) struct JoinShape {
     pub(crate) post: Vec<Stage>,
     pub(crate) left_source: String,
     pub(crate) right_source: String,
+    left_keys: Vec<usize>,
+    right_keys: Vec<usize>,
     left_n_cols: usize,
     right_n_cols: usize,
     /// Running output column count after `post` (so far) is applied — the
@@ -682,19 +760,23 @@ fn transfer_predicate(shape: &mut JoinShape, predicate: &Expr) -> bool {
     if let Some(predicate) = left {
         shape
             .left_pre
-            .push(Stage::Stateless(Arc::new(FilterOp::new(predicate.clone()))));
+            .push(stateless_step_stage(StatelessStep::Filter(
+                predicate.clone(),
+            )));
         if let Some(spec) = &mut shape.factorized_spec {
             spec.left_pre
-                .push(Stage::Stateless(Arc::new(FilterOp::new(predicate))));
+                .push(stateless_step_stage(StatelessStep::Filter(predicate)));
         }
     }
     if let Some(predicate) = right {
         shape
             .right_pre
-            .push(Stage::Stateless(Arc::new(FilterOp::new(predicate.clone()))));
+            .push(stateless_step_stage(StatelessStep::Filter(
+                predicate.clone(),
+            )));
         if let Some(spec) = &mut shape.factorized_spec {
             spec.right_pre
-                .push(Stage::Stateless(Arc::new(FilterOp::new(predicate))));
+                .push(stateless_step_stage(StatelessStep::Filter(predicate)));
         }
     }
     true
@@ -768,6 +850,8 @@ pub(crate) fn try_compile_join_shape(
                 post,
                 left_source,
                 right_source,
+                left_keys: left_keys.clone(),
+                right_keys: right_keys.clone(),
                 left_n_cols: left_schema.fields().len(),
                 right_n_cols: right_schema.fields().len(),
                 post_n_cols,
@@ -821,6 +905,8 @@ pub(crate) fn try_compile_join_shape(
                 post,
                 left_source,
                 right_source,
+                left_keys: left_keys.clone(),
+                right_keys: right_keys.clone(),
                 left_n_cols: left_schema.fields().len(),
                 right_n_cols: right_schema.fields().len(),
                 post_n_cols,
@@ -833,9 +919,9 @@ pub(crate) fn try_compile_join_shape(
                 Some(mut shape) => {
                     if !transfer_predicate(&mut shape, predicate) {
                         shape.factorized_spec = None;
-                        shape
-                            .post
-                            .push(Stage::Stateless(Arc::new(FilterOp::new(predicate.clone()))));
+                        shape.post.push(stateless_step_stage(StatelessStep::Filter(
+                            predicate.clone(),
+                        )));
                     }
                     Ok(Some(shape))
                 }
@@ -865,7 +951,7 @@ pub(crate) fn try_compile_join_shape(
                     shape.post_n_cols = named.len();
                     shape
                         .post
-                        .push(Stage::Stateless(Arc::new(ProjectOp::new(named))));
+                        .push(stateless_step_stage(StatelessStep::Project(named)));
                     Ok(Some(shape))
                 }
                 None => Ok(None),
@@ -877,10 +963,10 @@ pub(crate) fn try_compile_join_shape(
                     shape.factorized_spec = None;
                     shape.factorized_columns = None;
                     shape.post_n_cols += 1;
-                    shape.post.push(Stage::Stateless(Arc::new(MapOp::new(
-                        func.clone(),
-                        "value",
-                    ))));
+                    shape.post.push(stateless_step_stage(StatelessStep::Map {
+                        expr: func.clone(),
+                        output_name: "value".to_string(),
+                    }));
                     Ok(Some(shape))
                 }
                 None => Ok(None),
@@ -976,17 +1062,17 @@ pub(crate) fn try_compile_join_shape(
                 }
                 shape
                     .post
-                    .push(Stage::Stateless(Arc::new(ProjectOp::new(vec![
+                    .push(stateless_step_stage(StatelessStep::Project(vec![
                         NamedExpr::new("k", group_by[0].clone()),
                         NamedExpr::new("v", agg.input.clone()),
-                    ]))));
+                    ])));
                 let result_col = compile_aggregate_body(&mut shape.post, agg)?;
                 shape
                     .post
-                    .push(Stage::Stateless(Arc::new(ProjectOp::new(vec![
+                    .push(stateless_step_stage(StatelessStep::Project(vec![
                         NamedExpr::new("k", Expr::Column(0)),
                         NamedExpr::new("agg", Expr::Column(result_col)),
-                    ]))));
+                    ])));
                 shape.post_n_cols = 2;
                 Ok(Some(shape))
             }
@@ -1096,8 +1182,15 @@ fn compile_multi_aggregate_lanes(
 ) -> Result<(Vec<Stage>, SchemaRef), OpError> {
     let _ = in_schema; // already type-checked by the caller
     let n_keys = group_by.len();
-    let packer = (n_keys > 1 || (n_keys == 1 && !expr_is_int64(&group_by[0], in_schema)))
-        .then(|| Arc::new(GroupKeyPacker::new(n_keys)));
+    let packer =
+        (n_keys > 1 || (n_keys == 1 && !expr_is_int64(&group_by[0], in_schema))).then(|| {
+            Arc::new(GroupKeyPacker::new_with_key_types(
+                group_by
+                    .iter()
+                    .map(|g| legacy_group_key_type(g, in_schema))
+                    .collect(),
+            ))
+        });
     let mut lanes: Vec<StatefulPipeline> = Vec::with_capacity(aggregates.len());
     // Per-lane payload width (columns beyond `k`): 1 for every lane except
     // `AVG`'s, which is 2 — see the `AggregateFunc::Avg` arm below.
@@ -1116,7 +1209,7 @@ fn compile_multi_aggregate_lanes(
             .collect();
         pre_named.push(NamedExpr::new("v", agg.input.clone()));
         let mut lane_stages: Vec<Stage> =
-            vec![Stage::Stateless(Arc::new(ProjectOp::new(pre_named)))];
+            vec![stateless_step_stage(StatelessStep::Project(pre_named))];
         if let Some(packer) = &packer {
             lane_stages.push(Stage::KeyPack(packer.clone(), next_stateful_op_id()));
         }
@@ -1128,15 +1221,17 @@ fn compile_multi_aggregate_lanes(
             // `Distinct`/`Aggregate` so they don't count as a (spurious)
             // distinct value, matching SQL's "CASE with no ELSE is NULL,
             // COUNT(DISTINCT ...) ignores NULL" semantics.
-            lane_stages.push(Stage::Stateless(Arc::new(FilterOp::new(Expr::BinaryOp {
-                op: rockstream_plan::BinaryOp::Ne,
-                left: Box::new(Expr::Column(1)),
-                right: Box::new(Expr::Literal(
-                    rockstream_plan::CASE_MISSING_ELSE_SENTINEL
-                        .to_be_bytes()
-                        .to_vec(),
-                )),
-            }))));
+            lane_stages.push(stateless_step_stage(StatelessStep::Filter(
+                Expr::BinaryOp {
+                    op: rockstream_plan::BinaryOp::Ne,
+                    left: Box::new(Expr::Column(1)),
+                    right: Box::new(Expr::Literal(
+                        rockstream_plan::CASE_MISSING_ELSE_SENTINEL
+                            .to_be_bytes()
+                            .to_vec(),
+                    )),
+                },
+            )));
         }
         let result_col = compile_aggregate_body(&mut lane_stages, agg)?;
         if agg.func == AggregateFunc::Avg {
@@ -1148,11 +1243,11 @@ fn compile_multi_aggregate_lanes(
             // combines them into one true `Float64` avg column via
             // `avg_from_sum_count` *after* the whole join cascade
             // completes, so every intermediate join stays Int64-only.
-            lane_stages.push(Stage::Stateless(Arc::new(ProjectOp::new(vec![
+            lane_stages.push(stateless_step_stage(StatelessStep::Project(vec![
                 NamedExpr::new("k", Expr::Column(0)),
                 NamedExpr::new("sum", Expr::Column(1)),
                 NamedExpr::new("count", Expr::Column(2)),
-            ]))));
+            ])));
             lane_widths.push(2);
             finalize.push(crate::live_exec::FinalizeCol::Avg {
                 sum_idx: next_payload_idx,
@@ -1163,16 +1258,16 @@ fn compile_multi_aggregate_lanes(
             // AggregateOp/MinMaxOp always emit `(k, agg, ..)`; project down
             // to this lane's own `(k, agg)` shape so every non-`AVG` lane
             // has an identical, joinable 2-column output.
-            lane_stages.push(Stage::Stateless(Arc::new(ProjectOp::new(vec![
+            lane_stages.push(stateless_step_stage(StatelessStep::Project(vec![
                 NamedExpr::new("k", Expr::Column(0)),
                 NamedExpr::new("agg", Expr::Column(result_col)),
-            ]))));
+            ])));
             lane_widths.push(1);
             finalize.push(crate::live_exec::FinalizeCol::Direct(next_payload_idx));
             next_payload_idx += 1;
         }
         let mut pipeline = StatefulPipeline::new();
-        for stage in lane_stages {
+        for stage in fuse_stateless_stages(lane_stages) {
             pipeline = pipeline.push(stage);
         }
         lanes.push(pipeline);
@@ -1246,8 +1341,10 @@ pub(crate) fn compile_node(
         }
         PlanNode::Filter { input, predicate } => {
             let (mut stages, schema) = compile_node(input, source_schema)?;
-            stages.push(Stage::Stateless(Arc::new(FilterOp::new(predicate.clone()))));
-            Ok((stages, schema))
+            stages.push(stateless_step_stage(StatelessStep::Filter(
+                predicate.clone(),
+            )));
+            Ok((fuse_stateless_stages(stages), schema))
         }
         PlanNode::Project { input, columns } => {
             let (mut stages, in_schema) = compile_node(input, source_schema)?;
@@ -1256,11 +1353,6 @@ pub(crate) fn compile_node(
                 .enumerate()
                 .map(|(i, expr)| NamedExpr::new(format!("col{i}"), expr.clone()))
                 .collect();
-            // Best-effort output schema: a plain column reference keeps its
-            // source field's real type; anything else defaults to `Int64`
-            // (matches this codebase's existing arithmetic-expression
-            // convention — only consulted by a stateful operator gate
-            // further up the tree, never by `ProjectOp` itself).
             let out_fields: Vec<Field> = columns
                 .iter()
                 .enumerate()
@@ -1270,22 +1362,22 @@ pub(crate) fn compile_node(
                 })
                 .collect();
             let out_schema: SchemaRef = Arc::new(Schema::new(out_fields));
-            stages.push(Stage::Stateless(Arc::new(ProjectOp::new(named))));
-            Ok((stages, out_schema))
+            stages.push(stateless_step_stage(StatelessStep::Project(named)));
+            Ok((fuse_stateless_stages(stages), out_schema))
         }
         PlanNode::Map { input, func } => {
             let (mut stages, in_schema) = compile_node(input, source_schema)?;
-            stages.push(Stage::Stateless(Arc::new(MapOp::new(
-                func.clone(),
-                "value",
-            ))));
+            stages.push(stateless_step_stage(StatelessStep::Map {
+                expr: func.clone(),
+                output_name: "value".to_string(),
+            }));
             let mut fields: Vec<Field> = in_schema
                 .fields()
                 .iter()
                 .map(|f| f.as_ref().clone())
                 .collect();
             fields.push(Field::new("value", DataType::Int64, true));
-            Ok((stages, Arc::new(Schema::new(fields))))
+            Ok((fuse_stateless_stages(stages), Arc::new(Schema::new(fields))))
         }
 
         // ── v0.51.4 Slice 2: TumbleWindow / HopWindow ──────────────────────
@@ -1380,6 +1472,7 @@ pub(crate) fn compile_node(
             time_col,
             gap_ms,
             late_data_policy,
+            partition_by,
         } => {
             let (mut stages, in_schema) = compile_node(input, source_schema)?;
             let (packed_schema, utf8_packers) =
@@ -1389,11 +1482,12 @@ pub(crate) fn compile_node(
                     "SessionWindow over a non-Int64/Utf8 input schema (SessionWindowOp only supports Int64 columns, plus Utf8 passthrough)",
                 ));
             }
-            let op = Arc::new(SessionWindowOp::new(
+            let op = Arc::new(SessionWindowOp::new_with_partition_by(
                 packed_schema.clone(),
                 *time_col,
                 *gap_ms,
                 late_data_policy.clone(),
+                partition_by.clone(),
             ));
             stages.push(Stage::SessionWindow(op, next_stateful_op_id()));
             unpack_utf8_columns(&mut stages, 2, utf8_packers);
@@ -1448,20 +1542,25 @@ pub(crate) fn compile_node(
             k,
             rank_col,
             partition_by,
+            order_by,
         } => {
             let (mut stages, in_schema) = compile_node(input, source_schema)?;
-            if !schema_all_int64(&in_schema) {
+            let (packed_schema, utf8_packers) =
+                pack_utf8_columns(&mut stages, &in_schema, &HashMap::new());
+            if !schema_all_int64(&packed_schema) {
                 return Err(OpError::unsupported_plan_node(
-                    "TopK over a non-Int64-only input schema (TopKOp only supports Int64 columns)",
+                    "TopK over a non-Int64/Utf8 input schema (TopKOp only supports Int64 columns, plus Utf8 passthrough)",
                 ));
             }
-            let op = Arc::new(TopKOp::new(
-                in_schema.clone(),
+            let op = Arc::new(TopKOp::new_with_order(
+                packed_schema.clone(),
                 *k,
                 *rank_col,
                 partition_by.clone(),
+                order_by.clone(),
             ));
             stages.push(Stage::TopK(op, next_stateful_op_id()));
+            unpack_utf8_columns(&mut stages, 0, utf8_packers);
             Ok((stages, in_schema))
         }
 
@@ -1534,13 +1633,6 @@ pub(crate) fn compile_node(
                 // at the lowering layer (see comment above); `HopWindow`'s
                 // separate date_bin lowering path was not touched by that
                 // fix and remains rejected here.
-                if matches!(input.as_ref(), PlanNode::HopWindow { .. }) {
-                    return Err(OpError::unsupported_plan_node(
-                        "multi-aggregate composition (Slice 8) over a HopWindow input \
-                         is not yet supported (pre-existing date_bin/timestamp-precision \
-                         gap in that lowering path, unrelated to multi-aggregate composition)",
-                    ));
-                }
                 let (stages, in_schema) = compile_node(input, source_schema)?;
                 // A `Utf8` group-by column (e.g. Nexmark q16's `GROUP BY
                 // channel, date_bin(...)`) is packed into an `Int64`
@@ -1604,7 +1696,7 @@ pub(crate) fn compile_node(
                 .map(|(i, g)| NamedExpr::new(format!("k{i}"), g.clone()))
                 .collect();
             pre_named.push(NamedExpr::new("v", agg.input.clone()));
-            stages.push(Stage::Stateless(Arc::new(ProjectOp::new(pre_named))));
+            stages.push(stateless_step_stage(StatelessStep::Project(pre_named)));
 
             #[allow(dead_code)]
             enum KeyPacking {
@@ -1622,7 +1714,12 @@ pub(crate) fn compile_node(
             } else if has_real_group_by
                 && (n_keys > 1 || !expr_is_int64(&effective_group_by[0], &in_schema))
             {
-                let packer = Arc::new(GroupKeyPacker::new(n_keys));
+                let packer = Arc::new(GroupKeyPacker::new_with_key_types(
+                    effective_group_by
+                        .iter()
+                        .map(|g| legacy_group_key_type(g, &in_schema))
+                        .collect(),
+                ));
                 stages.push(Stage::KeyPack(packer.clone(), next_stateful_op_id()));
                 KeyPacking::Composite(packer)
             } else {
@@ -1642,7 +1739,7 @@ pub(crate) fn compile_node(
                         .map(|i| NamedExpr::new(format!("k{i}"), Expr::Column(i)))
                         .collect();
                     post_named.push(NamedExpr::new("agg", Expr::Column(n_keys + result_col - 1)));
-                    stages.push(Stage::Stateless(Arc::new(ProjectOp::new(post_named))));
+                    stages.push(stateless_step_stage(StatelessStep::Project(post_named)));
                     let mut out_fields: Vec<Field> = (0..n_keys)
                         .map(|i| {
                             let dt = static_expr_type(&effective_group_by[i], &in_schema)
@@ -1656,21 +1753,24 @@ pub(crate) fn compile_node(
                         DataType::Int64
                     };
                     out_fields.push(Field::new("agg", agg_dt, false));
-                    Ok((stages, Arc::new(Schema::new(out_fields))))
+                    Ok((
+                        fuse_stateless_stages(stages),
+                        Arc::new(Schema::new(out_fields)),
+                    ))
                 }
                 KeyPacking::Utf8(packer) => {
                     // Unpack the surrogate key back to the original Utf8
                     // value, then project down to (k: Utf8, agg: Int64).
                     stages.push(Stage::Utf8KeyUnpack(packer, next_stateful_op_id()));
-                    stages.push(Stage::Stateless(Arc::new(ProjectOp::new(vec![
+                    stages.push(stateless_step_stage(StatelessStep::Project(vec![
                         NamedExpr::new("k", Expr::Column(0)),
                         NamedExpr::new("agg", Expr::Column(result_col)),
-                    ]))));
+                    ])));
                     let schema = Arc::new(Schema::new(vec![
                         Field::new("k", DataType::Utf8, false),
                         Field::new("agg", DataType::Int64, false),
                     ]));
-                    Ok((stages, schema))
+                    Ok((fuse_stateless_stages(stages), schema))
                 }
                 KeyPacking::None if has_real_group_by => {
                     // AggregateOp always emits (k, sum_v, count, avg_v);
@@ -1682,18 +1782,18 @@ pub(crate) fn compile_node(
                             agg.func == AggregateFunc::Avg,
                         ))));
                         Ok((
-                            stages,
+                            fuse_stateless_stages(stages),
                             Arc::new(Schema::new(vec![
                                 Field::new("k", DataType::Int64, false),
                                 Field::new("agg", DataType::Utf8, false),
                             ])),
                         ))
                     } else {
-                        stages.push(Stage::Stateless(Arc::new(ProjectOp::new(vec![
+                        stages.push(stateless_step_stage(StatelessStep::Project(vec![
                             NamedExpr::new("k", Expr::Column(0)),
                             NamedExpr::new("agg", Expr::Column(result_col)),
-                        ]))));
-                        Ok((stages, int64_schema(2)))
+                        ])));
+                        Ok((fuse_stateless_stages(stages), int64_schema(2)))
                     }
                 }
                 KeyPacking::None => {
@@ -1705,22 +1805,24 @@ pub(crate) fn compile_node(
                             scale,
                             agg.func == AggregateFunc::Avg,
                         ))));
-                        stages.push(Stage::Stateless(Arc::new(ProjectOp::new(vec![
+                        stages.push(stateless_step_stage(StatelessStep::Project(vec![
                             NamedExpr::new("agg", Expr::Column(1)),
-                        ]))));
+                        ])));
                         Ok((
-                            stages,
+                            fuse_stateless_stages(stages),
                             Arc::new(Schema::new(vec![Field::new("agg", DataType::Utf8, false)])),
                         ))
                     } else {
-                        stages.push(Stage::Stateless(Arc::new(ProjectOp::new(vec![
+                        stages.push(stateless_step_stage(StatelessStep::Project(vec![
                             NamedExpr::new("agg", Expr::Column(result_col)),
-                        ]))));
-                        Ok((stages, int64_schema(1)))
+                        ])));
+                        Ok((fuse_stateless_stages(stages), int64_schema(1)))
                     }
                 }
             }
         }
+
+        PlanNode::Exchange { child, .. } => compile_node(child, source_schema),
 
         other => Err(OpError::unsupported_plan_node(plan_node_kind(other))),
     }
@@ -1755,7 +1857,7 @@ mod tests {
     use super::*;
     use crate::expr::lit;
     use crate::zset::ArrowZSet;
-    use arrow::array::{Int64Array, StringArray};
+    use arrow::array::{Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use object_store::local::LocalFileSystem;
@@ -1783,6 +1885,129 @@ mod tests {
         )
         .unwrap();
         ArrowZSet::new(data, vec![1; ids.len()])
+    }
+
+    #[test]
+    fn legacy_key_types_follow_expression_output_types() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("label", DataType::Utf8, false),
+        ]);
+        let expression = |op| Expr::BinaryOp {
+            op,
+            left: Box::new(Expr::Column(0)),
+            right: Box::new(Expr::Literal(1i64.to_be_bytes().to_vec())),
+        };
+        assert_eq!(
+            legacy_group_key_type(&expression(BinaryOp::Add), &schema),
+            Some(DataType::Int64)
+        );
+        assert_eq!(
+            legacy_group_key_type(&expression(BinaryOp::Gt), &schema),
+            Some(DataType::Boolean)
+        );
+        let upper = Expr::ScalarUdf {
+            name: "upper".to_string(),
+            args: vec![Expr::Column(1)],
+        };
+        assert_eq!(legacy_group_key_type(&upper, &schema), Some(DataType::Utf8));
+        let unknown = Expr::ScalarUdf {
+            name: "unknown".to_string(),
+            args: vec![Expr::Column(0)],
+        };
+        assert_eq!(legacy_group_key_type(&unknown, &schema), None);
+        let nested = Expr::BinaryOp {
+            op: BinaryOp::Add,
+            left: Box::new(unknown),
+            right: Box::new(lit(1)),
+        };
+        assert_eq!(legacy_group_key_type(&nested, &schema), None);
+    }
+
+    #[tokio::test]
+    async fn legacy_expression_keys_restore_without_reassigning_surrogates() {
+        let (_dir, db) = make_db().await;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("label", DataType::Utf8, false),
+        ]));
+        let expr = |op| Expr::BinaryOp {
+            op,
+            left: Box::new(Expr::Column(0)),
+            right: Box::new(lit(1)),
+        };
+        let keys = [
+            expr(BinaryOp::Add),
+            expr(BinaryOp::Gt),
+            Expr::ScalarUdf {
+                name: "upper".to_string(),
+                args: vec![Expr::Column(1)],
+            },
+        ];
+        let packer = GroupKeyPacker::new_with_key_types(
+            keys.iter()
+                .map(|e| legacy_group_key_type(e, &schema))
+                .collect(),
+        );
+        let op_id = OperatorId(47);
+        let mut batch = rockstream_storage::WriteBatch::new();
+        for (surrogate, (number, flag, text)) in [(2i64, false, "AB"), (3, true, "CD")]
+            .into_iter()
+            .enumerate()
+        {
+            let mut key = vec![0x01, 0x4b, 0x50];
+            key.extend_from_slice(&op_id.0.to_be_bytes());
+            key.push(1);
+            key.extend_from_slice(&number.to_be_bytes());
+            key.extend_from_slice(&[1, u8::from(flag)]);
+            key.push(1);
+            key.extend_from_slice(&(text.len() as u32).to_be_bytes());
+            key.extend_from_slice(text.as_bytes());
+            batch.put(&key, &(surrogate as i64).to_be_bytes());
+        }
+        db.write_batch(batch).await.unwrap();
+        packer.restore_in_place(&db, op_id).await.unwrap();
+        let input = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["ab", "cd"])),
+            ],
+        )
+        .unwrap();
+        let arrays = keys
+            .iter()
+            .map(|e| crate::expr::eval_to_array(e, &input).unwrap())
+            .collect::<Vec<_>>();
+        let projected = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Int64, false),
+                Field::new("b", DataType::Boolean, false),
+                Field::new("c", DataType::Utf8, false),
+                Field::new("v", DataType::Int64, false),
+            ])),
+            vec![
+                arrays[0].clone(),
+                arrays[1].clone(),
+                arrays[2].clone(),
+                Arc::new(Int64Array::from(vec![10, 20])),
+            ],
+        )
+        .unwrap();
+        let packed = packer.pack(ArrowZSet::new(projected, vec![1, 1])).unwrap();
+        assert_eq!(
+            packed.data.column(0).to_data(),
+            Int64Array::from(vec![0, 1]).to_data()
+        );
+        let unpacked = packer.unpack(packed).unwrap();
+        assert_eq!(unpacked.data.column(0).to_data(), arrays[0].to_data());
+        assert_eq!(unpacked.data.column(1).to_data(), arrays[1].to_data());
+        assert_eq!(unpacked.data.column(2).to_data(), arrays[2].to_data());
+        assert_eq!(
+            unpacked.data.column(3).to_data(),
+            Int64Array::from(vec![10, 20]).to_data()
+        );
+        assert_eq!(unpacked.weights, vec![1, 1]);
     }
 
     #[tokio::test]

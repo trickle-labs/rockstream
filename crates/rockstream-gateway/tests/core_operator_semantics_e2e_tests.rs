@@ -819,23 +819,26 @@ async fn aggregate_cell(key_type: &str, value_type: &str, function: &str) {
         ))
         .await
         .unwrap();
-    client
+    let insert = client
         .simple_query(&format!(
             "INSERT INTO aggregate VALUES (1, {key_one}, {value_one}), \
              (2, {key_one}, {value_two}), (3, {key_two}, {value_three})"
         ))
-        .await
-        .unwrap();
+        .await;
     if key_type == "text" && float {
-        assert!(
-            rows(&client, "SELECT * FROM aggregate_view")
-                .await
-                .is_empty(),
-            "unsupported text × float64 aggregate cells must not publish partial output"
+        assert_eq!(error_text(insert.unwrap_err()), "[RS-2026] query.query_time_execution_failed: query-time execution failed: compiled pipeline process(aggregate_view): [RS-1013] Plan node not supported by the direct operator compiler: Utf8KeyPacker::pack: column 1 is not Int64; next_steps: this query shape requires the DiffCtx/OpNode physical-plan path, not the v0.51.3 fast-path compiler. next_steps: Simplify the query, validate referenced table/view schemas, or materialize the query into a view.");
+        assert_eq!(
+            rows(&client, "SELECT * FROM aggregate").await,
+            Vec::<Vec<String>>::new()
+        );
+        assert_eq!(
+            rows(&client, "SELECT * FROM aggregate_view").await,
+            Vec::<Vec<String>>::new()
         );
         handle.abort();
         return;
     }
+    insert.unwrap();
     let expected = function_expected(function);
     let expected_rows = |a: &str, b: &str| {
         vec![

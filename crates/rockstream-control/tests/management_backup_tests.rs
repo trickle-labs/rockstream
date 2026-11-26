@@ -9,10 +9,15 @@ use rockstream_management_proto::v1::{
     management_service_client::ManagementServiceClient, CreateBackupRequest, GetOperationRequest,
     Operation,
 };
+use rockstream_runtime::client::start_worker_client_with_insecure_internal_dev_and_metadata as start_test_worker_client;
 use rockstream_types::checkpoint::{CheckpointId, ClusterCheckpoint, PerShardCheckpoint};
 use rockstream_types::config::NodeConfig;
 use rockstream_types::ids::{ShardId, WorkerId};
 use tokio::net::TcpListener;
+
+#[path = "common/management_auth.rs"]
+mod management_auth;
+use management_auth::ManagementAuth;
 
 async fn management_addr() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -59,24 +64,36 @@ async fn await_succeeded(
 async fn create_backup_snapshots_real_worker_shard_and_is_idempotent() {
     let storage = tempfile::tempdir().unwrap();
     let destination = tempfile::tempdir().unwrap();
+    let auth = ManagementAuth::new(&[destination.path().display().to_string()]).await;
     let source_store = local_store(storage.path());
     let management_addr = management_addr().await;
     let catalog = TopologyCatalog::new();
     let manager = ShardManager::new();
-    let control = ControlService::new(catalog.clone())
-        .with_shard_manager(manager)
-        .with_single_worker_local_backup_source_store(source_store.clone(), WorkerId(17))
-        .with_management(
-            management_addr.clone(),
-            source_store.clone(),
-            NodeConfig::default(),
-        );
-    let control = control.start("127.0.0.1:0").await.unwrap();
+    let control = auth.protect_control(
+        ControlService::new(catalog.clone())
+            .with_shard_manager(manager)
+            .with_single_worker_local_backup_source_store(source_store.clone(), WorkerId(17))
+            .with_management(
+                management_addr.clone(),
+                source_store.clone(),
+                NodeConfig::default(),
+            ),
+    );
+    let control = control
+        .with_insecure_dev_mode()
+        .start("127.0.0.1:0")
+        .await
+        .unwrap();
     let control_url = control.addr.to_string();
-    let (worker, worker_task) =
-        rockstream_runtime::start_worker_client(17, &control_url, storage.path())
-            .await
-            .unwrap();
+    let (worker, worker_task) = start_test_worker_client(
+        17,
+        &control_url,
+        storage.path(),
+        Default::default(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
         while worker.worker_id().is_none() {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -102,14 +119,23 @@ async fn create_backup_snapshots_real_worker_shard_and_is_idempotent() {
         b"durable-value"
     );
 
-    let mut client = ManagementServiceClient::connect(format!("http://{management_addr}"))
-        .await
-        .unwrap();
+    let mut client = auth.client(management_addr.parse().unwrap()).await;
+    let idempotency_key = "00000000-0000-4000-8000-000000000314";
+    drop(
+        client
+            .create_backup(CreateBackupRequest {
+                protocol_version: 1,
+                destination: destination.path().display().to_string(),
+                idempotency_key: idempotency_key.to_owned(),
+            })
+            .await
+            .unwrap(),
+    );
     let backup_response = client
         .create_backup(CreateBackupRequest {
             protocol_version: 1,
             destination: destination.path().display().to_string(),
-            idempotency_key: "backup-exact-key".to_owned(),
+            idempotency_key: idempotency_key.to_owned(),
         })
         .await;
     assert!(backup_response.is_ok());
@@ -117,9 +143,10 @@ async fn create_backup_snapshots_real_worker_shard_and_is_idempotent() {
     assert_eq!(accepted.protocol_version, 1);
     let accepted_operation = accepted.operation.unwrap();
     assert_eq!(accepted_operation.kind, "create_backup");
-    assert_eq!(accepted_operation.source_version, "operation-record:2");
+    assert_eq!(accepted_operation.source_version, "operation-record:4");
+    assert_eq!(accepted_operation.operation_id, idempotency_key);
     assert!(!accepted_operation.operation_id.is_empty());
-    let completed = await_succeeded(&mut client, &accepted_operation.operation_id).await;
+    let completed = await_succeeded(&mut client, idempotency_key).await;
     assert_eq!(completed.operation_id, accepted_operation.operation_id);
     assert_eq!(completed.kind, "create_backup");
     assert_eq!(completed.state, "succeeded");
@@ -132,12 +159,12 @@ async fn create_backup_snapshots_real_worker_shard_and_is_idempotent() {
     assert_eq!(completed.phase, "completed");
     assert_eq!(completed.error_code, "");
     assert!(completed.next_steps.is_empty());
-    assert_eq!(completed.source_version, "operation-record:2");
+    assert_eq!(completed.source_version, "operation-record:4");
     let replay = client
         .create_backup(CreateBackupRequest {
             protocol_version: 1,
             destination: destination.path().display().to_string(),
-            idempotency_key: "backup-exact-key".to_owned(),
+            idempotency_key: idempotency_key.to_owned(),
         })
         .await
         .unwrap()
@@ -287,17 +314,22 @@ async fn create_backup_reconciles_persisted_exporting_record_from_manifest() {
         .unwrap();
 
     let management_addr = management_addr().await;
-    let service = ControlService::new(TopologyCatalog::new())
-        .with_single_worker_local_backup_source_store(source.clone(), WorkerId(1))
-        .with_management(
-            management_addr.clone(),
-            source.clone(),
-            NodeConfig::default(),
-        );
-    let running = service.start("127.0.0.1:0").await.unwrap();
-    let mut client = ManagementServiceClient::connect(format!("http://{management_addr}"))
+    let auth = ManagementAuth::new(std::slice::from_ref(&destination_text)).await;
+    let service = auth.protect_control(
+        ControlService::new(TopologyCatalog::new())
+            .with_single_worker_local_backup_source_store(source.clone(), WorkerId(1))
+            .with_management(
+                management_addr.clone(),
+                source.clone(),
+                NodeConfig::default(),
+            ),
+    );
+    let running = service
+        .with_insecure_dev_mode()
+        .start("127.0.0.1:0")
         .await
         .unwrap();
+    let mut client = auth.client(management_addr.parse().unwrap()).await;
     let operation = await_succeeded(&mut client, "restart-backup-operation").await;
     assert_eq!(operation.operation_id, "restart-backup-operation");
     assert_eq!(operation.kind, "create_backup");
@@ -323,6 +355,7 @@ async fn create_backup_reconciles_persisted_exporting_record_from_manifest() {
 
 #[tokio::test]
 async fn create_backup_is_unavailable_without_a_real_source_store() {
+    let auth = ManagementAuth::new(&["file:///tmp/backup".to_owned()]).await;
     let operations = ManagementOperationStore::new(Arc::new(object_store::memory::InMemory::new()));
     let service = ManagementService::new(
         TopologyCatalog::new(),
@@ -330,10 +363,8 @@ async fn create_backup_is_unavailable_without_a_real_source_store() {
         operations.clone(),
         NodeConfig::default(),
     );
-    let running = service.start("127.0.0.1:0").await.unwrap();
-    let mut client = ManagementServiceClient::connect(format!("http://{}", running.addr))
-        .await
-        .unwrap();
+    let running = auth.start_management(service).await;
+    let mut client = auth.client(running.addr).await;
     let error = client
         .create_backup(CreateBackupRequest {
             protocol_version: 1,

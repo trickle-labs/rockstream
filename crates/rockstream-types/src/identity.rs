@@ -214,19 +214,18 @@ impl NodeIdentity {
         }
         let id_str = worker_id.to_string();
         let prefixed = format!("worker-{worker_id}");
-        self.node_id == id_str || self.node_id == prefixed || self.node_id == "worker"
+        self.node_id == id_str || self.node_id == prefixed
     }
 
     /// Check if this identity matches a given string worker ID or name.
     pub fn matches_worker_str(&self, id: &str) -> bool {
-        if self.role != NodeRole::Worker {
+        if self.role != NodeRole::Worker || self.node_id == "worker" {
             return false;
         }
         let trimmed = id.trim();
         self.node_id == trimmed
             || self.node_id == format!("worker-{}", trimmed)
             || trimmed == format!("worker-{}", self.node_id)
-            || self.node_id == "worker"
     }
 }
 
@@ -335,6 +334,12 @@ mod tests {
         assert!(id.matches_worker_str("1"));
         assert!(id.matches_worker_str("worker-1"));
         assert!(!id.matches_worker_id(2));
+
+        let role_only = NodeIdentity::new(NodeRole::Worker, "worker", None::<String>);
+        assert!(!role_only.matches_worker_id(1));
+        assert!(!role_only.matches_worker_str("1"));
+        assert!(!role_only.matches_worker_str("worker-1"));
+        assert!(!role_only.matches_worker_str("worker-worker"));
 
         let control_id = NodeIdentity::new(NodeRole::Control, "control-1", None::<String>);
         assert!(!control_id.matches_worker_id(1));

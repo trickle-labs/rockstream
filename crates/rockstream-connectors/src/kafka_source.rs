@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::CString;
 use std::time::Duration;
 
 use arrow::datatypes::SchemaRef;
@@ -10,7 +11,6 @@ use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
 use rockstream_types::connector::PartitionFilter;
 use rockstream_types::ids::ConnectorId;
-use rockstream_types::secret::SecretToken;
 use rockstream_types::timestamp::{Epoch, EventTimeWatermark};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -295,7 +295,8 @@ impl KafkaSourceIdentityV1 {
 pub struct KafkaSource {
     _connector_id: ConnectorId,
     schema: SchemaRef,
-    consumer: StreamConsumer,
+    consumer: std::sync::Arc<StreamConsumer>,
+    consumer_config: ClientConfig,
     topic: String,
     paused: bool,
     watermarks: BTreeMap<i32, i64>,
@@ -304,8 +305,7 @@ pub struct KafkaSource {
     last_polled: Option<OffsetToken>,
     last_committed: Option<(Epoch, OffsetToken)>,
     secret_name: Option<String>,
-    pending_secret_token: Option<SecretToken>,
-    active_secret_token_id: Option<String>,
+    secret_version: u64,
     secret_rotations_applied: u64,
     assignment_generation: u64,
     assigned_partitions: BTreeSet<i32>,
@@ -324,6 +324,65 @@ impl KafkaSource {
         bootstrap_servers: &str,
         topic: &str,
         group_id: &str,
+    ) -> Result<Self, SourceError> {
+        Self::connect_inner(
+            connector_id,
+            schema,
+            bootstrap_servers,
+            topic,
+            group_id,
+            None,
+        )
+    }
+
+    /// Connect with PLAIN credentials over an explicitly selected Kafka transport.
+    #[allow(clippy::too_many_arguments)]
+    pub fn connect_with_sasl_plain(
+        connector_id: ConnectorId,
+        schema: SchemaRef,
+        bootstrap_servers: &str,
+        topic: &str,
+        group_id: &str,
+        security_protocol: &str,
+        secret_name: &str,
+        secret_version: u64,
+        username: &str,
+        password: &str,
+    ) -> Result<Self, SourceError> {
+        if !matches!(security_protocol, "SASL_SSL" | "SASL_PLAINTEXT") {
+            return Err(SourceError::Io(
+                "Kafka secret sources require security.protocol SASL_SSL or SASL_PLAINTEXT"
+                    .to_string(),
+            ));
+        }
+        if secret_name.is_empty() || username.is_empty() || password.is_empty() {
+            return Err(SourceError::Io(
+                "Kafka SASL secret requires a name, username, and password".to_string(),
+            ));
+        }
+        Self::connect_inner(
+            connector_id,
+            schema,
+            bootstrap_servers,
+            topic,
+            group_id,
+            Some((
+                security_protocol,
+                username,
+                password,
+                secret_name,
+                secret_version,
+            )),
+        )
+    }
+
+    fn connect_inner(
+        connector_id: ConnectorId,
+        schema: SchemaRef,
+        bootstrap_servers: &str,
+        topic: &str,
+        group_id: &str,
+        sasl: Option<(&str, &str, &str, &str, u64)>,
     ) -> Result<Self, SourceError> {
         if bootstrap_servers.is_empty() || topic.is_empty() || group_id.is_empty() {
             return Err(SourceError::Io(
@@ -346,28 +405,43 @@ impl KafkaSource {
         } else {
             None
         };
-        let config = || {
-            ClientConfig::new()
-                .set("bootstrap.servers", bootstrap_servers)
-                .set("group.id", group_id)
-                .set("enable.auto.commit", "false")
-                .set("enable.auto.offset.store", "false")
-                .set("auto.offset.reset", "earliest")
-                .set(
-                    "queued.max.messages.kbytes",
-                    KAFKA_SOURCE_BUFFER_LIMIT.to_string(),
-                )
-                .create::<StreamConsumer>()
-        };
+        let mut consumer_config = ClientConfig::new();
+        consumer_config
+            .set("bootstrap.servers", bootstrap_servers)
+            .set("group.id", group_id)
+            .set("enable.auto.commit", "false")
+            .set("enable.auto.offset.store", "false")
+            .set("auto.offset.reset", "earliest")
+            .set("socket.timeout.ms", "10000")
+            .set(
+                "queued.max.messages.kbytes",
+                KAFKA_SOURCE_BUFFER_LIMIT.to_string(),
+            );
+        if let Some((security_protocol, username, password, _, _)) = sasl {
+            consumer_config
+                .set("security.protocol", security_protocol)
+                .set("sasl.mechanisms", "PLAIN")
+                .set("sasl.username", username)
+                .set("sasl.password", password);
+        }
         let consumer = if let Some(runtime) = &runtime {
             let _guard = runtime.enter();
-            config()
+            consumer_config.create::<StreamConsumer>()
         } else {
-            config()
+            consumer_config.create::<StreamConsumer>()
         }
-        .map_err(|error| SourceError::Io(format!(
-            "Kafka consumer creation failed: {error}. Next steps: verify broker connectivity and consumer configuration"
-        )))?;
+        .map_err(|error| {
+            if sasl.is_some() {
+                SourceError::Io(
+                    "Kafka SASL consumer creation failed; verify broker transport and credentials"
+                        .to_string(),
+                )
+            } else {
+                SourceError::Io(format!(
+                    "Kafka consumer creation failed: {error}. Next steps: verify broker connectivity and consumer configuration"
+                ))
+            }
+        })?;
         consumer.subscribe(&[topic]).map_err(|error| {
             SourceError::Io(format!(
                 "Kafka subscription failed: {error}. Next steps: verify that topic {topic:?} exists and is authorized"
@@ -377,7 +451,8 @@ impl KafkaSource {
         Ok(Self {
             _connector_id: connector_id,
             schema,
-            consumer,
+            consumer: std::sync::Arc::new(consumer),
+            consumer_config,
             topic: topic.to_owned(),
             paused: false,
             watermarks: BTreeMap::new(),
@@ -385,9 +460,8 @@ impl KafkaSource {
             last_poll_fill_level: 0,
             last_polled: None,
             last_committed: None,
-            secret_name: None,
-            pending_secret_token: None,
-            active_secret_token_id: None,
+            secret_name: sasl.map(|(_, _, _, name, _)| name.to_string()),
+            secret_version: sasl.map_or(0, |(_, _, _, _, version)| version),
             secret_rotations_applied: 0,
             assignment_generation: 0,
             assigned_partitions: BTreeSet::new(),
@@ -409,35 +483,71 @@ impl KafkaSource {
         self.last_poll_fill_level
     }
 
-    /// Bind this connector to a catalog secret without retaining plaintext credentials.
-    pub fn bind_secret(&mut self, secret_name: impl Into<String>) {
-        self.secret_name = Some(secret_name.into());
+    pub fn secret_binding(&self) -> (Option<&str>, u64) {
+        (self.secret_name.as_deref(), self.secret_version)
     }
 
-    /// Queue one encrypted replacement token for the next epoch boundary.
-    pub fn set_secret_token(&mut self, token: SecretToken) -> Result<(), String> {
-        if self
-            .secret_name
-            .as_deref()
-            .is_some_and(|name| name != token.secret_name)
-        {
-            return Err("RS-5003: secret token does not match the connector binding".to_string());
+    /// Replace the consumer so its next broker connection authenticates with the new credentials.
+    pub fn rotate_sasl_plain_credentials(
+        &mut self,
+        secret_name: &str,
+        version: u64,
+        username: &str,
+        password: &str,
+    ) -> Result<bool, SourceError> {
+        if self.secret_name.as_deref() != Some(secret_name) {
+            return Err(SourceError::Io(
+                "rotated secret does not match the Kafka source binding".to_string(),
+            ));
         }
-        self.secret_name = Some(token.secret_name.clone());
-        self.pending_secret_token = Some(token);
-        Ok(())
-    }
-
-    /// Apply a pending token at the epoch boundary; the live client is never restarted.
-    pub fn apply_secret_token_at_epoch(&mut self) {
-        if let Some(token) = self.pending_secret_token.take() {
-            self.active_secret_token_id = Some(token.token_id);
-            self.secret_rotations_applied += 1;
+        if version < self.secret_version {
+            return Err(SourceError::Io(
+                "Kafka source secret version moved backwards".to_string(),
+            ));
         }
-    }
-
-    pub fn active_secret_token_id(&self) -> Option<&str> {
-        self.active_secret_token_id.as_deref()
+        if version == self.secret_version {
+            return Ok(false);
+        }
+        if username.is_empty() || password.is_empty() {
+            return Err(SourceError::Io(
+                "Kafka SASL secret requires a username and password".to_string(),
+            ));
+        }
+        CString::new(username).map_err(|_| {
+            SourceError::Io("Kafka SASL username contains an invalid NUL byte".to_string())
+        })?;
+        CString::new(password).map_err(|_| {
+            SourceError::Io("Kafka SASL password contains an invalid NUL byte".to_string())
+        })?;
+        let mut consumer_config = self.consumer_config.clone();
+        consumer_config
+            .set("sasl.username", username)
+            .set("sasl.password", password);
+        let replacement = if tokio::runtime::Handle::try_current().is_ok() {
+            consumer_config.create::<StreamConsumer>()
+        } else {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .map_err(|_| SourceError::Io("Kafka runtime creation failed".to_string()))?;
+            let _guard = runtime.enter();
+            consumer_config.create::<StreamConsumer>()
+        }
+        .map_err(|_| SourceError::Io("Kafka SASL consumer recreation failed".to_string()))?;
+        replacement
+            .subscribe(&[&self.topic])
+            .map_err(|_| SourceError::Io("Kafka SASL consumer subscription failed".to_string()))?;
+        drop(std::mem::replace(
+            &mut self.consumer,
+            std::sync::Arc::new(replacement),
+        ));
+        self.consumer_config = consumer_config;
+        self.assigned_partitions.clear();
+        // Force the replacement consumer to seek from the durable source token.
+        self.last_polled = None;
+        self.secret_version = version;
+        self.secret_rotations_applied += 1;
+        Ok(true)
     }
 
     pub fn secret_rotations_applied(&self) -> u64 {
@@ -676,7 +786,32 @@ impl SourceConnector for KafkaSource {
         &mut self,
         _partition_filter: Option<PartitionFilter>,
     ) -> Result<SnapshotDeltaFence, SourceError> {
-        let assigned = self.refresh_assignment()?;
+        let mut assigned = self.refresh_assignment()?;
+        let mut polled_for_assignment = false;
+        if assigned.is_empty() {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            while assigned.is_empty() && tokio::time::Instant::now() < deadline {
+                match tokio::time::timeout(self.idle_partition_timeout, self.consumer.recv()).await
+                {
+                    Ok(Ok(_)) => polled_for_assignment = true,
+                    Err(_) => {}
+                    Ok(Err(error)) => {
+                        return Err(SourceError::PollDeltaFailed {
+                            reason: format!(
+                                "Kafka group assignment poll failed: {error}. Next steps: retry source startup after verifying broker connectivity"
+                            ),
+                        });
+                    }
+                }
+                assigned = self.refresh_assignment()?;
+            }
+            if assigned.is_empty() {
+                return Err(SourceError::PollDeltaFailed {
+                    reason: "Kafka consumer has no assigned partitions while capturing its initial offset fence"
+                        .to_string(),
+                });
+            }
+        }
         let offsets = self
             .last_polled
             .clone()
@@ -692,6 +827,11 @@ impl SourceConnector for KafkaSource {
                 .map(OffsetToken::new)
                 .map_err(|error| SourceError::Io(format!("Kafka fence encoding failed: {error}")))
             })?;
+        if polled_for_assignment {
+            self.last_polled = None;
+            self.seek_recovery_offset(&offsets, &assigned)?;
+            self.last_polled = Some(offsets.clone());
+        }
         Ok(SnapshotDeltaFence::new(offsets.clone(), offsets))
     }
 
@@ -711,7 +851,6 @@ impl SourceConnector for KafkaSource {
         credits_available: usize,
         _partition_filter: Option<PartitionFilter>,
     ) -> Result<PollDeltaResult, SourceError> {
-        self.apply_secret_token_at_epoch();
         self.last_poll_fill_level = usize::from(self.pending_record.is_some());
         if self.paused || credits_available == 0 || max_bytes == 0 {
             return Ok(PollDeltaResult {
@@ -820,7 +959,6 @@ impl SourceConnector for KafkaSource {
         epoch: Epoch,
         offset: OffsetToken,
     ) -> Result<(), SourceError> {
-        self.apply_secret_token_at_epoch();
         let offsets: BTreeMap<u64, u64> =
             serde_json::from_slice(offset.as_bytes()).map_err(|e| {
                 SourceError::CommitOffsetFailed {
@@ -888,12 +1026,27 @@ impl SourceConnector for KafkaSource {
             // The first poll may fetch an older, unacknowledged group position; M3's token is authoritative.
             self.seek_recovery_offset(&offset, &assigned)?;
         }
-        if let Err(error) = self.consumer.commit(&commit, CommitMode::Sync) {
+        let consumer = std::sync::Arc::clone(&self.consumer);
+        let commit_result = tokio::time::timeout(
+            Duration::from_secs(15),
+            tokio::task::spawn_blocking(move || consumer.commit(&commit, CommitMode::Sync)),
+        )
+        .await;
+        let commit_error = match commit_result {
+            Ok(Ok(Ok(()))) => None,
+            Ok(Ok(Err(error))) => Some(format!(
+                "Kafka commit failed: {error}. Next steps: retry the source epoch"
+            )),
+            Ok(Err(error)) => Some(format!(
+                "Kafka commit task failed: {error}. Next steps: retry the source epoch"
+            )),
+            Err(_) => Some(
+                "Kafka commit timed out after 15s. Next steps: retry the source epoch".to_owned(),
+            ),
+        };
+        if let Some(reason) = commit_error {
             self.pending_retryable_broker_ack = Some((epoch, offset));
-            return Err(SourceError::CommitOffsetFailed {
-                epoch,
-                reason: format!("Kafka commit failed: {error}. Next steps: retry the source epoch"),
-            });
+            return Err(SourceError::CommitOffsetFailed { epoch, reason });
         }
         self.pending_retryable_broker_ack = None;
         self.last_committed = Some((epoch, offset));

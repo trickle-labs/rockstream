@@ -15,6 +15,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{DigitallySignedStruct, DistinguishedName, RootCertStore, SignatureScheme};
+use sha2::{Digest, Sha256};
 use tokio_rustls::TlsAcceptor;
 
 use crate::server::MAX_CONNECTIONS;
@@ -103,6 +104,7 @@ pub fn build_tls_acceptor(
     key_path: &Path,
     ca_cert_path: Option<&Path>,
 ) -> Result<Arc<TlsAcceptor>, GatewayTlsError> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let certs = load_certs(cert_path)?;
     let key = load_private_key(key_path)?;
 
@@ -143,7 +145,13 @@ pub fn build_tls_acceptor(
 /// Bound: `MAX_CONNECTIONS` (10_000), the same cap the existing
 /// `cancellation_registry` already enforces — one entry per live connection.
 /// Fill-level metric: `gateway_mtls_cn_cache_size()`.
-pub static MTLS_CN_BY_PEER_ADDR: LazyLock<DashMap<SocketAddr, String>> =
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedMtlsIdentity {
+    pub common_name: String,
+    pub certificate_sha256: [u8; 32],
+}
+
+pub static MTLS_CN_BY_PEER_ADDR: LazyLock<DashMap<SocketAddr, VerifiedMtlsIdentity>> =
     LazyLock::new(DashMap::new);
 
 /// Current fill level of `MTLS_CN_BY_PEER_ADDR` (gauge metric
@@ -218,7 +226,14 @@ impl ClientCertVerifier for MtlsCnExtractingVerifier {
                         "[RS-2406] mTLS connection cap ({MAX_CONNECTIONS}) reached; handshake rejected. next_steps: Reduce concurrent connections or raise MAX_CONNECTIONS."
                     )));
                 }
-                MTLS_CN_BY_PEER_ADDR.insert(peer_addr, cn);
+                let certificate_sha256 = Sha256::digest(end_entity.as_ref()).into();
+                MTLS_CN_BY_PEER_ADDR.insert(
+                    peer_addr,
+                    VerifiedMtlsIdentity {
+                        common_name: cn,
+                        certificate_sha256,
+                    },
+                );
                 rockstream_types::metrics::set_mtls_cn_cache_size(MTLS_CN_BY_PEER_ADDR.len() as u64);
                 MTLS_CN_RECORDED_TOTAL.fetch_add(1, Ordering::Relaxed);
             }
@@ -259,7 +274,15 @@ pub fn remove_mtls_cn(peer_addr: &SocketAddr) {
 /// Look up the CN recorded for `peer_addr` during the mTLS handshake (called
 /// from `AuthMode::Mtls`'s `on_startup` branch via `client.socket_addr()`).
 pub fn lookup_mtls_cn(peer_addr: &SocketAddr) -> Option<String> {
-    MTLS_CN_BY_PEER_ADDR.get(peer_addr).map(|v| v.clone())
+    MTLS_CN_BY_PEER_ADDR
+        .get(peer_addr)
+        .map(|identity| identity.common_name.clone())
+}
+
+pub fn lookup_mtls_identity(peer_addr: &SocketAddr) -> Option<VerifiedMtlsIdentity> {
+    MTLS_CN_BY_PEER_ADDR
+        .get(peer_addr)
+        .map(|identity| identity.clone())
 }
 
 #[cfg(test)]

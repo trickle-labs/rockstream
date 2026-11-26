@@ -56,6 +56,7 @@ fn every_core_capability_meets_min_proof_level() {
             "language.dml",
             "language.historical-streaming-reads",
             "language.joins.equi-integer",
+            "language.limit-order-by",
             "language.query-read",
             "language.scalar-expressions",
             "language.session-freshness",
@@ -64,6 +65,7 @@ fn every_core_capability_meets_min_proof_level() {
             "language.views",
             "language.window.slide",
             "language.window.tumble",
+            "sink.kafka",
         ]
     );
 

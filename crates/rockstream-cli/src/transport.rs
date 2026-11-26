@@ -18,11 +18,13 @@ use rockstream_control::{
 use rockstream_types::acl::Role;
 use rockstream_types::audit::AuditEvent;
 use rockstream_types::diagnostic::{
-    DiagnosticOccurrence, MAX_DIAGNOSTIC_BUNDLE_BYTES, MAX_DIAGNOSTIC_BUNDLE_OCCURRENCES,
+    redact_secrets_with_count, DiagnosticOccurrence, MAX_DIAGNOSTIC_BUNDLE_BYTES,
+    MAX_DIAGNOSTIC_BUNDLE_OCCURRENCES,
 };
 use rockstream_types::error_code::{
     RS_0003, RS_0004, RS_0005, RS_1001, RS_1004, RS_1005, RS_1006, RS_1007, RS_1008, RS_1014,
-    RS_2006, RS_2401, RS_2410, RS_2411, RS_3612, RS_3613, RS_3614, RS_3615, RS_3616, RS_4009,
+    RS_2006, RS_2400, RS_2401, RS_2410, RS_2411, RS_3612, RS_3613, RS_3614, RS_3615, RS_3616,
+    RS_4009,
 };
 use rockstream_types::mutation_policy::cli_mutation_policy;
 pub use rockstream_types::mutation_policy::CLI_MUTATION_POLICY;
@@ -36,11 +38,11 @@ use crate::output::{
     ManagementConfigSummaryInfo, ManagementConfigValue, ManagementHealthInfo,
     ManagementNodeDetailInfo, ManagementNodeInfo, ManagementNodesInfo, ManagementOperationInfo,
     ManagementOperationsInfo, ManagementShardDetailInfo, ManagementShardInfo, ManagementShardsInfo,
-    MigrationOutcome, MutationOutcome, QueryResult, ResourceUsageInfo, RestoreOutcome,
-    SchemaColumn, SchemaDetail, SchemaEvolutionHistoryInfo, SchemaEvolutionStatusInfo,
-    SchemaSummary, ShardAlignmentInfo, ShardInfo, SourceDetail, SourceSummary, SubscribeEvent,
-    SupportBundleInfo, ViewDetail, ViewStatusInfo, ViewSummary, WorkerStatusInfo, WorkloadDetail,
-    WorkloadSummary, AUDIT_TAIL_MAX_EVENTS, CLI_OUTPUT_MAX_ROWS,
+    ManagementSupportArtifactInfo, MigrationOutcome, MutationOutcome, QueryResult,
+    ResourceUsageInfo, RestoreOutcome, SchemaColumn, SchemaDetail, SchemaEvolutionHistoryInfo,
+    SchemaEvolutionStatusInfo, SchemaSummary, ShardAlignmentInfo, ShardInfo, SourceDetail,
+    SourceSummary, SubscribeEvent, SupportBundleInfo, ViewDetail, ViewStatusInfo, ViewSummary,
+    WorkerStatusInfo, WorkloadDetail, WorkloadSummary, AUDIT_TAIL_MAX_EVENTS, CLI_OUTPUT_MAX_ROWS,
 };
 use crate::CliError;
 
@@ -198,19 +200,71 @@ pub struct ManagementCliClient {
 }
 
 impl ManagementCliClient {
-    pub fn connect(addr: &str) -> Result<Self, CliError> {
+    pub fn connect(
+        addr: &str,
+        tls: rockstream_types::identity::InternalTlsConfig,
+    ) -> Result<Self, CliError> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        tls.validate()
+            .map_err(|error| management_client_error("TLS configuration", error))?;
+        let cert_path = tls.cert_path.as_ref().ok_or_else(|| {
+            management_client_error(
+                "TLS configuration",
+                "client certificate is required".to_owned(),
+            )
+        })?;
+        let key_path = tls.key_path.as_ref().ok_or_else(|| {
+            management_client_error(
+                "TLS configuration",
+                "client private key is required".to_owned(),
+            )
+        })?;
+        let ca_path = tls.ca_cert_path.as_ref().ok_or_else(|| {
+            management_client_error(
+                "TLS configuration",
+                "trusted CA certificate is required".to_owned(),
+            )
+        })?;
+        let client_identity = tonic::transport::Identity::from_pem(
+            fs::read(cert_path).map_err(|error| {
+                management_client_error("read client certificate", error.to_string())
+            })?,
+            fs::read(key_path).map_err(|error| {
+                management_client_error("read client private key", error.to_string())
+            })?,
+        );
+        let tls = tonic::transport::ClientTlsConfig::new()
+            .ca_certificate(tonic::transport::Certificate::from_pem(
+                fs::read(ca_path).map_err(|error| {
+                    management_client_error("read trusted CA certificate", error.to_string())
+                })?,
+            ))
+            .identity(client_identity);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|error| management_client_error("create runtime", error.to_string()))?;
-        let endpoint = if addr.starts_with("http://") || addr.starts_with("https://") {
+        if addr.starts_with("http://") {
+            return Err(management_client_error(
+                "TLS configuration",
+                "management API refuses plaintext HTTP".to_owned(),
+            ));
+        }
+        let endpoint = if addr.starts_with("https://") {
             addr.to_owned()
         } else {
-            format!("http://{addr}")
+            format!("https://{addr}")
         };
-        let client = runtime
-            .block_on(ManagementGrpcClient::connect(endpoint))
-            .map_err(|error| management_client_error("connect", error.to_string()))?;
+        let channel = runtime.block_on(async {
+            tonic::transport::Endpoint::from_shared(endpoint)
+                .map_err(|error| management_client_error("parse endpoint", error.to_string()))?
+                .tls_config(tls)
+                .map_err(|error| management_client_error("configure TLS", error.to_string()))?
+                .connect()
+                .await
+                .map_err(|error| management_client_error("connect", error.to_string()))
+        })?;
+        let client = ManagementGrpcClient::new(channel);
         Ok(Self { runtime, client })
     }
 
@@ -467,14 +521,18 @@ impl ManagementCliClient {
         })
     }
 
-    pub fn drain_worker(&mut self, worker_id: u64) -> Result<ManagementOperationInfo, CliError> {
+    pub fn drain_worker(
+        &mut self,
+        worker_id: u64,
+        idempotency_key: uuid::Uuid,
+    ) -> Result<ManagementOperationInfo, CliError> {
         let response = self
             .runtime
             .block_on(self.client.drain_worker(
                 rockstream_management_proto::v1::DrainWorkerRequest {
                     protocol_version: 1,
                     worker_id: worker_id.to_string(),
-                    idempotency_key: uuid::Uuid::new_v4().to_string(),
+                    idempotency_key: idempotency_key.to_string(),
                 },
             ))
             .map_err(|error| management_status_error("DrainWorker", error))?
@@ -488,6 +546,7 @@ impl ManagementCliClient {
         &mut self,
         shard_id: u64,
         target_node_id: u64,
+        idempotency_key: uuid::Uuid,
     ) -> Result<ManagementOperationInfo, CliError> {
         let response = self
             .runtime
@@ -496,7 +555,7 @@ impl ManagementCliClient {
                     protocol_version: 1,
                     shard_id: shard_id.to_string(),
                     target_node_id: target_node_id.to_string(),
-                    idempotency_key: uuid::Uuid::new_v4().to_string(),
+                    idempotency_key: idempotency_key.to_string(),
                 },
             ))
             .map_err(|error| management_status_error("MigrateShard", error))?
@@ -509,6 +568,7 @@ impl ManagementCliClient {
     pub fn create_backup(
         &mut self,
         destination: &str,
+        idempotency_key: uuid::Uuid,
     ) -> Result<ManagementOperationInfo, CliError> {
         let response = self
             .runtime
@@ -516,13 +576,95 @@ impl ManagementCliClient {
                 rockstream_management_proto::v1::CreateBackupRequest {
                     protocol_version: 1,
                     destination: destination.to_owned(),
-                    idempotency_key: uuid::Uuid::new_v4().to_string(),
+                    idempotency_key: idempotency_key.to_string(),
                 },
             ))
             .map_err(|error| management_status_error("CreateBackup", error))?
             .into_inner();
         response.operation.map(management_operation).ok_or_else(|| {
             management_client_error("CreateBackup", "server returned no operation".to_owned())
+        })
+    }
+
+    pub fn generate_support_artifact(
+        &mut self,
+        node_id: Option<u64>,
+        idempotency_key: uuid::Uuid,
+    ) -> Result<ManagementSupportArtifactInfo, CliError> {
+        let response = self
+            .runtime
+            .block_on(self.client.generate_support_artifact(
+                rockstream_management_proto::v1::GenerateSupportArtifactRequest {
+                    protocol_version: 1,
+                    node_id: node_id.map_or_else(String::new, |id| id.to_string()),
+                    idempotency_key: idempotency_key.to_string(),
+                },
+            ))
+            .map_err(|error| management_status_error("GenerateSupportArtifact", error))?
+            .into_inner();
+        Ok(ManagementSupportArtifactInfo {
+            opaque_id: response.opaque_id,
+            expires_at_ms: response.expires_at_ms,
+            downloaded_to: None,
+            size_bytes: None,
+        })
+    }
+
+    pub fn download_support_artifact(
+        &mut self,
+        opaque_id: uuid::Uuid,
+        path: &Path,
+    ) -> Result<ManagementSupportArtifactInfo, CliError> {
+        let opaque_id = opaque_id.to_string();
+        let (content, expires_at_ms) = self
+            .runtime
+            .block_on(async {
+                let response = self
+                    .client
+                    .download_support_artifact(
+                        rockstream_management_proto::v1::DownloadSupportArtifactRequest {
+                            protocol_version: 1,
+                            opaque_id: opaque_id.clone(),
+                        },
+                    )
+                    .await?;
+                let mut stream = response.into_inner();
+                let mut content = Vec::new();
+                let mut expires_at_ms = None;
+                let mut final_chunk = false;
+                while let Some(chunk) = stream.message().await? {
+                    append_support_artifact_chunk(
+                        &mut content,
+                        &mut expires_at_ms,
+                        &mut final_chunk,
+                        &chunk,
+                    )
+                    .map_err(|error| match error {
+                        SupportArtifactChunkError::OutOfOrder
+                        | SupportArtifactChunkError::ExpiryChanged => {
+                            tonic::Status::data_loss("support artifact chunks are inconsistent")
+                        }
+                        SupportArtifactChunkError::TooLarge => tonic::Status::resource_exhausted(
+                            "support artifact exceeds the 10 MiB limit",
+                        ),
+                    })?;
+                }
+                if !final_chunk {
+                    return Err(tonic::Status::data_loss(
+                        "support artifact download ended before its final chunk",
+                    ));
+                }
+                Ok((content, expires_at_ms.unwrap_or_default()))
+            })
+            .map_err(|error| management_status_error("DownloadSupportArtifact", error))?;
+        fs::write(path, &content).map_err(|error| {
+            management_client_error("write support artifact", error.to_string())
+        })?;
+        Ok(ManagementSupportArtifactInfo {
+            opaque_id,
+            expires_at_ms,
+            downloaded_to: Some(path.to_string_lossy().into_owned()),
+            size_bytes: Some(content.len() as u64),
         })
     }
 
@@ -548,6 +690,39 @@ impl ManagementCliClient {
 
 fn management_status_error(method: &str, error: tonic::Status) -> CliError {
     management_client_error(method, format!("{}: {}", error.code(), error.message()))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SupportArtifactChunkError {
+    OutOfOrder,
+    ExpiryChanged,
+    TooLarge,
+}
+
+fn append_support_artifact_chunk(
+    content: &mut Vec<u8>,
+    expires_at_ms: &mut Option<u64>,
+    final_chunk: &mut bool,
+    chunk: &rockstream_management_proto::v1::DownloadSupportArtifactChunk,
+) -> Result<(), SupportArtifactChunkError> {
+    if *final_chunk || chunk.offset != content.len() as u64 {
+        return Err(SupportArtifactChunkError::OutOfOrder);
+    }
+    if content.len().saturating_add(chunk.content.len())
+        > rockstream_types::diagnostic::MAX_DIAGNOSTIC_BUNDLE_BYTES
+    {
+        return Err(SupportArtifactChunkError::TooLarge);
+    }
+    match expires_at_ms {
+        Some(expected) if *expected != chunk.expires_at_ms => {
+            return Err(SupportArtifactChunkError::ExpiryChanged);
+        }
+        None => *expires_at_ms = Some(chunk.expires_at_ms),
+        _ => {}
+    }
+    content.extend_from_slice(&chunk.content);
+    *final_chunk = chunk.final_chunk;
+    Ok(())
 }
 
 fn management_client_error(method: &str, message: String) -> CliError {
@@ -2746,10 +2921,10 @@ impl StorageClient {
                     .ok_or_else(|| "no committed checkpoint manifest exists".to_string())?;
                 let generation = format!("checkpoint-{}", checkpoint.checkpoint_id.0);
                 rockstream_control::CheckpointExportService::new()
-                    .export_latest_prefix(
+                    .export_checkpoint_prefix(
                         source_store,
                         destination_store,
-                        &manifests,
+                        checkpoint,
                         generation,
                         &object_store::path::Path::from(""),
                     )
@@ -2913,11 +3088,18 @@ impl StorageClient {
         out: Option<&Path>,
         occurrences: &[DiagnosticOccurrence],
     ) -> Result<SupportBundleInfo, CliError> {
+        let (view, mut redacted_secrets_count) = match view {
+            Some(view) => {
+                let (_, count) = redact_secrets_with_count(view);
+                (Some("selected".to_string()), count)
+            }
+            None => (None, 0),
+        };
         if self.identity.role < required_role("support bundle") {
             let event = AuditEvent::now(
                 self.identity.user.clone(),
                 "support.bundle",
-                view.unwrap_or("all"),
+                view.as_deref().unwrap_or("all"),
             )
             .with_detail("unauthorized role")
             .with_error_code("RS-2401");
@@ -2943,26 +3125,21 @@ impl StorageClient {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| storage_path.join(format!("support_bundle_{now_ms}.tar.gz")));
 
-        let event = AuditEvent::now(
-            self.identity.user.clone(),
-            "support.bundle",
-            view.unwrap_or("all"),
-        )
-        .with_detail(format!("bundle written to {}", out_path.display()));
-        append_audit_file(storage_path, &event);
-
-        let mut diagnostic_occurrences = occurrences
-            .iter()
-            .take(MAX_DIAGNOSTIC_BUNDLE_OCCURRENCES)
-            .map(DiagnosticOccurrence::redacted)
-            .collect::<Vec<_>>();
+        let mut diagnostic_occurrences = Vec::new();
+        let mut diagnostic_redaction_counts = Vec::new();
+        for occurrence in occurrences.iter().take(MAX_DIAGNOSTIC_BUNDLE_OCCURRENCES) {
+            let (occurrence, count) = occurrence.sanitized_for_support();
+            redacted_secrets_count += count;
+            diagnostic_occurrences.push(occurrence);
+            diagnostic_redaction_counts.push(count);
+        }
         let mut omitted_occurrences = occurrences
             .len()
             .saturating_sub(diagnostic_occurrences.len());
         let mut bundle = serde_json::json!({
             "generated_at_ms": now_ms,
             "candidate_identity": rockstream_types::candidate_identity::CandidateIdentity::current(),
-            "view": view,
+            "view": view.as_deref(),
             "audit_events": [],
             "diagnostic_occurrences": diagnostic_occurrences,
             "redaction": "secret values are never included; only metadata and audit events are exported"
@@ -2980,6 +3157,7 @@ impl StorageClient {
                 .is_some_and(|items| !items.is_empty())
         {
             diagnostic_occurrences.pop();
+            redacted_secrets_count -= diagnostic_redaction_counts.pop().unwrap_or_default();
             omitted_occurrences += 1;
             bundle["diagnostic_occurrences"] = serde_json::to_value(&diagnostic_occurrences)
                 .expect("diagnostic occurrences are serializable");
@@ -3011,7 +3189,7 @@ impl StorageClient {
         if bytes.len() > MAX_DIAGNOSTIC_BUNDLE_BYTES {
             return Err(CliError::new(
                 RS_0003,
-                "support bundle exceeds the 1 MiB diagnostic bundle bound",
+                "support bundle exceeds the 10 MiB diagnostic bundle bound",
                 "Reduce diagnostic history and retry the support bundle command.",
             ));
         }
@@ -3027,19 +3205,47 @@ impl StorageClient {
                 )
             })?;
         }
-        fs::write(&out_path, &bytes).map_err(|error| {
+        let write_result = fs::write(&out_path, &bytes);
+        let generated = write_result.is_ok();
+        let event = AuditEvent::now(
+            self.identity.user.clone(),
+            "support.bundle",
+            view.as_deref().unwrap_or("all"),
+        )
+        .with_detail(if generated {
+            "support bundle generated"
+        } else {
+            "support bundle generation failed"
+        });
+        let event = if generated {
+            event
+        } else {
+            event.with_error_code(RS_0003.to_string())
+        };
+        // shortcut: the local file and audit log are not atomic; use an artifact store before remote downloads.
+        if rockstream_control::audit::FileAuditLog::open(storage_path.join("audit.jsonl"))
+            .and_then(|audit| audit.append(&event))
+            .is_err()
+        {
+            return Err(CliError::new(
+                RS_0003,
+                "support bundle audit could not be persisted",
+                "Check durable audit storage before retrying.",
+            ));
+        }
+        write_result.map_err(|_| {
             CliError::new(
                 RS_0003,
-                format!("failed to write support bundle: {error}"),
+                "failed to write support bundle",
                 "Check that the output path is writable and retry.",
             )
         })?;
 
         Ok(SupportBundleInfo {
             bundle_path: out_path.to_string_lossy().into_owned(),
-            view: view.map(Into::into),
+            view,
             size_bytes: bytes.len() as u64,
-            redacted_secrets_count: 1,
+            redacted_secrets_count,
             generated_at_ms: now_ms,
         })
     }
@@ -3815,6 +4021,14 @@ impl RemoteStorageAdminClient {
         Self { identity }
     }
 
+    fn checkpoint_unavailable<T>(&self, operation: &str) -> Result<T, CliError> {
+        Err(CliError::new(
+            RS_2400,
+            format!("authenticated checkpoint {operation} is unavailable from the management API"),
+            "Do not use --identity-role as authorization; use an authenticated checkpoint endpoint when one is available.",
+        ))
+    }
+
     fn unavailable<T>(&self, operation: &str) -> Result<T, CliError> {
         let _ = &self.identity;
         Err(remote_query_unavailable(operation))
@@ -3827,7 +4041,7 @@ impl StorageAdminApi for RemoteStorageAdminClient {
         _storage_path: &Path,
         _destination: &str,
     ) -> Result<CheckpointExportOutcome, CliError> {
-        self.unavailable("checkpoint export")
+        self.checkpoint_unavailable("export")
     }
 
     fn restore_checkpoint(
@@ -3836,11 +4050,11 @@ impl StorageAdminApi for RemoteStorageAdminClient {
         _source: &str,
         _target: &str,
     ) -> Result<RestoreOutcome, CliError> {
-        self.unavailable("checkpoint restore")
+        self.checkpoint_unavailable("restore")
     }
 
     fn list_checkpoints(&self, _storage_path: &Path) -> Result<Vec<CheckpointSummary>, CliError> {
-        self.unavailable("checkpoint listing")
+        self.checkpoint_unavailable("listing")
     }
 
     fn show_checkpoint(
@@ -3848,7 +4062,7 @@ impl StorageAdminApi for RemoteStorageAdminClient {
         _storage_path: &Path,
         _checkpoint_id: u64,
     ) -> Result<CheckpointAlignmentInfo, CliError> {
-        self.unavailable("checkpoint inspection")
+        self.checkpoint_unavailable("inspection")
     }
 
     fn generate_support_bundle(
@@ -3888,5 +4102,55 @@ impl StorageAdminApi for RemoteStorageAdminClient {
         _yes: bool,
     ) -> Result<crate::output::RestoreOutcome, CliError> {
         self.unavailable("backup restore")
+    }
+}
+
+#[cfg(test)]
+mod support_artifact_download_tests {
+    use super::*;
+
+    #[test]
+    fn download_chunks_must_reconstruct_exact_bytes_in_order() {
+        let chunks = [
+            rockstream_management_proto::v1::DownloadSupportArtifactChunk {
+                content: b"{\"format_version\":".to_vec(),
+                offset: 0,
+                final_chunk: false,
+                expires_at_ms: 600_000,
+            },
+            rockstream_management_proto::v1::DownloadSupportArtifactChunk {
+                content: b"1}".to_vec(),
+                offset: 18,
+                final_chunk: true,
+                expires_at_ms: 600_000,
+            },
+        ];
+        let mut content = Vec::new();
+        let mut expiry = None;
+        let mut final_chunk = false;
+        for chunk in &chunks {
+            append_support_artifact_chunk(&mut content, &mut expiry, &mut final_chunk, chunk)
+                .unwrap();
+        }
+        assert_eq!(content, br#"{"format_version":1}"#);
+        assert_eq!(expiry, Some(600_000));
+        assert!(final_chunk);
+
+        let out_of_order = rockstream_management_proto::v1::DownloadSupportArtifactChunk {
+            content: b"invalid".to_vec(),
+            offset: 0,
+            final_chunk: true,
+            expires_at_ms: 600_000,
+        };
+        assert_eq!(
+            append_support_artifact_chunk(
+                &mut content,
+                &mut expiry,
+                &mut final_chunk,
+                &out_of_order,
+            )
+            .unwrap_err(),
+            SupportArtifactChunkError::OutOfOrder
+        );
     }
 }

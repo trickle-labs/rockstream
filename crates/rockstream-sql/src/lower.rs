@@ -37,7 +37,7 @@ use datafusion::scalar::ScalarValue;
 
 use rockstream_plan::{
     AggregateExpr, AggregateFunc, BinaryOp, Expr, JoinSemantics, OuterJoinKind, PlanNode,
-    WindowExpr, WindowFunc,
+    TopKOrderKey, WindowExpr, WindowFunc,
 };
 use rockstream_types::config::RockstreamConfig;
 use rockstream_types::ids::OperatorId;
@@ -97,8 +97,10 @@ pub fn lower(plan: &LogicalPlan) -> Result<PlanNode, SqlError> {
             // special-cased plan directly instead, skipping the redundant
             // (and incompatible) outer projection.
             if let LogicalPlan::Aggregate(inner_agg) = proj.input.as_ref() {
-                if let Some(session_plan) = try_lower_session_window_aggregate(inner_agg)? {
-                    return Ok(session_plan);
+                if is_legacy_q11_session_aggregate(inner_agg) {
+                    if let Some(session_plan) = try_lower_session_window_aggregate(inner_agg)? {
+                        return Ok(session_plan);
+                    }
                 }
             }
             let input = lower(&proj.input)?;
@@ -449,6 +451,27 @@ pub fn lower(plan: &LogicalPlan) -> Result<PlanNode, SqlError> {
                 max_iterations: RockstreamConfig::default().recursion_max_iterations,
                 monotone: !recursive.is_distinct && !classification.non_monotone,
             })
+        }
+
+        LogicalPlan::Limit(limit) => lower_limit_plan(limit),
+
+        LogicalPlan::Sort(sort) => {
+            if let Some(fetch) = sort.fetch {
+                let order_by = lower_sort_exprs(&sort.expr, sort.input.schema())?;
+                let input = lower(&sort.input)?;
+                let rank_col = order_by.first().map(|k| k.col).unwrap_or(0);
+                Ok(PlanNode::TopK {
+                    input: Box::new(input),
+                    k: fetch,
+                    rank_col,
+                    partition_by: vec![],
+                    order_by,
+                })
+            } else {
+                Err(SqlError::UnsupportedPlanNode {
+                    node_type: "order_by_without_limit".to_string(),
+                })
+            }
         }
 
         other => Err(SqlError::UnsupportedPlanNode {
@@ -1482,6 +1505,7 @@ fn resolve_views_and_snapshots(
             time_col,
             gap_ms,
             late_data_policy,
+            partition_by,
         } => PlanNode::SessionWindow {
             input: Box::new(resolve_views_and_snapshots(
                 *input,
@@ -1491,12 +1515,14 @@ fn resolve_views_and_snapshots(
             time_col,
             gap_ms,
             late_data_policy,
+            partition_by,
         },
         PlanNode::TopK {
             input,
             k,
             rank_col,
             partition_by,
+            order_by,
         } => PlanNode::TopK {
             input: Box::new(resolve_views_and_snapshots(
                 *input,
@@ -1506,6 +1532,7 @@ fn resolve_views_and_snapshots(
             k,
             rank_col,
             partition_by,
+            order_by,
         },
         PlanNode::Recursion {
             base,
@@ -1548,8 +1575,13 @@ fn resolve_views_and_snapshots(
                 snapshot_sources,
             )),
         },
-        PlanNode::Exchange { kind, child } => PlanNode::Exchange {
+        PlanNode::Exchange {
             kind,
+            partition_key,
+            child,
+        } => PlanNode::Exchange {
+            kind,
+            partition_key,
             child: Box::new(resolve_views_and_snapshots(
                 *child,
                 registered_views,
@@ -1583,6 +1615,156 @@ struct HopTimeSpec {
     slide_ms: i64,
 }
 
+fn lower_limit_plan(limit: &datafusion::logical_expr::Limit) -> Result<PlanNode, SqlError> {
+    let skip = match &limit.skip {
+        Some(expr) => extract_limit_usize(expr.as_ref())?,
+        None => 0,
+    };
+    if skip > 0 {
+        return Err(SqlError::UnsupportedPlanNode {
+            node_type: "limit_offset_unsupported".to_string(),
+        });
+    }
+    let fetch = match &limit.fetch {
+        Some(expr) => extract_limit_usize(expr.as_ref())?,
+        None => {
+            return Err(SqlError::UnsupportedPlanNode {
+                node_type: "limit_requires_fetch".to_string(),
+            })
+        }
+    };
+
+    let mut inner = limit.input.as_ref();
+    while let LogicalPlan::SubqueryAlias(alias) = inner {
+        inner = alias.input.as_ref();
+    }
+
+    match inner {
+        LogicalPlan::Sort(sort) => {
+            let order_by = lower_sort_exprs(&sort.expr, sort.input.schema())?;
+            let input = lower(&sort.input)?;
+            let rank_col = order_by.first().map(|k| k.col).unwrap_or(0);
+            Ok(PlanNode::TopK {
+                input: Box::new(input),
+                k: fetch,
+                rank_col,
+                partition_by: vec![],
+                order_by,
+            })
+        }
+        LogicalPlan::Projection(proj) => {
+            let mut proj_inner = proj.input.as_ref();
+            while let LogicalPlan::SubqueryAlias(alias) = proj_inner {
+                proj_inner = alias.input.as_ref();
+            }
+            if let LogicalPlan::Sort(sort) = proj_inner {
+                let order_by = lower_sort_exprs(&sort.expr, sort.input.schema())?;
+                let input = lower(&sort.input)?;
+                let rank_col = order_by.first().map(|k| k.col).unwrap_or(0);
+                let topk = PlanNode::TopK {
+                    input: Box::new(input),
+                    k: fetch,
+                    rank_col,
+                    partition_by: vec![],
+                    order_by,
+                };
+                let columns = proj
+                    .expr
+                    .iter()
+                    .map(|e| lower_proj_expr(e, sort.input.schema()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(PlanNode::Project {
+                    input: Box::new(topk),
+                    columns,
+                })
+            } else {
+                let input = lower(inner)?;
+                Ok(PlanNode::TopK {
+                    input: Box::new(input),
+                    k: fetch,
+                    rank_col: 0,
+                    partition_by: vec![],
+                    order_by: vec![TopKOrderKey {
+                        col: 0,
+                        asc: true,
+                        nulls_first: false,
+                    }],
+                })
+            }
+        }
+        _ => {
+            let input = lower(inner)?;
+            Ok(PlanNode::TopK {
+                input: Box::new(input),
+                k: fetch,
+                rank_col: 0,
+                partition_by: vec![],
+                order_by: vec![TopKOrderKey {
+                    col: 0,
+                    asc: true,
+                    nulls_first: false,
+                }],
+            })
+        }
+    }
+}
+
+fn extract_limit_usize(expr: &DfExpr) -> Result<usize, SqlError> {
+    match expr {
+        DfExpr::Literal(ScalarValue::Int64(Some(v)), _) if *v >= 0 => Ok(*v as usize),
+        DfExpr::Literal(ScalarValue::Int32(Some(v)), _) if *v >= 0 => Ok(*v as usize),
+        DfExpr::Literal(ScalarValue::UInt64(Some(v)), _) => Ok(*v as usize),
+        DfExpr::Literal(ScalarValue::UInt32(Some(v)), _) => Ok(*v as usize),
+        _ => Err(SqlError::UnsupportedPlanNode {
+            node_type: "limit_non_literal_value".to_string(),
+        }),
+    }
+}
+
+fn lower_sort_exprs(
+    exprs: &[datafusion::logical_expr::SortExpr],
+    schema: &DFSchema,
+) -> Result<Vec<TopKOrderKey>, SqlError> {
+    if exprs.is_empty() {
+        return Err(SqlError::UnsupportedPlanNode {
+            node_type: "sort_empty_order_by".to_string(),
+        });
+    }
+    let mut keys = Vec::with_capacity(exprs.len());
+    for sort_expr in exprs {
+        let col_idx = extract_column_index(&sort_expr.expr, schema).ok_or_else(|| {
+            SqlError::UnsupportedPlanNode {
+                node_type: "sort_expr_must_be_column".to_string(),
+            }
+        })?;
+        keys.push(TopKOrderKey {
+            col: col_idx,
+            asc: sort_expr.asc,
+            nulls_first: sort_expr.nulls_first,
+        });
+    }
+    Ok(keys)
+}
+
+fn is_legacy_q11_session_aggregate(agg: &datafusion::logical_expr::Aggregate) -> bool {
+    let input_schema = agg.input.schema();
+    let Some((time_col, _)) = agg.group_expr.iter().find_map(|expr| {
+        let sf = find_session(expr)?;
+        if sf.args.len() < 2 {
+            return None;
+        }
+        let tc = extract_column_index(&sf.args[0], input_schema)?;
+        let gap = extract_interval_ms(&sf.args[1])?;
+        Some((tc, gap))
+    }) else {
+        return false;
+    };
+    agg.aggr_expr.len() == 3
+        && is_count_aggregate(&agg.aggr_expr[0])
+        && is_named_aggregate_on_column(&agg.aggr_expr[1], "min", input_schema, time_col)
+        && is_named_aggregate_on_column(&agg.aggr_expr[2], "max", input_schema, time_col)
+}
+
 fn try_lower_session_window_aggregate(
     agg: &datafusion::logical_expr::Aggregate,
 ) -> Result<Option<PlanNode>, SqlError> {
@@ -1613,90 +1795,206 @@ fn try_lower_session_window_aggregate(
             })
         }
     };
-
-    if agg.aggr_expr.len() != 3
-        || !is_count_aggregate(&agg.aggr_expr[0])
-        || !is_named_aggregate_on_column(&agg.aggr_expr[1], "min", input_schema, time_col)
-        || !is_named_aggregate_on_column(&agg.aggr_expr[2], "max", input_schema, time_col)
-    {
+    if gap_ms <= 0 {
         return Err(SqlError::UnsupportedPlanNode {
-            node_type: "session_window_requires_count_min_max_shape".to_string(),
+            node_type: format!("session_invalid_gap:gap_ms={gap_ms}"),
         });
     }
 
+    if is_legacy_q11_session_aggregate(agg) {
+        let mut partition_cols = Vec::new();
+        for (idx, expr) in agg.group_expr.iter().enumerate() {
+            if idx == session_idx {
+                continue;
+            }
+            partition_cols.push(extract_column_index(expr, input_schema).ok_or_else(|| {
+                SqlError::UnsupportedPlanNode {
+                    node_type: "session_partition_requires_column_group_by".to_string(),
+                }
+            })?);
+        }
+
+        let base_input = lower(&agg.input)?;
+        let mut project_columns = partition_cols
+            .iter()
+            .copied()
+            .map(Expr::Column)
+            .collect::<Vec<_>>();
+        project_columns.push(Expr::Column(time_col));
+
+        let session_input = PlanNode::Project {
+            input: Box::new(base_input),
+            columns: project_columns,
+        };
+        let session_node = PlanNode::SessionWindow {
+            input: Box::new(session_input),
+            time_col: partition_cols.len(),
+            gap_ms,
+            late_data_policy: rockstream_plan::LateDataPolicy::Drop,
+            partition_by: None,
+        };
+
+        let mut group_by = (0..partition_cols.len())
+            .map(|idx| Expr::Column(idx + 2))
+            .collect::<Vec<_>>();
+        group_by.push(Expr::Column(0));
+        group_by.push(Expr::Column(1));
+
+        let aggregate = PlanNode::Aggregate {
+            input: Box::new(session_node),
+            group_by,
+            aggregates: vec![AggregateExpr {
+                func: AggregateFunc::Count,
+                input: Expr::Literal(1i64.to_be_bytes().to_vec()),
+                distinct: false,
+            }],
+        };
+
+        let session_start_col = partition_cols.len();
+        let session_end_col = partition_cols.len() + 1;
+        let count_col = partition_cols.len() + 2;
+        let mut columns = (0..partition_cols.len())
+            .map(Expr::Column)
+            .collect::<Vec<_>>();
+        columns.push(Expr::Column(count_col));
+        columns.push(Expr::Column(session_start_col));
+        columns.push(Expr::Column(session_end_col));
+
+        return Ok(Some(PlanNode::Project {
+            input: Box::new(aggregate),
+            columns,
+        }));
+    }
+
+    // General SQL-reachable SESSION(time_col, INTERVAL '...') lowering:
+    // SessionWindowOp prepends (session_start, session_end) at columns 0 and 1,
+    // shifting every original input column index by +2.
     let mut partition_cols = Vec::new();
     for (idx, expr) in agg.group_expr.iter().enumerate() {
         if idx == session_idx {
             continue;
         }
-        partition_cols.push(extract_column_index(expr, input_schema).ok_or_else(|| {
-            SqlError::UnsupportedPlanNode {
-                node_type: "session_partition_requires_column_group_by".to_string(),
-            }
-        })?);
+        if let Some(col_idx) = extract_column_index(expr, input_schema) {
+            partition_cols.push(col_idx);
+        }
     }
 
     let base_input = lower(&agg.input)?;
-    let mut project_columns = partition_cols
-        .iter()
-        .copied()
-        .map(Expr::Column)
-        .collect::<Vec<_>>();
-    project_columns.push(Expr::Column(time_col));
-
-    let session_input = PlanNode::Project {
-        input: Box::new(base_input),
-        columns: project_columns,
-    };
     let session_node = PlanNode::SessionWindow {
-        input: Box::new(session_input),
-        time_col: partition_cols.len(),
+        input: Box::new(base_input),
+        time_col,
         gap_ms,
         late_data_policy: rockstream_plan::LateDataPolicy::Drop,
+        partition_by: Some(partition_cols),
     };
 
-    let mut group_by = (0..partition_cols.len())
-        .map(|idx| Expr::Column(idx + 2))
-        .collect::<Vec<_>>();
-    group_by.push(Expr::Column(0));
-    group_by.push(Expr::Column(1));
+    let mut group_by = Vec::new();
+    for (idx, expr) in agg.group_expr.iter().enumerate() {
+        if idx == session_idx {
+            group_by.push(Expr::Column(0));
+        } else {
+            let mut lowered = lower_expr(expr, input_schema)?;
+            shift_expr_cols(&mut lowered);
+            shift_expr_cols(&mut lowered);
+            group_by.push(lowered);
+        }
+    }
 
-    let aggregate = PlanNode::Aggregate {
+    let mut aggregates = Vec::new();
+    for expr in &agg.aggr_expr {
+        let mut lowered = lower_agg_expr(expr, input_schema)?;
+        shift_expr_cols(&mut lowered.input);
+        shift_expr_cols(&mut lowered.input);
+        aggregates.push(lowered);
+    }
+
+    Ok(Some(PlanNode::Aggregate {
         input: Box::new(session_node),
         group_by,
-        aggregates: vec![AggregateExpr {
-            func: AggregateFunc::Count,
-            input: Expr::Literal(1i64.to_be_bytes().to_vec()),
-            distinct: false,
-        }],
-    };
-
-    // The `Aggregate` node above outputs `(group_by columns..., count)` in
-    // order, i.e. `(partition_cols..., session_start, session_end, count)` —
-    // `count_col` is `bid_count`, `session_start_col`/`session_end_col`
-    // double as `MIN(date_time)`/`MAX(date_time)` (a session's start/end are
-    // by construction its earliest/latest event time), matching the
-    // `bidder, bid_count, starttime, endtime` column order Nexmark q11 asks
-    // for — no separate MIN/MAX aggregate is computed.
-    let session_start_col = partition_cols.len();
-    let session_end_col = partition_cols.len() + 1;
-    let count_col = partition_cols.len() + 2;
-    let mut columns = (0..partition_cols.len())
-        .map(Expr::Column)
-        .collect::<Vec<_>>();
-    columns.push(Expr::Column(count_col));
-    columns.push(Expr::Column(session_start_col));
-    columns.push(Expr::Column(session_end_col));
-
-    Ok(Some(PlanNode::Project {
-        input: Box::new(aggregate),
-        columns,
+        aggregates,
     }))
 }
 
 fn try_lower_hop_window_aggregate(
     agg: &datafusion::logical_expr::Aggregate,
 ) -> Result<Option<PlanNode>, SqlError> {
+    // 1. Direct SQL `HOP(time_col, INTERVAL '<slide>', INTERVAL '<size>')` in GROUP BY.
+    let input_schema = agg.input.schema();
+    let mut direct_hop_idx = None;
+    let mut direct_time_col = None;
+    let mut direct_slide_ms = None;
+    let mut direct_window_size_ms = None;
+    for (idx, expr) in agg.group_expr.iter().enumerate() {
+        let Some(sf) = find_hop(expr) else {
+            continue;
+        };
+        if sf.args.len() < 3 {
+            return Err(SqlError::UnsupportedPlanNode {
+                node_type: "hop_missing_args".to_string(),
+            });
+        }
+        direct_hop_idx = Some(idx);
+        direct_time_col = extract_column_index(&sf.args[0], input_schema);
+        direct_slide_ms = extract_interval_ms(&sf.args[1]);
+        direct_window_size_ms = extract_interval_ms(&sf.args[2]);
+        break;
+    }
+    if let Some(hop_idx) = direct_hop_idx {
+        let (time_col, slide_ms, window_size_ms) =
+            match (direct_time_col, direct_slide_ms, direct_window_size_ms) {
+                (Some(tc), Some(sl), Some(ws)) => (tc, sl, ws),
+                _ => {
+                    return Err(SqlError::UnsupportedPlanNode {
+                        node_type: "hop_invalid_args".to_string(),
+                    })
+                }
+            };
+        if slide_ms <= 0 || window_size_ms <= 0 || window_size_ms < slide_ms {
+            return Err(SqlError::UnsupportedPlanNode {
+                node_type: format!(
+                    "hop_window_invalid_slide:window_size_ms={window_size_ms},slide_ms={slide_ms}"
+                ),
+            });
+        }
+        if window_size_ms % slide_ms != 0 {
+            return Err(SqlError::UnsupportedPlanNode {
+                node_type: format!(
+                    "hop_window_non_integral_overlap:window_size_ms={window_size_ms},slide_ms={slide_ms}"
+                ),
+            });
+        }
+        let input = lower(&agg.input)?;
+        let hop_node = PlanNode::HopWindow {
+            input: Box::new(input),
+            time_col,
+            window_size_ms,
+            slide_ms,
+            late_data_policy: rockstream_plan::LateDataPolicy::Drop,
+        };
+        let mut group_by = Vec::new();
+        for (i, expr) in agg.group_expr.iter().enumerate() {
+            if i == hop_idx {
+                group_by.push(Expr::Column(0));
+            } else {
+                let mut lowered = lower_expr(expr, input_schema)?;
+                shift_expr_cols(&mut lowered);
+                group_by.push(lowered);
+            }
+        }
+        let mut aggregates = Vec::new();
+        for expr in &agg.aggr_expr {
+            let mut lowered = lower_agg_expr(expr, input_schema)?;
+            shift_expr_cols(&mut lowered.input);
+            aggregates.push(lowered);
+        }
+        return Ok(Some(PlanNode::Aggregate {
+            input: Box::new(hop_node),
+            group_by,
+            aggregates,
+        }));
+    }
+
+    // 2. Legacy `generate_series` cross-join hop pattern.
     let Some((source_input, slide_idx_col)) = extract_generate_series_hop_input(&agg.input) else {
         return Ok(None);
     };
@@ -1805,6 +2103,16 @@ fn find_session(expr: &DfExpr) -> Option<&datafusion::logical_expr::expr::Scalar
         DfExpr::Alias(alias) => find_session(&alias.expr),
         DfExpr::Cast(cast) => find_session(&cast.expr),
         DfExpr::TryCast(cast) => find_session(&cast.expr),
+        _ => None,
+    }
+}
+
+fn find_hop(expr: &DfExpr) -> Option<&datafusion::logical_expr::expr::ScalarFunction> {
+    match expr {
+        DfExpr::ScalarFunction(sf) if sf.func.name().eq_ignore_ascii_case("hop") => Some(sf),
+        DfExpr::Alias(alias) => find_hop(&alias.expr),
+        DfExpr::Cast(cast) => find_hop(&cast.expr),
+        DfExpr::TryCast(cast) => find_hop(&cast.expr),
         _ => None,
     }
 }
@@ -2207,6 +2515,7 @@ fn try_lower_topk_pattern(
         k: k as usize,
         rank_col,
         partition_by,
+        order_by: vec![],
     };
 
     let mut columns = Vec::new();

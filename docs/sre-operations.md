@@ -52,10 +52,12 @@ To debug critical catalog errors, search log files for `RS-XXXX` codes (e.g. `RS
 
 ## Support Bundle Parsing
 
-Support bundles can be produced on demand using the CLI command:
+Actor- and scope-bound support artifacts can be generated through the authenticated management API:
 ```bash
-rockstream support bundle [--view=<name>] [--since=<duration>] [--out=<path>]
+rockstream --management <addr> support artifact create [--node-id=<id>]
+rockstream --management <addr> support artifact download <opaque-id> --out=<path>
 ```
+The legacy local `rockstream support bundle` and `rockstream support diagnose` commands fail closed with `RS-2400` until they can enforce the same authenticated scope policy.
 
 Additionally, a support bundle is generated automatically every time a node runs `rockstream start`
 (`write_support_bundle()` in `crates/rockstream-cli/src/lib.rs`), written as a
@@ -100,7 +102,7 @@ Parse it directly with any JSON tool, e.g.:
 jq '.system_info, .metrics' support-bundle-*.json
 ```
 
-The on-demand `rockstream support bundle` CLI command produces diagnostic artifacts with secret redaction and bounded size (< 10MB default) for operational support and cluster troubleshooting.
+The automatic startup bundle contains sanitized operational metadata. For an on-demand, actor-bound artifact, use `support artifact create` and `support artifact download` through the authenticated management API.
 
 ---
 
@@ -116,7 +118,7 @@ When a materialized view is degraded or blocked, `SHOW VIEW STATUS` and `rockstr
 | `quota_admission_rejected` | `RS-3702` | Admission control rejected incoming work due to workload quota exhaustion | Increase workload memory budget using `ALTER WORKLOAD` or reduce incoming batch sizes and ingest rate. |
 | `spilling` | `RS-3703` | Active disk spilling in progress due to bounded memory pressure | Increase state memory budget (`state_budget_gb`) or scale out cluster workers to distribute arrangement memory. |
 | `over_budget_relaxed` | `RS-3704` | Workload exceeded soft memory budget and is running in relaxed mode | Allocate higher memory headroom or trigger proactive compaction to reclaim tombstone memory. |
-| `checkpoint_alignment_stalled` | `RS-3705` | Checkpoint barrier alignment is stalled waiting for lagging shards | Identify barrier holder shard/operator with `rockstream checkpoint show <id>` and inspect worker CPU/network. |
+| `checkpoint_alignment_stalled` | `RS-3705` | Checkpoint barrier alignment is stalled waiting for lagging shards | The v0.73 CLI has no authenticated checkpoint inspection endpoint; use an authenticated management operation when one is available and inspect worker CPU/network. |
 | `sink_blocked` | `RS-3706` | Transactional 2PC sink cannot commit batches to external storage | Check downstream sink endpoint health, transaction commit timeouts, and target database locking. |
 | `topology_transition_in_progress` | `RS-3707` | Active shard migration or worker drain is transitioning topology | Monitor live migration/drain progress via `rockstream view status` or `SHOW VIEW STATUS`; await cutover. |
 | `recovering` | `RS-3708` | Materialized view is backfilling or recovering from a checkpoint | Monitor backfill progress and await catch-up to the current stream frontier. |

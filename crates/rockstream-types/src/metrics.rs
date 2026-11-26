@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
@@ -347,6 +347,28 @@ pub struct R1PersistenceCounters {
     pub full_state_entries_visited: u64,
 }
 
+/// Physical SlateDB / object-store I/O counters tracked separately from logical
+/// `StateMutation` bytes so benchmarks and tests report logical vs. physical write amplification.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PhysicalPersistenceCounters {
+    pub wal_bytes_written: u64,
+    pub sst_bytes_written: u64,
+    pub manifest_bytes_written: u64,
+    pub other_bytes_written: u64,
+    pub put_ops: u64,
+    pub get_ops: u64,
+    pub get_bytes: u64,
+}
+
+impl PhysicalPersistenceCounters {
+    pub const fn total_written_bytes(&self) -> u64 {
+        self.wal_bytes_written
+            .saturating_add(self.sst_bytes_written)
+            .saturating_add(self.manifest_bytes_written)
+            .saturating_add(self.other_bytes_written)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct R1ArrangementCounters {
     pub logical_trace_bytes: u64,
@@ -399,6 +421,7 @@ struct MetricRegistry {
     r1_execution: HashMap<R1ExecutionKey, R1ExecutionCounters>,
     compiled_join_views: [u64; 2],
     r1_persistence: HashMap<OperatorId, R1PersistenceCounters>,
+    physical_persistence: HashMap<String, PhysicalPersistenceCounters>,
     r1_arrangements: HashMap<ArrangementId, R1ArrangementCounters>,
     r1_workers: HashMap<WorkerId, R1WorkerActivity>,
     applied: HashMap<LawMetricKey, Counter>,
@@ -409,6 +432,16 @@ struct MetricRegistry {
     rmw_required: HashMap<LawMetricKey, Counter>,
     /// Total manifest writes (global, not per-law).
     manifest_writes: AtomicU64,
+    security_audit_retained_records: u64,
+    security_audit_retained_bytes: u64,
+    security_audit_capacity_bytes: u64,
+    security_audit_degraded: bool,
+    security_audit_transport_pending: u64,
+    security_audit_transport_capacity: u64,
+    support_artifact_retained_count: u64,
+    support_artifact_retained_bytes: u64,
+    support_artifact_capacity_count: u64,
+    support_artifact_capacity_bytes: u64,
 
     // SRE Observability metrics
     compaction_bytes_reclaimed: HashMap<u16, Counter>,
@@ -452,6 +485,7 @@ struct MetricRegistry {
     exchange_pool_clients_size: AtomicU64,
     webhook_pending_size: AtomicU64,
     mtls_cn_cache_size: AtomicU64,
+    jwks_cache_sizes: HashMap<u64, (u64, Instant)>,
 
     // Stage lag & Barrier flight metrics
     view_stage_lags: HashMap<String, StageLagBreakdown>,
@@ -552,6 +586,7 @@ impl MetricRegistry {
             r1_execution: HashMap::new(),
             compiled_join_views: [0; 2],
             r1_persistence: HashMap::new(),
+            physical_persistence: HashMap::new(),
             r1_arrangements: HashMap::new(),
             r1_workers: HashMap::new(),
             applied: HashMap::new(),
@@ -559,6 +594,16 @@ impl MetricRegistry {
             rmw_avoided: HashMap::new(),
             rmw_required: HashMap::new(),
             manifest_writes: AtomicU64::new(0),
+            security_audit_retained_records: 0,
+            security_audit_retained_bytes: 0,
+            security_audit_capacity_bytes: 0,
+            security_audit_degraded: false,
+            security_audit_transport_pending: 0,
+            security_audit_transport_capacity: 0,
+            support_artifact_retained_count: 0,
+            support_artifact_retained_bytes: 0,
+            support_artifact_capacity_count: 0,
+            support_artifact_capacity_bytes: 0,
             compaction_bytes_reclaimed: HashMap::new(),
             duplicate_dropped_total: HashMap::new(),
             tombstone_bytes: HashMap::new(),
@@ -602,6 +647,7 @@ impl MetricRegistry {
             exchange_pool_clients_size: AtomicU64::new(0),
             webhook_pending_size: AtomicU64::new(0),
             mtls_cn_cache_size: AtomicU64::new(0),
+            jwks_cache_sizes: HashMap::new(),
             view_stage_lags: HashMap::new(),
             stage_timestamps: HashMap::new(),
             barrier_flight_samples: Vec::new(),
@@ -700,6 +746,42 @@ pub fn r1_persistence_snapshot() -> Vec<(OperatorId, R1PersistenceCounters)> {
     with_registry(|reg| {
         let mut snapshot: Vec<_> = reg.r1_persistence.iter().map(|(k, v)| (*k, *v)).collect();
         snapshot.sort_by_key(|(operator_id, _)| *operator_id);
+        snapshot
+    })
+}
+
+pub fn record_physical_persistence(scope: &str, delta: PhysicalPersistenceCounters) {
+    with_registry(|reg| {
+        let entry = reg
+            .physical_persistence
+            .entry(scope.to_string())
+            .or_default();
+        entry.wal_bytes_written = entry
+            .wal_bytes_written
+            .saturating_add(delta.wal_bytes_written);
+        entry.sst_bytes_written = entry
+            .sst_bytes_written
+            .saturating_add(delta.sst_bytes_written);
+        entry.manifest_bytes_written = entry
+            .manifest_bytes_written
+            .saturating_add(delta.manifest_bytes_written);
+        entry.other_bytes_written = entry
+            .other_bytes_written
+            .saturating_add(delta.other_bytes_written);
+        entry.put_ops = entry.put_ops.saturating_add(delta.put_ops);
+        entry.get_ops = entry.get_ops.saturating_add(delta.get_ops);
+        entry.get_bytes = entry.get_bytes.saturating_add(delta.get_bytes);
+    });
+}
+
+pub fn physical_persistence_snapshot() -> Vec<(String, PhysicalPersistenceCounters)> {
+    with_registry(|reg| {
+        let mut snapshot: Vec<_> = reg
+            .physical_persistence
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        snapshot.sort_by(|(a, _), (b, _)| a.cmp(b));
         snapshot
     })
 }
@@ -1252,6 +1334,7 @@ pub fn reset_all() {
         reg.r1_execution.clear();
         reg.compiled_join_views = [0; 2];
         reg.r1_persistence.clear();
+        reg.physical_persistence.clear();
         reg.r1_arrangements.clear();
         reg.r1_workers.clear();
         reg.applied.clear();
@@ -1259,6 +1342,16 @@ pub fn reset_all() {
         reg.rmw_avoided.clear();
         reg.rmw_required.clear();
         reg.manifest_writes.store(0, Ordering::Relaxed);
+        reg.security_audit_retained_records = 0;
+        reg.security_audit_retained_bytes = 0;
+        reg.security_audit_capacity_bytes = 0;
+        reg.security_audit_degraded = false;
+        reg.security_audit_transport_pending = 0;
+        reg.security_audit_transport_capacity = 0;
+        reg.support_artifact_retained_count = 0;
+        reg.support_artifact_retained_bytes = 0;
+        reg.support_artifact_capacity_count = 0;
+        reg.support_artifact_capacity_bytes = 0;
         reg.compaction_bytes_reclaimed.clear();
         reg.duplicate_dropped_total.clear();
         reg.tombstone_bytes.clear();
@@ -1310,6 +1403,7 @@ pub fn reset_all() {
         reg.exchange_pool_clients_size.store(0, Ordering::Relaxed);
         reg.webhook_pending_size.store(0, Ordering::Relaxed);
         reg.mtls_cn_cache_size.store(0, Ordering::Relaxed);
+        reg.jwks_cache_sizes.clear();
         reg.view_stage_lags.clear();
         reg.stage_timestamps.clear();
         reg.barrier_flight_samples.clear();
@@ -2298,6 +2392,52 @@ pub fn read_mtls_cn_cache_size() -> u64 {
     with_registry(|reg| reg.mtls_cn_cache_size.load(Ordering::Relaxed))
 }
 
+static NEXT_JWKS_CACHE_METRIC_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Tracks one issuer cache in the process-wide JWKS fill gauge.
+pub struct JwksCacheSizeMetric {
+    id: u64,
+}
+
+impl JwksCacheSizeMetric {
+    pub fn register() -> Self {
+        Self {
+            id: NEXT_JWKS_CACHE_METRIC_ID.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    pub fn set(&self, size: u64, expires_at: Option<Instant>) {
+        with_registry(|reg| match (size, expires_at) {
+            (0, _) | (_, None) => {
+                reg.jwks_cache_sizes.remove(&self.id);
+            }
+            (size, Some(expires_at)) => {
+                reg.jwks_cache_sizes.insert(self.id, (size, expires_at));
+            }
+        });
+    }
+}
+
+impl Drop for JwksCacheSizeMetric {
+    fn drop(&mut self) {
+        with_registry(|reg| {
+            reg.jwks_cache_sizes.remove(&self.id);
+        });
+    }
+}
+
+fn current_jwks_cache_size(reg: &MetricRegistry) -> u64 {
+    let now = Instant::now();
+    reg.jwks_cache_sizes
+        .values()
+        .filter(|(_, expires_at)| now < *expires_at)
+        .fold(0u64, |total, (size, _)| total.saturating_add(*size))
+}
+
+pub fn read_jwks_cache_size() -> u64 {
+    with_registry(|reg| current_jwks_cache_size(reg))
+}
+
 pub fn inc_shuffle_compression_disabled_total() {
     with_registry(|reg| {
         reg.shuffle_compression_disabled_total
@@ -2500,6 +2640,47 @@ pub fn prometheus_text() -> String {
     generate_prometheus_metrics()
 }
 
+pub fn set_security_audit_storage_metrics(
+    retained_records: u64,
+    retained_bytes: u64,
+    capacity_bytes: u64,
+) {
+    with_registry(|reg| {
+        reg.security_audit_retained_records = retained_records;
+        reg.security_audit_retained_bytes = retained_bytes;
+        reg.security_audit_capacity_bytes = capacity_bytes;
+    });
+}
+
+pub fn set_support_artifact_storage_metrics(
+    retained_count: u64,
+    retained_bytes: u64,
+    capacity_count: u64,
+    capacity_bytes: u64,
+) {
+    with_registry(|reg| {
+        reg.support_artifact_retained_count = retained_count;
+        reg.support_artifact_retained_bytes = retained_bytes;
+        reg.support_artifact_capacity_count = capacity_count;
+        reg.support_artifact_capacity_bytes = capacity_bytes;
+    });
+}
+
+pub fn set_security_audit_degraded(degraded: bool) {
+    with_registry(|reg| reg.security_audit_degraded = degraded);
+}
+
+pub fn set_security_audit_transport_metrics(pending: u64, capacity: u64) {
+    with_registry(|reg| {
+        reg.security_audit_transport_pending = pending;
+        reg.security_audit_transport_capacity = capacity;
+    });
+}
+
+pub fn is_security_audit_degraded() -> bool {
+    with_registry(|reg| reg.security_audit_degraded)
+}
+
 pub fn generate_prometheus_metrics() -> String {
     let mut out = String::new();
     with_registry(|reg| {
@@ -2515,6 +2696,72 @@ pub fn generate_prometheus_metrics() -> String {
             id.compiler_version,
             id.lockfile_digest,
             id.enabled_features.join(",")
+        ));
+
+        out.push_str(
+            "# HELP security_audit_retained_records Number of retained security audit records.\n",
+        );
+        out.push_str("# TYPE security_audit_retained_records gauge\n");
+        out.push_str(&format!(
+            "security_audit_retained_records {}\n",
+            reg.security_audit_retained_records
+        ));
+        out.push_str("# HELP security_audit_retained_bytes JSON-encoded size of retained security audit records.\n");
+        out.push_str("# TYPE security_audit_retained_bytes gauge\n");
+        out.push_str(&format!(
+            "security_audit_retained_bytes {}\n",
+            reg.security_audit_retained_bytes
+        ));
+        out.push_str("# HELP security_audit_capacity_bytes Configured security audit retention byte limit.\n");
+        out.push_str("# TYPE security_audit_capacity_bytes gauge\n");
+        out.push_str(&format!(
+            "security_audit_capacity_bytes {}\n",
+            reg.security_audit_capacity_bytes
+        ));
+        out.push_str(
+            "# HELP security_audit_degraded Whether required security audit writes are failing.\n",
+        );
+        out.push_str("# TYPE security_audit_degraded gauge\n");
+        out.push_str(&format!(
+            "security_audit_degraded {}\n\n",
+            u8::from(reg.security_audit_degraded)
+        ));
+        out.push_str("# HELP security_audit_transport_capacity Maximum in-flight worker security audit acknowledgements.\n");
+        out.push_str("# TYPE security_audit_transport_capacity gauge\n");
+        out.push_str(&format!(
+            "security_audit_transport_capacity {}\n",
+            reg.security_audit_transport_capacity
+        ));
+        out.push_str("# HELP security_audit_transport_pending Worker security audit requests awaiting durable acknowledgement.\n");
+        out.push_str("# TYPE security_audit_transport_pending gauge\n");
+        out.push_str(&format!(
+            "security_audit_transport_pending {}\n\n",
+            reg.security_audit_transport_pending
+        ));
+
+        out.push_str("# HELP support_artifact_retained_count Number of artifacts retained in the observed support-artifact ledger.\n");
+        out.push_str("# TYPE support_artifact_retained_count gauge\n");
+        out.push_str(&format!(
+            "support_artifact_retained_count {}\n",
+            reg.support_artifact_retained_count
+        ));
+        out.push_str("# HELP support_artifact_retained_bytes Payload bytes retained in the observed support-artifact ledger.\n");
+        out.push_str("# TYPE support_artifact_retained_bytes gauge\n");
+        out.push_str(&format!(
+            "support_artifact_retained_bytes {}\n",
+            reg.support_artifact_retained_bytes
+        ));
+        out.push_str("# HELP support_artifact_capacity_count Maximum retained support artifacts per deployment.\n");
+        out.push_str("# TYPE support_artifact_capacity_count gauge\n");
+        out.push_str(&format!(
+            "support_artifact_capacity_count {}\n",
+            reg.support_artifact_capacity_count
+        ));
+        out.push_str("# HELP support_artifact_capacity_bytes Maximum retained support-artifact payload bytes per deployment.\n");
+        out.push_str("# TYPE support_artifact_capacity_bytes gauge\n");
+        out.push_str(&format!(
+            "support_artifact_capacity_bytes {}\n\n",
+            reg.support_artifact_capacity_bytes
         ));
 
         // 1. merge_law_applied_total
@@ -2934,6 +3181,13 @@ pub fn generate_prometheus_metrics() -> String {
         out.push_str(&format!(
             "mtls_cn_cache_size {}\n\n",
             reg.mtls_cn_cache_size.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP jwks_cache_size Gauge showing usable cached OIDC signing keys.\n");
+        out.push_str("# TYPE jwks_cache_size gauge\n");
+        out.push_str(&format!(
+            "jwks_cache_size {}\n\n",
+            current_jwks_cache_size(reg)
         ));
 
         out.push_str("# HELP checkpoint_export_objects_in_flight Gauge showing checkpoint export copies in flight.\n");
@@ -3555,6 +3809,76 @@ mod tests {
     static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[test]
+    fn jwks_cache_size_metric_aggregates_live_issuer_caches() {
+        let _g = TEST_LOCK.lock().unwrap();
+        reset_all();
+        let metric_lines = || {
+            generate_prometheus_metrics()
+                .lines()
+                .filter(|line| {
+                    line.starts_with("# HELP jwks_cache_size")
+                        || line.starts_with("# TYPE jwks_cache_size")
+                        || line.starts_with("jwks_cache_size ")
+                })
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let first = JwksCacheSizeMetric::register();
+        let second = JwksCacheSizeMetric::register();
+        let expires_at = Instant::now() + Duration::from_secs(60);
+        first.set(2, Some(expires_at));
+        second.set(3, Some(expires_at));
+        assert_eq!(
+            metric_lines(),
+            [
+                "# HELP jwks_cache_size Gauge showing usable cached OIDC signing keys.",
+                "# TYPE jwks_cache_size gauge",
+                "jwks_cache_size 5",
+            ]
+        );
+
+        drop(first);
+        assert_eq!(
+            metric_lines(),
+            [
+                "# HELP jwks_cache_size Gauge showing usable cached OIDC signing keys.",
+                "# TYPE jwks_cache_size gauge",
+                "jwks_cache_size 3",
+            ]
+        );
+
+        second.set(3, Some(Instant::now() - Duration::from_secs(1)));
+        assert_eq!(
+            metric_lines(),
+            [
+                "# HELP jwks_cache_size Gauge showing usable cached OIDC signing keys.",
+                "# TYPE jwks_cache_size gauge",
+                "jwks_cache_size 0",
+            ]
+        );
+
+        second.set(3, Some(Instant::now() + Duration::from_secs(60)));
+        assert_eq!(
+            metric_lines(),
+            [
+                "# HELP jwks_cache_size Gauge showing usable cached OIDC signing keys.",
+                "# TYPE jwks_cache_size gauge",
+                "jwks_cache_size 3",
+            ]
+        );
+        drop(second);
+        assert_eq!(
+            metric_lines(),
+            [
+                "# HELP jwks_cache_size Gauge showing usable cached OIDC signing keys.",
+                "# TYPE jwks_cache_size gauge",
+                "jwks_cache_size 0",
+            ]
+        );
+        reset_all();
+    }
+
+    #[test]
     fn operator_runtime_stats_filter_ids_and_expire_after_sixty_seconds() {
         let _g = TEST_LOCK.lock().unwrap();
         reset_all();
@@ -3979,6 +4303,89 @@ mod tests {
         assert!(metrics.contains("write_amplification_ratio"));
         assert!(metrics.contains("segment_cache_hit_ratio"));
         assert!(metrics.contains("segment_cache_bytes_used"));
+    }
+
+    #[test]
+    fn security_audit_storage_metrics_are_exported_exactly() {
+        let _g = TEST_LOCK.lock().unwrap();
+        reset_all();
+
+        set_security_audit_storage_metrics(7, 2048, 4096);
+        set_security_audit_degraded(true);
+        set_security_audit_transport_metrics(2, 32);
+        let prometheus = generate_prometheus_metrics();
+        let lines: Vec<_> = prometheus
+            .lines()
+            .filter(|line| {
+                line.starts_with("# HELP security_audit_")
+                    || line.starts_with("# TYPE security_audit_")
+                    || line.starts_with("security_audit_")
+            })
+            .collect();
+
+        assert_eq!(
+            lines,
+            vec![
+                "# HELP security_audit_retained_records Number of retained security audit records.",
+                "# TYPE security_audit_retained_records gauge",
+                "security_audit_retained_records 7",
+                "# HELP security_audit_retained_bytes JSON-encoded size of retained security audit records.",
+                "# TYPE security_audit_retained_bytes gauge",
+                "security_audit_retained_bytes 2048",
+                "# HELP security_audit_capacity_bytes Configured security audit retention byte limit.",
+                "# TYPE security_audit_capacity_bytes gauge",
+                "security_audit_capacity_bytes 4096",
+                "# HELP security_audit_degraded Whether required security audit writes are failing.",
+                "# TYPE security_audit_degraded gauge",
+                "security_audit_degraded 1",
+                "# HELP security_audit_transport_capacity Maximum in-flight worker security audit acknowledgements.",
+                "# TYPE security_audit_transport_capacity gauge",
+                "security_audit_transport_capacity 32",
+                "# HELP security_audit_transport_pending Worker security audit requests awaiting durable acknowledgement.",
+                "# TYPE security_audit_transport_pending gauge",
+                "security_audit_transport_pending 2",
+            ]
+        );
+        assert!(is_security_audit_degraded());
+
+        reset_all();
+    }
+
+    #[test]
+    fn support_artifact_storage_metrics_are_exported_exactly() {
+        let _g = TEST_LOCK.lock().unwrap();
+        reset_all();
+
+        set_support_artifact_storage_metrics(3, 4096, 2048, 100 * 1024 * 1024);
+        let prometheus = generate_prometheus_metrics();
+        let lines: Vec<_> = prometheus
+            .lines()
+            .filter(|line| {
+                line.starts_with("# HELP support_artifact_")
+                    || line.starts_with("# TYPE support_artifact_")
+                    || line.starts_with("support_artifact_")
+            })
+            .collect();
+
+        assert_eq!(
+            lines,
+            vec![
+                "# HELP support_artifact_retained_count Number of artifacts retained in the observed support-artifact ledger.",
+                "# TYPE support_artifact_retained_count gauge",
+                "support_artifact_retained_count 3",
+                "# HELP support_artifact_retained_bytes Payload bytes retained in the observed support-artifact ledger.",
+                "# TYPE support_artifact_retained_bytes gauge",
+                "support_artifact_retained_bytes 4096",
+                "# HELP support_artifact_capacity_count Maximum retained support artifacts per deployment.",
+                "# TYPE support_artifact_capacity_count gauge",
+                "support_artifact_capacity_count 2048",
+                "# HELP support_artifact_capacity_bytes Maximum retained support-artifact payload bytes per deployment.",
+                "# TYPE support_artifact_capacity_bytes gauge",
+                "support_artifact_capacity_bytes 104857600",
+            ]
+        );
+
+        reset_all();
     }
 
     #[test]

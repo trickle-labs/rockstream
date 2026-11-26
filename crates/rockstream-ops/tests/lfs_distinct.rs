@@ -54,6 +54,8 @@ fn make_batch(rows: &[(i64, i64, i64)]) -> ArrowZSet {
 /// Collect all live (positive-weight) rows from a DistinctOp output accumulation.
 fn collect_positive_kv(zset: &ArrowZSet) -> BTreeMap<(i64, i64), i64> {
     let mut out = BTreeMap::new();
+    zset.validate()
+        .expect("distinct output must have aligned row weights");
     if zset.is_empty() {
         return out;
     }
@@ -69,9 +71,9 @@ fn collect_positive_kv(zset: &ArrowZSet) -> BTreeMap<(i64, i64), i64> {
         .as_any()
         .downcast_ref::<Int64Array>()
         .unwrap();
-    for i in 0..zset.num_rows() {
-        if zset.weights[i] > 0 {
-            out.insert((k_col.value(i), v_col.value(i)), zset.weights[i]);
+    for (i, &weight) in zset.weights.iter().enumerate() {
+        if weight > 0 {
+            out.insert((k_col.value(i), v_col.value(i)), weight);
         }
     }
     out
@@ -80,6 +82,76 @@ fn collect_positive_kv(zset: &ArrowZSet) -> BTreeMap<(i64, i64), i64> {
 async fn open_shard(dir: &TempDir) -> Arc<ShardDb> {
     let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
     Arc::new(ShardDb::builder("shard", store).build().await.unwrap())
+}
+
+#[tokio::test]
+async fn removed_distinct_row_does_not_reappear_after_recovery() {
+    let dir = TempDir::new().unwrap();
+    let db = open_shard(&dir).await;
+    let id = OperatorId(481);
+    let op = DistinctOp::new(kv_schema());
+    op.process_delta(make_batch(&[(1, 10, 1), (2, 20, 1)]))
+        .unwrap();
+    persist_distinct_state(&db, &op, id).await.unwrap();
+    op.process_delta(make_batch(&[(1, 10, -1)])).unwrap();
+    db.set_fail_writes(true);
+    assert!(persist_distinct_state(&db, &op, id).await.is_err());
+    db.set_fail_writes(false);
+    persist_distinct_state(&db, &op, id).await.unwrap();
+
+    let recovered = load_distinct_state(&db, kv_schema(), id).await.unwrap();
+    let output = recovered
+        .process_delta(make_batch(&[(1, 10, 1), (2, 20, 1)]))
+        .unwrap();
+    assert_eq!(output.weights, vec![1]);
+    assert_eq!(collect_positive_kv(&output), BTreeMap::from([((1, 10), 1)]));
+
+    op.process_delta(make_batch(&[(3, 30, 1)])).unwrap();
+    op.restore_in_place(&db, id).await.unwrap();
+    let output = op
+        .process_delta(make_batch(&[(1, 10, 1), (2, 20, 1), (3, 30, 1)]))
+        .unwrap();
+    assert_eq!(output.weights, vec![1, 1]);
+    assert_eq!(
+        collect_positive_kv(&output),
+        BTreeMap::from([((1, 10), 1), ((3, 30), 1)])
+    );
+}
+
+#[tokio::test]
+async fn acknowledgement_preserves_deletions_after_snapshot() {
+    let dir = TempDir::new().unwrap();
+    let db = open_shard(&dir).await;
+    let id = OperatorId(482);
+    let op = Arc::new(DistinctOp::new(kv_schema()));
+    let pipeline = rockstream_ops::live_exec::StatefulPipeline::new()
+        .push(rockstream_ops::live_exec::Stage::Distinct(op.clone(), id));
+    pipeline.process(make_batch(&[(1, 10, 1)])).unwrap();
+    let mut snapshot = rockstream_storage::WriteBatch::new();
+    pipeline.append_state(&db, &mut snapshot).await.unwrap();
+    pipeline.process(make_batch(&[(1, 10, -1)])).unwrap();
+    assert_eq!(op.state_bytes(), 24);
+    db.write_batch(snapshot).await.unwrap();
+    pipeline.ack_persisted_state();
+    assert_eq!(op.state_bytes(), 24);
+    persist_distinct_state(&db, &op, id).await.unwrap();
+    assert_eq!(op.state_bytes(), 0);
+
+    let recovered = load_distinct_state(&db, kv_schema(), id).await.unwrap();
+    let output = recovered.process_delta(make_batch(&[(1, 10, 1)])).unwrap();
+    assert_eq!(output.weights, vec![1]);
+    assert_eq!(collect_positive_kv(&output), BTreeMap::from([((1, 10), 1)]));
+
+    pipeline.process(make_batch(&[(2, 20, 1)])).unwrap();
+    pipeline.restore(&db).await.unwrap();
+    let output = pipeline
+        .process(make_batch(&[(1, 10, 1), (2, 20, 1)]))
+        .unwrap();
+    assert_eq!(output.weights, vec![1, 1]);
+    assert_eq!(
+        collect_positive_kv(&output),
+        BTreeMap::from([((1, 10), 1), ((2, 20), 1)])
+    );
 }
 
 // ─── Test 1: State persists across close/reopen ────────────────────────────

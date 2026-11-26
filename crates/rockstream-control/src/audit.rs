@@ -10,13 +10,27 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 // Re-export the canonical AuditEvent type.
 pub use rockstream_types::audit::AuditEvent;
 
 /// A file-backed audit log that writes JSONL.
 pub struct FileAuditLog {
     path: PathBuf,
-    write_lock: Mutex<()>,
+    directory_synced: Mutex<bool>,
 }
 
 impl FileAuditLog {
@@ -28,14 +42,14 @@ impl FileAuditLog {
         }
         Ok(Self {
             path,
-            write_lock: Mutex::new(()),
+            directory_synced: Mutex::new(false),
         })
     }
 
-    /// Append an audit event.
+    /// Append an audit event and sync it before returning success.
     pub fn append(&self, event: &AuditEvent) -> io::Result<()> {
-        let _guard = self
-            .write_lock
+        let mut directory_synced = self
+            .directory_synced
             .lock()
             .map_err(|_| io::Error::other("audit log lock poisoned"))?;
         let mut file = OpenOptions::new()
@@ -45,6 +59,12 @@ impl FileAuditLog {
         let line = serde_json::to_string(event)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         writeln!(file, "{line}")?;
+        file.sync_all()?;
+        if !*directory_synced {
+            // Persist the filename as well as the event data on Unix.
+            sync_parent_directory(&self.path)?;
+            *directory_synced = true;
+        }
         tracing::debug!(action = %event.action, resource = %event.resource, "audit event written");
         Ok(())
     }
@@ -106,15 +126,14 @@ mod tests {
         let log_path = dir.path().join("audit.jsonl");
         let log = FileAuditLog::open(&log_path).unwrap();
 
-        let e1 = AuditEvent::now("system", "pipeline.created", "p1");
-        let e2 = AuditEvent::now("system", "pipeline.started", "p1");
+        let e1 = AuditEvent::now("system", "pipeline.created", "p1").with_detail("source=ddl");
+        let e2 = AuditEvent::now("system", "pipeline.started", "p1").with_error_code("RS-0003");
         log.append(&e1).unwrap();
         log.append(&e2).unwrap();
+        drop(log);
 
-        let events = log.read_all().unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].action, "pipeline.created");
-        assert_eq!(events[1].action, "pipeline.started");
+        let reopened = FileAuditLog::open(&log_path).unwrap();
+        assert_eq!(reopened.read_all().unwrap(), vec![e1, e2]);
     }
 
     #[test]

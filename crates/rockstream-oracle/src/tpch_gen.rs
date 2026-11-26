@@ -1194,6 +1194,8 @@ mod tests {
     /// (positive-weight-only) kv Z-set.
     fn batch_agg_reference(kv: &ArrowZSet) -> BTreeMap<i64, (i64, i64)> {
         let mut result: BTreeMap<i64, (i64, i64)> = BTreeMap::new();
+        kv.validate()
+            .expect("aggregate input must have aligned row weights");
         if kv.is_empty() {
             return result;
         }
@@ -1209,8 +1211,7 @@ mod tests {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        for i in 0..kv.num_rows() {
-            let w = kv.weights[i];
+        for (i, &w) in kv.weights.iter().enumerate() {
             if w <= 0 {
                 continue;
             }
@@ -1223,6 +1224,9 @@ mod tests {
 
     /// Apply AggregateOp output Z-set deltas to an in-memory state map.
     fn apply_agg_output_deltas(state: &mut BTreeMap<i64, (i64, i64)>, output: &ArrowZSet) {
+        output
+            .validate()
+            .expect("aggregate output must have aligned row weights");
         if output.is_empty() {
             return;
         }
@@ -1244,11 +1248,10 @@ mod tests {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        for i in 0..output.num_rows() {
+        for (i, &w) in output.weights.iter().enumerate() {
             let k = k_col.value(i);
             let s = s_col.value(i);
             let c = c_col.value(i);
-            let w = output.weights[i];
             if w > 0 {
                 state.insert(k, (s, c));
             } else {
@@ -1406,6 +1409,9 @@ mod tests {
     /// This allows counting filtered lineitems via `AggregateOp` SUM(1) = COUNT(*).
     /// Lineitem column indices: 0=l_orderkey, 3=l_extendedprice, 4=l_discount, 5=l_quantity.
     fn project_lineitem_q6(lineitem: &ArrowZSet) -> ArrowZSet {
+        lineitem
+            .validate()
+            .expect("lineitem input must have aligned row weights");
         if lineitem.is_empty() {
             let schema = Arc::new(Schema::new(vec![
                 Field::new("k", DataType::Int64, false),
@@ -1435,14 +1441,14 @@ mod tests {
         let mut k_vals = Vec::new();
         let mut v_vals = Vec::new();
         let mut weights = Vec::new();
-        for i in 0..lineitem.num_rows() {
+        for (i, &weight) in lineitem.weights.iter().enumerate() {
             let discount = discount_col.value(i);
             let quantity = quantity_col.value(i);
             // Q6 filter: discount in [5, 7] and quantity < 25
             if (5..=7).contains(&discount) && quantity < 25 {
                 k_vals.push(0i64); // single group (no GROUP BY in Q6)
                 v_vals.push(ep_col.value(i));
-                weights.push(lineitem.weights[i]);
+                weights.push(weight);
             }
         }
         let schema = Arc::new(Schema::new(vec![
@@ -1466,6 +1472,9 @@ mod tests {
     /// Compute the Q6 batch reference: SUM(l_extendedprice) for rows matching
     /// `l_discount BETWEEN 5 AND 7 AND l_quantity < 25` from a physical lineitem Z-set.
     fn batch_q6_sum(lineitem: &ArrowZSet) -> i64 {
+        lineitem
+            .validate()
+            .expect("lineitem input must have aligned row weights");
         if lineitem.is_empty() {
             return 0;
         }
@@ -1488,8 +1497,7 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         let mut total = 0i64;
-        for i in 0..lineitem.num_rows() {
-            let w = lineitem.weights[i];
+        for (i, &w) in lineitem.weights.iter().enumerate() {
             if w <= 0 {
                 continue;
             }

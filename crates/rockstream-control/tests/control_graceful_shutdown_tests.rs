@@ -61,7 +61,11 @@ async fn test_control_leader_stepdown_and_store_flush() {
         .with_topology_store(topology_store.clone())
         .with_audit(audit.clone());
 
-    let handle = service.start("127.0.0.1:0").await.unwrap();
+    let handle = service
+        .with_insecure_dev_mode()
+        .start("127.0.0.1:0")
+        .await
+        .unwrap();
     let bound_addr = handle.addr;
 
     // Verify service accepts connections

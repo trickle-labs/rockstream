@@ -154,6 +154,7 @@ def check_budgets(root: Path, data: dict, errors: list[str]) -> None:
         "cold_verification_seconds",
         "incremental_verification_seconds",
         "production_compile_seconds",
+        "production_compile_macos_arm64_seconds",
         "runtime_regression_percent",
         "rss_regression_percent",
         "proof_maintenance_hours",

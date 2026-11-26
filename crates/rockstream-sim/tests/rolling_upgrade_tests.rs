@@ -310,7 +310,7 @@ async fn traffic(
     let mut boundary = boundary;
     for offset in start..end {
         let row = operation(offset);
-        let (partition, actual_offset) = producer
+        let delivery = producer
             .send(
                 FutureRecord::to("worker-failure-input")
                     .key("")
@@ -319,8 +319,8 @@ async fn traffic(
             )
             .await
             .unwrap();
-        acknowledgements.push(json!({"operation":row,"partition":partition,
-            "offset":actual_offset,"ack_at_ms":now_ms()}));
+        acknowledgements.push(json!({"operation":row,"partition":delivery.partition,
+            "offset":delivery.offset,"ack_at_ms":now_ms()}));
         let mut log = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -403,6 +403,7 @@ async fn three_worker_n_to_n_plus_1_zero_loss_tc() {
     let catalog = TopologyCatalog::new();
     let control = ControlService::new(catalog.clone())
         .with_shard_manager(manager.clone())
+        .with_insecure_dev_mode()
         .start("127.0.0.1:0")
         .await
         .unwrap();

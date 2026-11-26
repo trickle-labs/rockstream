@@ -8,6 +8,22 @@ Support bundles contain sanitized metadata and audit events only. Secret
 payloads are envelope-encrypted in the catalog and are not included in CLI
 output, `SHOW SECRETS`, errors, or generated support bundles.
 
+## Security audit history
+
+Connect to the PGWire endpoint as an authorized principal and run:
+
+```sql
+SHOW SECURITY AUDIT FROM 1798761600000 TO 1798848000000 LIMIT 100;
+```
+
+The optional inclusive time bounds use epoch milliseconds. Results are ordered
+by `(timestamp_ms, event_id)` and include a `cursor` column. Continue with
+`AFTER <cursor>` using the last row's cursor; `AFTER` is exclusive. The default
+page size is 100 rows and the maximum is 500. The current `security.audit.read`
+grant is checked on every request. See [security](security.md#audit-trail) for
+retention, storage-full behavior, and how live pagination handles concurrent
+history growth.
+
 RockStream ships as a **single binary** named `rockstream`. Every node role is a
 flag on this one binary — there is no separate server, worker, or gateway
 executable. `main` is always runnable through it.
@@ -31,14 +47,20 @@ rockstream [--json] [--control <url>] [--storage-dir <dir>] [--identity-user <na
 | `--json` | `false` | Backwards-compatible alias for `--output json`. |
 | `--control <url>` | — | Control service URL for cluster and shard inspection. |
 | `--storage-dir <dir>` | `.` | Local storage directory for reading checkpoints and audit logs. |
-| `--identity-user <name>` | `rockstream` | Principal presented to control-plane and catalog mutations. |
-| `--identity-role <role>` | `viewer` | RBAC role presented to mutations: `viewer`, `pipeline-owner`, or `admin`. |
+| `--identity-user <name>` | `rockstream` | Identity label used by legacy local CLI adapters; it does not identify a management API principal. |
+| `--identity-role <role>` | `viewer` | Legacy local role request; it does not authenticate or authorize a management API request. |
 | `--tls-ca-cert-path <path>` | — | Path to CA root certificate bundle for internal mTLS. |
 | `--tls-cert-path <path>` | — | Path to client/node X.509 certificate for internal mTLS. |
 | `--tls-key-path <path>` | — | Path to client/node private key for internal mTLS. |
 | `--internal-tls-ca-cert-path <path>` | — | Alias for `--tls-ca-cert-path`. |
 | `--internal-tls-cert-path <path>` | — | Alias for `--tls-cert-path`. |
 | `--internal-tls-key-path <path>` | — | Alias for `--tls-key-path`. |
+
+Management API commands require `--tls-ca-cert-path`, `--tls-cert-path`, and
+`--tls-key-path` (or their `--internal-tls-*` aliases). The server maps the
+client certificate fingerprint to an enabled principal in the durable security
+catalog and checks that principal's current grants for each action. The
+`--identity-user` and `--identity-role` values do not grant management access. The management API uses the principal mapped from the client certificate.
 
 ---
 
@@ -55,7 +77,7 @@ Starts a RockStream node.
 | `--storage <dir>` | yes | — | Local storage directory for node state and artifacts. Created if missing. |
 | `--role <role>` | no | `all` | Node role. One of `all`, `control`, `worker`, `gateway`, `frontier`. An unrecognised role, or a role requiring `--control` when it is omitted, is rejected with `RS-0002`. |
 | `--control <url>` | no (required for `worker`/`frontier`) | — | Control service URL. Required for the `worker` and `frontier` roles; omitting it is rejected with `RS-0002`. |
-| `--auth <mode>` | no | `off` | Authentication mode. One of `off`, `oidc`, `mtls`. |
+| `--auth <mode>` | no | `off` | Authentication mode. One of `off`, `scram`, `oidc`, `mtls`; MD5 is rejected. SCRAM requires an enabled durable login. |
 | `--host-id <id>` | no | — | Stable same-host identity advertised during worker registration. |
 | `--availability-zone <az>` | no | — | Availability zone advertised during worker registration. |
 | `--metrics-addr <addr>` | no | — | Metrics HTTP server listen address. |
@@ -69,6 +91,12 @@ Starts a RockStream node.
 | `--control-bind <addr>` | no | `127.0.0.1:8000` | Overrides the address the control-plane's worker-facing `ControlService` TCP listener binds to. |
 | `--control-shared-storage <dir>` | no | — | Directory for state shared across control nodes in this node's Raft group. |
 | `--query-time-shard-dir <dir>` | no | — | Root directory of a non-local shard included in every query-time scatter read. |
+
+For a connected authenticated gateway, configure `node.deployment_id` and
+`auth.actor_assertion_signing_key_path`; configure the same deployment ID and
+matching `auth.actor_assertion_public_key_path` on control. The gateway also
+requires internal mTLS. See [security configuration](security.md) for key
+distribution and assertion behavior.
 
 ---
 
@@ -139,7 +167,7 @@ Inspect cluster state, quotas, and worker fleet.
 - `rockstream cluster quotas` — Show total memory budgets, used memory, and parallelism limits.
 - `rockstream cluster workers list` — List all registered workers, addresses, availability zones, and health.
 - `rockstream cluster workers status [<worker_id>]` — Show detailed worker status, capacity headroom, and lifecycle state.
-- `rockstream cluster workers drain <worker_id> [--control <addr>] [--yes]` — Signal a worker to drain shard assignments before shutdown.
+- `rockstream cluster workers drain <worker_id> [--control <addr>] [--idempotency-key <uuid>] [--yes]` — Signal a worker to drain shard assignments before shutdown.
 
 ---
 
@@ -148,29 +176,53 @@ Inspect cluster state, quotas, and worker fleet.
 Inspect shard lease ownership and key ranges, and trigger shard migrations.
 
 - `rockstream shard list` — List all shards, lease tokens, owner workers, and active key ranges.
-- `rockstream shard migrate <shard_id> --to <worker_id> [--yes]` — Migrate a shard lease and state to another worker.
+- `rockstream shard migrate <shard_id> --to <worker_id> [--idempotency-key <uuid>] [--yes]` — Migrate a shard lease and state to another worker.
+
+For management drain, migration, and backup operations, RockStream prints `Idempotency-Key: <key>` to stderr before submitting the request. The key is also the operation ID, so after a lost response, retry with the same `--idempotency-key <key>` or inspect it with `rockstream admin operation show <key>`.
+
+Management mutations accept `--idempotency-key <UUID>`. Backup creation requires `--management`; without it the local CLI path fails closed with `RS-2400`. Backup inspect and verify remain local file checks. `admin restore` is unavailable until an authenticated restore endpoint exists. If a backup-creation response is lost, repeat the command with the same key, then reconcile with `rockstream admin operation show <UUID>`; the key is also the operation ID.
 
 ---
 
 ### `rockstream checkpoint`
 
-Inspect, export, and restore durable cluster checkpoints.
+The checkpoint commands are currently unavailable: the management protocol does not expose authenticated
+checkpoint operations, and `--identity-role` is only a local compatibility
+label, not proof of authority. Both the top-level and `admin checkpoint`
+routes fail with `RS-2400` without reading or writing checkpoint storage.
 
 - `rockstream checkpoint list` — List all durable checkpoints, creation timestamps, and shard counts.
 - `rockstream checkpoint export --destination <file://...|s3://...>` — Export the latest M3-committed checkpoint and its immutable object inventory.
 - `rockstream checkpoint restore --source <file://...|s3://...> --storage <file://...|s3://...> --yes` — Verify a committed export and restore it into fresh storage. The target bootstrap pointer is published last.
 
-Both commands require the Admin role and emit `checkpoint.export` or
-`checkpoint.restore` audit events. Integrity, truncation, mixed-generation,
-and partial-restore failures return `RS-3614` with recovery steps; a concurrent export returns `RS-3613`.
+The legacy local implementation is not exposed by the CLI because a caller-
+selected Admin role cannot authorize checkpoint access. Use only a future
+authenticated management endpoint when one is available; the disaster-recovery
+runbook records the current limitation.
 
 ---
 
 ### `rockstream support`
 
-Generate on-demand diagnostic support bundles.
+The legacy local `support bundle` and `support diagnose` commands fail closed
+with `RS-2400` because their caller-asserted identity cannot authorize support
+data access. Generate and download actor- and scope-bound artifacts through the
+authenticated management API instead.
 
-- `rockstream support bundle [--view <name>] [--since <duration>] [--out <path>]` — Generate a diagnostic support bundle with secret redaction and bounded size.
+- `rockstream support bundle [--view <name>] [--since <duration>] [--out <path>]` — Unavailable without authenticated support authorization.
+- `rockstream support diagnose (--code <RS-XXXX> | --correlation-id <uuid>) [--out <path>]` — Unavailable without authenticated diagnostic authorization.
+- `rockstream --management <addr> support artifact create [--node-id <id>] [--idempotency-key <uuid>]` — Create a sanitized cluster- or node-scoped artifact through the authenticated management API. The client prints its idempotency UUID before sending the request; reuse that UUID to retry or reconcile.
+- `rockstream --management <addr> support artifact download <opaque-id> --out <path>` — Download the artifact to a local file while it remains available.
+
+Creation requires current `SupportGenerate` authority on the requested scope.
+Downloads require the creating principal, artifact-download authority, and
+current authority on the artifact's original scope. Opaque IDs expire after 10
+minutes; each artifact is limited to 10 MiB, and each deployment rejects new
+generation at 2,048 artifacts or 100 MiB rather than evicting unexpired data.
+Expired and orphaned data is cleaned within 60 seconds. Artifact operations are
+disabled when the object store lacks atomic conditional writes, and startup
+fails closed before listeners open if it cannot list artifacts for recovery.
+See the [security guide](security.md) for audit and storage recovery details.
 
 ---
 
@@ -194,10 +246,12 @@ Inspect online schema evolution versions and history.
 
 ### `rockstream audit`
 
-Inspect security and lifecycle audit log events.
+Local `audit tail` and `audit query` fail closed with `RS-2400`; their JSONL
+reader is not scoped to a durable principal. For authorized retained security
+history, use an authenticated pgwire client with `SHOW SECURITY AUDIT`.
 
-- `rockstream audit tail [--max=<n>]` — Tail recent audit log events (bounded by default, maximum 1000).
-- `rockstream audit query [--filter=<pattern>] [--max=<n>]` — Query audit log events matching a filter substring.
+- `rockstream audit tail [--max=<n>]` — Unavailable for local audit logs.
+- `rockstream audit query [--filter=<pattern>] [--max=<n>]` — Unavailable for local audit logs.
 
 ---
 
@@ -288,6 +342,8 @@ Generates shell completion scripts directly to stdout.
 | `RS-1731` | Control node is not the Raft leader. | Re-resolve control plane leadership and route the request to the active leader. |
 | `RS-2006` | Requested subscription epoch is prior to storage retention window. | Subscribe with `--snapshot` or specify a more recent epoch. |
 | `RS-2401` | Permission denied due to insufficient RBAC role. | Request elevated RBAC role (PipelineOwner / Admin) or authenticate under an authorized principal. |
+| `RS-3613` | Checkpoint export is already in progress. | Wait for the active export to finish, then retry through an authenticated management endpoint. |
+| `RS-3614` | Checkpoint export or restore failed validation or storage access. | Inspect checkpoint and object-store state before retrying through an authenticated management endpoint. |
 | `RS-4009` | Ingestion source not found. | Check source name with `rockstream source list`. |
 | `RS-4017` | Removed cold-tier storage configuration was passed. | Remove legacy cold-tier storage flags. |
 | `RS-5030` | In-flight shard migration conflict. | Wait for the active migration to complete before re-initiating shard migration. |

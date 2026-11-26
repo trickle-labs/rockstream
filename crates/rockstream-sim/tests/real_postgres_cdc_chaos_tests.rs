@@ -28,9 +28,8 @@ use rockstream_ops::{
     ArrowZSet,
 };
 use rockstream_plan::PlanNode;
-use rockstream_runtime::{
-    exchange::persistence::committed_frontier, start_worker_client, WorkerClientHandle,
-};
+use rockstream_runtime::client::start_worker_client_with_insecure_internal_dev_and_metadata as start_test_worker_client;
+use rockstream_runtime::{exchange::persistence::committed_frontier, WorkerClientHandle};
 use rockstream_storage::{keys::ShardKeyEncoder, ShardReader, WriteBatch};
 use rockstream_test_support::minio::{minio_object_store, start_minio, MINIO_PASS, MINIO_USER};
 use rockstream_types::{
@@ -314,10 +313,15 @@ async fn postgres_cdc_worker_process_fixture() {
         "worker_started",
         json!({"unsafe_future_ack":unsafe_future_ack}),
     );
-    let (worker, _task) =
-        start_worker_client(id, &control_addr, &root.join(format!("worker-{id}")))
-            .await
-            .unwrap();
+    let (worker, _task) = start_test_worker_client(
+        id,
+        &control_addr,
+        &root.join(format!("worker-{id}")),
+        Default::default(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
     let deadline = Instant::now() + WAIT;
     while worker.worker_id().is_none() {
         assert!(Instant::now() < deadline, "registration deadline");
@@ -662,6 +666,7 @@ async fn run_postgres_case(
     let control = ControlService::new(TopologyCatalog::new())
         .with_shard_manager(manager.clone())
         .with_audit(audit)
+        .with_insecure_dev_mode()
         .start("127.0.0.1:0")
         .await
         .unwrap();
@@ -1203,6 +1208,9 @@ fn validate_postgres_recovery(
                 "view_epoch": 4,
                 "transaction": 4,
                 "pending": null,
+                "snapshot_chunk_offset": 0,
+                "snapshot_epoch": null,
+                "change_chunk_offset": 0,
             }))
     {
         return Err(QualificationFailure::SinkOutput);

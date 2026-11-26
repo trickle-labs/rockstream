@@ -8,6 +8,7 @@ pub mod acl;
 pub mod arrangement;
 pub mod arrow_batch;
 pub mod audit;
+pub mod authorization;
 pub mod batch;
 pub mod candidate_identity;
 pub mod capability;
@@ -50,6 +51,7 @@ pub mod sink;
 pub mod state_budget;
 pub mod state_mutation;
 pub mod tiering;
+pub mod tls;
 pub mod topology;
 pub mod view_lifecycle;
 pub mod workload;
@@ -58,6 +60,12 @@ pub use arrangement::{
     ArrangementSpec, CanonicalBinaryOp, CanonicalExpr, CanonicalLiteral, CanonicalType,
     CanonicalUnaryOp, CollationId, CollationVersion, NullSemantics, PartitioningSpec,
     SourceIdentity, TimeDomainSemantics,
+};
+pub use authorization::{
+    AuditCorrelation, AuditField, AuditIdentity, AuthorizationModelError, LoginMethod,
+    PermissionPreset, PolicyScope, ResourceKind, ScopedActionGrant, ScopedPresetGrant,
+    SecurityAction, SecurityAuditClass, SecurityAuditOutcome, SecurityAuditRecord,
+    SecurityPrincipal, SECURITY_AUDIT_FORMAT_VERSION, SECURITY_PRINCIPAL_FORMAT_VERSION,
 };
 pub use candidate_identity::CandidateIdentity;
 pub use capability::{CapabilityDocument, CapabilityEntry, CapabilityRegistry};
@@ -80,7 +88,11 @@ pub use ids::{
     LeaseToken, NamespaceId, OperatorId, PrincipalId, ShardId, SinkId, SourceId, TableId, TenantId,
     ViewId, WorkerId, WorkloadId,
 };
-pub use key_capsule::{KeyCapsule, KeyCapsuleError, KeyValue};
+pub use key_capsule::{
+    batch_key_capsule_encodings_global, batch_key_capsule_encodings_local,
+    measure_batch_key_capsule_encodings, reset_batch_key_capsule_encodings_local, BatchKeyCapsule,
+    KeyCapsule, KeyCapsuleError, KeySpec, KeyValue,
+};
 pub use lifecycle::{
     DependencyHealthReport, DependencyStatus, HealthDimensionObservation, HealthDimensionStatus,
     HealthDimensions, HealthReason, HealthReport, LifecycleState, LifecycleTracker, LiveResponse,
@@ -93,8 +105,9 @@ pub use logging::{
 };
 pub use platform::{ClassificationTier, PlatformClassification, PlatformClassifier};
 pub use qualification::{
-    QualificationAggregateMetrics, QualificationError, QualificationEvidenceManifest,
-    QualificationGateDecision, QualificationGateRejection, QualificationProfile,
+    MeasuredExecutionMetadata, QualificationAggregateMetrics, QualificationCostAccounting,
+    QualificationError, QualificationEvidenceManifest, QualificationGateDecision,
+    QualificationGateRejection, QualificationProfile, QualificationProvenance,
     QualificationReleaseGate, QualificationRun, QualificationRunStatus, QualificationWorkload,
     TopologySpec, WorkloadRunResult,
 };
