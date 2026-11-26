@@ -976,10 +976,10 @@ impl CheckpointExportService {
         }
         if let Some((prefix, baseline)) = &metadata_baseline {
             let current = self.snapshot_live_metadata(&source, prefix).await?;
-            if &current != baseline {
-                return Err(CheckpointExportError::Integrity(
-                    "unversioned control/catalog/source metadata changed during export".to_string(),
-                ));
+            if let Some(path) = first_changed_metadata_path(baseline, &current) {
+                return Err(CheckpointExportError::Integrity(format!(
+                    "unversioned control/catalog/source metadata changed during export: {path}"
+                )));
             }
         } else {
             for (path, expected_digest) in mutable_metadata {
@@ -1284,6 +1284,20 @@ fn is_selected_checkpoint_metadata(path: &Path, checkpoint: &ClusterCheckpoint) 
     true
 }
 
+// Report the first changed object name without logging any metadata contents.
+fn first_changed_metadata_path<'a>(
+    baseline: &'a BTreeMap<Path, String>,
+    current: &'a BTreeMap<Path, String>,
+) -> Option<&'a Path> {
+    if baseline == current {
+        return None;
+    }
+    current
+        .keys()
+        .chain(baseline.keys())
+        .find(|path| current.get(*path) != baseline.get(*path))
+}
+
 fn is_unversioned_export_metadata(path: &Path) -> bool {
     let name = path.as_ref();
     (name.starts_with("control/")
@@ -1568,6 +1582,32 @@ mod tests {
 
     fn checkpoint() -> ClusterCheckpoint {
         ClusterCheckpoint::new(CheckpointId(7))
+    }
+
+    #[test]
+    fn changed_metadata_reports_added_removed_and_modified_paths() {
+        let path = Path::from("control/catalog/views");
+        let added = Path::from("control/catalog/other");
+        let baseline = BTreeMap::from([(path.clone(), "original".to_owned())]);
+        assert_eq!(first_changed_metadata_path(&baseline, &baseline), None);
+
+        let modified = BTreeMap::from([(path.clone(), "modified".to_owned())]);
+        assert_eq!(
+            first_changed_metadata_path(&baseline, &modified),
+            Some(&path)
+        );
+
+        let mut expanded = baseline.clone();
+        expanded.insert(added.clone(), "new".to_owned());
+        assert_eq!(
+            first_changed_metadata_path(&baseline, &expanded),
+            Some(&added)
+        );
+
+        assert_eq!(
+            first_changed_metadata_path(&baseline, &BTreeMap::new()),
+            Some(&path)
+        );
     }
 
     #[tokio::test]
