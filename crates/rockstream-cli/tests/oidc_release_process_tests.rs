@@ -48,7 +48,7 @@ use rockstream_types::{
     },
     data_plane::{DeploymentRequest, DEPLOYMENT_DESCRIPTOR_VERSION},
     ids::{DatabaseId, NamespaceId, OperatorId, PrincipalId, ShardId, WorkerId, WorkloadId},
-    topology::WorkerMessage,
+    topology::{CapacityHeadroom, ControlMessage, NodeRole, WorkerMessage, WorkerRegistration},
 };
 use sha2::Digest;
 use testcontainers::core::{ContainerPort, ExecCommand, WaitFor};
@@ -56,7 +56,7 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, Image, ImageExt};
 use testcontainers_modules::kafka::apache;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
 };
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
@@ -1402,6 +1402,251 @@ async fn support_artifact_object_path(
     };
     object_store::path::Path::from("control/support-artifacts")
         .join(format!("artifacts/{encoded_id}{generation}.json"))
+}
+
+#[tokio::test]
+async fn release_control_rejects_client_certificate_for_worker_registration() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("control-storage");
+    let pki = rockstream_test_support::pki::TestPki::generate();
+    let control_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let management_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let operator = mtls_operator_with_fingerprint(certificate_sha256(&pki.secondary_cli_cert_path));
+    let mut process = start_delegated_control_process_with_management_address(
+        temp.path(),
+        &storage,
+        (control_address, management_address),
+        &pki,
+        Some(operator),
+        false,
+        None,
+    )
+    .await;
+    wait_for_gateway(&mut process.0, control_address).await;
+
+    let mut admin = wait_for_management_client(management_address, &pki).await;
+    let principal_page = admin
+        .list_security_principals(ListSecurityPrincipalsRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            page_size: 10,
+            page_token: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        principal_page
+            .principals
+            .iter()
+            .map(|principal| (principal.principal_id, principal.display_name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, "release control test administrator"),
+            (2, "mTLS operator")
+        ]
+    );
+
+    let mut operator_client = management_client_with_identity(
+        management_address,
+        &pki,
+        &pki.secondary_cli_cert_path,
+        &pki.secondary_cli_key_path,
+    )
+    .await
+    .unwrap();
+    let status_before = operator_client
+        .get_cluster_status(GetClusterStatusRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let audit_store = rockstream_storage::build_runtime_object_store(
+        &storage.join("gateway-shard"),
+        "gateway-shard",
+    )
+    .unwrap();
+    let audit_before = DurableCatalogStore::recover(audit_store, "gateway")
+        .await
+        .unwrap()
+        .list_security_audit_records()
+        .await
+        .unwrap();
+
+    let (worker_cert, worker_key) = pki.worker_certs.get(&1).unwrap();
+    let mut node_client =
+        management_client_with_identity(management_address, &pki, worker_cert, worker_key)
+            .await
+            .unwrap();
+    let rejected_node_admin = tokio::time::timeout(
+        Duration::from_secs(2),
+        node_client.list_security_principals(ListSecurityPrincipalsRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            page_size: 10,
+            page_token: String::new(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        rejected_node_admin.is_err(),
+        "worker certificate obtained management administrator access"
+    );
+    let principals_after_rejection = admin
+        .list_security_principals(ListSecurityPrincipalsRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            page_size: 10,
+            page_token: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        principals_after_rejection.principals,
+        principal_page.principals
+    );
+
+    let connector =
+        rockstream_runtime::tls::build_client_tls_connector(&pki.cli_tls_config()).unwrap();
+    let tcp = tokio::net::TcpStream::connect(control_address)
+        .await
+        .unwrap();
+    let tls = connector
+        .connect(
+            rustls::pki_types::ServerName::try_from("localhost".to_owned()).unwrap(),
+            tcp,
+        )
+        .await
+        .unwrap();
+    let mut stream = tokio::io::BufReader::new(tls);
+    let request = WorkerMessage::Register(WorkerRegistration::new(
+        WorkerId(1),
+        NodeRole::Worker,
+        "127.0.0.1:9001",
+        CapacityHeadroom::FULL,
+    ));
+    let mut request = serde_json::to_vec(&request).unwrap();
+    request.push(b'\n');
+    stream.get_mut().write_all(&request).await.unwrap();
+
+    let mut response = String::new();
+    assert_ne!(
+        tokio::time::timeout(Duration::from_secs(2), stream.read_line(&mut response))
+            .await
+            .unwrap()
+            .unwrap(),
+        0,
+        "control process closed the rejected registration without a response"
+    );
+    match serde_json::from_str::<ControlMessage>(&response).unwrap() {
+        ControlMessage::OperationFailed {
+            code,
+            message,
+            next_steps,
+        } => {
+            assert_eq!(code, rockstream_types::error_code::RS_2412.to_string());
+            assert_eq!(
+                message,
+                "certificate identity cli:admin does not match requested worker_id worker-1"
+            );
+            assert_eq!(
+                next_steps,
+                rockstream_types::error_code::next_steps(rockstream_types::error_code::RS_2412)
+            );
+        }
+        other => panic!("unexpected client-certificate registration response: {other:?}"),
+    }
+    let mut trailing = String::new();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), stream.read_line(&mut trailing))
+            .await
+            .unwrap()
+            .unwrap(),
+        0,
+        "control process kept the rejected worker connection open"
+    );
+
+    let status_after = operator_client
+        .get_cluster_status(GetClusterStatusRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(status_after.nodes, status_before.nodes);
+
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+    let audit_store = rockstream_storage::build_runtime_object_store(
+        &storage.join("gateway-shard"),
+        "gateway-shard",
+    )
+    .unwrap();
+    let records = DurableCatalogStore::recover(audit_store, "gateway")
+        .await
+        .unwrap()
+        .list_security_audit_records()
+        .await
+        .unwrap();
+    let denials: Vec<_> = records
+        .iter()
+        .filter(|record| record.action == SecurityAuditClass::NodeIdentityRejection)
+        .collect();
+    assert_eq!(denials.len(), 1, "unexpected audit records: {records:?}");
+    let denial = denials[0];
+    assert!(denial.event_id.starts_with("node-identity-rejection:"));
+    assert!(denial.timestamp_ms > 0);
+    assert_eq!(
+        denial,
+        &SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: denial.event_id.clone(),
+            timestamp_ms: denial.timestamp_ms,
+            actor: AuditIdentity::Unverified("cli:admin".to_owned()),
+            target: AuditField::Unverified("worker-1".to_owned()),
+            scope: AuditField::Known("cluster".to_owned()),
+            action: SecurityAuditClass::NodeIdentityRejection,
+            outcome: SecurityAuditOutcome::Denied,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::NotApplicable,
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
+    );
+    let authentication_failures: Vec<_> = records
+        .iter()
+        .filter(|record| record.action == SecurityAuditClass::AuthenticationFailure)
+        .collect();
+    assert_eq!(
+        authentication_failures.len(),
+        1,
+        "unexpected authentication audit records: {records:?}"
+    );
+    let failure = authentication_failures[0];
+    assert!(failure.event_id.starts_with("management-authn-"));
+    assert!(failure.timestamp_ms > 0);
+    assert_eq!(
+        failure,
+        &SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: failure.event_id.clone(),
+            timestamp_ms: failure.timestamp_ms,
+            actor: AuditIdentity::Unverified("worker:worker-1".to_owned()),
+            target: AuditField::Known("management-api".to_owned()),
+            scope: AuditField::NotApplicable,
+            action: SecurityAuditClass::AuthenticationFailure,
+            outcome: SecurityAuditOutcome::Failure,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::Unknown,
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
+    );
+    assert!(records.starts_with(&audit_before));
 }
 
 #[tokio::test]
