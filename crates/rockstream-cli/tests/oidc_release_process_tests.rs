@@ -4763,6 +4763,26 @@ async fn oidc_password_auth_runs_in_release_process_and_audits_after_restart() {
         oversized_error.as_db_error().unwrap().message(),
         "[RS-2400] auth.unauthenticated: OIDC token exceeds the 16 KiB limit. next_steps: Provide valid credentials (Bearer token or mTLS certificate)"
     );
+    // Reuse the payload and signature so only the declared algorithm changes.
+    let mut valid_parts = VALID_TOKEN.split('.');
+    let _rs256_header = valid_parts.next().unwrap();
+    let payload = valid_parts.next().unwrap();
+    let signature = valid_parts.next().unwrap();
+    let hs256_header = "eyJhbGciOiJIUzI1NiIsImtpZCI6InRlc3QtcnNhIn0";
+    let wrong_algorithm_token = format!("{hs256_header}.{payload}.{signature}");
+    let wrong_algorithm_error =
+        oidc_authentication_error(address.port(), &wrong_algorithm_token, &client_tls).await;
+    assert_eq!(
+        wrong_algorithm_error.as_db_error().unwrap().code().code(),
+        "28000"
+    );
+    assert_eq!(
+        wrong_algorithm_error
+            .as_db_error()
+            .unwrap()
+            .message(),
+        "[RS-2400] auth.unauthenticated: OIDC accepts only RS256 tokens. next_steps: Provide valid credentials (Bearer token or mTLS certificate)"
+    );
     drop(client);
     connection_task.abort();
     process.0.kill().unwrap();
@@ -4831,7 +4851,7 @@ async fn oidc_password_auth_runs_in_release_process_and_audits_after_restart() {
         .await
         .unwrap();
     let records = recovered.list_security_audit_records().await.unwrap();
-    assert_eq!(records.len(), 11);
+    assert_eq!(records.len(), 12);
     assert_eq!(records[0].action, SecurityAuditClass::GrantChange);
     assert_eq!(records[0].outcome, SecurityAuditOutcome::Success);
     assert_eq!(records[1].action, SecurityAuditClass::GrantChange);
@@ -4904,15 +4924,11 @@ async fn oidc_password_auth_runs_in_release_process_and_audits_after_restart() {
             after_state: AuditField::NotApplicable,
         }
     );
-    assert!(!serde_json::to_string(&records)
-        .unwrap()
-        .contains("bad-token"));
-    assert!(!serde_json::to_string(&records)
-        .unwrap()
-        .contains(&exact_limit_token));
-    assert!(!serde_json::to_string(&records)
-        .unwrap()
-        .contains(&oversized_token));
+    let serialized_audit = serde_json::to_string(&records).unwrap();
+    assert!(!serialized_audit.contains("bad-token"));
+    assert!(!serialized_audit.contains(&exact_limit_token));
+    assert!(!serialized_audit.contains(&oversized_token));
+    assert!(!serialized_audit.contains(&wrong_algorithm_token));
 }
 
 #[tokio::test]
