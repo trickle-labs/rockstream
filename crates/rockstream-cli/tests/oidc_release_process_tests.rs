@@ -5311,42 +5311,12 @@ async fn oidc_password_auth_runs_in_release_process_and_audits_after_restart() {
     assert!(!serialized_audit.contains(&wrong_algorithm_token));
 }
 
-#[tokio::test]
-async fn oidc_startup_rejects_unavailable_jwks_before_listening() {
-    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
-    let temp = tempfile::tempdir().unwrap();
-    let storage = temp.path().join("oidc-startup-storage");
-
-    let mut tls_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-    tls_params
-        .subject_alt_names
-        .push(rcgen::SanType::IpAddress("127.0.0.1".parse().unwrap()));
-    let tls_key = rcgen::KeyPair::generate().unwrap();
-    let tls_cert = tls_params.self_signed(&tls_key).unwrap();
-    let cert_path = temp.path().join("gateway.pem");
-    let key_path = temp.path().join("gateway-key.pem");
-    std::fs::write(&cert_path, tls_cert.pem()).unwrap();
-    std::fs::write(&key_path, tls_key.serialize_pem()).unwrap();
-
-    let jwks_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let jwks_address = jwks_listener.local_addr().unwrap();
-    drop(jwks_listener);
-    let address: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-    assert_ne!(address.port(), jwks_address.port());
-
-    let jwks_url = format!("http://{jwks_address}/jwks");
-    let mut process = start_gateway_process(
-        temp.path(),
-        &storage,
-        address,
-        &cert_path,
-        &key_path,
-        "oidc",
-        None,
-        "https://issuer.example",
-        "rockstream",
-        &jwks_url,
-    );
+async fn assert_oidc_startup_rejected_before_listening(
+    process: &mut RunningGateway,
+    address: std::net::SocketAddr,
+    jwks_url: &str,
+    jwks_error: &str,
+) {
     let deadline = Instant::now() + Duration::from_secs(30);
     let status = loop {
         if let Some(status) = process.0.try_wait().unwrap() {
@@ -5384,13 +5354,88 @@ async fn oidc_startup_rejects_unavailable_jwks_before_listening() {
     let normalized = stderr.replace(correlation_id, "<correlation_id>");
     assert_eq!(
         normalized.trim_end(),
-        "[RS-0003] storage.unavailable: Storage unavailable (detail=OIDC verifier initialization failed: [RS-2400] auth.unauthenticated: OIDC JWKS request failed) (correlation_id=<correlation_id> context=detail=OIDC verifier initialization failed: [RS-2400] auth.unauthenticated: OIDC JWKS request failed) next_steps: Verify storage directory permissions and disk space.\n  next steps: Restore access to the configured JWKS endpoint before starting the gateway."
+        format!(
+            "[RS-0003] storage.unavailable: Storage unavailable (detail=OIDC verifier initialization failed: [RS-2400] auth.unauthenticated: {jwks_error}) (correlation_id=<correlation_id> context=detail=OIDC verifier initialization failed: [RS-2400] auth.unauthenticated: {jwks_error}) next_steps: Verify storage directory permissions and disk space.\n  next steps: Restore access to the configured JWKS endpoint before starting the gateway."
+        )
     );
     assert!(
-        !stderr.contains(&jwks_url),
+        !stderr.contains(jwks_url),
         "diagnostic exposed the JWKS URL"
     );
     assert!(tokio::net::TcpStream::connect(address).await.is_err());
+}
+
+#[tokio::test]
+async fn oidc_startup_rejects_unavailable_jwks_before_listening() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("oidc-startup-storage");
+
+    let mut tls_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    tls_params
+        .subject_alt_names
+        .push(rcgen::SanType::IpAddress("127.0.0.1".parse().unwrap()));
+    let tls_key = rcgen::KeyPair::generate().unwrap();
+    let tls_cert = tls_params.self_signed(&tls_key).unwrap();
+    let cert_path = temp.path().join("gateway.pem");
+    let key_path = temp.path().join("gateway-key.pem");
+    std::fs::write(&cert_path, tls_cert.pem()).unwrap();
+    std::fs::write(&key_path, tls_key.serialize_pem()).unwrap();
+
+    let jwks_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let jwks_address = jwks_listener.local_addr().unwrap();
+    drop(jwks_listener);
+    let address: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    assert_ne!(address.port(), jwks_address.port());
+
+    let jwks_url = format!("http://{jwks_address}/jwks");
+    let mut process = start_gateway_process(
+        temp.path(),
+        &storage,
+        address,
+        &cert_path,
+        &key_path,
+        "oidc",
+        None,
+        "https://issuer.example",
+        "rockstream",
+        &jwks_url,
+    );
+    assert_oidc_startup_rejected_before_listening(
+        &mut process,
+        address,
+        &jwks_url,
+        "OIDC JWKS request failed",
+    )
+    .await;
+    drop(process);
+
+    let jwks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let jwks_address = jwks_listener.local_addr().unwrap();
+    let jwks_url = format!("http://{jwks_address}/jwks");
+    let jwks_task = tokio::spawn(serve_jwks(jwks_listener, 2, 2));
+    let retry_storage = temp.path().join("oidc-retry-storage");
+    let address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut process = start_gateway_process(
+        temp.path(),
+        &retry_storage,
+        address,
+        &cert_path,
+        &key_path,
+        "oidc",
+        None,
+        "https://issuer.example",
+        "rockstream",
+        &jwks_url,
+    );
+    assert_oidc_startup_rejected_before_listening(
+        &mut process,
+        address,
+        &jwks_url,
+        "OIDC JWKS endpoint returned an unsuccessful status",
+    )
+    .await;
+    jwks_task.await.unwrap();
 }
 
 #[tokio::test]
