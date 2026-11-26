@@ -1731,7 +1731,7 @@ Options
 
 | Name | Short | Long | Value | Required | Default | Values | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| auth | — | --auth | AUTH | no | — | off, scram, md5, oidc, mtls | Authentication mode. SCRAM requires an enabled durable login; OIDC and mTLS require their configuration. MD5 is rejected. Omitted uses `[auth].mode` |
+| auth | — | --auth | AUTH | no | — | off, scram, md5, oidc, mtls | Authentication mode. SCRAM requires an enabled durable login; OIDC uses RS256, limits tokens to 16 KiB, and requires its issuer, audience, TLS, and JWKS settings; mTLS requires its gateway credentials. MD5 is rejected. Omitted uses `[auth].mode` |
 | availability_zone | — | --availability-zone | AVAILABILITY_ZONE | no | — | — | Availability zone advertised during worker registration |
 | checkpoint_retention_count | — | --checkpoint-retention-count | CHECKPOINT_RETENTION_COUNT | no | — | — |  |
 | control | — | --control | CONTROL | no | — | — | Control service URL (required for the worker, frontier, and compactor roles) |

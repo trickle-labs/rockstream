@@ -20,13 +20,16 @@ use rockstream_types::error_code::{
 };
 use rockstream_types::secret::{
     EncryptedSecret, Secret, SecretMetadata, SecretRotation, SecretToken, SecretType,
+    MAX_WORKER_SECRET_TOKEN_PAYLOAD_BYTES,
 };
 use slatedb::{Db, WriteBatch};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::{watch, OwnedRwLockReadGuard, RwLock as AsyncRwLock};
+use tokio::sync::{
+    watch, OwnedRwLockReadGuard, OwnedSemaphorePermit, RwLock as AsyncRwLock, Semaphore,
+};
 
 type SecretReferenceKey = (u128, String);
 type SecretReferences = HashMap<SecretReferenceKey, HashSet<String>>;
@@ -39,6 +42,12 @@ const SECURITY_AUDIT_OUTBOX_PREFIX: &[u8] = b"security-audit-outbox/";
 pub const MAX_SECRETS_PER_NAMESPACE: usize = 100_000;
 /// Maximum number of in-memory secrets retained by a process without SlateDB.
 pub const MAX_IN_MEMORY_SECRETS: usize = 1_000_000;
+/// Maximum number of callers waiting to enter secret-store rotation locks.
+pub const MAX_SECRET_STORE_WAITERS: usize = 64;
+/// Maximum number of entries staged by one KEK rotation, including its audit outbox record.
+pub const MAX_KEK_ROTATION_STAGED_ENTRIES: usize = MAX_IN_MEMORY_SECRETS;
+/// Maximum serialized values retained by one KEK rotation batch.
+pub const MAX_KEK_ROTATION_STAGING_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum lifetime for a worker credential before current policy must be checked again.
 pub const MAX_WORKER_SECRET_TOKEN_TTL_SECS: u64 = 60;
 /// Maximum number of source/sink references retained for one secret.
@@ -55,6 +64,9 @@ pub struct SecretStoreMetricsSnapshot {
     pub reference_fill_level: usize,
     pub in_memory_fill_level: usize,
     pub rotation_fill_level: usize,
+    pub rotation_waiter_fill_level: usize,
+    pub kek_rotation_staging_fill_level: usize,
+    pub kek_rotation_staging_bytes: usize,
 }
 
 #[derive(Debug, Default)]
@@ -63,6 +75,8 @@ struct SecretStoreMetrics {
     reference_fill_level: AtomicUsize,
     in_memory_fill_level: AtomicUsize,
     rotation_fill_level: AtomicUsize,
+    kek_rotation_staging_fill_level: AtomicUsize,
+    kek_rotation_staging_bytes: AtomicUsize,
 }
 
 impl SecretStoreMetrics {
@@ -72,8 +86,93 @@ impl SecretStoreMetrics {
             reference_fill_level: self.reference_fill_level.load(Ordering::Relaxed),
             in_memory_fill_level: self.in_memory_fill_level.load(Ordering::Relaxed),
             rotation_fill_level: self.rotation_fill_level.load(Ordering::Relaxed),
+            rotation_waiter_fill_level: 0,
+            kek_rotation_staging_fill_level: self
+                .kek_rotation_staging_fill_level
+                .load(Ordering::Relaxed),
+            kek_rotation_staging_bytes: self.kek_rotation_staging_bytes.load(Ordering::Relaxed),
         }
     }
+}
+
+struct KekRotationStagingGauge {
+    metrics: Arc<SecretStoreMetrics>,
+    entries: usize,
+    bytes: usize,
+}
+
+impl KekRotationStagingGauge {
+    fn new(metrics: Arc<SecretStoreMetrics>) -> Self {
+        Self {
+            metrics,
+            entries: 0,
+            bytes: 0,
+        }
+    }
+
+    fn add(&mut self, bytes: usize) -> Result<(), SecretStoreError> {
+        let (entries, bytes) = next_kek_rotation_staging_fill(self.entries, self.bytes, bytes)?;
+        self.entries = entries;
+        self.bytes = bytes;
+        self.update_metrics();
+        Ok(())
+    }
+
+    fn replace(&mut self, old_bytes: usize, new_bytes: usize) -> Result<(), SecretStoreError> {
+        let bytes = self
+            .bytes
+            .checked_sub(old_bytes)
+            .and_then(|bytes| bytes.checked_add(new_bytes))
+            .filter(|bytes| *bytes <= MAX_KEK_ROTATION_STAGING_BYTES)
+            .ok_or_else(kek_rotation_staging_exceeded)?;
+        self.bytes = bytes;
+        self.update_metrics();
+        Ok(())
+    }
+
+    fn update_metrics(&self) {
+        self.metrics
+            .kek_rotation_staging_fill_level
+            .store(self.entries, Ordering::Relaxed);
+        self.metrics
+            .kek_rotation_staging_bytes
+            .store(self.bytes, Ordering::Relaxed);
+    }
+}
+
+impl Drop for KekRotationStagingGauge {
+    fn drop(&mut self) {
+        self.metrics
+            .kek_rotation_staging_fill_level
+            .store(0, Ordering::Relaxed);
+        self.metrics
+            .kek_rotation_staging_bytes
+            .store(0, Ordering::Relaxed);
+    }
+}
+
+fn next_kek_rotation_staging_fill(
+    entries: usize,
+    bytes: usize,
+    next_bytes: usize,
+) -> Result<(usize, usize), SecretStoreError> {
+    let next_entries = entries
+        .checked_add(1)
+        .ok_or_else(kek_rotation_staging_exceeded)?;
+    let next_bytes = bytes
+        .checked_add(next_bytes)
+        .ok_or_else(kek_rotation_staging_exceeded)?;
+    if next_entries > MAX_KEK_ROTATION_STAGED_ENTRIES || next_bytes > MAX_KEK_ROTATION_STAGING_BYTES
+    {
+        return Err(kek_rotation_staging_exceeded());
+    }
+    Ok((next_entries, next_bytes))
+}
+
+fn kek_rotation_staging_exceeded() -> SecretStoreError {
+    SecretStoreError::capacity_exceeded(format!(
+        "KEK rotation staging limit reached (maximum {MAX_KEK_ROTATION_STAGED_ENTRIES} entries and {MAX_KEK_ROTATION_STAGING_BYTES} serialized bytes)"
+    ))
 }
 
 /// Errors produced by the secret store.
@@ -214,6 +313,28 @@ impl From<KekError> for SecretStoreError {
     }
 }
 
+fn serialize_worker_secret_payload(
+    payload: &HashMap<String, String>,
+) -> Result<Vec<u8>, SecretStoreError> {
+    let unescaped_bytes = payload.iter().fold(0usize, |total, (key, value)| {
+        total.saturating_add(key.len()).saturating_add(value.len())
+    });
+    if unescaped_bytes > MAX_WORKER_SECRET_TOKEN_PAYLOAD_BYTES {
+        return Err(SecretStoreError::capacity_exceeded(format!(
+            "secret payload exceeds {MAX_WORKER_SECRET_TOKEN_PAYLOAD_BYTES} serialized bytes"
+        )));
+    }
+
+    let serialized = serde_json::to_vec(payload)
+        .map_err(|_| SecretStoreError::encryption_failed("serialize failed"))?;
+    if serialized.len() > MAX_WORKER_SECRET_TOKEN_PAYLOAD_BYTES {
+        return Err(SecretStoreError::capacity_exceeded(format!(
+            "secret payload exceeds {MAX_WORKER_SECRET_TOKEN_PAYLOAD_BYTES} serialized bytes"
+        )));
+    }
+    Ok(serialized)
+}
+
 /// Metadata item returned when listing secrets (never contains secret values).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretListing {
@@ -251,6 +372,7 @@ pub struct SecretStore {
     db: Option<Arc<Db>>,
     kek_provider: Arc<RwLock<Arc<dyn KekProvider>>>,
     rotation_lock: Arc<AsyncRwLock<()>>,
+    secret_waiter_gate: Arc<Semaphore>,
     audit_log: Option<Arc<FileAuditLog>>,
     security_audit_catalog: Option<Arc<dyn CatalogStore>>,
     management_operations: Option<ManagementOperationStore>,
@@ -271,6 +393,7 @@ impl SecretStore {
             db,
             kek_provider: Arc::new(RwLock::new(kek_provider)),
             rotation_lock: Arc::new(AsyncRwLock::new(())),
+            secret_waiter_gate: Arc::new(Semaphore::new(MAX_SECRET_STORE_WAITERS)),
             audit_log: None,
             security_audit_catalog: None,
             management_operations: None,
@@ -430,9 +553,23 @@ impl SecretStore {
         self.kek_provider.read().clone()
     }
 
-    /// Return fill levels for bounded secret-store state and scans.
+    /// Return fill levels for bounded secret-store state, scans, and rotation work.
     pub fn metrics(&self) -> SecretStoreMetricsSnapshot {
-        self.metrics.snapshot()
+        let mut snapshot = self.metrics.snapshot();
+        snapshot.rotation_waiter_fill_level =
+            MAX_SECRET_STORE_WAITERS - self.secret_waiter_gate.available_permits();
+        snapshot
+    }
+
+    fn admit_secret_waiter(&self) -> Result<OwnedSemaphorePermit, SecretStoreError> {
+        self.secret_waiter_gate
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                SecretStoreError::capacity_exceeded(format!(
+                    "secret rotation waiter limit reached (maximum {MAX_SECRET_STORE_WAITERS}); retry after active operations complete"
+                ))
+            })
     }
 
     /// Subscribe to the latest secret rotation notification.
@@ -459,8 +596,10 @@ impl SecretStore {
         secret_name: &str,
         ref_name: &str,
     ) -> Result<bool, SecretStoreError> {
+        let _waiter = self.admit_secret_waiter()?;
         let _reference_lock = self.reference_mutation_lock.lock().await;
         let rotation = self.rotation_lock.clone().read_owned().await;
+        drop(_waiter);
         let secret_name = secret_name.trim();
         let ref_name = ref_name.trim();
         if ref_name.is_empty() {
@@ -526,8 +665,10 @@ impl SecretStore {
         secret_name: &str,
         ref_name: &str,
     ) -> Result<(), SecretStoreError> {
+        let _waiter = self.admit_secret_waiter()?;
         let _reference_lock = self.reference_mutation_lock.lock().await;
         let rotation = self.rotation_lock.clone().read_owned().await;
+        drop(_waiter);
         let secret_name = secret_name.trim();
         let ref_name = ref_name.trim();
         let key = (namespace_id, secret_name.to_string());
@@ -566,8 +707,10 @@ impl SecretStore {
         namespace_id: u128,
         secret_name: &str,
     ) -> Result<Vec<String>, SecretStoreError> {
+        let _waiter = self.admit_secret_waiter()?;
         let _reference_lock = self.reference_mutation_lock.lock().await;
         let _rotation = self.rotation_lock.read().await;
+        drop(_waiter);
         let secret_name = secret_name.trim();
         let encrypted = self.get_encrypted_raw(namespace_id, secret_name).await?;
         let mut references = encrypted
@@ -775,12 +918,15 @@ impl SecretStore {
         payload: HashMap<String, String>,
         actor: &str,
     ) -> Result<SecretMetadata, SecretStoreError> {
+        let _waiter = self.admit_secret_waiter()?;
         let _reference_lock = self.reference_mutation_lock.lock().await;
         let rotation = self.rotation_lock.clone().read_owned().await;
+        drop(_waiter);
         let trimmed_name = name.trim();
         if trimmed_name.is_empty() {
             return Err(SecretStoreError::ddl_invalid("secret name cannot be empty"));
         }
+        drop(serialize_worker_secret_payload(&payload)?);
 
         if self
             .get_encrypted_raw(namespace_id, trimmed_name)
@@ -1020,6 +1166,7 @@ impl SecretStore {
         mut audit: Option<SecurityAuditRecord>,
         operation_id: Option<&str>,
     ) -> Result<Option<SecretMetadata>, SecretStoreError> {
+        let _waiter = self.admit_secret_waiter()?;
         let _reference_lock = self.reference_mutation_lock.lock().await;
         let _audit_lock = self.security_audit_lock.lock().await;
         if self.security_audit_catalog.is_some() && audit.is_none() {
@@ -1063,7 +1210,9 @@ impl SecretStore {
                 ));
             }
         }
+        drop(serialize_worker_secret_payload(&payload)?);
         let rotation = self.rotation_lock.clone().read_owned().await;
+        drop(_waiter);
         let trimmed_name = name.trim();
         let existing = match self.get_encrypted_raw(namespace_id, trimmed_name).await? {
             Some(e) => e,
@@ -1140,8 +1289,10 @@ impl SecretStore {
         name: &str,
         actor: &str,
     ) -> Result<(), SecretStoreError> {
+        let _waiter = self.admit_secret_waiter()?;
         let _reference_lock = self.reference_mutation_lock.lock().await;
         let _rotation = self.rotation_lock.clone().read_owned().await;
+        drop(_waiter);
         let trimmed_name = name.trim();
         let encrypted = match self.get_encrypted_raw(namespace_id, trimmed_name).await? {
             Some(e) => e,
@@ -1181,7 +1332,9 @@ impl SecretStore {
         namespace_id: u128,
         name: &str,
     ) -> Result<Secret, SecretStoreError> {
+        let _waiter = self.admit_secret_waiter()?;
         let _rotation = self.rotation_lock.read().await;
+        drop(_waiter);
         let trimmed_name = name.trim();
         let encrypted = match self.get_encrypted_raw(namespace_id, trimmed_name).await? {
             Some(e) => e,
@@ -1277,7 +1430,9 @@ impl SecretStore {
         new_kek_provider: Arc<dyn KekProvider>,
         actor: &str,
     ) -> Result<usize, SecretStoreError> {
+        let _waiter = self.admit_secret_waiter()?;
         let rotation = self.rotation_lock.clone().write_owned().await;
+        drop(_waiter);
         if self.db.is_some() {
             self.flush_pending_security_audit_outbox_locked().await?;
         }
@@ -1286,6 +1441,7 @@ impl SecretStore {
 
         if let Some(db) = &self.db {
             let mut batch = WriteBatch::new();
+            let mut staging = KekRotationStagingGauge::new(self.metrics.clone());
             let prefix = CATALOG_SECRETS_PREFIX;
             let mut iter = db
                 .scan_prefix(&prefix, ..)
@@ -1303,6 +1459,7 @@ impl SecretStore {
                         .await?;
                 let serialized = serde_json::to_vec(&rotated)
                     .map_err(|e| SecretStoreError::storage(format!("serialize failed: {e}")))?;
+                staging.add(serialized.len())?;
                 batch.put(&entry.key, &serialized);
                 rotated_count += 1;
                 self.metrics
@@ -1337,6 +1494,7 @@ impl SecretStore {
             let audit_key = security_audit_outbox_key(&audit_record.event_id);
             let audit_bytes = serde_json::to_vec(&audit_record)
                 .map_err(|error| SecretStoreError::storage(error.to_string()))?;
+            staging.add(audit_bytes.len())?;
             batch.put(&audit_key, &audit_bytes);
 
             let db = db.clone();
@@ -1345,6 +1503,7 @@ impl SecretStore {
             let event = AuditEvent::now(actor, "secret.rotated", "cluster_kek");
             // Cancellation must not separate rewrapping, provider switch, and audit commit.
             return tokio::spawn(async move {
+                let _staging = staging;
                 let _rotation = rotation;
                 *provider.write() =
                     Arc::new(RetainedKekProvider::new(old_kek, new_kek_provider.clone()));
@@ -1374,25 +1533,38 @@ impl SecretStore {
             .await
             .map_err(|e| SecretStoreError::rotation_failed(e.to_string()))?;
         } else {
+            let mut staging = KekRotationStagingGauge::new(self.metrics.clone());
             let mut entries: Vec<_> = {
                 let map = self.in_memory.read();
-                map.iter()
-                    .map(|(key, encrypted)| (key.clone(), encrypted.clone()))
-                    .collect()
+                let mut entries = Vec::with_capacity(map.len());
+                for (key, encrypted) in map.iter() {
+                    let serialized = serde_json::to_vec(encrypted).map_err(|error| {
+                        SecretStoreError::storage(format!("serialize failed: {error}"))
+                    })?;
+                    staging.add(serialized.len())?;
+                    entries.push((key.clone(), encrypted.clone(), serialized.len()));
+                }
+                entries
             };
-            if entries.len() > MAX_IN_MEMORY_SECRETS {
-                return Err(SecretStoreError::capacity_exceeded(
-                    "in-memory secret rotation window limit reached",
-                ));
-            }
-            for (_, enc) in &mut entries {
-                *enc = rotate_secret_kek(enc, old_kek.as_ref(), new_kek_provider.as_ref()).await?;
+            for (_, encrypted, staged_bytes) in &mut entries {
+                let rotated =
+                    rotate_secret_kek(encrypted, old_kek.as_ref(), new_kek_provider.as_ref())
+                        .await?;
+                let serialized = serde_json::to_vec(&rotated).map_err(|error| {
+                    SecretStoreError::storage(format!("serialize failed: {error}"))
+                })?;
+                staging.replace(*staged_bytes, serialized.len())?;
+                *encrypted = rotated;
+                *staged_bytes = serialized.len();
                 rotated_count += 1;
                 self.metrics
                     .secret_scan_fill_level
                     .store(rotated_count, Ordering::Relaxed);
             }
-            *self.in_memory.write() = entries.into_iter().collect();
+            *self.in_memory.write() = entries
+                .into_iter()
+                .map(|(key, encrypted, _)| (key, encrypted))
+                .collect();
         }
 
         *self.kek_provider.write() = new_kek_provider;
@@ -1421,8 +1593,7 @@ impl SecretStore {
 
         let node_key = SecretToken::workload_key(worker_identity, workload_id);
 
-        let serialized_payload = serde_json::to_vec(&secret.payload)
-            .map_err(|e| SecretStoreError::encryption_failed(format!("serialize failed: {e}")))?;
+        let serialized_payload = serialize_worker_secret_payload(&secret.payload)?;
 
         let (encrypted_payload, nonce) =
             crate::kek::encrypt_aes_256_gcm(&node_key, &serialized_payload)?;
@@ -1451,5 +1622,88 @@ impl SecretStore {
         );
 
         Ok(token)
+    }
+}
+
+#[cfg(test)]
+mod rotation_capacity_tests {
+    use super::*;
+    use crate::kek::EnvKekProvider;
+
+    #[test]
+    fn kek_rotation_staging_accepts_exact_limits_and_rejects_overflow() {
+        assert_eq!(
+            next_kek_rotation_staging_fill(
+                MAX_KEK_ROTATION_STAGED_ENTRIES - 1,
+                MAX_KEK_ROTATION_STAGING_BYTES - 1,
+                1,
+            )
+            .unwrap(),
+            (
+                MAX_KEK_ROTATION_STAGED_ENTRIES,
+                MAX_KEK_ROTATION_STAGING_BYTES
+            )
+        );
+        let error = next_kek_rotation_staging_fill(
+            MAX_KEK_ROTATION_STAGED_ENTRIES,
+            MAX_KEK_ROTATION_STAGING_BYTES,
+            1,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "[RS-3601] secret.capacity_exceeded: KEK rotation staging limit reached (maximum 1000000 entries and 67108864 serialized bytes). Next steps: remove unused secrets or references, then retry."
+        );
+        for (entries, bytes, next_bytes) in [
+            (MAX_KEK_ROTATION_STAGED_ENTRIES, 0, 0),
+            (0, MAX_KEK_ROTATION_STAGING_BYTES, 1),
+        ] {
+            assert_eq!(
+                next_kek_rotation_staging_fill(entries, bytes, next_bytes)
+                    .unwrap_err()
+                    .to_string(),
+                "[RS-3601] secret.capacity_exceeded: KEK rotation staging limit reached (maximum 1000000 entries and 67108864 serialized bytes). Next steps: remove unused secrets or references, then retry."
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn secret_rotation_waiter_overflow_reports_exact_error_and_fill() {
+        let store = SecretStore::new(None, Arc::new(EnvKekProvider::new([1; 32])));
+        let permits: Vec<_> = (0..MAX_SECRET_STORE_WAITERS)
+            .map(|_| {
+                store
+                    .secret_waiter_gate
+                    .clone()
+                    .try_acquire_owned()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            store.metrics().rotation_waiter_fill_level,
+            MAX_SECRET_STORE_WAITERS
+        );
+
+        let error = store.get_secret(0, "missing").await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "[RS-3601] secret.capacity_exceeded: secret rotation waiter limit reached (maximum 64); retry after active operations complete. Next steps: remove unused secrets or references, then retry."
+        );
+
+        drop(permits);
+        assert_eq!(store.metrics().rotation_waiter_fill_level, 0);
+    }
+
+    #[test]
+    fn kek_rotation_staging_gauges_clear_after_drop() {
+        let metrics = Arc::new(SecretStoreMetrics::default());
+        {
+            let mut staging = KekRotationStagingGauge::new(metrics.clone());
+            staging.add(17).unwrap();
+            assert_eq!(metrics.snapshot().kek_rotation_staging_fill_level, 1);
+            assert_eq!(metrics.snapshot().kek_rotation_staging_bytes, 17);
+        }
+        assert_eq!(metrics.snapshot().kek_rotation_staging_fill_level, 0);
+        assert_eq!(metrics.snapshot().kek_rotation_staging_bytes, 0);
     }
 }

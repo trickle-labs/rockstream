@@ -53,7 +53,7 @@ if [ -z "$changed_files" ]; then
     exit 0
 fi
 
-# Coordination crates and design doc — changes here require a model touch.
+# Coordination implementation sources and design doc — changes here require a model touch.
 # Data-plane behavior covered by focused checks does not need a FizzBee model.
 # Durable catalog reconstruction is specified in FIZZBEE_TEST_PLAN.md §3.6 and
 # checked by exact catalog recovery tests.
@@ -65,10 +65,10 @@ if [ -z "$changed_files" ]; then
 fi
 
 COORDINATION_PATTERNS=(
-    "crates/rockstream-runtime/"
-    "crates/rockstream-control/"
-    "crates/rockstream-connectors/"
-    "crates/rockstream-storage/"
+    "crates/rockstream-runtime/src/"
+    "crates/rockstream-control/src/"
+    "crates/rockstream-connectors/src/"
+    "crates/rockstream-storage/src/"
     "DESIGN.md"
 )
 
@@ -87,7 +87,7 @@ for pattern in "${COORDINATION_PATTERNS[@]}"; do
 done
 
 if [ "$coordination_changed" -eq 0 ]; then
-    echo "check-path-coupling: no coordination-crate or DESIGN.md changes — OK."
+    echo "check-path-coupling: no coordination source or DESIGN.md changes — OK."
     exit 0
 fi
 
@@ -102,11 +102,11 @@ done
 
 if [ "$model_touched" -eq 0 ]; then
     echo ""
-    echo "PATH-COUPLING VIOLATION: coordination-crate or DESIGN.md changed without a"
+    echo "PATH-COUPLING VIOLATION: coordination source or DESIGN.md changed without a"
     echo "corresponding touch to formal/*.fizz or FIZZBEE_TEST_PLAN.md."
     echo ""
     echo "Changed coordination files:"
-    echo "$changed_files" | grep -E "^(crates/rockstream-(runtime|control|connectors|storage)/|DESIGN\.md)" || true
+    echo "$changed_files" | grep -E "^(crates/rockstream-(runtime|control|connectors|storage)/src/|DESIGN\.md)" || true
     echo ""
     echo "Fix: update the relevant FizzBee model and/or FIZZBEE_TEST_PLAN.md §3.6"
     echo "to reflect the protocol change before merging."

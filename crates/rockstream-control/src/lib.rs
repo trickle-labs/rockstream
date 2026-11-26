@@ -95,6 +95,8 @@ pub use rockstream_types::migration::MigrationProgress;
 pub use scheduler::{ShardAssignment, ShardScheduler};
 pub use secret_store::{
     SecretListing, SecretRotationOperationError, SecretStore, SecretStoreError,
+    SecretStoreMetricsSnapshot, MAX_KEK_ROTATION_STAGED_ENTRIES, MAX_KEK_ROTATION_STAGING_BYTES,
+    MAX_SECRET_STORE_WAITERS,
 };
 pub use service::{ControlService, ControlServiceHandle};
 pub use shard::{LeaseError, ShardManager, ShardManagerSnapshot, ShardPersistentStore};

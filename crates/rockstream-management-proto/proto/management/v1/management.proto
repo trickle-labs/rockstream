@@ -9,6 +9,7 @@ service ManagementService {
   rpc ListShards(ListShardsRequest) returns (ListShardsResponse);
   rpc GetShard(GetShardRequest) returns (GetShardResponse);
   rpc ListOperations(ListOperationsRequest) returns (ListOperationsResponse);
+  rpc ListSecurityAuditRecords(ListSecurityAuditRecordsRequest) returns (ListSecurityAuditRecordsResponse);
   rpc ListSecurityPrincipals(ListSecurityPrincipalsRequest) returns (ListSecurityPrincipalsResponse);
   rpc SetSecurityPrincipalGrants(SetSecurityPrincipalGrantsRequest) returns (SetSecurityPrincipalGrantsResponse);
   rpc GetOperation(GetOperationRequest) returns (GetOperationResponse);
@@ -111,6 +112,21 @@ message ListOperationsResponse {
   string observed_at = 2;
   string source_version = 3;
   repeated Operation operations = 4;
+  string next_page_token = 5;
+}
+message ListSecurityAuditRecordsRequest {
+  uint32 protocol_version = 1;
+  optional uint64 from_timestamp_ms = 2;
+  optional uint64 to_timestamp_ms = 3;
+  uint32 page_size = 4;
+  string page_token = 5;
+}
+message ListSecurityAuditRecordsResponse {
+  uint32 protocol_version = 1;
+  string observed_at = 2;
+  string source_version = 3;
+  // Each entry is JSON for one SecurityAuditRecord in its versioned record format.
+  repeated string records_json = 4;
   string next_page_token = 5;
 }
 message GetOperationRequest { uint32 protocol_version = 1; string operation_id = 2; }

@@ -1,7 +1,7 @@
 use rockstream_management_proto::{ensure_protocol_version, v1, PROTOCOL_VERSION};
 
 #[test]
-fn management_v1_contract_has_all_eighteen_methods() {
+fn management_v1_contract_has_all_nineteen_methods() {
     let proto = include_str!("../proto/management/v1/management.proto");
     let service = proto
         .split("service ManagementService {")
@@ -25,6 +25,7 @@ fn management_v1_contract_has_all_eighteen_methods() {
             "rpc ListShards(ListShardsRequest) returns (ListShardsResponse);",
             "rpc GetShard(GetShardRequest) returns (GetShardResponse);",
             "rpc ListOperations(ListOperationsRequest) returns (ListOperationsResponse);",
+            "rpc ListSecurityAuditRecords(ListSecurityAuditRecordsRequest) returns (ListSecurityAuditRecordsResponse);",
             "rpc ListSecurityPrincipals(ListSecurityPrincipalsRequest) returns (ListSecurityPrincipalsResponse);",
             "rpc SetSecurityPrincipalGrants(SetSecurityPrincipalGrantsRequest) returns (SetSecurityPrincipalGrantsResponse);",
             "rpc GetOperation(GetOperationRequest) returns (GetOperationResponse);",
@@ -160,6 +161,12 @@ impl v1::management_service_server::ManagementService for TestService {
         &self,
         _: tonic::Request<v1::ListOperationsRequest>,
     ) -> Result<tonic::Response<v1::ListOperationsResponse>, tonic::Status> {
+        Err(rockstream_management_proto::unavailable_status())
+    }
+    async fn list_security_audit_records(
+        &self,
+        _: tonic::Request<v1::ListSecurityAuditRecordsRequest>,
+    ) -> Result<tonic::Response<v1::ListSecurityAuditRecordsResponse>, tonic::Status> {
         Err(rockstream_management_proto::unavailable_status())
     }
     async fn list_security_principals(

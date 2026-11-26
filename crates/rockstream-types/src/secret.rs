@@ -5,6 +5,9 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock};
 
+/// Maximum serialized credential payload carried by one worker secret token.
+pub const MAX_WORKER_SECRET_TOKEN_PAYLOAD_BYTES: usize = 1024 * 1024;
+
 /// Return the name carried by a supported secret reference.
 ///
 /// Bare names are accepted for reading legacy catalog entries and the

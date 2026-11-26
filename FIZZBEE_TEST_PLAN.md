@@ -714,6 +714,13 @@ model; no new FizzBee transition or invariant is asserted.
 
 ### 3.6 Cross-Cutting Coverage Assertions
 
+PR #455 (issue #303) changes only malformed control-message diagnostics in
+`crates/rockstream-runtime/src/client.rs`: the read loop still skips invalid
+lines, while logs retain the error code, decoder error, and byte length without
+the raw message. `client::data_plane_tests::invalid_control_message_log_has_exact_redacted_output`
+asserts the complete log record. No coordinator or worker state transitions
+change, so the existing model assumptions remain unchanged.
+
 PR #420 (issue #400) completes the direct distributed execution path across
 `rockstream-control`, `rockstream-runtime`, `rockstream-storage`, and
 `rockstream-sql`. Control-plane `GetWorkloadTopology` exposes a versioned
@@ -821,6 +828,17 @@ existing audit commit and recovery outcomes; they add no M1–M7 transition or
 authorization rule. `security_audit_metrics_tests.rs::durable_audit_metrics_follow_commit_and_restart`
 and `security_audit_health_tests.rs::audit_storage_degradation_is_visible_without_failing_ready_health`
 check the metric and health surfaces.
+
+PR #445 (issue #305) adds the management `ListSecurityAuditRecords` endpoint
+over the existing durable audit catalog. The handler authorizes
+`SecurityAuditRead` for the requested `AuditRange` and policy revision, binds
+page tokens to that range, and returns bounded versioned-JSON pages. Its
+authorization-denial audit append changes no M1–M7 coordination transition.
+`management.rs::security_audit_history_is_range_authorized_and_paginated`
+checks exact page records, range-bound token rejection, denial status, and the
+normalized denial audit record. This management-query evidence does not
+qualify audit retention, storage-full recovery, or the complete v0.73 audit
+contract.
 
 Issue #304 wires `sasl_plain` references into SQL Kafka sinks. Resolution checks
 the durable consumer grant and secret version; a replacement transactional
@@ -938,6 +956,23 @@ reopened store retains the reference and continues to reject secret deletion.
 The `sink_secret_reference_blocks_secret_drop_until_sink_drop` regression in
 `crates/rockstream-gateway/src/server.rs` verifies that a sink binding blocks
 deletion until `DROP SINK` removes it.
+
+PR #450 adds a 1 MiB serialized worker-secret payload cap and a per-worker cache
+cap of 1,024 entries and 64 MiB across active and pending generations.
+`secrets_lifecycle_tests.rs::worker_secret_payload_limit_accepts_exact_bound_and_rejects_overflow`
+and `worker_secret_resolution_tests.rs::worker_accepts_maximum_payload_and_rejects_one_byte_over`
+check exact-bound and overflow rejection without changing the stored secret or
+retained-byte metric. `worker_secret_resolution_tests.rs::worker_resolves_exact_payload_in_memory_and_rejects_wrong_identity`
+checks active/pending promotion, and
+`runtime/src/secrets.rs::cache_byte_admission_counts_active_and_pending_generations`
+checks cache byte-accounting arithmetic, and
+`runtime/src/secrets.rs::expired_cache_entry_does_not_block_replacement_admission`
+verifies that an expired active payload releases its recorded bytes before a
+fresh token is admitted. These worker-local resource bounds add no M1–M7
+coordination transition; the formal models still do not represent cache bytes
+or token admission. This is partial #304 resource-bound evidence, not
+release-process cache-pressure, cancellation/expiry recovery, or complete
+secret-rotation qualification.
 
 Issue #306 keeps release support artifacts sanitized and addresses downloads by
 opaque artifact ID bound to the authenticated principal and scope. The release
@@ -1609,6 +1644,18 @@ SQL catalog tables (`rockstream_catalog.*`). While diagnostic inspection and
 metrics export are outside the internal M1–M7 FizzBee consensus models, health
 and status evaluations reflect durable shard/worker state and are verified by
 integration test suites and deterministic simulation tests.
+
+PR #453 (issue #304) bounds KEK rotation staging at 1,000,000 entries and 64
+MiB of serialized values (including the durable audit outbox record), and caps
+secret-store rotation-lock admissions at 64. An over-limit item is rejected
+before it is added to the durable batch or applied to in-memory secrets. The
+`secret_store.rs` tests `kek_rotation_staging_accepts_exact_limits_and_rejects_overflow`,
+`secret_rotation_waiter_overflow_reports_exact_error_and_fill`, and
+`kek_rotation_staging_gauges_clear_after_drop` check the exact boundary and
+error, waiter fill and rejection, and staging-gauge reset. These are
+implementation-level resource-admission assertions: M1–M7 do not model secret
+rotation or store waiters, so this slice adds no FizzBee transition. Connector
+credential-rotation continuity remains open.
 
 A failing `exists` assertion means the fault is not being explored and the
 corresponding `always` proofs are untrustworthy — treated as a build failure.
