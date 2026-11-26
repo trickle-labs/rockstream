@@ -8392,25 +8392,89 @@ async fn operator_only_management_access_keeps_artifacts_and_denies_backup_creat
     );
 
     let idempotency_key = uuid::Uuid::new_v4().to_string();
-    let artifact = client
-        .generate_support_artifact(GenerateSupportArtifactRequest {
-            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
-            node_id: String::new(),
-            idempotency_key: idempotency_key.clone(),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(artifact.opaque_id, idempotency_key);
-    let generated_at_ms = artifact.expires_at_ms - 600_000;
+    let started_at_ms = chrono::Utc::now().timestamp_millis().max(1) as u64;
+    let management_cli = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_rockstream"));
+        command
+            .arg("--json")
+            .arg("--management")
+            .arg(management_address.to_string())
+            .arg("--tls-ca-cert-path")
+            .arg(&pki.ca_cert_path)
+            .arg("--tls-cert-path")
+            .arg(&pki.secondary_cli_cert_path)
+            .arg("--tls-key-path")
+            .arg(&pki.secondary_cli_key_path);
+        command
+    };
+    let create = management_cli()
+        .args(["support", "artifact", "create", "--idempotency-key"])
+        .arg(&idempotency_key)
+        .output()
+        .unwrap();
+    assert!(
+        create.status.success(),
+        "support artifact create failed: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    let created: rockstream_cli::output::ManagementSupportArtifactInfo =
+        serde_json::from_slice(&create.stdout).unwrap();
+    assert_eq!(created.opaque_id, idempotency_key);
+    assert!(created.expires_at_ms > started_at_ms);
+    let expected_created = rockstream_cli::output::ManagementSupportArtifactInfo {
+        opaque_id: idempotency_key.clone(),
+        expires_at_ms: created.expires_at_ms,
+        downloaded_to: None,
+        size_bytes: None,
+    };
+    assert_eq!(created, expected_created);
+    assert_eq!(
+        String::from_utf8(create.stdout).unwrap(),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&expected_created).unwrap()
+        )
+    );
+
+    let artifact_path = temp.path().join("operator-support-artifact.json");
+    let download = management_cli()
+        .args(["support", "artifact", "download"])
+        .arg(&idempotency_key)
+        .arg("--out")
+        .arg(&artifact_path)
+        .output()
+        .unwrap();
+    assert!(
+        download.status.success(),
+        "support artifact download failed: {}",
+        String::from_utf8_lossy(&download.stderr)
+    );
+    let content = std::fs::read(&artifact_path).unwrap();
+    let generated_at_ms = created.expires_at_ms - 600_000;
     let expected_content = format!(
         "{{\"format_version\":1,\"generated_at_ms\":{generated_at_ms},\"scope\":\"cluster\",\"source_version\":\"rockstream:{}\",\"topology_revision\":1,\"active_operations\":1,\"retained_operations\":1,\"node\":null}}",
         env!("CARGO_PKG_VERSION")
     );
-    let (content, expires_at_ms) =
-        download_support_artifact(&mut client, &artifact.opaque_id).await;
-    assert_eq!(String::from_utf8(content).unwrap(), expected_content);
-    assert_eq!(expires_at_ms, artifact.expires_at_ms);
+    assert_eq!(
+        String::from_utf8(content.clone()).unwrap(),
+        expected_content
+    );
+    let expected_downloaded = rockstream_cli::output::ManagementSupportArtifactInfo {
+        opaque_id: idempotency_key,
+        expires_at_ms: created.expires_at_ms,
+        downloaded_to: Some(artifact_path.to_string_lossy().into_owned()),
+        size_bytes: Some(content.len() as u64),
+    };
+    let downloaded: rockstream_cli::output::ManagementSupportArtifactInfo =
+        serde_json::from_slice(&download.stdout).unwrap();
+    assert_eq!(downloaded, expected_downloaded);
+    assert_eq!(
+        String::from_utf8(download.stdout).unwrap(),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&expected_downloaded).unwrap()
+        )
+    );
 
     let principal_request = rockstream_management_proto::v1::ListSecurityPrincipalsRequest {
         protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
