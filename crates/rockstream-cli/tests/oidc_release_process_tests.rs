@@ -11789,13 +11789,23 @@ async fn support_artifact_download_limit_holds_under_release_process_pressure() 
         .list_security_audit_records()
         .await
         .unwrap();
-    assert_eq!(records.len(), audit_before.len() + 20);
     assert_eq!(&records[..audit_before.len()], audit_before.as_slice());
     let expected_scope = serde_json::to_string(&PolicyScope::Artifact {
         opaque_id: artifact_id.clone(),
     })
     .unwrap();
-    let mut downloads = records[audit_before.len()..].to_vec();
+    let download_target = AuditField::Known(format!("support-artifact:{artifact_id}"));
+    let mut downloads = Vec::new();
+    for record in &records[audit_before.len()..] {
+        if record.target == download_target {
+            downloads.push(record.clone());
+        } else {
+            assert_eq!(record.action, SecurityAuditClass::AuthenticationSuccess);
+            assert_eq!(record.outcome, SecurityAuditOutcome::Success);
+            assert_eq!(record.target, AuditField::Known("management-api".to_owned()));
+            assert_eq!(record.actor, AuditIdentity::Verified("principal:1".to_owned()));
+        }
+    }
     let mut event_ids = Vec::new();
     for record in &mut downloads {
         assert!(record.timestamp_ms > 0);
