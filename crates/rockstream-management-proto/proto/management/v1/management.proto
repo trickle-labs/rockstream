@@ -11,6 +11,7 @@ service ManagementService {
   rpc ListOperations(ListOperationsRequest) returns (ListOperationsResponse);
   rpc ListSecurityAuditRecords(ListSecurityAuditRecordsRequest) returns (ListSecurityAuditRecordsResponse);
   rpc ListSecurityPrincipals(ListSecurityPrincipalsRequest) returns (ListSecurityPrincipalsResponse);
+  rpc CreateServicePrincipal(CreateServicePrincipalRequest) returns (CreateServicePrincipalResponse);
   rpc SetSecurityPrincipalGrants(SetSecurityPrincipalGrantsRequest) returns (SetSecurityPrincipalGrantsResponse);
   rpc GetOperation(GetOperationRequest) returns (GetOperationResponse);
   rpc GetConfigSummary(GetConfigSummaryRequest) returns (GetConfigSummaryResponse);
@@ -168,6 +169,7 @@ message SecurityPrincipal {
   repeated SecurityPresetGrant preset_grants = 5;
   repeated SecurityActionGrant scoped_grants = 6;
   repeated SecurityActionGrant effective_permissions = 7;
+  repeated string service_ids = 8;
 }
 message SecurityPresetGrant {
   string preset = 1;
@@ -176,6 +178,19 @@ message SecurityPresetGrant {
 message SecurityActionGrant {
   string action = 1;
   string scope_json = 2;
+}
+message CreateServicePrincipalRequest {
+  uint32 protocol_version = 1;
+  uint64 principal_id = 2;
+  string display_name = 3;
+  string service_id = 4;
+  uint64 expected_grantor_revision = 5;
+  string idempotency_key = 6;
+  repeated SecurityActionGrant scoped_grants = 7;
+}
+message CreateServicePrincipalResponse {
+  uint32 protocol_version = 1;
+  SecurityPrincipal principal = 2;
 }
 message SetSecurityPrincipalGrantsRequest {
   uint32 protocol_version = 1;

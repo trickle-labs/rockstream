@@ -23,7 +23,8 @@ The protocol version is `1`. Every request carries `protocol_version`. The serve
 | `GetShard` | Returns one current shard lease or `NOT_FOUND`. |
 | `ListOperations` | Returns a page of retained operation records. |
 | `GetOperation` | Returns one operation or `NOT_FOUND`. |
-| `ListSecurityPrincipals` | Returns safe principal, fixed-preset, scoped-grant, and effective-permission data to a principal authorized for grant management. Login credentials are omitted. |
+| `ListSecurityPrincipals` | Returns safe principal, service-identity, fixed-preset, scoped-grant, and effective-permission data to a principal authorized for grant management. Login credentials are omitted. |
+| `CreateServicePrincipal` | Creates an enabled service-only principal with scoped grants after checking the reviewed grantor revision. The principal and correlated grant/completion audit records commit together; retry the same canonical UUID after a lost response. |
 | `SetSecurityPrincipalGrants` | Replaces an existing principal's grants after checking the reviewed target and grantor revisions. Persists the operation before applying the change and commits the grant record with its audit event. |
 | `GetConfigSummary` | Returns effective configuration values and redaction flags. |
 | `GetCapabilities` | Returns the methods attached to this server. |
@@ -120,6 +121,6 @@ Cancellation is allowed before lease transfer. A migration cancelled during dono
 
 Management RPC errors retain their gRPC status. The CLI currently maps management status errors to `RS-0003`, so automation cannot distinguish every gRPC failure through the CLI output.
 
-`SetSecurityPrincipalGrants` updates grants on an existing principal. Principal creation, deletion, login-method changes, password changes, and their bootstrap workflows have separate interfaces and are not implemented by this RPC. The CLI's local identity flags do not authenticate a caller to the management service.
+`CreateServicePrincipal` creates a service identity with scoped grants and no presets. Principal deletion, interactive login-method changes, password changes, and bootstrap recovery use separate interfaces. The CLI's local identity flags do not authenticate a caller to the management service.
 
 The server has no authoritative process-health telemetry, so `GetHealth` returns `unknown`. This is the qualified behavior for v0.66; the limitation remains explicit until health telemetry is implemented.
