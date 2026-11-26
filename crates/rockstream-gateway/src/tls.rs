@@ -71,9 +71,15 @@ fn read_path(path: &Path) -> Result<Vec<u8>, GatewayTlsError> {
 /// Load a PEM-encoded certificate chain from `path`.
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, GatewayTlsError> {
     let bytes = read_path(path)?;
-    rustls_pemfile::certs(&mut bytes.as_slice())
+    let certs = rustls_pemfile::certs(&mut bytes.as_slice())
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| GatewayTlsError::Parse(format!("invalid certificate PEM in {path:?}: {e}")))
+        .map_err(|e| GatewayTlsError::Parse(format!("invalid certificate PEM in {path:?}: {e}")))?;
+    if certs.is_empty() {
+        return Err(GatewayTlsError::Parse(format!(
+            "no certificates found in {path:?}"
+        )));
+    }
+    Ok(certs)
 }
 
 /// Load a single PEM-encoded private key from `path`.
@@ -107,6 +113,14 @@ pub fn build_tls_acceptor(
     let _ = rustls::crypto::ring::default_provider().install_default();
     let certs = load_certs(cert_path)?;
     let key = load_private_key(key_path)?;
+    rockstream_types::tls::validate_server_certificate(&certs[0]).map_err(|error| {
+        GatewayTlsError::Parse(
+            error
+                .strip_prefix("RS-2411: ")
+                .unwrap_or(&error)
+                .to_string(),
+        )
+    })?;
 
     let config = if let Some(ca_path) = ca_cert_path {
         let ca_certs = load_certs(ca_path)?;
@@ -319,5 +333,23 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("RS-2405"));
+    }
+
+    #[test]
+    fn build_tls_acceptor_reports_rs_2405_for_empty_cert_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let cert_path = temp.path().join("empty.pem");
+        std::fs::write(&cert_path, b"").unwrap();
+
+        let err = match build_tls_acceptor(&cert_path, Path::new("/nonexistent/key.pem"), None) {
+            Ok(_) => panic!("empty certificate file must fail without panicking"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "[RS-2405] auth.tls_config_invalid: no certificates found in {cert_path:?}. next_steps: Verify the configured paths point to valid PEM-encoded certificate/key files readable by the gateway process."
+            )
+        );
     }
 }
