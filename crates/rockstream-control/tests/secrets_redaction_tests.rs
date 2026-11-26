@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rockstream_control::audit::FileAuditLog;
 use rockstream_control::kek::EnvKekProvider;
 use rockstream_control::{SecretListing, SecretStore};
@@ -18,12 +19,16 @@ async fn secret_literal_is_absent_from_audit_and_metadata_artifacts() {
     )
     .with_audit_log(audit.clone());
     let literal = "literal-secret-that-must-not-leak";
+    let encoded_literal = STANDARD.encode(literal);
     store
         .create_secret(
             0,
             "redacted",
             SecretType::BearerToken,
-            HashMap::from([(String::from("token"), literal.to_string())]),
+            HashMap::from([
+                (String::from("token"), literal.to_string()),
+                (String::from("encoded"), encoded_literal.clone()),
+            ]),
             "admin",
         )
         .await
@@ -61,9 +66,11 @@ async fn secret_literal_is_absent_from_audit_and_metadata_artifacts() {
     expected_audit_bytes.push(b'\n');
     let audit_bytes = std::fs::read(&audit_path).unwrap();
     assert_eq!(audit_bytes, expected_audit_bytes);
-    assert!(!audit_bytes
-        .windows(literal.len())
-        .any(|window| window == literal.as_bytes()));
+    for forbidden in [literal.as_bytes(), encoded_literal.as_bytes()] {
+        assert!(!audit_bytes
+            .windows(forbidden.len())
+            .any(|window| window == forbidden));
+    }
 
     let metadata = serde_json::json!({
         "name": listing[0].name,
@@ -83,7 +90,9 @@ async fn secret_literal_is_absent_from_audit_and_metadata_artifacts() {
         })
     );
     let metadata_bytes = serde_json::to_vec(&metadata).unwrap();
-    assert!(!metadata_bytes
-        .windows(literal.len())
-        .any(|window| window == literal.as_bytes()));
+    for forbidden in [literal.as_bytes(), encoded_literal.as_bytes()] {
+        assert!(!metadata_bytes
+            .windows(forbidden.len())
+            .any(|window| window == forbidden));
+    }
 }
