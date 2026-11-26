@@ -1405,6 +1405,143 @@ async fn support_artifact_object_path(
 }
 
 #[tokio::test]
+async fn release_control_rejects_client_certificate_for_worker_registration() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("control-storage");
+    let pki = rockstream_test_support::pki::TestPki::generate();
+    let control_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let management_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let operator = mtls_operator_with_fingerprint(certificate_sha256(&pki.secondary_cli_cert_path));
+    let mut process = start_delegated_control_process_with_management_address(
+        temp.path(),
+        &storage,
+        (control_address, management_address),
+        &pki,
+        Some(operator),
+        false,
+        None,
+    )
+    .await;
+    wait_for_gateway(&mut process.0, control_address).await;
+
+    let mut admin = wait_for_management_client(management_address, &pki).await;
+    let principal_page = admin
+        .list_security_principals(ListSecurityPrincipalsRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            page_size: 10,
+            page_token: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        principal_page
+            .principals
+            .iter()
+            .map(|principal| (principal.principal_id, principal.display_name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, "release control test administrator"),
+            (2, "mTLS operator")
+        ]
+    );
+
+    let mut operator_client = management_client_with_identity(
+        management_address,
+        &pki,
+        &pki.secondary_cli_cert_path,
+        &pki.secondary_cli_key_path,
+    )
+    .await
+    .unwrap();
+    let status_before = operator_client
+        .get_cluster_status(GetClusterStatusRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let audit_store = rockstream_storage::build_runtime_object_store(
+        &storage.join("gateway-shard"),
+        "gateway-shard",
+    )
+    .unwrap();
+    let audit_before = DurableCatalogStore::recover(audit_store, "gateway")
+        .await
+        .unwrap()
+        .list_security_audit_records()
+        .await
+        .unwrap();
+
+    let control_url = control_address.to_string();
+    let worker_storage = temp.path().join("client-storage");
+    let (worker, worker_task) = rockstream_runtime::client::start_worker_client_with_tls(
+        1,
+        &control_url,
+        &worker_storage,
+        pki.cli_tls_config(),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(worker.worker_id(), None);
+    worker_task.abort();
+    let _ = worker_task.await;
+
+    let status_after = operator_client
+        .get_cluster_status(GetClusterStatusRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(status_after.nodes, status_before.nodes);
+
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+    let audit_store = rockstream_storage::build_runtime_object_store(
+        &storage.join("gateway-shard"),
+        "gateway-shard",
+    )
+    .unwrap();
+    let records = DurableCatalogStore::recover(audit_store, "gateway")
+        .await
+        .unwrap()
+        .list_security_audit_records()
+        .await
+        .unwrap();
+    let denials: Vec<_> = records
+        .iter()
+        .filter(|record| record.action == SecurityAuditClass::NodeIdentityRejection)
+        .collect();
+    assert_eq!(denials.len(), 1, "unexpected audit records: {records:?}");
+    let denial = denials[0];
+    assert!(denial.event_id.starts_with("node-identity-rejection:"));
+    assert!(denial.timestamp_ms > 0);
+    assert_eq!(
+        denial,
+        &SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: denial.event_id.clone(),
+            timestamp_ms: denial.timestamp_ms,
+            actor: AuditIdentity::Unverified("cli:admin".to_owned()),
+            target: AuditField::Unverified("worker-1".to_owned()),
+            scope: AuditField::Known("cluster".to_owned()),
+            action: SecurityAuditClass::NodeIdentityRejection,
+            outcome: SecurityAuditOutcome::Denied,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::NotApplicable,
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
+    );
+    assert!(records.starts_with(&audit_before));
+}
+
+#[tokio::test]
 async fn delegated_actor_policy_is_rechecked_by_release_control_process() {
     let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
