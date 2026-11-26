@@ -312,7 +312,7 @@ pub(crate) async fn handle_command(
             || input.epoch != frame.epoch
             || input.join_bootstrap.is_none()
         {
-            return Err("join bootstrap frame does not match routing identity".into());
+            return Err("RS-3004: join bootstrap frame does not match routing identity".into());
         }
         crate::client::execute_frame(client, deployments, input)
             .await
@@ -375,7 +375,7 @@ pub(crate) async fn handle_command(
             let scans: Vec<crate::skew_join::JoinLedgerScan> =
                 serde_json::from_slice(&payload).map_err(|error| error.to_string())?;
             if scans.len() > MAX_ROUTING_POINT_KEYS {
-                return Err("too many join scalar scans".into());
+                return Err("RS-3006: too many join scalar scans".into());
             }
             let mut results = BTreeMap::new();
             for scan in scans {
@@ -384,7 +384,7 @@ pub(crate) async fn handle_command(
                 if !scan.prefix.starts_with("join/v1/")
                     || !(scan.prefix.ends_with("/Left/") || scan.prefix.ends_with("/Right/"))
                 {
-                    return Err("invalid join ledger scan prefix".into());
+                    return Err("RS-1002: invalid join ledger scan prefix".into());
                 }
                 let prefix = point_key(command.workload_id, &scan.prefix)?;
                 let mut continuation = None;
@@ -405,7 +405,7 @@ pub(crate) async fn handle_command(
                     }
                     continuation = page.next_token;
                     if continuation.is_none() {
-                        return Err("join ledger scan made no progress".into());
+                        return Err("RS-0001: join ledger scan made no progress".into());
                     }
                 }
                 results.insert(

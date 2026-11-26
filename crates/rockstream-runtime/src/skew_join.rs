@@ -292,18 +292,18 @@ pub fn validate_join_final_rows(
     let spec = join_spec(&descriptor.plan_json, Some(&topology))
         .ok_or("join finalization shape is not supported")?;
     if spec.aggregate.is_none() {
-        return Err("join finalization requires SUM or COUNT".into());
+        return Err("RS-1013: join finalization requires SUM or COUNT".into());
     }
     for row in rows {
         if !matches!(row.weight, -1 | 1) || row.values_tsv.split('\t').count() != 2 {
-            return Err("invalid canonical join group transition".into());
+            return Err("RS-1002: invalid canonical join group transition".into());
         }
         for column in row.values_tsv.split('\t') {
             let value: i64 = column
                 .parse()
                 .map_err(|_| "invalid canonical join scalar")?;
             if value.to_string() != column {
-                return Err("noncanonical join final scalar".into());
+                return Err("RS-1002: noncanonical join final scalar".into());
             }
         }
     }
@@ -366,7 +366,7 @@ impl SideState {
                     .checked_add(row.weight)
                     .ok_or("join row weight overflow")?;
                 if after < 0 {
-                    return Err("join deletion exceeds the live row multiplicity".into());
+                    return Err("RS-1002: join deletion exceeds the live row multiplicity".into());
                 }
                 if after == 0 {
                     self.rows.remove(&row.row.values_tsv);
@@ -388,14 +388,14 @@ impl SideState {
             .ok_or("join key weight overflow")?;
         self.live_weight = i64::try_from(next_weight).map_err(|_| "join key weight overflow")?;
         if self.live_weight < 0 {
-            return Err("join key has negative live multiplicity".into());
+            return Err("RS-1002: join key has negative live multiplicity".into());
         }
         if !self.budget_inexact {
             let budget = i128::from(self.abs_value_sum)
                 .checked_add(value_delta)
                 .ok_or("join absolute operand budget overflow")?;
             if budget < 0 {
-                return Err("join absolute operand budget is negative".into());
+                return Err("RS-0001: join absolute operand budget is negative".into());
             }
             match u64::try_from(budget) {
                 Ok(budget) => self.abs_value_sum = budget,
@@ -500,7 +500,7 @@ impl JoinLedgerStats {
         let row: SaltedRow =
             serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
         if row.total_weight < 0 {
-            return Err("negative durable join row multiplicity".into());
+            return Err("RS-0001: negative durable join row multiplicity".into());
         }
         self.max_row_weight = self.max_row_weight.max(row.total_weight);
         let total: i128 = self.total_weight.parse().unwrap_or(0);
@@ -585,7 +585,7 @@ fn snapshot_bytes(rows: &BTreeMap<String, i64>) -> Result<usize, String> {
         bytes
             .checked_add(row.len())
             .and_then(|bytes| bytes.checked_add(8))
-            .ok_or_else(|| "join snapshot size overflow".to_string())
+            .ok_or_else(|| "RS-3006: join snapshot size overflow".to_string())
     })
 }
 
@@ -602,7 +602,7 @@ fn key_for(row: &RuntimeRow, column: usize) -> Result<&str, String> {
     row.values_tsv
         .split('\t')
         .nth(column)
-        .ok_or_else(|| format!("join row missing key column {column}"))
+        .ok_or_else(|| format!("RS-1002: join row missing key column {column}"))
 }
 
 fn validate_row_identity(
@@ -617,7 +617,7 @@ fn validate_row_identity(
     for row in &request.rows {
         let fields: Vec<_> = row.values_tsv.split('\t').collect();
         if fields.len() != schema.columns.len() {
-            return Err("join row does not match its source schema".into());
+            return Err("RS-1002: join row does not match its source schema".into());
         }
         for (field, column) in fields.into_iter().zip(&schema.columns) {
             if field == "\\N" {
@@ -631,7 +631,9 @@ fn validate_row_identity(
                     .parse()
                     .map_err(|_| "join row has an invalid integer")?;
                 if value.to_string() != field {
-                    return Err("join routing requires canonical integer row identities".into());
+                    return Err(
+                        "RS-1002: join routing requires canonical integer row identities".into(),
+                    );
                 }
             }
         }
@@ -713,7 +715,7 @@ fn scalar_budget(
     let delta_count = rows.iter().try_fold(0u128, |total, row| {
         total
             .checked_add(u128::from(row.weight.unsigned_abs()))
-            .ok_or("join operand budget overflow")
+            .ok_or("RS-1002: join operand budget overflow")
     })?;
     let count = |input: JoinInputSide| {
         u128::try_from(before.side(input).live_weight)
@@ -732,10 +734,10 @@ fn scalar_budget(
             rows.iter().try_fold(0u128, |total, row| {
                 let operand = u128::from(row_value(row.row, column)?.unsigned_abs())
                     .checked_mul(u128::from(row.weight.unsigned_abs()))
-                    .ok_or("join operand budget overflow")?;
+                    .ok_or("RS-1002: join operand budget overflow")?;
                 total
                     .checked_add(operand)
-                    .ok_or_else(|| "join operand budget overflow".to_string())
+                    .ok_or_else(|| "RS-1002: join operand budget overflow".to_string())
             })?
         } else {
             0
@@ -870,7 +872,9 @@ fn check_individual_join_products(
         .map_err(|_| "invalid joined row proof total")?
         != i128::from(opposite.live_weight)
     {
-        return Err("join scalar proof does not cover the complete opposite arrangement".into());
+        return Err(
+            "RS-0001: join scalar proof does not cover the complete opposite arrangement".into(),
+        );
     }
     for row in rows {
         let joined_weight = row
@@ -926,7 +930,7 @@ fn final_value(
                 .checked_mul(i128::from(other.live_weight))
                 .ok_or("join final sum overflow")?
         }
-        _ => return Err("canonical join finalization requires SUM or COUNT".into()),
+        _ => return Err("RS-1013: canonical join finalization requires SUM or COUNT".into()),
     };
     Ok(Some(
         i64::try_from(value).map_err(|_| "RS-1002: canonical join sum overflow")?,
@@ -1110,7 +1114,7 @@ pub fn prepare_join_epoch(
         if previous.get("kind").and_then(Value::as_str) != Some("join")
             || previous.get("plan_digest").and_then(Value::as_str) != Some(&spec.plan_digest)
         {
-            return Err("join routing state does not match deployed plan".into());
+            return Err("RS-0001: join routing state does not match deployed plan".into());
         }
     }
     let side = spec
@@ -1124,7 +1128,7 @@ pub fn prepare_join_epoch(
     shard_ids.sort();
     shard_ids.dedup();
     if shard_ids.is_empty() {
-        return Err("join routing has no active shards".into());
+        return Err("RS-1703: join routing has no active shards".into());
     }
     let grouped = group_request(request, spec.key_column(side))?;
     let mut plan = EpochPlan {
@@ -1144,7 +1148,7 @@ pub fn prepare_join_epoch(
             continue;
         }
         let original = rendezvous_hash(fnv1a_64(key.as_bytes()) % VIRTUAL_BUCKETS, &shard_ids, 1)
-            .ok_or("join routing has no active shards")?;
+            .ok_or("RS-1703: join routing has no active shards")?;
         if key == "\\N" {
             for row in &rows {
                 push_route(&mut plan.shards, original, row, row.weight);
@@ -1157,7 +1161,7 @@ pub fn prepare_join_epoch(
             .parse()
             .map_err(|_| "join routing key is not an integer")?;
         if canonical.to_string() != key {
-            return Err("join routing requires canonical integer keys".into());
+            return Err("RS-1002: join routing requires canonical integer keys".into());
         }
         let storage_key = state_key(&spec, &key);
         let mut state: KeyState = point_state
@@ -1169,13 +1173,13 @@ pub fn prepare_join_epoch(
                 ..KeyState::default()
             });
         if state.key != key {
-            return Err("join key identity does not match durable record".into());
+            return Err("RS-0001: join key identity does not match durable record".into());
         }
         if state
             .last_observed_epoch
             .is_some_and(|epoch| request.epoch <= epoch)
         {
-            return Err("join routing epoch did not advance".into());
+            return Err("RS-3008: join routing epoch did not advance".into());
         }
         let admitted = scalar_budget(&state, side, &rows, &spec)?;
         let before = state.clone();
@@ -1194,14 +1198,14 @@ pub fn prepare_join_epoch(
                     total_weight: 0,
                 });
             if ledger.row != row.row.values_tsv || ledger.total_weight < 0 || ledger.weight < 0 {
-                return Err("join row identity or multiplicity is invalid".into());
+                return Err("RS-0001: join row identity or multiplicity is invalid".into());
             }
             ledger.total_weight = ledger
                 .total_weight
                 .checked_add(row.weight)
                 .ok_or("join row multiplicity overflow")?;
             if ledger.total_weight < 0 {
-                return Err("join deletion exceeds the live row multiplicity".into());
+                return Err("RS-1002: join deletion exceeds the live row multiplicity".into());
             }
             row_updates.insert(ledger_key, ledger);
         }
@@ -1216,7 +1220,9 @@ pub fn prepare_join_epoch(
                 .iter()
                 .any(|shard| !shard_ids.contains(shard))
             {
-                return Err("join routing generation lost a target shard; finish canonical shard migration first".into());
+                return Err(
+                    "RS-3004: join lost a target shard; finish canonical shard migration first".into(),
+                );
             }
         }
         if state.canonical_owner.is_some() || (!admitted && spec.aggregate.is_some()) {
@@ -1339,7 +1345,9 @@ pub fn prepare_join_epoch(
                             final_rows: Vec::new(),
                         });
                         if bootstrap.source != spec.source(low_side) {
-                            return Err("one epoch requires incompatible join bootstraps".into());
+                            return Err(
+                                "RS-0001: one epoch requires incompatible join bootstraps".into(),
+                            );
                         }
                         bootstrap.rows.extend(snapshot.clone());
                     }
@@ -1363,7 +1371,9 @@ pub fn prepare_join_epoch(
                         .get_mut(&ledger_key)
                         .ok_or("missing join row ledger")?;
                     if salted.row != row.row.values_tsv || salted.weight < 0 {
-                        return Err("salted join row identity or multiplicity is invalid".into());
+                        return Err(
+                            "RS-0001: salted join row identity or multiplicity is invalid".into(),
+                        );
                     }
                     let target = promoted.targets[(fnv1a_64(row.row.values_tsv.as_bytes())
                         % promoted.targets.len() as u64)
@@ -1489,7 +1499,7 @@ pub fn route_join_epoch(
     let plan: EpochPlan =
         serde_json::from_value(plan.clone()).map_err(|error| error.to_string())?;
     if plan.kind != "heavy_light_join/v1" || plan.request_digest != request_digest(request)? {
-        return Err("join routing replay input does not match prepared epoch".into());
+        return Err("RS-3008: join routing replay input does not match prepared epoch".into());
     }
     let mut batches = BTreeMap::new();
     for (shard, plan) in plan.shards {
@@ -1521,7 +1531,7 @@ pub fn route_join_epoch(
                 .transpose()?
                 .unwrap_or(0);
         if bootstrap_bytes > MAX_JOIN_BOOTSTRAP_BYTES {
-            return Err("join bootstrap exceeds epoch replication budget".into());
+            return Err("RS-3006: join bootstrap exceeds epoch replication budget".into());
         }
         batches.insert(
             shard,
@@ -1972,7 +1982,7 @@ mod tests {
         wrong.rows[0].weight = 2;
         assert_eq!(
             route_join_epoch(&epoch.plan, &wrong).unwrap_err(),
-            "join routing replay input does not match prepared epoch"
+            "RS-3008: join routing replay input does not match prepared epoch"
         );
         assert_eq!(
             route_join_epoch(&epoch.plan, &input).unwrap(),
