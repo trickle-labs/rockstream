@@ -27,11 +27,12 @@ use rockstream_control::management_store::{
 };
 use rockstream_management_proto::v1::{
     management_service_client::ManagementServiceClient, CancelOperationRequest,
-    CreateBackupRequest, DownloadSupportArtifactChunk, DownloadSupportArtifactRequest,
-    GenerateSupportArtifactRequest, GenerateSupportArtifactResponse, GetClusterStatusRequest,
-    GetOperationRequest, ListOperationsRequest, ListSecurityAuditRecordsRequest,
-    ListSecurityPrincipalsRequest, Operation as ManagementWireOperation, SecurityActionGrant,
-    SecurityPresetGrant, SetSecurityPrincipalGrantsRequest,
+    CreateBackupRequest, CreateServicePrincipalRequest, DeleteSecurityPrincipalRequest,
+    DownloadSupportArtifactChunk, DownloadSupportArtifactRequest, GenerateSupportArtifactRequest,
+    GenerateSupportArtifactResponse, GetClusterStatusRequest, GetOperationRequest,
+    ListOperationsRequest, ListSecurityAuditRecordsRequest, ListSecurityPrincipalsRequest,
+    Operation as ManagementWireOperation, SecurityActionGrant, SecurityPresetGrant,
+    SetSecurityPrincipalGrantsRequest,
 };
 use rockstream_runtime::exchange::pool::ShuffleClientPool;
 use rockstream_runtime::exchange::proto::ShuffleFrame;
@@ -1083,6 +1084,22 @@ async fn start_control_process_with_operator(
         None,
     )
     .await
+}
+
+async fn wait_for_release_management_client(
+    address: std::net::SocketAddr,
+    pki: &rockstream_test_support::pki::TestPki,
+) -> ManagementServiceClient<tonic::transport::Channel> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match try_management_client(address, pki).await {
+            Ok(client) => return client,
+            Err(_) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => panic!("management endpoint did not start: {error}"),
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4485,6 +4502,229 @@ async fn security_audit_history_uses_release_pgwire_pages_after_denial() {
     assert_eq!(audit_denial.before_state, AuditField::NotApplicable);
     assert_eq!(audit_denial.after_state, AuditField::NotApplicable);
     assert!(!serde_json::to_string(&records).unwrap().contains("pencil"));
+}
+
+#[tokio::test]
+async fn service_principal_deletion_survives_release_process_restart() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("control-storage");
+    let pki = rockstream_test_support::pki::TestPki::generate();
+    let address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let management_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut process = start_control_process_with_operator(
+        temp.path(),
+        &storage,
+        address,
+        management_address,
+        &pki,
+        None,
+        false,
+        None,
+        true,
+        false,
+    )
+    .await;
+    wait_for_gateway(&mut process.0, address).await;
+    let mut management = wait_for_release_management_client(management_address, &pki).await;
+    let principal = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(3),
+        display_name: "Restarted deletion target".to_owned(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::Service {
+            service_id: "restart-deletion-target".to_owned(),
+        }],
+        preset_grants: Vec::new(),
+        scoped_grants: Vec::new(),
+    };
+    let created = management
+        .create_service_principal(CreateServicePrincipalRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            principal_id: principal.id.0,
+            display_name: principal.display_name.clone(),
+            service_id: "restart-deletion-target".to_owned(),
+            expected_grantor_revision: 1,
+            idempotency_key: "dfda7766-a06c-4fd2-a313-48219319eb79".to_owned(),
+            scoped_grants: Vec::new(),
+        })
+        .await
+        .expect("authenticated management administrator should create the service principal")
+        .into_inner();
+    assert_eq!(
+        created.protocol_version,
+        rockstream_management_proto::PROTOCOL_VERSION
+    );
+    assert_eq!(
+        created.principal,
+        Some(rockstream_management_proto::v1::SecurityPrincipal {
+            principal_id: 3,
+            display_name: "Restarted deletion target".to_owned(),
+            enabled: true,
+            revision: 1,
+            preset_grants: Vec::new(),
+            scoped_grants: Vec::new(),
+            effective_permissions: Vec::new(),
+            service_ids: vec!["restart-deletion-target".to_owned()],
+        })
+    );
+    drop(management);
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+    drop(process);
+
+    let store = rockstream_storage::build_runtime_object_store(
+        &storage.join("gateway-shard"),
+        "gateway-shard",
+    )
+    .unwrap();
+    let catalog = DurableCatalogStore::recover(store, "gateway")
+        .await
+        .unwrap();
+    assert_eq!(
+        catalog.get_security_principal(principal.id).await.unwrap(),
+        Some(principal.clone())
+    );
+    drop(catalog);
+
+    let request = DeleteSecurityPrincipalRequest {
+        protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+        principal_id: 3,
+        expected_revision: 1,
+        expected_grantor_revision: 1,
+        idempotency_key: "ea536238-7aa9-49b2-8393-4428bb4fc9db".to_owned(),
+    };
+    let mut process = start_control_process_with_operator(
+        temp.path(),
+        &storage,
+        address,
+        management_address,
+        &pki,
+        None,
+        false,
+        None,
+        true,
+        false,
+    )
+    .await;
+    wait_for_gateway(&mut process.0, address).await;
+    let mut management = wait_for_release_management_client(management_address, &pki).await;
+    let deleted = management
+        .delete_security_principal(request.clone())
+        .await
+        .expect("service-principal deletion should survive the creator process restart")
+        .into_inner();
+    assert_eq!(
+        deleted,
+        rockstream_management_proto::v1::DeleteSecurityPrincipalResponse {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            principal_id: 3,
+            deleted_revision: 2,
+            operation_id: deleted.operation_id.clone(),
+        }
+    );
+    assert!(deleted.operation_id.parse::<u64>().is_ok_and(|id| id > 0));
+    drop(management);
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+    drop(process);
+
+    let store = rockstream_storage::build_runtime_object_store(
+        &storage.join("gateway-shard"),
+        "gateway-shard",
+    )
+    .unwrap();
+    let catalog = DurableCatalogStore::recover(store, "gateway")
+        .await
+        .unwrap();
+    assert!(catalog
+        .get_security_principal(PrincipalId(3))
+        .await
+        .unwrap()
+        .is_none());
+    let mut audit_after_delete: Vec<_> = catalog
+        .list_security_audit_records()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|record| {
+            record.correlation == AuditCorrelation::Observed(request.idempotency_key.clone())
+        })
+        .collect();
+    audit_after_delete.sort_by(|left, right| left.event_id.cmp(&right.event_id));
+    let mut expected_event_ids = vec![
+        format!("management-principal-delete:{}", request.idempotency_key),
+        format!(
+            "management-principal-delete-completion:{}",
+            request.idempotency_key
+        ),
+        format!(
+            "management-principal-delete-start:{}",
+            request.idempotency_key
+        ),
+    ];
+    expected_event_ids.sort();
+    assert_eq!(
+        audit_after_delete
+            .iter()
+            .map(|record| record.event_id.clone())
+            .collect::<Vec<_>>(),
+        expected_event_ids
+    );
+    drop(catalog);
+
+    let mut process = start_control_process_with_operator(
+        temp.path(),
+        &storage,
+        address,
+        management_address,
+        &pki,
+        None,
+        false,
+        None,
+        true,
+        false,
+    )
+    .await;
+    wait_for_gateway(&mut process.0, address).await;
+    let mut management = wait_for_release_management_client(management_address, &pki).await;
+    let retry = management
+        .delete_security_principal(request.clone())
+        .await
+        .expect("an exact delete replay should survive a second process restart")
+        .into_inner();
+    assert_eq!(retry, deleted);
+    drop(management);
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+    drop(process);
+
+    let store = rockstream_storage::build_runtime_object_store(
+        &storage.join("gateway-shard"),
+        "gateway-shard",
+    )
+    .unwrap();
+    let catalog = DurableCatalogStore::recover(store, "gateway")
+        .await
+        .unwrap();
+    assert!(catalog
+        .get_security_principal(PrincipalId(3))
+        .await
+        .unwrap()
+        .is_none());
+    let mut audit_after_retry: Vec<_> = catalog
+        .list_security_audit_records()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|record| {
+            record.correlation == AuditCorrelation::Observed(request.idempotency_key.clone())
+        })
+        .collect();
+    audit_after_retry.sort_by(|left, right| left.event_id.cmp(&right.event_id));
+    assert_eq!(audit_after_retry, audit_after_delete);
 }
 
 #[tokio::test]

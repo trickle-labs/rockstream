@@ -737,8 +737,12 @@ catalog records the removal with its grant-change and completion audit events.
 `principal_deletion_is_revision_checked_idempotent_and_audited` checks stale
 revisions, last-administrator protection, operator denial, exact audit
 contents, concurrent and replayed requests, changed-request rejection, and
-replay after reopening the catalog. This security-catalog mutation does not
-change the coordinator, worker, lease, or epoch transitions modeled by M1–M7.
+replay after reopening the catalog. The release-process test
+`service_principal_deletion_survives_release_process_restart` also kills and
+restarts the control process between creation, deletion, and exact replay, then
+checks that replay leaves the complete deletion-correlated audit records
+unchanged. This security-catalog mutation does not change the coordinator,
+worker, lease, or epoch transitions modeled by M1–M7.
 
 PR #420 (issue #400) completes the direct distributed execution path across
 `rockstream-control`, `rockstream-runtime`, `rockstream-storage`, and
