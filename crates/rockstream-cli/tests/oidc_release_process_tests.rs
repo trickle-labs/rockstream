@@ -11802,8 +11802,14 @@ async fn support_artifact_download_limit_holds_under_release_process_pressure() 
         } else {
             assert_eq!(record.action, SecurityAuditClass::AuthenticationSuccess);
             assert_eq!(record.outcome, SecurityAuditOutcome::Success);
-            assert_eq!(record.target, AuditField::Known("management-api".to_owned()));
-            assert_eq!(record.actor, AuditIdentity::Verified("principal:1".to_owned()));
+            assert_eq!(
+                record.target,
+                AuditField::Known("management-api".to_owned())
+            );
+            assert_eq!(
+                record.actor,
+                AuditIdentity::Verified("principal:1".to_owned())
+            );
         }
     }
     let mut event_ids = Vec::new();
