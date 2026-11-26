@@ -112,10 +112,11 @@ impl DirectGrantRegistry {
         });
     }
 
-    pub(crate) fn revoke_completed(&self, record: &RoutingEpochRecord) {
-        self.grants
-            .write()
-            .retain(|_, grant| !metadata_matches_record(&grant.metadata, record));
+    pub(crate) fn revoke_completed(&self, record: &RoutingEpochRecord) -> bool {
+        let mut grants = self.grants.write();
+        let count = grants.len();
+        grants.retain(|_, grant| !metadata_matches_record(&grant.metadata, record));
+        grants.len() != count
     }
 
     pub(crate) fn unwrap_context(
@@ -593,7 +594,8 @@ mod tests {
             next_state: serde_json::Value::Null,
             point_mutations: BTreeMap::new(),
         };
-        registry.revoke_completed(&record);
+        assert!(registry.revoke_completed(&record));
+        assert!(!registry.revoke_completed(&record));
         assert_eq!(registry.grants.read().clone(), HashMap::new());
         let mut next = grant;
         next.grant_id = uuid::Uuid::from_u128(11);
