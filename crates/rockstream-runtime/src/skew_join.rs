@@ -1221,7 +1221,8 @@ pub fn prepare_join_epoch(
                 .any(|shard| !shard_ids.contains(shard))
             {
                 return Err(
-                    "RS-3004: join lost a target shard; finish canonical shard migration first".into(),
+                    "RS-3004: join lost a target shard; finish canonical shard migration first"
+                        .into(),
                 );
             }
         }
@@ -1346,7 +1347,7 @@ pub fn prepare_join_epoch(
                         });
                         if bootstrap.source != spec.source(low_side) {
                             return Err(
-                                "RS-0001: one epoch requires incompatible join bootstraps".into(),
+                                "RS-0001: one epoch requires incompatible join bootstraps".into()
                             );
                         }
                         bootstrap.rows.extend(snapshot.clone());
