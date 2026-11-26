@@ -552,14 +552,30 @@ impl DataPlaneClient {
                         return Err(error);
                     }
                     let message = error.to_string();
-                    if attempt + 1 < MAX_STALE_TOPOLOGY_RETRIES
-                        && (message.contains("RS-3004")
-                            || message.contains("RS-1702")
-                            || message.contains("not deployed")
-                            || message.contains("transport")
-                            || message.contains("connection"))
-                    {
+                    let is_connect_failure = message.contains("tcp connect error")
+                        || message.contains("transport error")
+                        || message.contains("Connection refused")
+                        || message.contains("connection closed");
+                    let retryable = is_connect_failure
+                        || message.contains("RS-3004")
+                        || message.contains("RS-1702")
+                        || message.contains("not deployed")
+                        || message.contains("transport")
+                        || message.contains("connection");
+                    let error = if is_connect_failure {
+                        io::Error::other(format!(
+                            "{RS_0001}: a routed shard owner has no active worker connection; Retry after the workload and workers are ready."
+                        ))
+                    } else {
+                        error
+                    };
+                    if retryable && attempt + 1 < MAX_STALE_TOPOLOGY_RETRIES {
                         self.invalidate_topology(request.workload_id);
+                        if is_connect_failure {
+                            for worker in &topology.workers {
+                                self.shuffle_pool.evict_worker(worker.worker_id);
+                            }
+                        }
                         last_err = Some(error);
                         continue;
                     }
@@ -865,6 +881,29 @@ impl DataPlaneClient {
                     ),
                 }
             };
+            // Reject invalid passthrough input before reserving a durable epoch.
+            // Once prepared, a different request must not replace this decision.
+            if plan.get("kind").and_then(serde_json::Value::as_str) == Some("passthrough") {
+                let partitioned = Self::partition_request(topology, request)?;
+                let schemas = crate::client::deployment_schemas_from_slice(&topology.schemas)?;
+                let schema = schemas.get(&request.source).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "{RS_1012}: unknown source relation '{}' for workload {}",
+                            request.source, request.workload_id
+                        ),
+                    )
+                })?;
+                for (_, rows) in partitioned {
+                    crate::client::rows_to_zset(&rows, schema.clone()).map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("{RS_1012}: invalid source rows: {error}"),
+                        )
+                    })?;
+                }
+            }
             let record = RoutingEpochRecord {
                 version: crate::skew_routing::ROUTING_VERSION,
                 workload_id: request.workload_id,

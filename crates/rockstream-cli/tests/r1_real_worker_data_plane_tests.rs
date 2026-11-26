@@ -746,11 +746,11 @@ async fn interrupted_dispatch_blocks_distributed_reads_after_gateway_restart() {
                     let wire = serde_json::to_string(&response).unwrap() + "\n";
                     write.write_all(wire.as_bytes()).await.unwrap();
                 }
-                WorkerMessage::AuthorizeSourceEpoch { metadata } => {
-                    request_tx.take().unwrap().send(metadata).unwrap();
-                    // Interrupt the admission RPC after control receives the
-                    // request, before the gateway can learn its outcome.
-                    // Continue accepting shard discovery after restart.
+                WorkerMessage::SubmitSourceDelta(request) => {
+                    request_tx.take().unwrap().send(request).unwrap();
+                    // This insecure development gateway has no actor assertion
+                    // and no direct workers. Interrupt its control fallback
+                    // before the gateway can learn the dispatch outcome.
                     tokio::spawn(async move {
                         let _pending_connection = write;
                         std::future::pending::<()>().await;
@@ -768,7 +768,7 @@ async fn interrupted_dispatch_blocks_distributed_reads_after_gateway_restart() {
                 }
                 WorkerMessage::GetWorkloadTopology { workload_id } => {
                     // This mock fixture has no live workers; returning an empty
-                    // shard list is sufficient for restart/read recovery;
+                    // shard list selects the control fallback under test;
                     // this mock never issues a direct epoch grant.
                     let response = ControlMessage::WorkloadTopology {
                         snapshot: rockstream_types::data_plane::WorkloadTopologySnapshot {
@@ -821,9 +821,12 @@ async fn interrupted_dispatch_blocks_distributed_reads_after_gateway_restart() {
         .await
         .unwrap()
         .unwrap();
-    assert!(request.is_valid());
+    assert_eq!(
+        request.version,
+        rockstream_types::data_plane::DEPLOYMENT_DESCRIPTOR_VERSION
+    );
     assert_eq!(request.epoch, 1);
-    // Authorization carries a digest, not rows. Check the exact original input.
+    // Check the exact original input before interrupting dispatch.
     let expected = rockstream_types::data_plane::SourceDeltaRequest {
         version: rockstream_types::data_plane::DEPLOYMENT_DESCRIPTOR_VERSION,
         workload_id: request.workload_id,
@@ -841,11 +844,20 @@ async fn interrupted_dispatch_blocks_distributed_reads_after_gateway_restart() {
             },
         ],
     };
+    assert_eq!(request.source, expected.source);
+    assert_eq!(request.rows, expected.rows);
+    // Separately preserve the metadata-only authorization wire assertion.
+    let authorization = rockstream_runtime::DataPlaneClient::source_authorization_request(&request)
+        .unwrap();
+    let WorkerMessage::AuthorizeSourceEpoch { metadata } = authorization else {
+        panic!("expected source epoch authorization metadata");
+    };
+    assert!(metadata.is_valid());
     assert_eq!(
-        request,
+        metadata,
         rockstream_types::direct_epoch::SourceEpochMetadata::from_request(&expected).unwrap()
     );
-    assert!(serde_json::to_value(&request)
+    assert!(serde_json::to_value(&metadata)
         .unwrap()
         .get("rows")
         .is_none());
