@@ -406,7 +406,9 @@ fn serving_and_compaction_settings_are_validated_for_both_config_formats() {
         report.diagnostics
     );
 
-    let node = NodeConfig::from(&legacy);
+    let mut node = NodeConfig::from(&legacy);
+    node.control.elasticity.enabled = false;
+    node.control.elasticity.initial_virtual_shards = 16;
     let serialized = node.to_string().unwrap();
     let report = validate_config_str(&serialized, false);
     assert!(
@@ -423,6 +425,7 @@ fn serving_and_compaction_settings_are_validated_for_both_config_formats() {
         "version = 1\n[gateway.serving]\nunknown_setting = true\n",
         "[storage.compaction]\nunknown_setting = true\n",
         "version = 1\n[storage.compaction]\nunknown_setting = true\n",
+        "[control.elasticity]\nunknown_setting = true\n",
     ] {
         let report = validate_config_str(toml, false);
         assert!(!report.valid, "unknown config key was accepted: {toml}");
