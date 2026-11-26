@@ -278,6 +278,14 @@ const KNOWN_CONTROL_SECTION_KEYS: &[&str] = &[
     "url",
     "shared_storage",
     "raft",
+    "elasticity",
+];
+const KNOWN_CONTROL_ELASTICITY_KEYS: &[&str] = &[
+    "enabled",
+    "initial_virtual_shards",
+    "hysteresis_frontiers",
+    "minimum_residency_ms",
+    "minimum_headroom_gap_bps",
 ];
 const KNOWN_CONTROL_RAFT_KEYS: &[&str] = &["peers", "node_id", "bind", "bootstrap"];
 const KNOWN_WORKER_SECTION_KEYS: &[&str] = &[
@@ -556,6 +564,13 @@ fn validate_node_config_keys(
                     sub,
                     "control",
                     KNOWN_CONTROL_SECTION_KEYS,
+                    toml_str,
+                    diagnostics,
+                ),
+                "control.elasticity" => validate_node_config_keys(
+                    sub,
+                    "control.elasticity",
+                    KNOWN_CONTROL_ELASTICITY_KEYS,
                     toml_str,
                     diagnostics,
                 ),

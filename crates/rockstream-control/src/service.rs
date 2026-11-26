@@ -2063,7 +2063,13 @@ impl ManagementDrainRuntime {
     }
 
     async fn execute(&self, worker_id: WorkerId, operation_id: &str) {
-        if let Some(runtime) = &self.automatic_rebalance {
+        // Local-only workers still use the existing acknowledged drain path,
+        // which rejects any owned shards that cannot be moved safely.
+        if let Some(runtime) = self.automatic_rebalance.as_ref().filter(|_| {
+            self.catalog
+                .get(worker_id)
+                .is_some_and(|worker| worker.capabilities.shared_shard_store_id.is_some())
+        }) {
             if let Err(error) = runtime.begin_drain(worker_id, Some(operation_id)).await {
                 self.fail(
                     operation_id,
@@ -2368,8 +2374,7 @@ impl ManagementMigrationRuntime {
         };
         // Polling an unchanged disconnection must not consume the bounded
         // operation journal. Resume the same operation when the worker returns.
-        self
-            .worker_senders
+        self.worker_senders
             .lock()
             .await
             .get(&worker)
@@ -8349,7 +8354,11 @@ async fn handle_connection_stream<R, W>(
                 }
             }
             WorkerMessage::RequestDrain { worker_id } => {
-                if let Some(runtime) = &automatic_rebalance {
+                if let Some(runtime) = automatic_rebalance.as_ref().filter(|_| {
+                    catalog
+                        .get(worker_id)
+                        .is_some_and(|worker| worker.capabilities.shared_shard_store_id.is_some())
+                }) {
                     match runtime.begin_drain(worker_id, None).await {
                         Ok(state) => {
                             send_message(
