@@ -26,6 +26,7 @@ use rockstream_types::authorization::{
     ScopedPresetGrant, SecurityAuditClass, SecurityAuditOutcome, SecurityAuditRecord,
     SecurityPrincipal, SECURITY_AUDIT_FORMAT_VERSION, SECURITY_PRINCIPAL_FORMAT_VERSION,
 };
+use rockstream_types::identity::InternalTlsConfig;
 use rockstream_types::ids::PrincipalId;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -231,6 +232,60 @@ async fn assert_single_unknown_tls_failure(durable: &DurableCatalogStore) {
 }
 
 // ── gateway_with_tls_starts_and_binds ────────────────────────────────────────
+
+#[test]
+fn expired_server_certificate_is_rejected_before_startup_and_reload() {
+    ensure_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let (ca_cert, ca_key) = make_ca();
+    let ca_cert_path = write_file(dir.path(), "ca.pem", &ca_cert.pem());
+    let (server_cert, server_key) = make_expired_leaf(&ca_cert, &ca_key, "expired-server");
+    let server_cert_path = write_file(dir.path(), "expired-server.pem", &server_cert);
+    let server_key_path = write_file(dir.path(), "expired-server-key.pem", &server_key);
+
+    let error = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(CatalogStubs::new()),
+        Arc::new(NoopViewReader),
+    )
+    .with_tls(&server_cert_path, &server_key_path, None)
+    .err()
+    .expect("expired server certificate must fail before listener startup");
+    assert_eq!(
+        error.to_string(),
+        "[RS-2405] auth.tls_config_invalid: server certificate is expired or not yet valid. next_steps: Verify the configured paths point to valid PEM-encoded certificate/key files readable by the gateway process."
+    );
+
+    let expired_config = InternalTlsConfig {
+        cert_path: Some(server_cert_path.clone()),
+        key_path: Some(server_key_path.clone()),
+        ca_cert_path: Some(ca_cert_path.clone()),
+        ..InternalTlsConfig::default()
+    };
+    let internal_error = rockstream_types::tls::TlsCertificateReloader::new(expired_config.clone())
+        .expect_err("expired internal server certificate must fail startup");
+    assert_eq!(
+        internal_error,
+        "RS-2411: server certificate is expired or not yet valid"
+    );
+
+    let (valid_cert, valid_key) = make_leaf(&ca_cert, &ca_key, "valid-server", vec![]);
+    let valid_config = InternalTlsConfig {
+        cert_path: Some(write_file(dir.path(), "valid-server.pem", &valid_cert)),
+        key_path: Some(write_file(dir.path(), "valid-server-key.pem", &valid_key)),
+        ca_cert_path: Some(ca_cert_path),
+        ..InternalTlsConfig::default()
+    };
+    let reloader = rockstream_types::tls::TlsCertificateReloader::new(valid_config)
+        .expect("valid internal server certificate must initialize");
+    let reload_error = reloader
+        .reload(expired_config)
+        .expect_err("expired replacement server certificate must be rejected");
+    assert_eq!(
+        reload_error,
+        "RS-2411: server certificate is expired or not yet valid"
+    );
+}
 
 #[tokio::test]
 async fn gateway_with_tls_starts_and_binds() {

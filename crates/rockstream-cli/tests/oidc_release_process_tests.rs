@@ -7581,6 +7581,18 @@ async fn mtls_certificate_rejections_run_in_release_process_and_audit_after_rest
         .signed_by(&wrong_ca_key, &rogue_ca_cert, &rogue_ca_key)
         .unwrap();
 
+    let mut future_client_params =
+        rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    future_client_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "alice");
+    future_client_params.not_before = rcgen::date_time_ymd(2099, 1, 1);
+    future_client_params.not_after = rcgen::date_time_ymd(2100, 1, 2);
+    let future_client_key = rcgen::KeyPair::generate().unwrap();
+    let future_client_cert = future_client_params
+        .signed_by(&future_client_key, &ca_cert, &ca_key)
+        .unwrap();
+
     let principal = mtls_principal(&client_cert);
     let store =
         rockstream_storage::build_runtime_object_store(&shard_dir, "gateway-shard").unwrap();
@@ -7639,6 +7651,95 @@ async fn mtls_certificate_rejections_run_in_release_process_and_audit_after_rest
         .expect("invalid TLS configuration left the gateway listener bound");
     drop(listener);
 
+    let expired_server_cert_path = temp.path().join("gateway-expired.pem");
+    let expired_server_key_path = temp.path().join("gateway-expired-key.pem");
+    let expired_server_key_pem = expired_key.serialize_pem();
+    std::fs::write(&expired_server_cert_path, expired_cert.pem()).unwrap();
+    std::fs::write(&expired_server_key_path, &expired_server_key_pem).unwrap();
+
+    let mut future_server_params =
+        rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    future_server_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "gateway");
+    future_server_params.not_before = rcgen::date_time_ymd(2099, 1, 1);
+    future_server_params.not_after = rcgen::date_time_ymd(2100, 1, 2);
+    let future_server_key = rcgen::KeyPair::generate().unwrap();
+    let future_server_cert = future_server_params
+        .signed_by(&future_server_key, &ca_cert, &ca_key)
+        .unwrap();
+    let future_server_cert_path = temp.path().join("gateway-not-yet-valid.pem");
+    let future_server_key_path = temp.path().join("gateway-not-yet-valid-key.pem");
+    let future_server_key_pem = future_server_key.serialize_pem();
+    std::fs::write(&future_server_cert_path, future_server_cert.pem()).unwrap();
+    std::fs::write(&future_server_key_path, &future_server_key_pem).unwrap();
+
+    let expected_error = "[RS-0002] config.invalid: Configuration error (detail=gateway mTLS configuration is invalid: [RS-2405] auth.tls_config_invalid: server certificate is expired or not yet valid. next_steps: Verify the configured paths point to valid PEM-encoded certificate/key files readable by the gateway process.) (correlation_id=<correlation-id> context=detail=gateway mTLS configuration is invalid: [RS-2405] auth.tls_config_invalid: server certificate is expired or not yet valid. next_steps: Verify the configured paths point to valid PEM-encoded certificate/key files readable by the gateway process.) next_steps: Check configuration file and CLI flags.\n  next steps: Check the gateway certificate, key, and client CA files.";
+    for (case, cert_path, key_path, key_pem) in [
+        (
+            "expired",
+            expired_server_cert_path.as_path(),
+            expired_server_key_path.as_path(),
+            expired_server_key_pem.as_str(),
+        ),
+        (
+            "not-yet-valid",
+            future_server_cert_path.as_path(),
+            future_server_key_path.as_path(),
+            future_server_key_pem.as_str(),
+        ),
+    ] {
+        let mut invalid_server_process = start_gateway_process(
+            temp.path(),
+            &storage,
+            address,
+            cert_path,
+            key_path,
+            "mtls",
+            Some(&ca_path),
+            "",
+            "",
+            "",
+        );
+        let status = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(status) = invalid_server_process.0.try_wait().unwrap() {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("release gateway accepted the {case} server certificate"));
+        assert_eq!(status.code(), Some(1));
+        let mut stderr = String::new();
+        invalid_server_process
+            .0
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        let correlation_id = stderr
+            .split_once("correlation_id=")
+            .and_then(|(_, value)| value.split_whitespace().next())
+            .expect("startup diagnostic should include its correlation ID");
+        assert_eq!(correlation_id.len(), 36);
+        let normalized_stderr = stderr.replace(correlation_id, "<correlation-id>");
+        assert_eq!(
+            normalized_stderr
+                .strip_suffix('\n')
+                .unwrap_or(&normalized_stderr),
+            expected_error,
+            "unexpected {case} server certificate error"
+        );
+        assert!(!stderr.contains(key_pem));
+        let listener = tokio::net::TcpListener::bind(address)
+            .await
+            .expect("invalid server certificate left the gateway listener bound");
+        drop(listener);
+    }
+
     let mut process = start_gateway_process(
         temp.path(),
         &storage,
@@ -7688,6 +7789,12 @@ async fn mtls_certificate_rejections_run_in_release_process_and_audit_after_rest
     )
     .await;
     assert!(wrong_ca_error.as_db_error().is_none());
+    let future_client_error = mtls_connection_error(
+        address.port(),
+        mtls_client_config(&ca_cert, &future_client_cert, &future_client_key),
+    )
+    .await;
+    assert!(future_client_error.as_db_error().is_none());
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     process.0.kill().unwrap();
@@ -7700,8 +7807,8 @@ async fn mtls_certificate_rejections_run_in_release_process_and_audit_after_rest
     let records = recovered.list_security_audit_records().await.unwrap();
     assert_eq!(
         records.len(),
-        4,
-        "expired TLS error: {expired_error}; wrong-CA TLS error: {wrong_ca_error}; records: {records:?}"
+        5,
+        "expired TLS error: {expired_error}; wrong-CA TLS error: {wrong_ca_error}; not-yet-valid TLS error: {future_client_error}; records: {records:?}"
     );
     assert_eq!(records[0].action, SecurityAuditClass::GrantChange);
     assert_eq!(records[0].outcome, SecurityAuditOutcome::Success);
@@ -7719,7 +7826,7 @@ async fn mtls_certificate_rejections_run_in_release_process_and_audit_after_rest
             .iter()
             .filter(|record| record.action == SecurityAuditClass::AuthenticationFailure)
             .count(),
-        2
+        3
     );
     let normalized_failures = records[2..]
         .iter()
@@ -7744,6 +7851,8 @@ async fn mtls_certificate_rejections_run_in_release_process_and_audit_after_rest
         })
         .collect::<Vec<_>>();
     assert_ne!(records[2].correlation, records[3].correlation);
+    assert_ne!(records[2].correlation, records[4].correlation);
+    assert_ne!(records[3].correlation, records[4].correlation);
     let expected_failure = SecurityAuditRecord {
         format_version: SECURITY_AUDIT_FORMAT_VERSION,
         event_id: "<event_id>".to_owned(),
@@ -7761,7 +7870,11 @@ async fn mtls_certificate_rejections_run_in_release_process_and_audit_after_rest
     };
     assert_eq!(
         normalized_failures,
-        vec![expected_failure.clone(), expected_failure]
+        vec![
+            expected_failure.clone(),
+            expected_failure.clone(),
+            expected_failure
+        ]
     );
     assert_eq!(
         recovered.list_security_principals().await.unwrap(),

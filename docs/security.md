@@ -157,8 +157,10 @@ and client-certificate mTLS. OIDC requires `[auth].oidc_issuer`,
 `[auth].oidc_audience`, `[auth].oidc_jwks_url`, and gateway TLS certificate
 and key paths. Clients may supply the bearer token in the PostgreSQL password
 response or the `Authorization` startup parameter; both require an encrypted
-TLS connection. The gateway fetches and validates JWKS before opening the
-listener and rejects requests when token verification fails. The verified `(issuer, subject)`
+TLS connection. The gateway rejects an expired or not-yet-valid server leaf
+certificate before opening the listener. OIDC also fetches and validates JWKS
+before opening the listener and rejects requests when token verification fails.
+The verified `(issuer, subject)`
 must map to an enabled durable principal before the gateway creates an
 application session. Gateway mTLS requires `gateway.tls.cert_path`, `key_path`,
 and `ca_cert_path`; a CA-verified client certificate must map by SHA-256
@@ -190,7 +192,7 @@ Other principals' subscriptions continue independently.
 
 Starting in **v0.55**, RockStream enforces mutual TLS (mTLS) with cryptographically verified node identity across all internal network transport boundaries:
 
-The control-worker TCP listener used for registration, heartbeats, and shard leases requires internal mTLS and a durable security catalog for node-identity rejection audit. Control and embedded `all` roles must recover that catalog before opening the listener. Control, worker, and embedded `all` roles need a certificate, matching private key, trusted CA roots, and `client_auth_required = true`; invalid or incomplete TLS material, or an unavailable control security catalog, fails startup before the listener opens.
+The control-worker TCP listener used for registration, heartbeats, and shard leases requires internal mTLS and a durable security catalog for node-identity rejection audit. Control and embedded `all` roles must recover that catalog before opening the listener. Control, worker, and embedded `all` roles need a currently valid server leaf certificate, matching private key, trusted CA roots, and `client_auth_required = true`; invalid or incomplete TLS material, or an unavailable control security catalog, fails startup before the listener opens. Reload rejects an expired or not-yet-valid replacement and leaves the active acceptor in place.
 
 For local development only, `--allow-insecure-internal-dev` explicitly permits plaintext control traffic when the control listener or worker target uses a literal loopback socket address. The option rejects non-loopback addresses and must not be used for production or release qualification.
 
