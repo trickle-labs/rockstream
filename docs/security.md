@@ -1,5 +1,31 @@
 # RockStream Security Architecture & Internal mTLS (v0.55)
 
+## Durable security audit history (v0.73)
+
+The authenticated management gRPC method `ListSecurityAuditRecords` reads the
+authoritative security audit catalog. It requires `security.audit.read`; the
+Administrator preset grants cluster-wide history access. A grant can restrict
+that permission to an `AuditRange` with inclusive `from_timestamp_ms` and
+`to_timestamp_ms` bounds. Requests outside the caller's range are denied and
+audited. The Operator preset does not grant audit or principal-management
+access.
+
+Set `page_size` to 1–100 (0 selects 50). Optional timestamp bounds filter the
+90-day retained history. Each returned `records_json` entry is one
+versioned `SecurityAuditRecord` JSON value. Use the opaque `next_page_token`
+unchanged with the same timestamp bounds to continue; it follows the stable
+`(timestamp_ms, event_id)` order. A changed range requires a new first-page
+request. Pages also fit within the 1 MiB management response limit, so a page
+can contain fewer records than requested. If a single record exceeds that
+limit, the method returns `RESOURCE_EXHAUSTED` for that page.
+
+The durable catalog retains at most 1 GiB of encoded audit records. When that
+budget is full, required security writes fail instead of discarding events.
+Monitor `security_audit_retained_records`, `security_audit_retained_bytes`,
+`security_audit_capacity_bytes`, and `security_audit_degraded` on the metrics
+endpoint. History reads use the shared bounded management request gate and cap
+each page at 100 records.
+
 ## Secrets and envelope encryption (v0.55.1)
 
 `CREATE SECRET`, `ALTER SECRET`, `DROP SECRET`, and `SHOW SECRETS` store only
@@ -60,12 +86,19 @@ scoped AWS fixture: `ROCKSTREAM_TEST_KMS_KEY_ARN`,
 must identify an authorized principal. Run explicitly with
 `cargo test -p rockstream-control --test aws_kms_tests real_kms_enforces_key_and_principal_permissions -- --ignored --exact`.
 
-`SecretStore::rotate_kek` stages all rewrapped envelopes before publishing one
-atomic SlateDB batch (or replacing the in-memory catalog). Secret reads and
-mutations wait for rotation; once the batch is submitted, cancelling the caller
-does not cancel its commit. Success waits for durable storage before retiring
-the store's old provider. A provider or decode failure during staging leaves
-every stored envelope unchanged.
+`SecretStore::rotate_kek` stages at most 1,000,000 catalog entries and 64 MiB
+of serialized envelope and audit values in the pending rotation before
+publishing one atomic SlateDB batch (or replacing the in-memory catalog).
+Exceeding either limit returns `RS-3601` before publishing rewrapped secrets;
+existing secret envelopes and the active provider remain unchanged. At most 64
+callers may wait to enter rotation-protected secret operations; excess callers
+receive `RS-3601` without waiting. The
+`SecretStore::metrics()` snapshot exposes the current waiter, staging-entry,
+and staging-byte fill levels. Secret reads and mutations wait for rotation;
+once the batch is submitted, cancelling the caller does not cancel its commit.
+Success waits for durable storage before retiring the store's old provider. A
+provider or decode failure during staging leaves every stored envelope
+unchanged.
 
 With durable storage, rotation also requires the durable security audit
 catalog. The rewrap batch carries a structured audit outbox record, and success
@@ -84,11 +117,19 @@ by older releases. The retained provider encrypts with its first provider and
 tries both providers for decryption; it never writes key material to the catalog.
 Only retire the previous key after successful recovery and durable rotation.
 Use one shared `SecretStore` for a catalog; independent instances must not mutate
-that catalog during rotation. Rotation stages memory proportional to the catalog.
+that catalog during rotation. The staged-entry and serialized-value limits
+bound the catalog rotation batch.
 
 Workers receive short-lived tokens over authenticated mTLS. Decrypted payloads
 remain in worker process memory and are refreshed at the next epoch after an
 `ALTER SECRET`; they are never written to worker storage.
+The serialized JSON credential payload is limited to 1 MiB when secrets are
+created, altered, or issued to workers. Each worker admits at most 1,024
+workload/secret entries and 64 MiB of serialized payload across active and
+pending tokens. The worker manager exposes item and byte fill through
+`fill_level()` and `fill_bytes()`. Tokens over the per-token limit are rejected
+before decryption; a cache-capacity rejection leaves the previously admitted
+token unchanged, and every token still expires by its signed deadline.
 
 Connector SQL continues to accept `secret = '<name>'`; newly persisted source
 and sink metadata uses the canonical `secret://<name>` reference. A role preset
@@ -116,8 +157,10 @@ and client-certificate mTLS. OIDC requires `[auth].oidc_issuer`,
 `[auth].oidc_audience`, `[auth].oidc_jwks_url`, and gateway TLS certificate
 and key paths. Clients may supply the bearer token in the PostgreSQL password
 response or the `Authorization` startup parameter; both require an encrypted
-TLS connection. The gateway fetches and validates JWKS before opening the
-listener and rejects requests when token verification fails. The verified `(issuer, subject)`
+TLS connection. The gateway rejects an expired or not-yet-valid server leaf
+certificate before opening the listener. OIDC also fetches and validates JWKS
+before opening the listener and rejects requests when token verification fails.
+The verified `(issuer, subject)`
 must map to an enabled durable principal before the gateway creates an
 application session. Gateway mTLS requires `gateway.tls.cert_path`, `key_path`,
 and `ca_cert_path`; a CA-verified client certificate must map by SHA-256
@@ -128,6 +171,12 @@ boundary. SCRAM-SHA-256 requires a recovered durable principal store with an
 enabled SCRAM login; startup rejects an unavailable or empty store. MD5 is not
 a release authentication mode. Enabling these startup paths does not satisfy
 the v0.73 ten-case release qualification gate by itself.
+
+OIDC accepts RS256 tokens up to 16 KiB. The JWKS response is limited to 1 MiB
+and 100 keys; cache entries expire within 60 seconds and honor a shorter issuer
+cache lifetime. Fetches time out after 5 seconds and make at most one retry
+after 250 milliseconds for transient transport, 429, or server errors. An
+expired key is never used after a failed refresh.
 
 Service-only principals (`LoginMethod::Service`) do not log in interactively.
 They may retain a consumer-scoped `SecretUse` grant for a background connector;
@@ -143,7 +192,7 @@ Other principals' subscriptions continue independently.
 
 Starting in **v0.55**, RockStream enforces mutual TLS (mTLS) with cryptographically verified node identity across all internal network transport boundaries:
 
-The control-worker TCP listener used for registration, heartbeats, and shard leases requires internal mTLS and a durable security catalog for node-identity rejection audit. Control and embedded `all` roles must recover that catalog before opening the listener. Control, worker, and embedded `all` roles need a certificate, matching private key, trusted CA roots, and `client_auth_required = true`; invalid or incomplete TLS material, or an unavailable control security catalog, fails startup before the listener opens.
+The control-worker TCP listener used for registration, heartbeats, and shard leases requires internal mTLS and a durable security catalog for node-identity rejection audit. Control and embedded `all` roles must recover that catalog before opening the listener. Control, worker, and embedded `all` roles need a currently valid server leaf certificate, matching private key, trusted CA roots, and `client_auth_required = true`; invalid or incomplete TLS material, or an unavailable control security catalog, fails startup before the listener opens. Reload rejects an expired or not-yet-valid replacement and leaves the active acceptor in place.
 
 For local development only, `--allow-insecure-internal-dev` explicitly permits plaintext control traffic when the control listener or worker target uses a literal loopback socket address. The option rejects non-loopback addresses and must not be used for production or release qualification.
 
@@ -174,7 +223,7 @@ preserving internal mTLS, lease fencing, replay identity, and durable audit.
 
 When a gateway connects to `--control`, its cross-process SQL data-plane client uses internal mTLS and presents a CA-verified `Gateway` node identity. For authenticated gateway configurations, each deploy, source-delta, workload-read, and operator-stats request carries a short-lived RS256 actor assertion. Version 2 claims include explicit `SecretUse` scopes for secret-backed sources in a deployment, limited to scopes the actor is authorized to use when the assertion is issued. Control retains those scopes with the workload; each worker secret refresh must match the retained allowance and the actor's current scoped policy. A later grant applies to a workload only after a fresh authorized deployment assertion includes that scope. The gateway signs assertions with the dedicated deployment-managed private key at `auth.actor_assertion_signing_key_path`; control verifies them with the matching RSA public JWK at `auth.actor_assertion_public_key_path`. Both nodes require the same `node.deployment_id`. The assertion audience is exactly `rockstream-control:<deployment_id>`, and its lifetime is 60 seconds. Control verifies the gateway certificate role, signature, deployment, request digest, action and scope, then checks the actor's current durable grants. Effective authority is the intersection of the asserted allowance and those current grants. Version 1 assertions remain valid for their original action and scope and carry no delegated secret-use scopes. Missing keys, invalid assertions, disabled actors, and revoked grants are rejected and audited before the data-plane request is dispatched. The signing key pair must be distinct from both gateway and internal TLS key pairs.
 
-The explicit loopback plaintext development mode continues to permit bare data-plane messages for local development. It does not establish a verified node identity and cannot carry actor assertions; signed delegation requires internal mTLS. Worker secret-token requests name an active workload. Control verifies that the mTLS worker is assigned to it, derives the reference and namespace from durable source metadata, and rechecks both the source consumer's and delegated actor's current scoped `SecretUse` grants. Name-only legacy requests are rejected and audited. Versioned tokens are encrypted and cached per worker and workload; unsupported token formats are rejected. Tokens expire within 60 seconds and are reauthorized every 30 seconds while the workload is active. A denied refresh removes the cached token. Secret-rotation refreshes target only workloads that reference that secret; replacement tokens remain pending until the workload enters a later epoch. The worker secret-token path still needs real-process release qualification, including revocation and refresh behavior.
+The explicit loopback plaintext development mode continues to permit bare data-plane messages for local development. It does not establish a verified node identity and cannot carry actor assertions; signed delegation requires internal mTLS. Worker secret-token requests name an active workload. Control verifies that the mTLS worker is assigned to it, derives the reference and namespace from durable source metadata, and rechecks both the source consumer's and delegated actor's current scoped `SecretUse` grants. Name-only legacy requests are rejected and audited. Versioned tokens are encrypted and cached per worker and workload; unsupported token formats are rejected. Tokens expire within 60 seconds and are reauthorized every 30 seconds while the workload is active. A denied refresh removes the cached token. Secret-rotation refreshes target only workloads that reference that secret; replacement tokens remain pending until the workload enters a later epoch. A worker processes one token resolution at a time. The worker secret-token path still needs real-process release qualification, including revocation and refresh behavior.
 
 Configure the values in the node configuration file or with `ROCKSTREAM_NODE_DEPLOYMENT_ID`, `ROCKSTREAM_AUTH_ACTOR_ASSERTION_SIGNING_KEY_PATH` on the gateway, and `ROCKSTREAM_AUTH_ACTOR_ASSERTION_PUBLIC_KEY_PATH` on control. The public JWK must contain one RSA signing key with `kty=RSA`, `alg=RS256`, and `use=sig`; distribute it through the deployment's trusted configuration channel.
 
@@ -313,6 +362,8 @@ an audit-page read with RS-2050 and leaves retained history unchanged.
 ## First administrator preprovisioning
 
 Run trusted offline tooling while all RockStream processes for the deployment are stopped. Invoke `rockstream security preprovision-admin --storage <root> --layout <all|gateway> --principal-file <path> --operation-id <id> [--yes]`. The command accepts a JSON `SecurityPrincipal` with an enabled interactive cluster administrator; provide only verifier or public certificate identity material, never a plaintext password or private key. Select `--layout all` for an `all` role deployment, or `--layout gateway` for a `gateway` or `control` deployment. `--storage` must match the deployment's `start --storage` value, and `--operation-id` must be unique for the catalog and reused on retry. The command requires `--yes` in non-interactive use.
+
+A control deployment that starts the native management API also needs an enabled cluster Administrator with an mTLS login method. The preprovision command accepts SCRAM- or OIDC-only administrators, but `ManagementService` initialization fails with `RS-2405` until the catalog contains an mTLS administrator. Keep processes stopped and use `security recover-admin` to replace the administrator's login-method set with one that includes mTLS before starting control.
 
 The principal and its grant-change audit event commit together; the audit actor is `unknown` because bootstrap has no authenticated application session. The operation rejects a nonempty security catalog, and a retry verifies the committed principal and audit record. It is not a public network operation. Catalog mutations also reject removal, disablement, or downgrade of the last active administrator.
 

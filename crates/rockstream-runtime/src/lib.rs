@@ -39,7 +39,8 @@ pub use client::{
 pub use compaction::{CompactionBudget, CompactionPermit, CompactionWorker};
 pub use data_plane::DataPlaneClient;
 pub use secrets::{
-    ResolvedSecret, SecretManagerError, WorkerSecretManager, MAX_WORKER_SECRET_TOKENS,
+    ResolvedSecret, SecretManagerError, WorkerSecretManager, MAX_WORKER_SECRET_CACHE_BYTES,
+    MAX_WORKER_SECRET_TOKENS,
 };
 pub use shard_actor::{
     CreditError, ExchangeCredit, ExchangeCredits, ExecutionMorsel, FrameExecutor, MailboxFillLevel,

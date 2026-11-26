@@ -58,6 +58,7 @@ impl SecurityAction {
         matches!(
             self,
             Self::SecretUse
+                | Self::SecurityAuditRead
                 | Self::CheckpointExport
                 | Self::CheckpointRestore
                 | Self::BackupCreate

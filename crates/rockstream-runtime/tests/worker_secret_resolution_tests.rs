@@ -2,7 +2,7 @@ use rockstream_control::kek::EnvKekProvider;
 use rockstream_control::SecretStore;
 use rockstream_runtime::WorkerSecretManager;
 use rockstream_types::ids::WorkloadId;
-use rockstream_types::secret::SecretType;
+use rockstream_types::secret::{SecretType, MAX_WORKER_SECRET_TOKEN_PAYLOAD_BYTES};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -36,7 +36,9 @@ async fn worker_resolves_exact_payload_in_memory_and_rejects_wrong_identity() {
     let manager = WorkerSecretManager::new("worker-7");
     manager.initialize_workload_epoch(WorkloadId(17), 5);
     let resolved = manager.resolve_token(&token, token.issued_at).unwrap();
+    let token_payload_bytes = token.encrypted_payload.len() - 16;
     assert_eq!(resolved.payload, payload);
+    assert_eq!(manager.fill_bytes(), token_payload_bytes);
     assert_eq!(
         manager
             .get(WorkloadId(17), "kafka", token.issued_at)
@@ -51,6 +53,11 @@ async fn worker_resolves_exact_payload_in_memory_and_rejects_wrong_identity() {
     manager
         .resolve_token(&replacement, replacement.issued_at)
         .unwrap();
+    let replacement_payload_bytes = replacement.encrypted_payload.len() - 16;
+    assert_eq!(
+        manager.fill_bytes(),
+        token_payload_bytes + replacement_payload_bytes
+    );
     assert_eq!(
         manager
             .get(WorkloadId(17), "kafka", replacement.issued_at)
@@ -60,6 +67,7 @@ async fn worker_resolves_exact_payload_in_memory_and_rejects_wrong_identity() {
     );
     assert_eq!(manager.advance_workload_epoch(WorkloadId(17), 5), 0);
     assert_eq!(manager.advance_workload_epoch(WorkloadId(17), 6), 1);
+    assert_eq!(manager.fill_bytes(), replacement_payload_bytes);
     assert_eq!(
         manager
             .get(WorkloadId(17), "kafka", replacement.issued_at)
@@ -103,6 +111,7 @@ async fn worker_resolves_exact_payload_in_memory_and_rejects_wrong_identity() {
     manager.reject_refresh(WorkloadId(17), "kafka", false);
     assert!(manager.refresh_targets(&active).is_empty());
     assert_eq!(manager.fill_level(), 0);
+    assert_eq!(manager.fill_bytes(), 0);
 
     let wrong_worker = WorkerSecretManager::new("worker-8");
     assert!(wrong_worker.resolve_token(&token, token.issued_at).is_err());
@@ -135,8 +144,53 @@ async fn expired_token_is_removed_from_memory() {
         .unwrap();
     let manager = WorkerSecretManager::new("worker-7");
     manager.resolve_token(&token, token.issued_at).unwrap();
+    assert_eq!(manager.fill_bytes(), token.encrypted_payload.len() - 16);
     assert!(manager
         .get(WorkloadId(17), "short_lived", token.expires_at)
         .is_none());
     assert_eq!(manager.fill_level(), 0);
+    assert_eq!(manager.fill_bytes(), 0);
+}
+
+#[tokio::test]
+async fn worker_accepts_maximum_payload_and_rejects_one_byte_over() {
+    let store = SecretStore::new(
+        None,
+        Arc::new(EnvKekProvider::from_passphrase("worker-test-kek")),
+    );
+    let empty_payload = HashMap::from([("credential".to_owned(), String::new())]);
+    let empty_payload_bytes = serde_json::to_vec(&empty_payload).unwrap().len();
+    let payload = HashMap::from([(
+        "credential".to_owned(),
+        "x".repeat(MAX_WORKER_SECRET_TOKEN_PAYLOAD_BYTES - empty_payload_bytes),
+    )]);
+    assert_eq!(
+        serde_json::to_vec(&payload).unwrap().len(),
+        MAX_WORKER_SECRET_TOKEN_PAYLOAD_BYTES
+    );
+    store
+        .create_secret(0, "bounded", SecretType::BearerToken, payload, "test")
+        .await
+        .unwrap();
+    let token = store
+        .issue_worker_token(0, WorkloadId(17), "bounded", "worker-7", 60, "test")
+        .await
+        .unwrap();
+    let manager = WorkerSecretManager::new("worker-7");
+    manager.resolve_token(&token, token.issued_at).unwrap();
+    assert_eq!(manager.fill_bytes(), MAX_WORKER_SECRET_TOKEN_PAYLOAD_BYTES);
+
+    let mut oversized = token.clone();
+    oversized
+        .encrypted_payload
+        .resize(MAX_WORKER_SECRET_TOKEN_PAYLOAD_BYTES + 17, 0);
+    assert_eq!(
+        manager
+            .resolve_token(&oversized, token.issued_at)
+            .err()
+            .unwrap()
+            .to_string(),
+        "[RS-2423] secret.token_invalid: token payload exceeds the maximum supported size. Next steps: request a fresh secret token using valid mTLS node credentials."
+    );
+    assert_eq!(manager.fill_bytes(), MAX_WORKER_SECRET_TOKEN_PAYLOAD_BYTES);
 }
