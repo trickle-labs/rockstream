@@ -1951,10 +1951,7 @@ impl ManagementService {
                 ));
             }
 
-            let catalog_operation_id = catalog
-                .allocate_id()
-                .await
-                .map_err(|_| Status::unavailable("management security catalog is unavailable"))?;
+            let catalog_operation_id = rand::random::<u64>().max(1);
             let catalog_operation_id_string = catalog_operation_id.to_string();
             let timestamp_ms = Utc::now().timestamp_millis().max(1) as u64;
             let grant_audit = SecurityAuditRecord {
