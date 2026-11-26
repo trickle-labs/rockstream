@@ -938,6 +938,7 @@ pub struct ControlService {
     security_catalog: Option<Arc<dyn CatalogStore>>,
     actor_assertion_verifier: Option<Arc<crate::delegation::ActorAssertionVerifier>>,
     backup_source: Option<BackupSource>,
+    backup_startup_ready: Option<Arc<std::sync::atomic::AtomicBool>>,
     elasticity: rockstream_types::config::ElasticityConfig,
 }
 
@@ -972,6 +973,7 @@ impl ControlService {
             security_catalog: None,
             actor_assertion_verifier: None,
             backup_source: None,
+            backup_startup_ready: None,
             elasticity: rockstream_types::config::ElasticityConfig::default(),
         }
     }
@@ -1101,6 +1103,13 @@ impl ControlService {
         worker_id: WorkerId,
     ) -> Self {
         self.backup_source = Some((store, None, Some(worker_id)));
+        self
+    }
+
+    /// Defer backup execution until the embedding process has recovered its shard.
+    /// The caller must publish readiness only after the durable lease is initialized.
+    pub fn with_backup_startup_gate(mut self, ready: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.backup_startup_ready = Some(ready);
         self
     }
 
@@ -1317,6 +1326,7 @@ impl ControlService {
                     source: source.clone(),
                     source_store_id: shared_store_id,
                     local_worker_id,
+                    startup_ready: self.backup_startup_ready.clone(),
                     manifests: crate::checkpoint_store::CheckpointManifestStore::new(
                         source.clone(),
                     ),
@@ -3118,6 +3128,7 @@ pub(crate) struct ManagementBackupRuntime {
     source: Arc<dyn object_store::ObjectStore>,
     source_store_id: Option<[u8; 32]>,
     local_worker_id: Option<WorkerId>,
+    startup_ready: Option<Arc<std::sync::atomic::AtomicBool>>,
     manifests: crate::checkpoint_store::CheckpointManifestStore,
     gc_pins: crate::checkpoint_store::GcPinStore,
     started: Arc<AsyncMutex<HashSet<String>>>,
@@ -3204,6 +3215,19 @@ impl ManagementBackupRuntime {
             .await
             .is_err()
         {
+            return;
+        }
+
+        // A recovered manifest skips worker checkpoint creation. In an embedded
+        // deployment, do not export mutable metadata until shard startup has
+        // completed its lease acquisition and opened the recovered database.
+        if self
+            .startup_ready
+            .as_ref()
+            .is_some_and(|ready| !ready.load(std::sync::atomic::Ordering::Acquire))
+        {
+            self.wait(operation_id, "embedded shard startup is not complete")
+                .await;
             return;
         }
 

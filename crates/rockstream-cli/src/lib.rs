@@ -1668,6 +1668,7 @@ pub fn run_start_with_dev_transport(
         }
 
         let mut control_handle = None;
+        let backup_startup_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut worker_handle = None;
         let mut compactor_shutdown_tx: Option<tokio::sync::watch::Sender<bool>> = None;
         let mut compactor_task: Option<tokio::task::JoinHandle<()>> = None;
@@ -1767,10 +1768,12 @@ pub fn run_start_with_dev_transport(
                         |e| CliError::new(RS_0003, format!("failed to open management store: {e}"), "Check storage directory permissions."),
                     )?,
                 );
-                service = service.with_single_worker_local_backup_source_store(
-                    store.clone(),
-                    rockstream_types::ids::WorkerId(opts.worker_id.unwrap_or(1)),
-                );
+                service = service
+                    .with_single_worker_local_backup_source_store(
+                        store.clone(),
+                        rockstream_types::ids::WorkerId(opts.worker_id.unwrap_or(1)),
+                    )
+                    .with_backup_startup_gate(backup_startup_ready.clone());
                 if let Some(addr) = node_config
                     .control
                     .management_addr
@@ -2131,6 +2134,7 @@ pub fn run_start_with_dev_transport(
                         )
                     })?;
                     shared_gateway_shard = Some((Arc::new(db), store));
+                    backup_startup_ready.store(true, std::sync::atomic::Ordering::Release);
                 }
             }
             if worker_exchange_endpoint.is_some() && opts.config.internal_tls.is_enabled() {
