@@ -2390,7 +2390,10 @@ impl ManagementMigrationRuntime {
         ) {
             return;
         }
-        if self.idle_drain_retry_blocked(shard_id, target, &previous).await {
+        if self
+            .idle_drain_retry_blocked(shard_id, target, &previous)
+            .await
+        {
             return;
         }
         let expected_phase = previous.phase().map(str::to_owned);
