@@ -1475,6 +1475,39 @@ async fn release_control_rejects_client_certificate_for_worker_registration() {
         .await
         .unwrap();
 
+    let (worker_cert, worker_key) = pki.worker_certs.get(&1).unwrap();
+    let mut node_client =
+        management_client_with_identity(management_address, &pki, worker_cert, worker_key)
+            .await
+            .unwrap();
+    let rejected_node_admin = tokio::time::timeout(
+        Duration::from_secs(2),
+        node_client.list_security_principals(ListSecurityPrincipalsRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            page_size: 10,
+            page_token: String::new(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        rejected_node_admin.is_err(),
+        "worker certificate obtained management administrator access"
+    );
+    let principals_after_rejection = admin
+        .list_security_principals(ListSecurityPrincipalsRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            page_size: 10,
+            page_token: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        principals_after_rejection.principals,
+        principal_page.principals
+    );
+
     let control_url = control_address.to_string();
     let worker_storage = temp.path().join("client-storage");
     let (worker, worker_task) = rockstream_runtime::client::start_worker_client_with_tls(
@@ -1534,6 +1567,36 @@ async fn release_control_rejects_client_certificate_for_worker_registration() {
             correlation: AuditCorrelation::Unknown,
             operation_id: AuditField::NotApplicable,
             policy_revision: AuditField::NotApplicable,
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
+    );
+    let authentication_failures: Vec<_> = records
+        .iter()
+        .filter(|record| record.action == SecurityAuditClass::AuthenticationFailure)
+        .collect();
+    assert_eq!(
+        authentication_failures.len(),
+        1,
+        "unexpected authentication audit records: {records:?}"
+    );
+    let failure = authentication_failures[0];
+    assert!(failure.event_id.starts_with("management-authn-"));
+    assert!(failure.timestamp_ms > 0);
+    assert_eq!(
+        failure,
+        &SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: failure.event_id.clone(),
+            timestamp_ms: failure.timestamp_ms,
+            actor: AuditIdentity::Unverified("worker:worker-1".to_owned()),
+            target: AuditField::Known("management-api".to_owned()),
+            scope: AuditField::NotApplicable,
+            action: SecurityAuditClass::AuthenticationFailure,
+            outcome: SecurityAuditOutcome::Failure,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::Unknown,
             before_state: AuditField::NotApplicable,
             after_state: AuditField::NotApplicable,
         }
