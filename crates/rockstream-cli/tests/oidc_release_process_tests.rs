@@ -3430,7 +3430,7 @@ async fn delegated_worker_secret_rechecks_actor_scope_in_release_control_process
             authorized_actor.id,
             authorized_actor.revision,
             action,
-            view_scope,
+            view_scope.clone(),
             vec![secret_scope.clone()],
             request_digest,
         )
@@ -3493,6 +3493,7 @@ async fn delegated_worker_secret_rechecks_actor_scope_in_release_control_process
         );
     }
     let resolved = resolved.unwrap();
+    let secret_received_at = Instant::now();
     assert_eq!(resolved.workload_id, request.workload_id);
     assert_eq!(resolved.secret_name, "kafka");
     assert_eq!(
@@ -3502,6 +3503,125 @@ async fn delegated_worker_secret_rechecks_actor_scope_in_release_control_process
             "release-worker-secret".to_owned(),
         )])
     );
+
+    let mut management = wait_for_management_client(management_address, &pki).await;
+    let revoke_operation_id = uuid::Uuid::new_v4().to_string();
+    let revoke_operation = management
+        .set_security_principal_grants(SetSecurityPrincipalGrantsRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            principal_id: authorized_actor.id.0,
+            expected_revision: authorized_actor.revision,
+            expected_grantor_revision: 1,
+            idempotency_key: revoke_operation_id.clone(),
+            preset_grants: vec![SecurityPresetGrant {
+                preset: "builder".to_owned(),
+                scope_json: serde_json::to_string(&PolicyScope::Resource {
+                    namespace: "public".to_owned(),
+                    kind: ResourceKind::View,
+                    name: "delegated_view".to_owned(),
+                })
+                .unwrap(),
+            }],
+            scoped_grants: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .operation
+        .unwrap();
+    assert_eq!(revoke_operation.operation_id, revoke_operation_id);
+    assert_eq!(revoke_operation.kind, "security_principal_grants");
+    assert_eq!(revoke_operation.state, "succeeded");
+    assert_eq!(revoke_operation.phase, "security_policy_committed");
+    let mut revoked_actor = authorized_actor.clone();
+    revoked_actor.revision += 1;
+    revoked_actor.scoped_grants.clear();
+    drop(management);
+    catalog.refresh().await.unwrap();
+    assert_eq!(
+        catalog
+            .get_security_principal(revoked_actor.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        revoked_actor
+    );
+
+    let audit_before_refresh = catalog.list_security_audit_records().await.unwrap();
+    let refresh_denial = tokio::time::timeout(Duration::from_secs(35), async {
+        loop {
+            catalog.refresh().await.unwrap();
+            let records = catalog.list_security_audit_records().await.unwrap();
+            if let Some(record) = records
+                .iter()
+                .skip(audit_before_refresh.len())
+                .find(|record| {
+                    record.action == SecurityAuditClass::AuthorizationDenial
+                        && record.actor == AuditIdentity::Verified(actor.id.to_string())
+                        && record.target == AuditField::Known("kafka".to_owned())
+                        && record.policy_revision == AuditField::Known(revoked_actor.revision)
+                })
+            {
+                break record.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("release worker did not periodically reauthorize the revoked secret");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if worker
+                .secret(
+                    request.workload_id,
+                    "kafka",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                )
+                .is_none()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("denied release-process refresh must remove the cached worker secret");
+    assert!(
+        secret_received_at.elapsed() < Duration::from_secs(60),
+        "the token expired before the periodic refresh denial"
+    );
+    assert_eq!(worker.worker_id(), Some(WorkerId(1)));
+    let refresh_event_id = refresh_denial
+        .event_id
+        .strip_prefix("gateway-delegation:")
+        .expect("revoked secret refresh audit ID");
+    assert!(uuid::Uuid::parse_str(refresh_event_id).is_ok());
+    let mut normalized_refresh_denial = refresh_denial.clone();
+    normalized_refresh_denial.event_id = "gateway-delegation:<uuid>".to_owned();
+    assert!(normalized_refresh_denial.timestamp_ms > 0);
+    normalized_refresh_denial.timestamp_ms = 0;
+    assert_eq!(
+        normalized_refresh_denial,
+        SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: "gateway-delegation:<uuid>".to_owned(),
+            timestamp_ms: 0,
+            actor: AuditIdentity::Verified(actor.id.to_string()),
+            target: AuditField::Known("kafka".to_owned()),
+            scope: AuditField::Known(format!("{secret_scope:?}")),
+            action: SecurityAuditClass::AuthorizationDenial,
+            outcome: SecurityAuditOutcome::Denied,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::Known(revoked_actor.revision),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
+    );
+
     worker_handle.abort();
     gateway_process.0.kill().unwrap();
     gateway_process.0.wait().unwrap();
@@ -3522,7 +3642,7 @@ async fn delegated_worker_secret_rechecks_actor_scope_in_release_control_process
             .await
             .unwrap()
             .unwrap(),
-        authorized_actor
+        revoked_actor
     );
     assert_eq!(
         recovered
@@ -3531,6 +3651,14 @@ async fn delegated_worker_secret_rechecks_actor_scope_in_release_control_process
             .unwrap()
             .unwrap(),
         denial_record
+    );
+    assert_eq!(
+        recovered
+            .get_security_audit_record(&refresh_denial.event_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        refresh_denial
     );
     let secret_audits: Vec<_> = records[audit_before_restart.len()..]
         .iter()
@@ -5008,6 +5136,26 @@ async fn oidc_password_auth_runs_in_release_process_and_audits_after_restart() {
         oversized_error.as_db_error().unwrap().message(),
         "[RS-2400] auth.unauthenticated: OIDC token exceeds the 16 KiB limit. next_steps: Provide valid credentials (Bearer token or mTLS certificate)"
     );
+    // Reuse the payload and signature so only the declared algorithm changes.
+    let mut valid_parts = VALID_TOKEN.split('.');
+    let _rs256_header = valid_parts.next().unwrap();
+    let payload = valid_parts.next().unwrap();
+    let signature = valid_parts.next().unwrap();
+    let hs256_header = "eyJhbGciOiJIUzI1NiIsImtpZCI6InRlc3QtcnNhIn0";
+    let wrong_algorithm_token = format!("{hs256_header}.{payload}.{signature}");
+    let wrong_algorithm_error =
+        oidc_authentication_error(address.port(), &wrong_algorithm_token, &client_tls).await;
+    assert_eq!(
+        wrong_algorithm_error.as_db_error().unwrap().code().code(),
+        "28000"
+    );
+    assert_eq!(
+        wrong_algorithm_error
+            .as_db_error()
+            .unwrap()
+            .message(),
+        "[RS-2400] auth.unauthenticated: OIDC accepts only RS256 tokens. next_steps: Provide valid credentials (Bearer token or mTLS certificate)"
+    );
     drop(client);
     connection_task.abort();
     process.0.kill().unwrap();
@@ -5076,7 +5224,7 @@ async fn oidc_password_auth_runs_in_release_process_and_audits_after_restart() {
         .await
         .unwrap();
     let records = recovered.list_security_audit_records().await.unwrap();
-    assert_eq!(records.len(), 11);
+    assert_eq!(records.len(), 12);
     assert_eq!(records[0].action, SecurityAuditClass::GrantChange);
     assert_eq!(records[0].outcome, SecurityAuditOutcome::Success);
     assert_eq!(records[1].action, SecurityAuditClass::GrantChange);
@@ -5149,15 +5297,11 @@ async fn oidc_password_auth_runs_in_release_process_and_audits_after_restart() {
             after_state: AuditField::NotApplicable,
         }
     );
-    assert!(!serde_json::to_string(&records)
-        .unwrap()
-        .contains("bad-token"));
-    assert!(!serde_json::to_string(&records)
-        .unwrap()
-        .contains(&exact_limit_token));
-    assert!(!serde_json::to_string(&records)
-        .unwrap()
-        .contains(&oversized_token));
+    let serialized_audit = serde_json::to_string(&records).unwrap();
+    assert!(!serialized_audit.contains("bad-token"));
+    assert!(!serialized_audit.contains(&exact_limit_token));
+    assert!(!serialized_audit.contains(&oversized_token));
+    assert!(!serialized_audit.contains(&wrong_algorithm_token));
 }
 
 #[tokio::test]
@@ -8423,6 +8567,18 @@ async fn support_artifact_download_is_bound_to_authenticated_principal() {
     let (content, expires_at_ms) = download_support_artifact(&mut client, &artifact_id).await;
     assert_eq!(String::from_utf8(content).unwrap(), expected_content);
     assert_eq!(expires_at_ms, artifact.expires_at_ms);
+
+    for opaque_id in ["../../etc/passwd", "/etc/passwd"] {
+        let denial = client
+            .download_support_artifact(DownloadSupportArtifactRequest {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                opaque_id: opaque_id.to_owned(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(denial.code(), tonic::Code::NotFound);
+        assert_eq!(denial.message(), "support artifact not found or expired");
+    }
 
     let denial = admin
         .download_support_artifact(DownloadSupportArtifactRequest {
