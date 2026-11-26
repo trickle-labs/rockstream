@@ -2435,12 +2435,12 @@ impl ManagementMigrationRuntime {
         };
         // Polling an unchanged disconnection must not consume the bounded
         // operation journal. Resume the same operation when the worker returns.
-        !self
+        self
             .worker_senders
             .lock()
             .await
             .get(&worker)
-            .is_some_and(|sender| !sender.is_closed())
+            .is_none_or(|sender| sender.is_closed())
     }
 
     async fn execute(&self, shard_id: ShardId, target: WorkerId, operation_id: &str) {
