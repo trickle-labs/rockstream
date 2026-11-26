@@ -1535,13 +1535,13 @@ impl AutomaticRebalanceRuntime {
             .as_ref()
             .is_some_and(|raft| !raft.is_leader())
         {
-            return Err("control is not leader".into());
+            return Err("RS-1731: control is not leader".into());
         }
         let worker = self
             .migration
             .catalog
             .get(worker_id)
-            .ok_or("worker is unavailable")?;
+            .ok_or("RS-3610: worker is unavailable")?;
         if !worker.healthy
             || worker.capabilities.shared_shard_store_id.is_none()
             || !self
@@ -1556,7 +1556,7 @@ impl AutomaticRebalanceRuntime {
                             == worker.capabilities.shared_shard_store_id
                 })
         {
-            return Err("drain requires a healthy recipient sharing the same object store".into());
+            return Err("RS-3611: drain requires a healthy shared-store recipient".into());
         }
         let leases: Vec<_> = self
             .migration
@@ -1658,6 +1658,25 @@ impl AutomaticRebalanceRuntime {
                 {
                     return;
                 }
+                continue;
+            }
+            // A transferred lease alone is not completion: recipient open
+            // and workload redeployment must finish before decommissioning.
+            // Re-read the journal after observing no donor leases, since a
+            // migration could have started since the first scan.
+            let Ok(current) = self.migration.operations.load_all().await else {
+                return;
+            };
+            if current.iter().any(|operation| {
+                operation.kind() == crate::management_store::OperationKind::MigrateShard
+                    && !operation.status().is_terminal()
+            }) || self
+                .migration
+                .shard_manager
+                .leases()
+                .iter()
+                .any(|lease| lease.worker_id == worker_id)
+            {
                 continue;
             }
             if let Some(worker) = self.migration.catalog.set_lifecycle(
@@ -9559,7 +9578,7 @@ mod tests {
         assert_eq!(
             actual,
             vec![
-                (parent, OperationStatus::Running),
+                (parent.clone(), OperationStatus::Running),
                 (
                     format!("auto-idle-drain-1-9-{}-0", lease.lease_token.0),
                     OperationStatus::Failed
@@ -9570,6 +9589,74 @@ mod tests {
                 ),
             ]
         );
+        // A lease transfer can precede the recipient acknowledgement and
+        // the workload redeployment. The parent must not complete yet.
+        let child_id = "drain-recipient-opening";
+        operations
+            .accept_idempotent(
+                child_id,
+                1,
+                &serde_json::json!({
+                    "shard_id": 9,
+                    "target_node_id": 2,
+                    "drain_operation_id": parent,
+                }),
+                child_id.to_owned(),
+                crate::management_store::OperationKind::MigrateShard,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .unwrap();
+        operations
+            .transition(
+                child_id,
+                OperationUpdate {
+                    status: OperationStatus::Running,
+                    updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                    progress: Some(80),
+                    phase: Some("recipient_opening".into()),
+                    error_code: None,
+                    next_steps: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let transferred = manager.transfer_if_owner(&lease, WorkerId(2)).unwrap();
+        runtime.finish_drains().await;
+        assert_eq!(
+            operations.get(&parent).await.unwrap().unwrap().status(),
+            OperationStatus::Running
+        );
+        assert!(matches!(
+            runtime.migration.catalog.get(WorkerId(1)).unwrap().lifecycle,
+            WorkerLifecycleState::Draining { .. }
+        ));
+        assert_eq!(manager.get(ShardId(9)), Some(transferred.clone()));
+
+        operations
+            .transition(
+                child_id,
+                OperationUpdate {
+                    status: OperationStatus::Succeeded,
+                    updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                    progress: Some(100),
+                    phase: Some("completed".into()),
+                    error_code: None,
+                    next_steps: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        runtime.finish_drains().await;
+        assert_eq!(
+            operations.get(&parent).await.unwrap().unwrap().status(),
+            OperationStatus::Succeeded
+        );
+        assert!(matches!(
+            runtime.migration.catalog.get(WorkerId(1)).unwrap().lifecycle,
+            WorkerLifecycleState::Decommissioned { .. }
+        ));
+        assert_eq!(manager.get(ShardId(9)), Some(transferred));
     }
 
     #[test]
