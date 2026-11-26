@@ -181,7 +181,13 @@ async fn management_drain_retries_after_mismatched_recipient_ack() {
     // A mismatched recipient ACK must roll ownership back to the donor
     // with a new fence before the parent drain may attempt another move.
     let rollback = read_until(&mut donor, |message| {
-        matches!(message, ControlMessage::ShardAssigned { operation_id: Some(_), .. })
+        matches!(
+            message,
+            ControlMessage::ShardAssigned {
+                operation_id: Some(_),
+                ..
+            }
+        )
     })
     .await;
     let ControlMessage::ShardAssigned {
