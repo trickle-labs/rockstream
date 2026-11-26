@@ -2308,6 +2308,74 @@ impl ManagementMigrationRuntime {
         }
     }
 
+    async fn idle_drain_retry_blocked(
+        &self,
+        shard_id: ShardId,
+        target: WorkerId,
+        previous: &crate::management_store::OperationRecord,
+    ) -> bool {
+        if previous.status() != OperationStatus::Waiting
+            || previous
+                .request()
+                .and_then(|request| request.get("idle_drain"))
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+        {
+            return false;
+        }
+        // Journal transitions are content-addressed. A new attempt must
+        // not recreate an earlier record at the same millisecond.
+        if chrono::Utc::now().timestamp_millis() <= previous.updated_at_ms() {
+            return true;
+        }
+        if previous.phase() != Some("validating_lease_and_workers") {
+            return false;
+        }
+        let Some(lease) = self.shard_manager.get(shard_id) else {
+            return false;
+        };
+        let expected_token = previous
+            .request()
+            .and_then(|request| request.get("expected_donor_lease_token"))
+            .and_then(serde_json::Value::as_u64);
+        // Changed fences or topology must still go through normal validation.
+        if expected_token != Some(lease.lease_token.0) || lease.worker_id == target {
+            return false;
+        }
+        let Some(donor_info) = self.catalog.get(lease.worker_id) else {
+            return false;
+        };
+        let Some(target_info) = self.catalog.get(target) else {
+            return false;
+        };
+        if !donor_info.healthy
+            || !(donor_info.lifecycle.is_active()
+                || matches!(donor_info.lifecycle, WorkerLifecycleState::Draining { .. }))
+            || !target_info.healthy
+            || !target_info.lifecycle.is_active()
+            || donor_info.capabilities.shared_shard_store_id.is_none()
+            || donor_info.capabilities.shared_shard_store_id
+                != target_info.capabilities.shared_shard_store_id
+        {
+            return false;
+        }
+        let worker = match previous.next_steps().first().map(String::as_str) {
+            Some("current shard owner must reconnect before migration can resume") => {
+                lease.worker_id
+            }
+            Some("target worker must reconnect before migration can resume") => target,
+            _ => return false,
+        };
+        // Polling an unchanged disconnection must not consume the bounded
+        // operation journal. Resume the same operation when the worker returns.
+        !self
+            .worker_senders
+            .lock()
+            .await
+            .get(&worker)
+            .is_some_and(|sender| !sender.is_closed())
+    }
+
     async fn execute(&self, shard_id: ShardId, target: WorkerId, operation_id: &str) {
         if self.raft.as_ref().is_some_and(|raft| !raft.is_leader()) {
             return;
@@ -2320,6 +2388,9 @@ impl ManagementMigrationRuntime {
             previous.status(),
             OperationStatus::Pending | OperationStatus::Waiting
         ) {
+            return;
+        }
+        if self.idle_drain_retry_blocked(shard_id, target, &previous).await {
             return;
         }
         let expected_phase = previous.phase().map(str::to_owned);
@@ -9386,6 +9457,70 @@ mod tests {
             );
             assert_eq!(record.status(), OperationStatus::Waiting);
             assert_eq!(manager.get(ShardId(9)), Some(lease.clone()));
+            if attempt == 1 {
+                let previous_update = record.updated_at_ms();
+                assert_eq!(
+                    record.next_steps(),
+                    &["current shard owner must reconnect before migration can resume"]
+                );
+                // More polls than the journal's transition bound must leave
+                // the durable waiting state intact while the donor is absent.
+                for _ in 0..70 {
+                    runtime
+                        .migration
+                        .schedule(ShardId(9), WorkerId(2), operation_id.clone())
+                        .await;
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while !runtime.migration.started.lock().await.is_empty() {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    let waiting = operations.get(&operation_id).await.unwrap().unwrap();
+                    assert_eq!(waiting.status(), OperationStatus::Waiting);
+                    assert_eq!(waiting.updated_at_ms(), previous_update);
+                    assert_eq!(waiting.next_steps(), record.next_steps());
+                    assert_eq!(manager.get(ShardId(9)), Some(lease.clone()));
+                }
+                // A reconnect permits the same durable operation to resume.
+                // Leave the recipient disconnected to prove the next wait
+                // reason changes without moving the lease.
+                let (sender, _receiver) = mpsc::channel(1);
+                runtime
+                    .migration
+                    .worker_senders
+                    .lock()
+                    .await
+                    .insert(WorkerId(1), sender);
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while chrono::Utc::now().timestamp_millis() <= previous_update {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                runtime
+                    .migration
+                    .schedule(ShardId(9), WorkerId(2), operation_id.clone())
+                    .await;
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while !runtime.migration.started.lock().await.is_empty() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                let retried = operations.get(&operation_id).await.unwrap().unwrap();
+                assert_eq!(retried.status(), OperationStatus::Waiting);
+                assert!(retried.updated_at_ms() > previous_update);
+                assert_eq!(
+                    retried.next_steps(),
+                    &["target worker must reconnect before migration can resume"]
+                );
+                assert_eq!(retried.request(), record.request());
+                assert_eq!(manager.get(ShardId(9)), Some(lease.clone()));
+            }
             operations
                 .transition(
                     &operation_id,
