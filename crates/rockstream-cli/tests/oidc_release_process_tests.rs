@@ -8552,6 +8552,18 @@ async fn support_artifact_download_is_bound_to_authenticated_principal() {
     assert_eq!(String::from_utf8(content).unwrap(), expected_content);
     assert_eq!(expires_at_ms, artifact.expires_at_ms);
 
+    for opaque_id in ["../../etc/passwd", "/etc/passwd"] {
+        let denial = client
+            .download_support_artifact(DownloadSupportArtifactRequest {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                opaque_id: opaque_id.to_owned(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(denial.code(), tonic::Code::NotFound);
+        assert_eq!(denial.message(), "support artifact not found or expired");
+    }
+
     let denial = admin
         .download_support_artifact(DownloadSupportArtifactRequest {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
