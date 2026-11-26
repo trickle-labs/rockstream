@@ -42,6 +42,17 @@ use crate::shard_actor::{CancellationReporter, OwnedFrameExecutor, ShardActorReg
 use rockstream_ops::PhysicalCommitGroup;
 use rockstream_storage::{ShardDb, WriteBatch};
 
+fn log_invalid_control_message(error: &serde_json::Error, message_bytes: usize) {
+    tracing::error!(
+        code = %rockstream_types::error_code::RS_0001,
+        error_kind = ?error.classify(),
+        error_line = error.line(),
+        error_column = error.column(),
+        message_bytes,
+        "Invalid message from control plane"
+    );
+}
+
 pub struct WorkerDeployment {
     pub descriptor: DeploymentDescriptor,
     pub schemas: HashMap<String, SchemaRef>,
@@ -1355,6 +1366,59 @@ mod data_plane_tests {
 
     use super::*;
     use rockstream_types::ids::OperatorId;
+
+    #[derive(Clone)]
+    struct CapturedLogWriter(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    struct CapturedLogWriterGuard(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogWriter {
+        type Writer = CapturedLogWriterGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogWriterGuard(self.0.clone())
+        }
+    }
+
+    impl std::io::Write for CapturedLogWriterGuard {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn invalid_control_message_log_has_exact_redacted_output() {
+        let line = r#"{"type":"redaction-marker"}"#;
+        let error = serde_json::from_str::<ControlMessage>(line).unwrap_err();
+        let output = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_writer(CapturedLogWriter(output.clone()))
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            super::log_invalid_control_message(&error, line.len());
+        });
+
+        let actual = String::from_utf8(output.lock().clone()).unwrap();
+        let expected = format!(
+            "ERROR Invalid message from control plane code={} error_kind={:?} error_line={} error_column={} message_bytes={}\n",
+            rockstream_types::error_code::RS_0001,
+            error.classify(),
+            error.line(),
+            error.column(),
+            line.len()
+        );
+        assert_eq!(actual, expected);
+        assert!(!actual.contains("redaction-marker"));
+    }
 
     #[tokio::test]
     async fn handoff_flushes_and_closes_each_open_writer_once() {
@@ -3867,12 +3931,7 @@ where
             let msg: ControlMessage = match serde_json::from_str(&line) {
                 Ok(m) => m,
                 Err(e) => {
-                    tracing::error!(
-                        code = %rockstream_types::error_code::RS_0001,
-                        "Invalid message from control plane: {:?}, raw: {}",
-                        e,
-                        line
-                    );
+                    log_invalid_control_message(&e, line.len());
                     continue;
                 }
             };

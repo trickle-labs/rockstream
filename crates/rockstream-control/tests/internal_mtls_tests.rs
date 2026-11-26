@@ -509,6 +509,11 @@ async fn worker_secret_tokens_are_workload_bound_and_recheck_current_grants() {
     .unwrap();
 
     let mut request = delegated_view_request();
+    request.storage_root = storage_dir
+        .path()
+        .join("delegated-view-storage")
+        .display()
+        .to_string();
     request.schemas = vec![rockstream_types::data_plane::DeploymentSchema {
         relation: "orders".to_owned(),
         columns: vec![rockstream_types::data_plane::DeploymentColumn {
@@ -828,7 +833,7 @@ async fn test_peer_invalid_expired_absent_cert_rejected_with_audit_denial_no_dat
 
     // 2. Expired certificate peer connection attempt
     let expired_tls = pki.expired_worker_tls_config();
-    let (c2, h2) = start_worker_client_for_local_test(
+    let expired_client_error = match start_worker_client_for_local_test(
         2,
         &control_url,
         storage_dir.path(),
@@ -837,7 +842,17 @@ async fn test_peer_invalid_expired_absent_cert_rejected_with_audit_denial_no_dat
         expired_tls,
     )
     .await
-    .unwrap();
+    {
+        Err(error) => error,
+        Ok((_, handle)) => {
+            handle.abort();
+            panic!("expired worker certificate was accepted");
+        }
+    };
+    assert_eq!(
+        expired_client_error.to_string(),
+        "RS-2411: server certificate is expired or not yet valid"
+    );
 
     // 3. Absent certificate (plaintext) peer connection attempt
     let absent_tls = rockstream_types::identity::InternalTlsConfig::default();
@@ -859,11 +874,6 @@ async fn test_peer_invalid_expired_absent_cert_rejected_with_audit_denial_no_dat
         c1.worker_id(),
         None,
         "Untrusted peer must not obtain WorkerId"
-    );
-    assert_eq!(
-        c2.worker_id(),
-        None,
-        "Expired peer must not obtain WorkerId"
     );
     assert_eq!(
         c3.worker_id(),
@@ -892,7 +902,6 @@ async fn test_peer_invalid_expired_absent_cert_rejected_with_audit_denial_no_dat
     );
 
     h1.abort();
-    h2.abort();
     h3.abort();
     handle.shutdown();
 }

@@ -67,3 +67,4 @@ sha2 = { workspace = true }
 rand = { workspace = true }
 async-trait = { workspace = true }
 criterion = { workspace = true, features = ["async_tokio"] }
+tracing-subscriber = { workspace = true }
