@@ -380,11 +380,7 @@ impl DataPlaneClient {
     /// Submit a source delta using the direct Arrow IPC path to shard owners
     /// (bypassing `ControlService` for all row payloads).
     pub async fn submit_delta(&self, request: SourceDeltaRequest) -> io::Result<u64> {
-        if self.uses_insecure_internal_dev() {
-            self.submit_delta_with_assertion(request, None).await
-        } else {
-            self.submit_delta_direct(request).await
-        }
+        self.submit_delta_direct(request).await
     }
 
     pub async fn submit_delta_delegated(

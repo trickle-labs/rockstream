@@ -440,8 +440,8 @@ pub(crate) async fn handle_command(
                 return Err("routing finish does not match anchor or membership".to_owned());
             }
             let bytes = bounded_json(&finish_record(&deployment.db, &finish.record).await?)?;
-            client.direct_grants.revoke_completed(&finish.record);
-            completed = Some(finish);
+            let grant_was_installed = client.direct_grants.revoke_completed(&finish.record);
+            completed = Some((finish, grant_was_installed));
             bytes
         }
         RoutingOperation::AggregatePartial | RoutingOperation::JoinExecute => unreachable!(),
@@ -451,7 +451,7 @@ pub(crate) async fn handle_command(
         .verify_lease_token(command.lease_token)
         .await
         .map_err(|error| error.to_string())?;
-    if let Some(finish) = completed {
+    if let Some((finish, grant_was_installed)) = completed {
         let kind = finish
             .record
             .plan
@@ -467,26 +467,26 @@ pub(crate) async fn handle_command(
             "fallback_key_count":finish.record.plan.get("single_owner_fallback_keys").and_then(Value::as_array).map_or(0, Vec::len),
             "joins":finish.record.plan.get("diagnostics"),
         });
-        client
-            .msg_tx
-            .send(
-                rockstream_types::topology::WorkerMessage::RoutingEpochCommitted {
-                    worker_id: deployment.descriptor.shard.worker_id,
-                    workload_id: command.workload_id,
-                    anchor_shard_id: command.shard_id,
-                    anchor_lease_token: command.lease_token,
-                    epoch: finish.record.epoch,
-                    generation: finish.record.generation,
-                    request_id: finish.record.request_id.clone(),
-                    input_digest: finish.record.input_digest,
-                    decision,
-                    shard_leases: finish.shard_leases,
-                },
-            )
-            .await
-            .map_err(|_| {
+        let message = rockstream_types::topology::WorkerMessage::RoutingEpochCommitted {
+            worker_id: deployment.descriptor.shard.worker_id,
+            workload_id: command.workload_id,
+            anchor_shard_id: command.shard_id,
+            anchor_lease_token: command.lease_token,
+            epoch: finish.record.epoch,
+            generation: finish.record.generation,
+            request_id: finish.record.request_id.clone(),
+            input_digest: finish.record.input_digest,
+            decision,
+            shard_leases: finish.shard_leases,
+        };
+        if grant_was_installed {
+            client.msg_tx.send(message).await.map_err(|_| {
                 "committed routing notification requires control reconnection".to_owned()
             })?;
+        } else {
+            // No authorization reservation exists; this hint cannot gate a durable commit.
+            let _ = client.msg_tx.try_send(message);
+        }
     }
     Ok(result.into())
 }
