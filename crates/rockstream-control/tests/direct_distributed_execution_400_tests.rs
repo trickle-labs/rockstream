@@ -282,7 +282,27 @@ async fn r1_r2_r6_direct_arrow_ingestion_bypasses_control_and_wires_worker_inlet
         "expected RS-1012 for missing routing column/source, got: {bad_source_err}"
     );
 
-    // A rejected source must not reserve the epoch or change committed output.
+    // Malformed rows must also fail before a durable routing decision exists.
+    let bad_row_err = client
+        .submit_delta(SourceDeltaRequest {
+            version: DEPLOYMENT_DESCRIPTOR_VERSION,
+            request_id: "bad-row".to_owned(),
+            workload_id,
+            epoch: 3,
+            source: "orders".to_owned(),
+            rows: vec![RuntimeRow {
+                values_tsv: "1".to_owned(),
+                weight: 1,
+            }],
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        bad_row_err.to_string().contains("RS-1012"),
+        "expected RS-1012 for malformed input, got: {bad_row_err}"
+    );
+
+    // Neither rejected request may reserve the epoch or change committed output.
     // A valid request with a different identity can still commit epoch 3.
     assert_eq!(
         client
