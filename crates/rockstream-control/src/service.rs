@@ -9847,7 +9847,12 @@ mod tests {
             OperationStatus::Running
         );
         assert!(matches!(
-            runtime.migration.catalog.get(WorkerId(1)).unwrap().lifecycle,
+            runtime
+                .migration
+                .catalog
+                .get(WorkerId(1))
+                .unwrap()
+                .lifecycle,
             WorkerLifecycleState::Draining { .. }
         ));
         assert_eq!(manager.get(ShardId(9)), Some(transferred.clone()));
@@ -9872,7 +9877,12 @@ mod tests {
             OperationStatus::Succeeded
         );
         assert!(matches!(
-            runtime.migration.catalog.get(WorkerId(1)).unwrap().lifecycle,
+            runtime
+                .migration
+                .catalog
+                .get(WorkerId(1))
+                .unwrap()
+                .lifecycle,
             WorkerLifecycleState::Decommissioned { .. }
         ));
         assert_eq!(manager.get(ShardId(9)), Some(transferred));
