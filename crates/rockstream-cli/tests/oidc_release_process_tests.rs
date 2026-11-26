@@ -48,7 +48,7 @@ use rockstream_types::{
     },
     data_plane::{DeploymentRequest, DEPLOYMENT_DESCRIPTOR_VERSION},
     ids::{DatabaseId, NamespaceId, OperatorId, PrincipalId, ShardId, WorkerId, WorkloadId},
-    topology::WorkerMessage,
+    topology::{CapacityHeadroom, ControlMessage, NodeRole, WorkerMessage, WorkerRegistration},
 };
 use sha2::Digest;
 use testcontainers::core::{ContainerPort, ExecCommand, WaitFor};
@@ -56,7 +56,7 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, Image, ImageExt};
 use testcontainers_modules::kafka::apache;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
 };
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
@@ -1508,20 +1508,65 @@ async fn release_control_rejects_client_certificate_for_worker_registration() {
         principal_page.principals
     );
 
-    let control_url = control_address.to_string();
-    let worker_storage = temp.path().join("client-storage");
-    let (worker, worker_task) = rockstream_runtime::client::start_worker_client_with_tls(
-        1,
-        &control_url,
-        &worker_storage,
-        pki.cli_tls_config(),
-    )
-    .await
-    .unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(worker.worker_id(), None);
-    worker_task.abort();
-    let _ = worker_task.await;
+    let connector =
+        rockstream_runtime::tls::build_client_tls_connector(&pki.cli_tls_config()).unwrap();
+    let tcp = tokio::net::TcpStream::connect(control_address)
+        .await
+        .unwrap();
+    let tls = connector
+        .connect(
+            rustls::pki_types::ServerName::try_from("localhost".to_owned()).unwrap(),
+            tcp,
+        )
+        .await
+        .unwrap();
+    let mut stream = tokio::io::BufReader::new(tls);
+    let request = WorkerMessage::Register(WorkerRegistration::new(
+        WorkerId(1),
+        NodeRole::Worker,
+        "127.0.0.1:9001",
+        CapacityHeadroom::FULL,
+    ));
+    let mut request = serde_json::to_vec(&request).unwrap();
+    request.push(b'\n');
+    stream.get_mut().write_all(&request).await.unwrap();
+
+    let mut response = String::new();
+    assert_ne!(
+        tokio::time::timeout(Duration::from_secs(2), stream.read_line(&mut response))
+            .await
+            .unwrap()
+            .unwrap(),
+        0,
+        "control process closed the rejected registration without a response"
+    );
+    match serde_json::from_str::<ControlMessage>(&response).unwrap() {
+        ControlMessage::OperationFailed {
+            code,
+            message,
+            next_steps,
+        } => {
+            assert_eq!(code, rockstream_types::error_code::RS_2412.to_string());
+            assert_eq!(
+                message,
+                "certificate identity cli:admin does not match requested worker_id worker-1"
+            );
+            assert_eq!(
+                next_steps,
+                rockstream_types::error_code::next_steps(rockstream_types::error_code::RS_2412)
+            );
+        }
+        other => panic!("unexpected client-certificate registration response: {other:?}"),
+    }
+    let mut trailing = String::new();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), stream.read_line(&mut trailing))
+            .await
+            .unwrap()
+            .unwrap(),
+        0,
+        "control process kept the rejected worker connection open"
+    );
 
     let status_after = operator_client
         .get_cluster_status(GetClusterStatusRequest {
