@@ -3210,6 +3210,9 @@ impl GatewayHandler {
             .get_durable_store()
             .ok_or_else(|| "durable secret authorization state is unavailable".to_string())?;
         use rockstream_storage::catalog::CatalogStore;
+        self.refresh_security_policy_if_stale(&store)
+            .await
+            .map_err(|_| "durable secret authorization state is unavailable".to_string())?;
         let consumers = store
             .list_security_principals()
             .await
@@ -27650,7 +27653,7 @@ mod v073_secret_policy_refresh_tests {
     }
 
     #[tokio::test]
-    async fn source_secret_use_refreshes_durable_policy_before_resolution() {
+    async fn source_and_sink_secret_use_refresh_durable_policy_before_resolution() {
         use rockstream_storage::catalog::{
             CatalogMutation, CatalogStore, CatalogTxn, DurableCatalogStore,
         };
@@ -27767,6 +27770,30 @@ mod v073_secret_policy_refresh_tests {
         let catalog = Arc::new(CatalogStubs::new());
         catalog.set_durable_store(stale_store);
         let handler = GatewayHandler::new(catalog, Arc::new(NoopViewReader));
+        let sink = CatalogSinkEntry {
+            name: "kafka_sink".to_string(),
+            view: "orders".to_string(),
+            format: "KAFKA".to_string(),
+            path: "localhost:9092".to_string(),
+            snapshot_interval_epochs: None,
+            snapshot_interval_ms: None,
+            parquet_row_group_bytes: None,
+            format_version: None,
+            partition_by: Vec::new(),
+            catalog: "orders".to_string(),
+            secret_name: Some("secret://kafka".to_string()),
+            security_protocol: Some("SASL_SSL".to_string()),
+            secret_consumer: Some(PrincipalId(1)),
+            secret_namespace: Some("public".to_string()),
+            last_snapshot_epoch: None,
+            state: "OK".to_string(),
+        };
+        assert_eq!(
+            handler
+                .authorize_sink_secret_use(&sink, "secret://kafka")
+                .await,
+            Err("[RS-2401] sink secret consumer is no longer authorized".to_string())
+        );
         let source = CatalogSourceEntry {
             name: "kafka_source".to_string(),
             table_name: Some("orders".to_string()),
