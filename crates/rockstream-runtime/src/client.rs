@@ -3841,6 +3841,57 @@ where
         }));
 
         let refresh_msg_tx = msg_tx.clone();
+        let heat_tx = msg_tx.clone();
+        let heat_deployments = deployments_clone.clone();
+        let heat_shards = active_shards_clone.clone();
+        let heat_context = storage_context_clone.clone();
+        let _heat_task = AbortOnDropHandle::new(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                let leases: Vec<_> = heat_shards
+                    .read()
+                    .values()
+                    .map(|state| state.lease.clone())
+                    .collect();
+                let scopes: HashMap<_, Vec<String>> = {
+                    let deployments = heat_deployments.read();
+                    leases
+                        .iter()
+                        .map(|lease| {
+                            let mut scopes: Vec<_> = deployments
+                                .values()
+                                .filter(|deployment| {
+                                    deployment.descriptor.shard.shard_id == lease.shard_id
+                                })
+                                .map(|deployment| deployment.descriptor.storage_identity.clone())
+                                .collect();
+                            scopes.push(format!("shards/{}", lease.shard_id.0));
+                            (lease.shard_id, scopes)
+                        })
+                        .collect()
+                };
+                for lease in leases {
+                    let heat = heat_context.heat_cache().heat(
+                        &scopes[&lease.shard_id],
+                        rockstream_storage::heat_cache::now_ms(),
+                    );
+                    if !heat.blocks.is_empty()
+                        && heat_tx
+                            .send(WorkerMessage::ShardHeatReport {
+                                worker_id: lease.worker_id,
+                                shard_id: lease.shard_id,
+                                lease_token: lease.lease_token,
+                                heat,
+                            })
+                            .await
+                            .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        }));
         let refresh_secret_manager = secret_manager_clone.clone();
         let refresh_deployments = deployments_clone.clone();
         let _secret_refresh_task = AbortOnDropHandle::new(tokio::spawn(async move {
@@ -4051,6 +4102,7 @@ where
                                 }
                             }
                         }
+                        let store: Arc<dyn object_store::ObjectStore> = Arc::new(rockstream_storage::heat_cache::HeatObjectStore::new(descriptor.storage_identity.clone(), store, storage_context_clone.heat_cache()));
                         let db = Arc::new(
                             ShardDb::builder("db", store)
                                 .with_storage_context(storage_context_clone.clone())
@@ -4400,6 +4452,12 @@ where
                         Some("remote")
                     );
                     // Attempt to open the ShardDb
+                    let store: Arc<dyn object_store::ObjectStore> =
+                        Arc::new(rockstream_storage::heat_cache::HeatObjectStore::new(
+                            remote_prefix,
+                            store,
+                            storage_context_clone.heat_cache(),
+                        ));
                     let mut builder = ShardDb::builder("db", store)
                         .with_supported_format_range(
                             rockstream_types::compatibility::SupportedStorageFormatRange::v1_through_v2(
@@ -4497,6 +4555,58 @@ where
                             }
                         }
                     }
+                }
+                ControlMessage::WarmShardCache {
+                    operation_id,
+                    lease,
+                    storage_scopes,
+                } => {
+                    let Some(target) = *worker_id_clone.read() else {
+                        continue;
+                    };
+                    let mut stores = Vec::new();
+                    if storage_scopes.len() <= 64 && lease.heat_hint.blocks.len() <= 64 {
+                        for (scope, prefix) in storage_scopes {
+                            if scope.len() > 512 || prefix.len() > 512 {
+                                continue;
+                            }
+                            if !lease
+                                .heat_hint
+                                .blocks
+                                .iter()
+                                .any(|block| block.storage_scope == scope)
+                            {
+                                continue;
+                            }
+                            let local = scope.strip_prefix("lfs:").unwrap_or(&scope);
+                            if let Ok(store) = rockstream_storage::build_runtime_object_store(
+                                Path::new(local),
+                                &prefix,
+                            ) {
+                                stores.push((scope, store));
+                            }
+                        }
+                    }
+                    let bytes = storage_context_clone
+                        .heat_cache()
+                        .warm(
+                            &stores,
+                            &lease.heat_hint,
+                            rockstream_storage::heat_cache::now_ms(),
+                        )
+                        .await;
+                    tracing::info!(shard_id = %lease.shard_id, prefetch_bytes = bytes, "recipient cache preparation finished before lease acquisition");
+                    let _ = msg_tx
+                        .send(WorkerMessage::ShardTransferAck {
+                            operation_id,
+                            stage: "prefetch".into(),
+                            worker_id: target,
+                            shard_id: lease.shard_id,
+                            lease_token: lease.lease_token,
+                            success: true,
+                            error: None,
+                        })
+                        .await;
                 }
                 ControlMessage::VerifyWorkloadIdle {
                     operation_id,

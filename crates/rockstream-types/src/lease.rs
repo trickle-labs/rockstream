@@ -27,6 +27,40 @@ pub struct LeaseHeatHint {
     pub hot_sst_ids: Vec<String>,
     pub hot_block_ranges: Vec<(u64, u64)>,
     pub expected_read_rate: u64,
+    /// Object-associated immutable SST ranges. Legacy unassociated arrays are
+    /// retained for wire compatibility but are never used for prefetch I/O.
+    #[serde(default)]
+    pub blocks: Vec<SstBlockHeat>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SstBlockHeat {
+    pub storage_scope: String,
+    pub object_path: String,
+    pub start: u64,
+    pub end: u64,
+    pub observed_at_ms: u64,
+}
+
+impl SstBlockHeat {
+    pub fn is_valid(&self) -> bool {
+        !self.storage_scope.is_empty()
+            && self.storage_scope.len() <= 512
+            && self.object_path.len() <= 256
+            && self.object_path.starts_with("db/compacted/")
+            && self.object_path.ends_with(".sst")
+            && !self
+                .object_path
+                .split('/')
+                .any(|part| part == ".." || part.is_empty())
+            && self.object_path.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'-' | b'_')
+            })
+            && self
+                .end
+                .checked_sub(self.start)
+                .is_some_and(|bytes| bytes > 0 && bytes <= LeaseHeatHint::MAX_BLOCK_RANGE_BYTES)
+    }
 }
 
 impl LeaseHeatHint {
@@ -35,6 +69,7 @@ impl LeaseHeatHint {
     pub const MAX_SST_ID_BYTES: usize = 128;
     pub const MAX_BLOCK_RANGE_BYTES: u64 = 1024 * 1024;
     pub const MAX_PREFETCH_BYTES: u64 = 4 * 1024 * 1024;
+    pub const MAX_AGE_MS: u64 = 60_000;
 
     /// Decay rate exponentially by epoch while retaining the useful locality hints.
     pub fn decay(&mut self, elapsed_epochs: u64, half_life_epochs: u64) {
@@ -72,6 +107,15 @@ impl LeaseHeatHint {
             true
         });
         self.hot_block_ranges.truncate(Self::MAX_ENTRIES);
+        let mut remaining = Self::MAX_PREFETCH_BYTES;
+        self.blocks.retain(|block| {
+            if !block.is_valid() || block.end - block.start > remaining {
+                return false;
+            }
+            remaining -= block.end - block.start;
+            true
+        });
+        self.blocks.truncate(Self::MAX_ENTRIES);
         self
     }
 }
@@ -203,6 +247,7 @@ mod tests {
                 (max * 4, max * 5),
             ],
             expected_read_rate: 100,
+            blocks: Vec::new(),
         };
         assert_eq!(
             hint.bounded(),
@@ -216,6 +261,7 @@ mod tests {
                     (max * 3, max * 4),
                 ],
                 expected_read_rate: 100,
+                blocks: Vec::new(),
             }
         );
     }

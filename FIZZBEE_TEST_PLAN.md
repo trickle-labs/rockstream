@@ -20,6 +20,20 @@ decommission is guarded by an empty ownership set. CPU samples are advisory and
 cannot change the commit clock. Retrying a terminal failed move creates a new
 frontier-scoped operation identity and still requires the original donor fence.
 
+## Issue 403: advisory cache preparation before ownership
+
+The migration and legacy drain executors send `WarmShardCache` to the recipient
+under the donor's current fence before lease transfer. The recipient opens only
+raw ObjectStore references: it cannot acquire a SlateDB writer or advance a
+frontier during this stage. Cache preparation has one range in flight, a 4 MiB
+I/O cap, a two-second worker deadline, and a three-second control deadline.
+Object-associated heat is confined to the shard's authorized storage scopes;
+malformed, future and expired hints are dropped. Cache misses or failures are
+advisory and cannot alter M4/M6 ownership decisions. Exact-byte cache and backend
+I/O regressions verify warming reaches the same cache used by foreground SST
+reads. The handshake regression verifies the donor fence remains current until
+preparation is acknowledged. No new durable ownership state is introduced.
+
 **Status**: v1.0 — authoritative MDD specification for formal verification of
 RockStream's distributed coordination protocols.
 
