@@ -195,7 +195,39 @@ async fn test_explain_analyze_uses_distributed_stats_for_each_view_and_operator(
             let mut response_line = serde_json::to_string(&response).unwrap();
             response_line.push('\n');
             write.write_all(response_line.as_bytes()).await.unwrap();
-            responses.push((workload_id, expected));
+            // Each ANALYZE also requests the adaptive history for the same view.
+            let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .expect("gateway did not request adaptive diagnostics")
+                .unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut reader = BufReader::new(read);
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).await.unwrap() > 0);
+            let WorkerMessage::ReadAdaptiveDiagnostics {
+                workload_id: diagnostic_workload,
+            } = serde_json::from_str(&line).unwrap()
+            else {
+                panic!("gateway did not request adaptive diagnostics");
+            };
+            assert_eq!(diagnostic_workload, workload_id);
+            let events = if base_rows == 10 {
+                vec![serde_json::json!({
+                    "action": "routing.committed",
+                    "epoch": 17,
+                    "generation": 3
+                })]
+            } else {
+                Vec::new()
+            };
+            let response = ControlMessage::AdaptiveDiagnostics {
+                workload_id: diagnostic_workload,
+                events: events.clone(),
+            };
+            let mut response_line = serde_json::to_string(&response).unwrap();
+            response_line.push('\n');
+            write.write_all(response_line.as_bytes()).await.unwrap();
+            responses.push((workload_id, expected, events));
         }
         responses
     });
@@ -266,7 +298,7 @@ async fn test_explain_analyze_uses_distributed_stats_for_each_view_and_operator(
         .1
         .iter()
         .any(|(other_id, _)| operator_id == other_id)));
-    for ((view_name, output), (_, expected)) in
+    for ((view_name, output), (_, expected, events)) in
         ["view_a", "view_b"].into_iter().zip(outputs).zip(responses)
     {
         assert!(output.contains(&format!("View[{view_name}]")), "{output}");
@@ -274,6 +306,22 @@ async fn test_explain_analyze_uses_distributed_stats_for_each_view_and_operator(
             !output.contains("Live worker statistics unavailable"),
             "{output}"
         );
+        assert!(output.contains("Adaptive routing and elasticity:"), "{output}");
+        if events.is_empty() {
+            assert!(
+                output.contains("No runtime decisions observed by this control process."),
+                "{output}"
+            );
+            assert!(!output.contains("routing.committed"), "{output}");
+        } else {
+            for event in events {
+                assert!(output.contains(&event.to_string()), "{output}");
+            }
+            assert!(
+                !output.contains("No runtime decisions observed by this control process."),
+                "{output}"
+            );
+        }
         for (operator_id, rows_per_s) in expected {
             let line = output
                 .lines()

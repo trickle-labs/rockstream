@@ -748,6 +748,38 @@ model; no new FizzBee transition or invariant is asserted.
 
 ### 3.6 Cross-Cutting Coverage Assertions
 
+PR #443 (issue #403) adds workload-scoped observations of committed routing
+and automatic movement decisions. A `RoutingEpochCommitted` message carries
+the generation, epoch and bounded diagnostic summary only after the existing
+durable routing completion; heavy-key identifiers are hashed. The control
+handler retains a bounded recent history (32 events and 256 KiB per workload)
+and attempts to append committed decisions to the audit. The delegated
+`ReadAdaptiveDiagnostics` request uses the same view-read scope as operator
+statistics; the runtime client checks the returned workload identity.
+The history is observational, not a source of lease ownership or commit
+authority, and empty history after restart does not imply no prior decisions.
+
+The idle-drain retry in `AutomaticRebalanceRuntime::finish_drains` resumes a
+durable pending/waiting idle migration by its existing operation ID and
+target, only when no other nonterminal migration exists. It delegates to the
+existing fenced migration executor; it does not introduce a new ownership
+transition or relax the durable anchor barrier. The service regression
+`explicit_drain_proposes_unused_leases_and_retries_failed_idle_moves`
+exercises the retry through the scheduler, including repeated polls while
+the donor is unavailable. These changes refine the implementation boundary
+of M4/M6; the existing models do not represent diagnostic history, audit
+delivery, or scheduling retry cadence. No new formal guarantee is claimed.
+
+`crates/rockstream-gateway/tests/explain_analyze_opstats_tests.rs` checks
+per-view and per-operator statistics alongside the matching adaptive history
+and explicit empty-history output.
+`crates/rockstream-cli/tests/automatic_skew_process_tests.rs` exercises exact
+oracle results, signed retractions, crash replay, non-admitted fallback,
+release p99, and real MinIO 2→4→2 membership changes. CPU distribution,
+cache-hit rates after live cutover, and transient-load hysteresis under the
+real process workload still need separate operational evidence.
+
+
 PR #455 (issue #303) changes only malformed control-message diagnostics in
 `crates/rockstream-runtime/src/client.rs`: the read loop still skips invalid
 lines, while logs retain the error code, decoder error, and byte length without
