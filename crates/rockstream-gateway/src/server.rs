@@ -27438,7 +27438,7 @@ mod v073_subscription_policy_tests {
                     "[RS-2401] auth.permission_denied: principal 'subscription-reader' is not authorized for action 'DataRead' on public.v072_live_auth. next_steps: Request an authorized scoped grant, then retry."
                 );
             }
-            other => panic!("revoked cursor fetch must be denied without rows: {other:?}"),
+            _ => panic!("revoked cursor fetch must be denied without rows"),
         }
         assert_eq!(
             handler
