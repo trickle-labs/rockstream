@@ -1753,10 +1753,17 @@ mod tests {
                     .as_any()
                     .downcast_ref::<Int64Array>()
                     .unwrap();
-                for index in 0..keys.len() {
-                    let identity = (keys.value(index), values.value(index));
+                assert_eq!(keys.len(), values.len());
+                assert_eq!(keys.len(), output.weights.len());
+                for ((key, value), output_weight) in keys
+                    .values()
+                    .iter()
+                    .zip(values.values())
+                    .zip(&output.weights)
+                {
+                    let identity = (*key, *value);
                     let rows = self.output.entry(*shard).or_default();
-                    let weight = rows.get(&identity).copied().unwrap_or(0) + output.weights[index];
+                    let weight = rows.get(&identity).copied().unwrap_or(0) + *output_weight;
                     if weight == 0 {
                         rows.remove(&identity);
                     } else {

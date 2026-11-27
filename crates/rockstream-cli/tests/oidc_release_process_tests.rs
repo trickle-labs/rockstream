@@ -2498,6 +2498,7 @@ async fn delegated_gateway_sql_rechecks_control_policy_and_recovers_lost_grant_r
         .password(VALID_TOKEN)
         .dbname("test")
         .ssl_mode(tokio_postgres::config::SslMode::Require);
+    let pooled_tls = client_tls.clone();
     let (client, connection) = config
         .connect(tokio_postgres_rustls::MakeRustlsConnect::new(client_tls))
         .await
@@ -2507,6 +2508,10 @@ async fn delegated_gateway_sql_rechecks_control_policy_and_recovers_lost_grant_r
     let audit_before = control_catalog.list_security_audit_records().await.unwrap();
     client
         .execute("CREATE TABLE orders (id BIGINT, amount BIGINT)", &[])
+        .await
+        .unwrap();
+    client
+        .execute("CREATE TABLE active_subscription (id BIGINT)", &[])
         .await
         .unwrap();
     client
@@ -3030,7 +3035,7 @@ async fn delegated_gateway_sql_rechecks_control_policy_and_recovers_lost_grant_r
     scoped_actor.revision = 3;
     scoped_actor.scoped_grants = vec![ScopedActionGrant {
         action: SecurityAction::BackupCreate,
-        scope: backup_scope,
+        scope: backup_scope.clone(),
     }];
     let mut principals_after_scoped_grant = principals_after_grant.clone();
     *principals_after_scoped_grant
@@ -3179,8 +3184,176 @@ async fn delegated_gateway_sql_rechecks_control_policy_and_recovers_lost_grant_r
         "a denied read must preserve the authenticated session after the separate grant"
     );
 
+    let subscription_scope = PolicyScope::Resource {
+        namespace: "public".to_owned(),
+        kind: ResourceKind::Table,
+        name: "active_subscription".to_owned(),
+    };
+    let grant_operation_id = uuid::Uuid::new_v4().to_string();
+    let grant_operation = management
+        .set_security_principal_grants(SetSecurityPrincipalGrantsRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            principal_id: 2,
+            expected_revision: 3,
+            expected_grantor_revision: 1,
+            idempotency_key: grant_operation_id.clone(),
+            preset_grants: vec![SecurityPresetGrant {
+                preset: "data_reader".to_owned(),
+                scope_json: serde_json::to_string(&PolicyScope::Namespace {
+                    namespace: "public".to_owned(),
+                })
+                .unwrap(),
+            }],
+            scoped_grants: vec![SecurityActionGrant {
+                action: "backup_create".to_owned(),
+                scope_json: serde_json::to_string(&backup_scope).unwrap(),
+            }],
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .operation
+        .unwrap();
+    assert_eq!(grant_operation.operation_id, grant_operation_id);
+    assert_eq!(
+        grant_operation.state, "succeeded",
+        "grant operation result: {}",
+        grant_operation.result_json
+    );
+    assert_eq!(grant_operation.phase, "security_policy_committed");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let mut pooled_config = tokio_postgres::Config::new();
+    pooled_config
+        .host("127.0.0.1")
+        .port(gateway_address.port())
+        .user("alice")
+        .password(VALID_TOKEN)
+        .dbname("test")
+        .ssl_mode(tokio_postgres::config::SslMode::Require);
+    let (pooled_client, pooled_connection) = pooled_config
+        .connect(tokio_postgres_rustls::MakeRustlsConnect::new(pooled_tls))
+        .await
+        .expect("second OIDC session should connect for the same principal");
+    let pooled_connection_task = tokio::spawn(pooled_connection);
+    let allowed_pooled_rows = pooled_client
+        .query("SELECT id FROM active_subscription", &[])
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get::<_, i64>(0))
+        .collect::<Vec<_>>();
+    assert_eq!(allowed_pooled_rows, Vec::<i64>::new());
+
+    let mut subscription = Box::pin(
+        client
+            .simple_query_raw("SUBSCRIBE active_subscription AS OF NOW WITH SNAPSHOT")
+            .await
+            .unwrap(),
+    );
+    let schema = tokio::time::timeout(Duration::from_secs(5), subscription.next())
+        .await
+        .expect("SUBSCRIBE schema should arrive within five seconds")
+        .expect("SUBSCRIBE stream ended before its schema")
+        .unwrap();
+    let tokio_postgres::SimpleQueryMessage::RowDescription(columns) = schema else {
+        panic!("expected the SUBSCRIBE row schema, received {schema:?}");
+    };
+    assert_eq!(
+        columns
+            .iter()
+            .map(|column| column.name())
+            .collect::<Vec<_>>(),
+        vec!["id", "mz_timestamp", "mz_diff"]
+    );
+
+    let revoke_operation_id = uuid::Uuid::new_v4().to_string();
+    let revocation_started = Instant::now();
+    let revoke_operation = management
+        .set_security_principal_grants(SetSecurityPrincipalGrantsRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            principal_id: 2,
+            expected_revision: 4,
+            expected_grantor_revision: 1,
+            idempotency_key: revoke_operation_id.clone(),
+            preset_grants: vec![SecurityPresetGrant {
+                preset: "operator".to_owned(),
+                scope_json: serde_json::to_string(&PolicyScope::Cluster).unwrap(),
+            }],
+            scoped_grants: vec![SecurityActionGrant {
+                action: "backup_create".to_owned(),
+                scope_json: serde_json::to_string(&backup_scope).unwrap(),
+            }],
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .operation
+        .unwrap();
+    assert_eq!(revoke_operation.operation_id, revoke_operation_id);
+    assert_eq!(revoke_operation.state, "succeeded");
+    assert_eq!(revoke_operation.phase, "security_policy_committed");
+    let subscription_error = tokio::time::timeout(Duration::from_secs(60), async {
+        match subscription.next().await {
+            Some(Err(error)) => error,
+            Some(Ok(message)) => {
+                panic!("revoked SUBSCRIBE emitted another message: {message:?}")
+            }
+            None => panic!("revoked SUBSCRIBE ended without a permission error"),
+        }
+    })
+    .await
+    .expect("live subscription did not reauthorize within 60 seconds");
+    assert!(
+        revocation_started.elapsed() <= Duration::from_secs(60),
+        "subscription revocation took {:?}",
+        revocation_started.elapsed()
+    );
+    let subscription_denial = subscription_error
+        .as_db_error()
+        .expect("subscription revocation should be a pgwire permission error");
+    assert_eq!(subscription_denial.code().code(), "42501");
+    assert_eq!(
+        subscription_denial.message(),
+        "[RS-2401] auth.permission_denied: principal 'alice' is not authorized for action 'DataRead' on public.active_subscription. next_steps: Request an authorized scoped grant, then retry."
+    );
+    assert!(subscription.next().await.is_none());
+
+    let pooled_denial = pooled_client
+        .query("SELECT id FROM active_subscription", &[])
+        .await
+        .expect_err("revocation must deny a second established session");
+    assert_eq!(pooled_denial.as_db_error().unwrap().code().code(), "42501");
+    assert_eq!(
+        pooled_denial.as_db_error().unwrap().message(),
+        "[RS-2401] auth.permission_denied: principal 'alice' is not authorized for action 'DataRead' on public.active_subscription. next_steps: Request an authorized scoped grant, then retry."
+    );
+    assert_eq!(
+        pooled_client
+            .query_one("SELECT 1 AS value", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        1_i64,
+        "revocation must preserve the second authenticated session"
+    );
+
+    let mut principal_after_subscription_revocation = scoped_actor.clone();
+    principal_after_subscription_revocation.revision = 5;
+    let mut principals_after_subscription_revocation = principals_after_scoped_grant.clone();
+    *principals_after_subscription_revocation
+        .iter_mut()
+        .find(|principal| principal.id == PrincipalId(2))
+        .expect("delegated actor is provisioned") = principal_after_subscription_revocation.clone();
+    control_catalog.refresh().await.unwrap();
+    let mut current_principals = control_catalog.list_security_principals().await.unwrap();
+    current_principals.sort_by_key(|principal| principal.id);
+    assert_eq!(current_principals, principals_after_subscription_revocation);
+
     control_catalog.refresh().await.unwrap();
     let audit_before_shutdown = control_catalog.list_security_audit_records().await.unwrap();
+    drop(pooled_client);
+    pooled_connection_task.abort();
     drop(client);
     connection_task.abort();
     jwks_task.await.unwrap();
@@ -3215,7 +3388,7 @@ async fn delegated_gateway_sql_rechecks_control_policy_and_recovers_lost_grant_r
         .unwrap();
     let mut principals_after = recovered.list_security_principals().await.unwrap();
     principals_after.sort_by_key(|principal| principal.id);
-    assert_eq!(principals_after, principals_after_scoped_grant);
+    assert_eq!(principals_after, principals_after_subscription_revocation);
     let records = recovered.list_security_audit_records().await.unwrap();
     assert_eq!(records, audit_before_shutdown);
     let data_denials = records
@@ -3262,6 +3435,46 @@ async fn delegated_gateway_sql_rechecks_control_policy_and_recovers_lost_grant_r
                 correlation: record.correlation.clone(),
                 operation_id: AuditField::NotApplicable,
                 policy_revision: AuditField::Known(policy_revision),
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::NotApplicable,
+            }
+        );
+    }
+    let subscription_scope = AuditField::Known(serde_json::to_string(&subscription_scope).unwrap());
+    let subscription_denials = records
+        .iter()
+        .filter(|record| {
+            record.target == AuditField::Known("public.active_subscription".to_owned())
+                && record.action == SecurityAuditClass::AuthorizationDenial
+                && record.outcome == SecurityAuditOutcome::Denied
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(subscription_denials.len(), 2);
+    assert_ne!(
+        subscription_denials[0].correlation,
+        subscription_denials[1].correlation
+    );
+    for subscription_denial in subscription_denials {
+        assert!(subscription_denial.event_id.starts_with("gateway-authz-"));
+        assert!(subscription_denial.timestamp_ms > 0);
+        assert!(matches!(
+            &subscription_denial.correlation,
+            AuditCorrelation::Observed(value) if !value.is_empty()
+        ));
+        assert_eq!(
+            subscription_denial,
+            &SecurityAuditRecord {
+                format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: subscription_denial.event_id.clone(),
+                timestamp_ms: subscription_denial.timestamp_ms,
+                actor: actor.clone(),
+                target: AuditField::Known("public.active_subscription".to_owned()),
+                scope: subscription_scope.clone(),
+                action: SecurityAuditClass::AuthorizationDenial,
+                outcome: SecurityAuditOutcome::Denied,
+                correlation: subscription_denial.correlation.clone(),
+                operation_id: AuditField::NotApplicable,
+                policy_revision: AuditField::Known(5),
                 before_state: AuditField::NotApplicable,
                 after_state: AuditField::NotApplicable,
             }
