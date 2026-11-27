@@ -1183,10 +1183,10 @@ impl CheckpointExportService {
             let destination_name = dest_path.to_string();
             let record_path = inventory_path(&generation, index as u64);
             let captured = captured_metadata.get(&source_path);
-            let (object_source, object_source_path) = captured.map_or(
-                (&source, &source_path),
-                |metadata| (&destination, &metadata.path),
-            );
+            let (object_source, object_source_path) = captured
+                .map_or((&source, &source_path), |metadata| {
+                    (&destination, &metadata.path)
+                });
 
             let record = if let Some(existing) = self
                 .read_json::<InventoryRecord>(&destination, &record_path)
