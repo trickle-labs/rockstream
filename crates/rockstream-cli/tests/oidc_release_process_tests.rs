@@ -3054,14 +3054,12 @@ async fn delegated_gateway_sql_rechecks_control_policy_and_recovers_lost_grant_r
     assert_eq!(revoke_operation.state, "succeeded");
     assert_eq!(revoke_operation.phase, "security_policy_committed");
     let subscription_error = tokio::time::timeout(Duration::from_secs(60), async {
-        loop {
-            match subscription.next().await {
-                Some(Err(error)) => break error,
-                Some(Ok(message)) => {
-                    panic!("revoked SUBSCRIBE emitted another message: {message:?}")
-                }
-                None => panic!("revoked SUBSCRIBE ended without a permission error"),
+        match subscription.next().await {
+            Some(Err(error)) => error,
+            Some(Ok(message)) => {
+                panic!("revoked SUBSCRIBE emitted another message: {message:?}")
             }
+            None => panic!("revoked SUBSCRIBE ended without a permission error"),
         }
     })
     .await
