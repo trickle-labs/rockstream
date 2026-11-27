@@ -646,6 +646,34 @@ async fn management_release_process_authenticates_and_authorizes_real_cli_reques
         String::from_utf8_lossy(&after_plaintext.stderr)
     );
 
+    let (worker_certificate, worker_key) = pki.worker_certs.get(&1).unwrap();
+    let worker_management = run_management_cli(
+        binary,
+        management_addr,
+        &pki,
+        worker_certificate,
+        worker_key,
+        None,
+        &["status"],
+    );
+    assert!(!worker_management.status.success());
+    assert_eq!(worker_management.stdout, b"");
+    let mut worker_error: CliErrorEnvelope =
+        serde_json::from_slice(&worker_management.stderr).unwrap();
+    assert_eq!(
+        worker_management.stderr,
+        format!("{}\n", serde_json::to_string_pretty(&worker_error).unwrap()).as_bytes()
+    );
+    worker_error.correlation_id.clear();
+    let mut expected_worker_error =
+        CliErrorEnvelope::from_cli_error(&rockstream_cli::CliError::new(
+            RS_0003,
+            "management GetClusterStatus failed: Unknown error: transport error",
+            "Check the management endpoint, protocol compatibility, and server logs.",
+        ));
+    expected_worker_error.correlation_id.clear();
+    assert_eq!(worker_error, expected_worker_error);
+
     let admin_status = run_management_cli(
         binary,
         management_addr,
@@ -999,6 +1027,36 @@ async fn management_release_process_authenticates_and_authorizes_real_cli_reques
     assert_eq!(
         auth_failures,
         vec![unknown_failure.clone(), unknown_failure]
+    );
+
+    let mut rejected_node_identity = audit
+        .iter()
+        .filter(|record| {
+            record.action == SecurityAuditClass::AuthenticationFailure
+                && record.actor == AuditIdentity::Unverified("worker:worker-1".to_owned())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(rejected_node_identity.len(), 1);
+    rejected_node_identity[0].event_id = "<event-id>".to_owned();
+    rejected_node_identity[0].timestamp_ms = 1;
+    assert_eq!(
+        rejected_node_identity,
+        vec![SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: "<event-id>".to_owned(),
+            timestamp_ms: 1,
+            actor: AuditIdentity::Unverified("worker:worker-1".to_owned()),
+            target: AuditField::Known("management-api".to_owned()),
+            scope: AuditField::NotApplicable,
+            action: SecurityAuditClass::AuthenticationFailure,
+            outcome: SecurityAuditOutcome::Failure,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::Unknown,
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }]
     );
 
     let mut denials = audit
