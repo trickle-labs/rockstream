@@ -1909,8 +1909,9 @@ gate:
 - **DC.2** — Any change to a coordination protocol in `DESIGN.md` requires the
   corresponding `.fizz` model and the Section 3.6 mapping table to be updated in
   the same PR. CI fails if a coordination-crate change lands without a
-  corresponding model touch (enforced by a path-coupling check, analogous to the
-  [DESIGN.md §17.2](DESIGN.md) `buggify!()`-review rule).
+  corresponding model touch, except for diffs confined to trailing inline
+  `#[cfg(test)] mod tests` modules (enforced by a path-coupling check, analogous
+  to the [DESIGN.md §17.2](DESIGN.md) `buggify!()`-review rule).
 - **DC.3** — Every FizzBee counterexample is archived in `formal/findings.md`
   with its trace and its paired `SimRuntime` regression seed, and is replayed on
   every build forever ([DESIGN.md §17.6](DESIGN.md)).
