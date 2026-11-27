@@ -27228,9 +27228,7 @@ mod v073_subscription_policy_tests {
         use rockstream_storage::catalog::{
             CatalogMutation, CatalogStore, CatalogTxn, DurableCatalogStore,
         };
-        use rockstream_types::authorization::{
-            PermissionPreset, PolicyScope, ScopedActionGrant, ScopedPresetGrant, SecurityAction,
-        };
+        use rockstream_types::authorization::{PermissionPreset, PolicyScope, ScopedPresetGrant};
         use rockstream_types::ids::PrincipalId;
 
         async fn subscribe(
@@ -27365,12 +27363,7 @@ mod v073_subscription_policy_tests {
                 namespace: "other".to_string(),
             },
         }];
-        reader.scoped_grants = vec![ScopedActionGrant {
-            action: SecurityAction::NamespaceCrossAccess,
-            scope: PolicyScope::Namespace {
-                namespace: "other".to_string(),
-            },
-        }];
+        reader.scoped_grants.clear();
         let revoked_policy =
             serde_json::to_string(&(reader.enabled, &reader.preset_grants, &reader.scoped_grants))
                 .unwrap();
