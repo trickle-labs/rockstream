@@ -134,6 +134,16 @@ struct SecurityPrincipalCreateDigest {
 }
 
 #[derive(Serialize)]
+struct SecurityPrincipalDeleteDigest {
+    deployment_id: String,
+    principal_id: u64,
+    expected_revision: u64,
+    grantor_id: u64,
+    grantor_revision: u64,
+    certificate_sha256: String,
+}
+
+#[derive(Serialize)]
 struct SupportArtifactDocument {
     format_version: u16,
     generated_at_ms: u64,
@@ -1699,6 +1709,382 @@ impl ManagementService {
         .map_err(|_| required_audit_unavailable(request, "service principal audit is unavailable"))
     }
 
+    async fn ensure_security_principal_delete_started(
+        &self,
+        request: &Request<v1::DeleteSecurityPrincipalRequest>,
+        operation_id: &str,
+        change: &SecurityPrincipalDeleteDigest,
+        fingerprint: &str,
+    ) -> Result<(), Status> {
+        let catalog = self
+            .security_catalog
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("management security catalog is unavailable"))?;
+        let event_id = format!("management-principal-delete-start:{operation_id}");
+        let valid_start = |record: &SecurityAuditRecord| {
+            record.action == SecurityAuditClass::AdminOperationStart
+                && record.outcome == SecurityAuditOutcome::Success
+                && record.actor
+                    == AuditIdentity::Verified(format!("principal:{}", change.grantor_id))
+                && record.target == AuditField::Known(format!("principal:{}", change.principal_id))
+                && record.scope == AuditField::Known("cluster".to_owned())
+                && record.correlation == AuditCorrelation::Observed(operation_id.to_owned())
+                && record.operation_id == AuditField::Known(operation_id.to_owned())
+                && record.policy_revision == AuditField::Known(change.grantor_revision)
+                && record.before_state == AuditField::NotApplicable
+                && record.after_state == AuditField::Known(format!("request_sha256:{fingerprint}"))
+        };
+        catalog.refresh().await.map_err(|_| {
+            required_audit_unavailable(request, "principal deletion audit is unavailable")
+        })?;
+        if let Some(record) = catalog
+            .get_security_audit_record(&event_id)
+            .await
+            .map_err(|_| {
+                required_audit_unavailable(request, "principal deletion audit is unavailable")
+            })?
+        {
+            if valid_start(&record) {
+                return Ok(());
+            }
+            return Err(Status::already_exists(
+                "idempotency key is bound to another principal-deletion request",
+            ));
+        }
+        let start_record = SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: event_id.clone(),
+            timestamp_ms: Utc::now().timestamp_millis().max(1) as u64,
+            actor: AuditIdentity::Verified(format!("principal:{}", change.grantor_id)),
+            target: AuditField::Known(format!("principal:{}", change.principal_id)),
+            scope: AuditField::Known("cluster".to_owned()),
+            action: SecurityAuditClass::AdminOperationStart,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::Observed(operation_id.to_owned()),
+            operation_id: AuditField::Known(operation_id.to_owned()),
+            policy_revision: AuditField::Known(change.grantor_revision),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::Known(format!("request_sha256:{fingerprint}")),
+        };
+        if append_security_audit(catalog.as_ref(), start_record)
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+        catalog.refresh().await.map_err(|_| {
+            required_audit_unavailable(request, "principal deletion audit is unavailable")
+        })?;
+        if let Some(record) = catalog
+            .get_security_audit_record(&event_id)
+            .await
+            .map_err(|_| {
+                required_audit_unavailable(request, "principal deletion audit is unavailable")
+            })?
+        {
+            if valid_start(&record) {
+                return Ok(());
+            }
+            return Err(Status::already_exists(
+                "idempotency key is bound to another principal-deletion request",
+            ));
+        }
+        Err(required_audit_unavailable(
+            request,
+            "principal deletion audit is unavailable",
+        ))
+    }
+
+    async fn apply_security_principal_delete(
+        &self,
+        operation_id: &str,
+        change: &SecurityPrincipalDeleteDigest,
+    ) -> Result<u64, Status> {
+        if change.deployment_id != self.deployment_fingerprint() {
+            return Err(Status::failed_precondition(
+                "principal deletion request belongs to another deployment",
+            ));
+        }
+        let catalog = self
+            .security_catalog
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("management security catalog is unavailable"))?;
+        let expected_deleted_revision =
+            change.expected_revision.checked_add(1).ok_or_else(|| {
+                Status::resource_exhausted("security principal revision is exhausted")
+            })?;
+        let grantor_id = PrincipalId(change.grantor_id);
+        let principal_id = PrincipalId(change.principal_id);
+        let grant_event_id = format!("management-principal-delete:{operation_id}");
+        let completion_event_id = format!("management-principal-delete-completion:{operation_id}");
+        let actor = AuditIdentity::Verified(format!("principal:{}", grantor_id.0));
+        let target = AuditField::Known(format!("principal:{}", principal_id.0));
+        let certificate: [u8; 32] = hex::decode(&change.certificate_sha256)
+            .map_err(|_| Status::internal("principal deletion grantor identity is malformed"))?
+            .try_into()
+            .map_err(|_| Status::internal("principal deletion grantor identity is malformed"))?;
+
+        for attempt in 0..rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS {
+            catalog
+                .refresh()
+                .await
+                .map_err(|_| Status::unavailable("management security catalog is unavailable"))?;
+            if let Some(record) = catalog
+                .get_security_audit_record(&grant_event_id)
+                .await
+                .map_err(|_| Status::unavailable("management security catalog is unavailable"))?
+            {
+                let completion = catalog
+                    .get_security_audit_record(&completion_event_id)
+                    .await
+                    .map_err(|_| {
+                        Status::unavailable("management security catalog is unavailable")
+                    })?;
+                let expected_before_prefix =
+                    format!("revision={};policy=", change.expected_revision);
+                let operation_id_value = match &record.operation_id {
+                    AuditField::Known(value) => value.parse::<u64>().ok().filter(|id| *id > 0),
+                    _ => None,
+                };
+                let valid_grant = record.action == SecurityAuditClass::GrantChange
+                    && record.outcome == SecurityAuditOutcome::Success
+                    && record.actor == actor
+                    && record.target == target
+                    && record.scope == AuditField::Known("cluster".to_owned())
+                    && record.correlation == AuditCorrelation::Observed(operation_id.to_owned())
+                    && operation_id_value.is_some()
+                    && record.policy_revision == AuditField::Known(expected_deleted_revision)
+                    && matches!(&record.before_state, AuditField::Known(state) if state.starts_with(&expected_before_prefix))
+                    && record.after_state == AuditField::NotApplicable;
+                let valid_completion = completion.as_ref().is_some_and(|completion| {
+                    completion.action == SecurityAuditClass::AdminOperationCompletion
+                        && completion.outcome == SecurityAuditOutcome::Success
+                        && completion.actor == actor
+                        && completion.target == target
+                        && completion.scope == AuditField::Known("cluster".to_owned())
+                        && completion.correlation
+                            == AuditCorrelation::Observed(operation_id.to_owned())
+                        && completion.operation_id == record.operation_id
+                        && completion.policy_revision
+                            == AuditField::Known(expected_deleted_revision)
+                        && completion.before_state == record.before_state
+                        && completion.after_state == AuditField::Known("deleted".to_owned())
+                });
+                return if valid_grant && valid_completion {
+                    operation_id_value.ok_or_else(|| {
+                        Status::data_loss("principal deletion audit operation ID is invalid")
+                    })
+                } else {
+                    Err(Status::data_loss(
+                        "principal deletion audit does not match its request",
+                    ))
+                };
+            }
+            if let Some(completion) = catalog
+                .get_security_audit_record(&completion_event_id)
+                .await
+                .map_err(|_| Status::unavailable("management security catalog is unavailable"))?
+            {
+                if completion.action == SecurityAuditClass::AdminOperationCompletion
+                    && completion.outcome == SecurityAuditOutcome::Failure
+                    && completion.event_id == completion_event_id
+                    && completion.actor == actor
+                    && completion.target == target
+                    && completion.scope == AuditField::Known("cluster".to_owned())
+                    && completion.correlation == AuditCorrelation::Observed(operation_id.to_owned())
+                    && completion.operation_id == AuditField::Known(operation_id.to_owned())
+                    && completion.policy_revision == AuditField::Known(change.expected_revision)
+                    && completion.before_state == AuditField::NotApplicable
+                    && completion.after_state == AuditField::Known("rejected".to_owned())
+                {
+                    return Err(Status::failed_precondition(
+                        "principal deletion previously failed; use a new idempotency key",
+                    ));
+                }
+                return Err(Status::data_loss(
+                    "principal deletion completion audit is inconsistent",
+                ));
+            }
+
+            let grantor = catalog
+                .get_security_principal(grantor_id)
+                .await
+                .map_err(|_| Status::unavailable("management security catalog is unavailable"))?
+                .ok_or_else(|| Status::failed_precondition("granting principal is unavailable"))?;
+            if grantor.revision != change.grantor_revision
+                || !has_management_admin(std::slice::from_ref(&grantor))
+                || !grantor.login_methods.iter().any(|method| {
+                    matches!(method, rockstream_types::authorization::LoginMethod::Mtls { certificate_sha256 } if certificate_sha256 == &certificate)
+                })
+                || !crate::authorization::allows(
+                    &grantor,
+                    SecurityAction::GrantManage,
+                    &PolicyScope::Cluster,
+                )
+            {
+                return Err(Status::failed_precondition(
+                    "grantor authority or reviewed revision is no longer current",
+                ));
+            }
+            let principal = catalog
+                .get_security_principal(principal_id)
+                .await
+                .map_err(|_| Status::unavailable("management security catalog is unavailable"))?
+                .ok_or_else(|| Status::not_found("security principal was not found"))?;
+            if principal.revision != change.expected_revision {
+                return Err(Status::failed_precondition(
+                    "security principal revision is no longer current",
+                ));
+            }
+            let before_state = security_principal_policy_state(&principal)
+                .map_err(|_| Status::internal("failed to encode security principal policy"))?;
+            let principals = catalog
+                .list_security_principals()
+                .await
+                .map_err(|_| Status::unavailable("management security policy is unavailable"))?
+                .into_iter()
+                .filter(|candidate| candidate.id != principal_id)
+                .collect::<Vec<_>>();
+            if !has_management_admin(&principals) {
+                return Err(Status::failed_precondition(
+                    "principal deletion would remove the last management administrator",
+                ));
+            }
+
+            let catalog_operation_id = rand::random::<u64>().max(1);
+            let catalog_operation_id_string = catalog_operation_id.to_string();
+            let timestamp_ms = Utc::now().timestamp_millis().max(1) as u64;
+            let grant_audit = SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: grant_event_id.clone(),
+                timestamp_ms,
+                actor: actor.clone(),
+                target: target.clone(),
+                scope: AuditField::Known("cluster".to_owned()),
+                action: SecurityAuditClass::GrantChange,
+                outcome: SecurityAuditOutcome::Success,
+                correlation: AuditCorrelation::Observed(operation_id.to_owned()),
+                operation_id: AuditField::Known(catalog_operation_id_string.clone()),
+                policy_revision: AuditField::Known(expected_deleted_revision),
+                before_state: AuditField::Known(before_state.clone()),
+                after_state: AuditField::NotApplicable,
+            };
+            let completion_audit = SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: completion_event_id.clone(),
+                timestamp_ms,
+                actor: actor.clone(),
+                target: target.clone(),
+                scope: AuditField::Known("cluster".to_owned()),
+                action: SecurityAuditClass::AdminOperationCompletion,
+                outcome: SecurityAuditOutcome::Success,
+                correlation: AuditCorrelation::Observed(operation_id.to_owned()),
+                operation_id: AuditField::Known(catalog_operation_id_string),
+                policy_revision: AuditField::Known(expected_deleted_revision),
+                before_state: AuditField::Known(before_state),
+                after_state: AuditField::Known("deleted".to_owned()),
+            };
+            let revision = catalog.get_revision().await.checked_add(1).ok_or_else(|| {
+                Status::resource_exhausted("security catalog revision is exhausted")
+            })?;
+            let txn = CatalogTxn::new(
+                revision,
+                catalog_operation_id,
+                vec![
+                    CatalogMutation::DeleteSecurityPrincipal {
+                        principal_id,
+                        expected_revision: change.expected_revision,
+                        grantor_revision: Some((grantor_id, change.grantor_revision)),
+                        audit: grant_audit,
+                    },
+                    CatalogMutation::AppendSecurityAudit(completion_audit),
+                ],
+            )
+            .map_err(|_| Status::internal("invalid principal deletion transaction"))?;
+            match catalog.commit_txn(txn).await {
+                Ok(_) => return Ok(catalog_operation_id),
+                Err(rockstream_storage::catalog::CatalogError::OptimisticConflict(_))
+                    if attempt + 1
+                        < rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS => {}
+                Err(rockstream_storage::catalog::CatalogError::InvalidSecurityPolicy(_)) => {
+                    return Err(Status::failed_precondition(
+                        "principal deletion conflicts with current security policy",
+                    ));
+                }
+                Err(_) => {
+                    return Err(Status::unavailable(
+                        "management security catalog is unavailable",
+                    ));
+                }
+            }
+        }
+        Err(Status::unavailable(
+            "security catalog changed too frequently; retry the same idempotency key",
+        ))
+    }
+
+    async fn append_security_principal_delete_failure(
+        &self,
+        request: &Request<v1::DeleteSecurityPrincipalRequest>,
+        operation_id: &str,
+        change: &SecurityPrincipalDeleteDigest,
+    ) -> Result<(), Status> {
+        let catalog = self
+            .security_catalog
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("management security catalog is unavailable"))?;
+        let event_id = format!("management-principal-delete-completion:{operation_id}");
+        catalog.refresh().await.map_err(|_| {
+            required_audit_unavailable(request, "principal deletion audit is unavailable")
+        })?;
+        if let Some(record) = catalog
+            .get_security_audit_record(&event_id)
+            .await
+            .map_err(|_| {
+                required_audit_unavailable(request, "principal deletion audit is unavailable")
+            })?
+        {
+            if record.action == SecurityAuditClass::AdminOperationCompletion
+                && record.outcome == SecurityAuditOutcome::Failure
+                && record.event_id == event_id
+                && record.actor
+                    == AuditIdentity::Verified(format!("principal:{}", change.grantor_id))
+                && record.target == AuditField::Known(format!("principal:{}", change.principal_id))
+                && record.scope == AuditField::Known("cluster".to_owned())
+                && record.correlation == AuditCorrelation::Observed(operation_id.to_owned())
+                && record.operation_id == AuditField::Known(operation_id.to_owned())
+                && record.policy_revision == AuditField::Known(change.expected_revision)
+                && record.before_state == AuditField::NotApplicable
+                && record.after_state == AuditField::Known("rejected".to_owned())
+            {
+                return Ok(());
+            }
+            return Err(Status::data_loss(
+                "principal deletion completion audit is inconsistent",
+            ));
+        }
+        append_security_audit(
+            catalog.as_ref(),
+            SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id,
+                timestamp_ms: Utc::now().timestamp_millis().max(1) as u64,
+                actor: AuditIdentity::Verified(format!("principal:{}", change.grantor_id)),
+                target: AuditField::Known(format!("principal:{}", change.principal_id)),
+                scope: AuditField::Known("cluster".to_owned()),
+                action: SecurityAuditClass::AdminOperationCompletion,
+                outcome: SecurityAuditOutcome::Failure,
+                correlation: AuditCorrelation::Observed(operation_id.to_owned()),
+                operation_id: AuditField::Known(operation_id.to_owned()),
+                policy_revision: AuditField::Known(change.expected_revision),
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::Known("rejected".to_owned()),
+            },
+        )
+        .await
+        .map_err(|_| required_audit_unavailable(request, "principal deletion audit is unavailable"))
+    }
+
     async fn apply_security_principal_grants(
         &self,
         operation_id: &str,
@@ -2121,6 +2507,14 @@ fn security_principal_create_fingerprint(
     Ok(hex::encode(Sha256::digest(bytes)))
 }
 
+fn security_principal_delete_fingerprint(
+    change: &SecurityPrincipalDeleteDigest,
+) -> Result<String, Status> {
+    let bytes = serde_json::to_vec(change)
+        .map_err(|_| Status::internal("failed to fingerprint principal deletion request"))?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
 fn security_principal_policy_state(principal: &SecurityPrincipal) -> Result<String, String> {
     let policy = serde_json::to_string(&(
         principal.enabled,
@@ -2520,6 +2914,72 @@ impl v1::management_service_server::ManagementService for ManagementService {
         Ok(Response::new(v1::CreateServicePrincipalResponse {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
             principal: Some(security_principal_response(change.principal)?),
+        }))
+    }
+
+    async fn delete_security_principal(
+        &self,
+        request: Request<v1::DeleteSecurityPrincipalRequest>,
+    ) -> Result<Response<v1::DeleteSecurityPrincipalResponse>, Status> {
+        let _permit = self.acquire_request()?;
+        Self::ensure_version(request.get_ref().protocol_version)?;
+        let body = request.get_ref();
+        let operation_id = uuid::Uuid::parse_str(&body.idempotency_key)
+            .map(|value| value.to_string())
+            .ok()
+            .filter(|value| value == &body.idempotency_key)
+            .ok_or_else(|| Status::invalid_argument("idempotency_key must be a canonical UUID"))?;
+        if body.principal_id == 0
+            || body.expected_revision == 0
+            || body.expected_grantor_revision == 0
+        {
+            return Err(Status::invalid_argument(
+                "principal and reviewed policy revisions must be nonzero",
+            ));
+        }
+        self.authorize(&request, SecurityAction::GrantManage, PolicyScope::Cluster)
+            .await?;
+        let peer = request
+            .extensions()
+            .get::<ManagementConnectionInfo>()
+            .ok_or_else(|| Status::unauthenticated("management mTLS identity is required"))?;
+        let change = SecurityPrincipalDeleteDigest {
+            deployment_id: self.deployment_fingerprint(),
+            principal_id: body.principal_id,
+            expected_revision: body.expected_revision,
+            grantor_id: peer.principal_id.0,
+            grantor_revision: body.expected_grantor_revision,
+            certificate_sha256: hex::encode(peer.certificate_sha256),
+        };
+        let fingerprint = security_principal_delete_fingerprint(&change)?;
+        self.ensure_security_principal_delete_started(
+            &request,
+            &operation_id,
+            &change,
+            &fingerprint,
+        )
+        .await?;
+        let catalog_operation_id = match self
+            .apply_security_principal_delete(&operation_id, &change)
+            .await
+        {
+            Ok(operation_id) => operation_id,
+            Err(status) => {
+                if !matches!(
+                    status.code(),
+                    tonic::Code::Unavailable | tonic::Code::DataLoss
+                ) {
+                    self.append_security_principal_delete_failure(&request, &operation_id, &change)
+                        .await?;
+                }
+                return Err(status);
+            }
+        };
+        Ok(Response::new(v1::DeleteSecurityPrincipalResponse {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            principal_id: body.principal_id,
+            deleted_revision: body.expected_revision + 1,
+            operation_id: catalog_operation_id.to_string(),
         }))
     }
 
@@ -2991,6 +3451,7 @@ impl v1::management_service_server::ManagementService for ManagementService {
             "ListOperations".to_owned(),
             "ListSecurityPrincipals".to_owned(),
             "CreateServicePrincipal".to_owned(),
+            "DeleteSecurityPrincipal".to_owned(),
             "SetSecurityPrincipalGrants".to_owned(),
             "GetOperation".to_owned(),
             "GetConfigSummary".to_owned(),
@@ -3969,8 +4430,12 @@ mod tests {
     }
 
     async fn test_security_catalog() -> Arc<dyn CatalogStore> {
+        test_security_catalog_with_store(Arc::new(InMemory::new())).await
+    }
+
+    async fn test_security_catalog_with_store(store: Arc<InMemory>) -> Arc<dyn CatalogStore> {
         let catalog = Arc::new(rockstream_storage::catalog::DurableCatalogStore::new(
-            Arc::new(InMemory::new()),
+            store,
             "management-test",
         ));
         let principal = rockstream_types::authorization::SecurityPrincipal {
@@ -5203,6 +5668,10 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            stale.message(),
+            "grantor authority or reviewed revision is no longer current"
+        );
         assert!(security_catalog
             .get_security_principal(principal.id)
             .await
@@ -5392,5 +5861,344 @@ mod tests {
         assert!(capabilities
             .capabilities
             .contains(&"CreateServicePrincipal".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn principal_deletion_is_revision_checked_idempotent_and_audited() {
+        let object_store = Arc::new(InMemory::new());
+        let security_catalog = test_security_catalog_with_store(object_store.clone()).await;
+        let service = ManagementService::new(
+            TopologyCatalog::new(),
+            ShardManager::new(),
+            ManagementOperationStore::new(Arc::new(InMemory::new())),
+            NodeConfig::default(),
+        )
+        .with_security_catalog(security_catalog.clone());
+        let principal = SecurityPrincipal {
+            format_version: rockstream_types::authorization::SECURITY_PRINCIPAL_FORMAT_VERSION,
+            id: PrincipalId(3),
+            display_name: "Deletion target".to_owned(),
+            enabled: true,
+            revision: 1,
+            login_methods: vec![rockstream_types::authorization::LoginMethod::Service {
+                service_id: "deletion-target".to_owned(),
+            }],
+            preset_grants: Vec::new(),
+            scoped_grants: Vec::new(),
+        };
+        let created = <ManagementService as v1::management_service_server::ManagementService>::create_service_principal(
+            &service,
+            authenticated_request(v1::CreateServicePrincipalRequest {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                principal_id: principal.id.0,
+                display_name: principal.display_name.clone(),
+                service_id: "deletion-target".to_owned(),
+                expected_grantor_revision: 1,
+                idempotency_key: "c0f3c740-dcfe-4b4a-b7ef-a40a1a67fda1".to_owned(),
+                scoped_grants: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            created.principal,
+            Some(security_principal_response(principal.clone()).unwrap())
+        );
+
+        let request = v1::DeleteSecurityPrincipalRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            principal_id: principal.id.0,
+            expected_revision: 1,
+            expected_grantor_revision: 1,
+            idempotency_key: "5fbd04ca-bb0b-43df-9e55-d0b6f4475aef".to_owned(),
+        };
+        let mut stale_grantor = request.clone();
+        stale_grantor.expected_grantor_revision = 2;
+        stale_grantor.idempotency_key = "cd900848-6d68-45b4-9681-004761b88cda".to_owned();
+        let stale = <ManagementService as v1::management_service_server::ManagementService>::delete_security_principal(
+            &service,
+            authenticated_request(stale_grantor),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            stale.message(),
+            "grantor authority or reviewed revision is no longer current"
+        );
+
+        let mut stale_target = request.clone();
+        stale_target.expected_revision = 2;
+        stale_target.idempotency_key = "bac13606-4b9e-490a-8e29-0f46d10b59d9".to_owned();
+        let stale = <ManagementService as v1::management_service_server::ManagementService>::delete_security_principal(
+            &service,
+            authenticated_request(stale_target),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            stale.message(),
+            "security principal revision is no longer current"
+        );
+
+        let last_admin = <ManagementService as v1::management_service_server::ManagementService>::delete_security_principal(
+            &service,
+            authenticated_request(v1::DeleteSecurityPrincipalRequest {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                principal_id: 1,
+                expected_revision: 1,
+                expected_grantor_revision: 1,
+                idempotency_key: "7e675c59-4661-4ac1-a776-50a2abf30c55".to_owned(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(last_admin.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            last_admin.message(),
+            "principal deletion would remove the last management administrator"
+        );
+        assert!(security_catalog
+            .get_security_principal(PrincipalId(1))
+            .await
+            .unwrap()
+            .is_some());
+        assert!(security_catalog
+            .get_security_principal(principal.id)
+            .await
+            .unwrap()
+            .is_some());
+
+        let (deleted, concurrent_retry) = tokio::join!(
+            <ManagementService as v1::management_service_server::ManagementService>::delete_security_principal(
+                &service,
+                authenticated_request(request.clone()),
+            ),
+            <ManagementService as v1::management_service_server::ManagementService>::delete_security_principal(
+                &service,
+                authenticated_request(request.clone()),
+            ),
+        );
+        let deleted = deleted.unwrap().into_inner();
+        assert_eq!(concurrent_retry.unwrap().into_inner(), deleted);
+        assert!(security_catalog
+            .get_security_principal(principal.id)
+            .await
+            .unwrap()
+            .is_none());
+
+        let grant_event_id = format!("management-principal-delete:{}", request.idempotency_key);
+        let operation_id = match security_catalog
+            .get_security_audit_record(&grant_event_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .operation_id
+        {
+            AuditField::Known(operation_id) => operation_id,
+            _ => panic!("successful deletion must record its catalog operation ID"),
+        };
+        assert!(operation_id.parse::<u64>().is_ok_and(|id| id > 0));
+        assert_eq!(
+            deleted,
+            v1::DeleteSecurityPrincipalResponse {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                principal_id: principal.id.0,
+                deleted_revision: 2,
+                operation_id: operation_id.clone(),
+            }
+        );
+        let before_state = security_principal_policy_state(&principal).unwrap();
+        let change = SecurityPrincipalDeleteDigest {
+            deployment_id: service.deployment_fingerprint(),
+            principal_id: principal.id.0,
+            expected_revision: 1,
+            grantor_id: 1,
+            grantor_revision: 1,
+            certificate_sha256: hex::encode([7; 32]),
+        };
+        let fingerprint = security_principal_delete_fingerprint(&change).unwrap();
+        let mut operation_audit: Vec<_> = security_catalog
+            .list_security_audit_records()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|record| {
+                record.correlation == AuditCorrelation::Observed(request.idempotency_key.clone())
+            })
+            .collect();
+        operation_audit.sort_by(|left, right| left.event_id.cmp(&right.event_id));
+        for record in &mut operation_audit {
+            assert!(record.timestamp_ms > 0);
+            record.timestamp_ms = 0;
+        }
+        let expected_audit = vec![
+            SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: format!("management-principal-delete:{}", request.idempotency_key),
+                timestamp_ms: 0,
+                actor: AuditIdentity::Verified("principal:1".to_owned()),
+                target: AuditField::Known("principal:3".to_owned()),
+                scope: AuditField::Known("cluster".to_owned()),
+                action: SecurityAuditClass::GrantChange,
+                outcome: SecurityAuditOutcome::Success,
+                correlation: AuditCorrelation::Observed(request.idempotency_key.clone()),
+                operation_id: AuditField::Known(operation_id.clone()),
+                policy_revision: AuditField::Known(2),
+                before_state: AuditField::Known(before_state.clone()),
+                after_state: AuditField::NotApplicable,
+            },
+            SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: format!(
+                    "management-principal-delete-completion:{}",
+                    request.idempotency_key
+                ),
+                timestamp_ms: 0,
+                actor: AuditIdentity::Verified("principal:1".to_owned()),
+                target: AuditField::Known("principal:3".to_owned()),
+                scope: AuditField::Known("cluster".to_owned()),
+                action: SecurityAuditClass::AdminOperationCompletion,
+                outcome: SecurityAuditOutcome::Success,
+                correlation: AuditCorrelation::Observed(request.idempotency_key.clone()),
+                operation_id: AuditField::Known(operation_id.clone()),
+                policy_revision: AuditField::Known(2),
+                before_state: AuditField::Known(before_state),
+                after_state: AuditField::Known("deleted".to_owned()),
+            },
+            SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: format!(
+                    "management-principal-delete-start:{}",
+                    request.idempotency_key
+                ),
+                timestamp_ms: 0,
+                actor: AuditIdentity::Verified("principal:1".to_owned()),
+                target: AuditField::Known("principal:3".to_owned()),
+                scope: AuditField::Known("cluster".to_owned()),
+                action: SecurityAuditClass::AdminOperationStart,
+                outcome: SecurityAuditOutcome::Success,
+                correlation: AuditCorrelation::Observed(request.idempotency_key.clone()),
+                operation_id: AuditField::Known(request.idempotency_key.clone()),
+                policy_revision: AuditField::Known(1),
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::Known(format!("request_sha256:{fingerprint}")),
+            },
+        ];
+        let mut expected_audit = expected_audit;
+        expected_audit.sort_by(|left, right| left.event_id.cmp(&right.event_id));
+        assert_eq!(operation_audit, expected_audit);
+
+        let audit_before_retry = security_catalog
+            .list_security_audit_records()
+            .await
+            .unwrap();
+        let retry = <ManagementService as v1::management_service_server::ManagementService>::delete_security_principal(
+            &service,
+            authenticated_request(request.clone()),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(retry, deleted);
+        assert_eq!(
+            security_catalog
+                .list_security_audit_records()
+                .await
+                .unwrap(),
+            audit_before_retry
+        );
+
+        let restarted_catalog = Arc::new(rockstream_storage::catalog::DurableCatalogStore::new(
+            object_store,
+            "management-test",
+        ));
+        restarted_catalog.refresh().await.unwrap();
+        let restarted_service = ManagementService::new(
+            TopologyCatalog::new(),
+            ShardManager::new(),
+            ManagementOperationStore::new(Arc::new(InMemory::new())),
+            NodeConfig::default(),
+        )
+        .with_security_catalog(restarted_catalog.clone());
+        let restarted_retry = <ManagementService as v1::management_service_server::ManagementService>::delete_security_principal(
+            &restarted_service,
+            authenticated_request(request.clone()),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(restarted_retry, deleted);
+        assert_eq!(
+            restarted_catalog
+                .list_security_audit_records()
+                .await
+                .unwrap(),
+            audit_before_retry
+        );
+
+        let mut reused_key = request.clone();
+        reused_key.expected_revision = 2;
+        let conflict = <ManagementService as v1::management_service_server::ManagementService>::delete_security_principal(
+            &service,
+            authenticated_request(reused_key),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
+        assert_eq!(
+            conflict.message(),
+            "idempotency key is bound to another principal-deletion request"
+        );
+        assert_eq!(
+            security_catalog
+                .list_security_audit_records()
+                .await
+                .unwrap(),
+            audit_before_retry
+        );
+
+        let mut operator_request = Request::new(v1::DeleteSecurityPrincipalRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            principal_id: 2,
+            expected_revision: 1,
+            expected_grantor_revision: 1,
+            idempotency_key: "91cdfba0-b030-40b3-b465-1dba98f77c03".to_owned(),
+        });
+        operator_request
+            .extensions_mut()
+            .insert(ManagementConnectionInfo {
+                certificate_sha256: [8; 32],
+                principal_id: PrincipalId(2),
+                closed: Arc::new(AtomicBool::new(false)),
+            });
+        let denied = <ManagementService as v1::management_service_server::ManagementService>::delete_security_principal(
+            &service,
+            operator_request,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        assert_eq!(denied.message(), "management action is not authorized");
+        assert!(security_catalog
+            .get_security_principal(PrincipalId(2))
+            .await
+            .unwrap()
+            .is_some());
+
+        let capabilities = <ManagementService as v1::management_service_server::ManagementService>::get_capabilities(
+            &service,
+            authenticated_request(v1::GetCapabilitiesRequest {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(capabilities
+            .capabilities
+            .contains(&"DeleteSecurityPrincipal".to_owned()));
     }
 }

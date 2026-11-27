@@ -12,6 +12,7 @@ service ManagementService {
   rpc ListSecurityAuditRecords(ListSecurityAuditRecordsRequest) returns (ListSecurityAuditRecordsResponse);
   rpc ListSecurityPrincipals(ListSecurityPrincipalsRequest) returns (ListSecurityPrincipalsResponse);
   rpc CreateServicePrincipal(CreateServicePrincipalRequest) returns (CreateServicePrincipalResponse);
+  rpc DeleteSecurityPrincipal(DeleteSecurityPrincipalRequest) returns (DeleteSecurityPrincipalResponse);
   rpc SetSecurityPrincipalGrants(SetSecurityPrincipalGrantsRequest) returns (SetSecurityPrincipalGrantsResponse);
   rpc GetOperation(GetOperationRequest) returns (GetOperationResponse);
   rpc GetConfigSummary(GetConfigSummaryRequest) returns (GetConfigSummaryResponse);
@@ -191,6 +192,19 @@ message CreateServicePrincipalRequest {
 message CreateServicePrincipalResponse {
   uint32 protocol_version = 1;
   SecurityPrincipal principal = 2;
+}
+message DeleteSecurityPrincipalRequest {
+  uint32 protocol_version = 1;
+  uint64 principal_id = 2;
+  uint64 expected_revision = 3;
+  uint64 expected_grantor_revision = 4;
+  string idempotency_key = 5;
+}
+message DeleteSecurityPrincipalResponse {
+  uint32 protocol_version = 1;
+  uint64 principal_id = 2;
+  uint64 deleted_revision = 3;
+  string operation_id = 4;
 }
 message SetSecurityPrincipalGrantsRequest {
   uint32 protocol_version = 1;
