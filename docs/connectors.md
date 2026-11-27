@@ -33,8 +33,8 @@ connectors.
 
 ## Strategic contract
 
-The two source connectors are Core and release-gated. The Kafka sink is
-Experimental and delivers bounded runtime view snapshot/change envelopes. The generated
+The two source connectors are Core and release-gated. The Kafka sink is also
+Core and delivers bounded runtime view snapshot/change envelopes. The generated
 [`capability matrix`](capability-matrix.md) records these tiers.
 
 | Capability | Tier | Guarantee reference | Named proof |
@@ -299,7 +299,7 @@ checks only.
 
 | Axis | Guarantee |
 | --- | --- |
-| Delivery / recovery | Experimental bounded snapshot/change envelopes through `KafkaViewSink`; legacy count markers through `pre_commit`. Recovery checks all topic partitions before republishing. Setup failures, poll failures, and timeouts remain pending; only a complete stable scan confirms absence. |
+| Delivery / recovery | SQL-wired `KafkaViewSink` delivers bounded snapshot/change envelopes; the separate legacy `pre_commit` path emits count markers. Recovery checks all topic partitions before republishing. Setup failures, poll failures, and timeouts remain pending; only a complete stable scan confirms absence. |
 | Bound / fill metric / backpressure | `KAFKA_SINK_MAX_STAGED_EPOCHS=5`, `kafka_sink_staged_epochs_count`, and `backpressure_active`; staged-epoch admission rejects overflow. |
 | Degraded states | Pre-commit/commit uncertainty, timeout, staged-epoch backpressure, and idempotent recovery are explicit. |
 | Failure codes | `RS-4002`, `RS-4003`, `RS-4004`, `RS-4005`, and `RS-4030`; retry unknown-outcome recovery with the original pending handle after restoring lookup. |
