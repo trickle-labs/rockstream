@@ -1557,6 +1557,11 @@ pub fn run_start_with_dev_transport(
     }
 
     validate_internal_transport(opts, allow_insecure_internal_dev)?;
+    // Plaintext development only exposes the validated loopback control
+    // transport. The public management API always requires internal mTLS;
+    // its absence must not disable the durable internal operation executor.
+    let public_management_enabled =
+        opts.config.internal_tls.is_enabled() || !allow_insecure_internal_dev;
     let worker_exchange_endpoint = validate_worker_exchange_endpoint(
         &node_config,
         &opts.role,
@@ -1663,6 +1668,7 @@ pub fn run_start_with_dev_transport(
         }
 
         let mut control_handle = None;
+        let backup_startup_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut worker_handle = None;
         let mut compactor_shutdown_tx: Option<tokio::sync::watch::Sender<bool>> = None;
         let mut compactor_task: Option<tokio::task::JoinHandle<()>> = None;
@@ -1683,6 +1689,7 @@ pub fn run_start_with_dev_transport(
             let catalog = rockstream_control::TopologyCatalog::new();
             let manager = rockstream_control::ShardManager::new();
             let service = rockstream_control::ControlService::new(catalog.clone())
+                .with_elasticity(node_config.control.elasticity.clone())
                 .with_shard_manager(manager.clone())
                 .with_audit(audit_log.clone());
             let mut service = configure_control_actor_assertions(service, &node_config)?;
@@ -1750,7 +1757,10 @@ pub fn run_start_with_dev_transport(
             .await?;
             service = service
                 .with_security_catalog(security_catalog)
-                .with_secret_store(secret_store.clone());
+                .with_secret_store(secret_store.clone())
+                .with_shard_store(Arc::new(rockstream_control::ShardPersistentStore::new(
+                    management_store.clone(),
+                )));
             shared_gateway_secret_store = Some(secret_store);
             if opts.listen_addr.is_some() {
                 let store: Arc<dyn object_store::ObjectStore> = Arc::new(
@@ -1758,11 +1768,18 @@ pub fn run_start_with_dev_transport(
                         |e| CliError::new(RS_0003, format!("failed to open management store: {e}"), "Check storage directory permissions."),
                     )?,
                 );
-                service = service.with_single_worker_local_backup_source_store(
-                    store.clone(),
-                    rockstream_types::ids::WorkerId(opts.worker_id.unwrap_or(1)),
-                );
-                if let Some(addr) = &node_config.control.management_addr {
+                service = service
+                    .with_single_worker_local_backup_source_store(
+                        store.clone(),
+                        rockstream_types::ids::WorkerId(opts.worker_id.unwrap_or(1)),
+                    )
+                    .with_backup_startup_gate(backup_startup_ready.clone());
+                if let Some(addr) = node_config
+                    .control
+                    .management_addr
+                    .as_ref()
+                    .filter(|_| public_management_enabled)
+                {
                     let management_store = if let Some(shared_dir) = &opts.control_shared_storage {
                         fs::create_dir_all(shared_dir).map_err(|e| {
                             CliError::new(
@@ -1815,6 +1832,7 @@ pub fn run_start_with_dev_transport(
             let manager = rockstream_control::ShardManager::new();
             let frontier = Arc::new(rockstream_control::FrontierAggregator::new());
             let service = rockstream_control::ControlService::new(catalog)
+                .with_elasticity(node_config.control.elasticity.clone())
                 .with_shard_manager(manager.clone())
                 .with_frontier(frontier)
                 .with_audit(audit_log.clone());
@@ -1892,7 +1910,7 @@ pub fn run_start_with_dev_transport(
                 .with_migration_store(Arc::new(rockstream_control::MigrationPersistentStore::new(
                     shared_object_store.clone(),
                 )));
-            if opts.daemon {
+            if opts.daemon && public_management_enabled {
                 if let Some(addr) = &node_config.control.management_addr {
                     let management_store = if opts.control_shared_storage.is_some() {
                         shared_object_store.clone()
@@ -2116,6 +2134,7 @@ pub fn run_start_with_dev_transport(
                         )
                     })?;
                     shared_gateway_shard = Some((Arc::new(db), store));
+                    backup_startup_ready.store(true, std::sync::atomic::Ordering::Release);
                 }
             }
             if worker_exchange_endpoint.is_some() && opts.config.internal_tls.is_enabled() {

@@ -1863,7 +1863,7 @@ async fn management_drain_is_idempotent_and_transfers_the_owned_shard() {
         .unwrap();
     let mut donor = register_worker(control.addr, 1).await;
     let mut recipient = register_worker(control.addr, 2).await;
-    shard_manager.acquire(ShardId(77), WorkerId(1)).unwrap();
+    let original = shard_manager.acquire(ShardId(77), WorkerId(1)).unwrap();
     let mut client = auth.client(management_addr).await;
     let request = DrainWorkerRequest {
         protocol_version: 1,
@@ -1908,13 +1908,27 @@ async fn management_drain_is_idempotent_and_transfers_the_owned_shard() {
         WorkerId(1)
     );
 
-    let _ = read_until(&mut donor, |message| {
-        matches!(message, ControlMessage::BeginDrain(_))
+    let prepare = read_until(&mut donor, |message| {
+        matches!(message, ControlMessage::PrepareShardTransfer { .. })
     })
     .await;
-    let acknowledgement = serde_json::to_string(&WorkerMessage::DrainAck {
-        worker_id: WorkerId(1),
-        shards_remaining: 0,
+    let ControlMessage::PrepareShardTransfer {
+        operation_id: child_id,
+        lease: prepared,
+    } = prepare
+    else {
+        unreachable!();
+    };
+    assert_eq!(prepared, original);
+    assert_ne!(child_id, accepted.operation_id);
+    let acknowledgement = serde_json::to_string(&WorkerMessage::ShardTransferAck {
+        operation_id: child_id.clone(),
+        stage: "donor".to_owned(),
+        worker_id: original.worker_id,
+        shard_id: original.shard_id,
+        lease_token: original.lease_token,
+        success: true,
+        error: None,
     })
     .unwrap()
         + "\n";
@@ -1932,7 +1946,8 @@ async fn management_drain_is_idempotent_and_transfers_the_owned_shard() {
     };
     assert_eq!(lease.worker_id, WorkerId(2));
     assert_eq!(lease.shard_id, ShardId(77));
-    assert!(transfer_id.starts_with(&format!("{}:shard:", accepted.operation_id)));
+    assert_eq!(transfer_id, child_id);
+    assert!(lease.lease_token.0 > original.lease_token.0);
 
     let awaiting_recipient = client
         .get_operation(GetOperationRequest {
@@ -1973,7 +1988,8 @@ async fn management_drain_is_idempotent_and_transfers_the_owned_shard() {
 
     let mut completed = None;
     let mut last_state = None;
-    for _ in 0..50 {
+    // The parent completion is reconciled on a one-second scheduler tick.
+    for _ in 0..300 {
         let response = client
             .get_operation(GetOperationRequest {
                 protocol_version: 1,
@@ -2010,6 +2026,11 @@ async fn management_drain_is_idempotent_and_transfers_the_owned_shard() {
         shard_manager.get(ShardId(77)).unwrap().worker_id,
         WorkerId(2)
     );
+    assert_eq!(shard_manager.get(ShardId(77)), Some(lease));
+    assert!(matches!(
+        catalog.get(WorkerId(1)).unwrap().lifecycle,
+        rockstream_types::topology::WorkerLifecycleState::Decommissioned { .. }
+    ));
     control.shutdown();
 }
 

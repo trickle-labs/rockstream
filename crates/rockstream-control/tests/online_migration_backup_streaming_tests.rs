@@ -637,6 +637,42 @@ async fn online_backup_succeeds_with_active_workload_and_concurrent_writes() {
     control.shutdown();
 }
 
+// Fake workers must prove the durable idle barrier before the canonical
+// migration executor asks the donor to flush and close its writer.
+async fn acknowledge_idle_anchor(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    workload_id: WorkloadId,
+    expected_anchor: &rockstream_types::lease::ShardLease,
+) -> String {
+    let operation_id = match read_control_msg_skipping_topology(reader).await {
+        ControlMessage::VerifyWorkloadIdle {
+            operation_id,
+            workload_id: actual_workload,
+            anchor,
+        } => {
+            assert_eq!(actual_workload, workload_id);
+            assert_eq!(&anchor, expected_anchor);
+            operation_id
+        }
+        other => panic!("expected idle verification before donor handoff, got {other:?}"),
+    };
+    send_worker_msg(
+        writer,
+        &WorkerMessage::ShardTransferAck {
+            operation_id: operation_id.clone(),
+            stage: format!("idle:{}", workload_id.0),
+            worker_id: expected_anchor.worker_id,
+            shard_id: expected_anchor.shard_id,
+            lease_token: expected_anchor.lease_token,
+            success: true,
+            error: None,
+        },
+    )
+    .await;
+    operation_id
+}
+
 #[tokio::test]
 async fn online_migrate_shard_moves_active_workload_and_updates_routing_atomically() {
     let mgmt_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -705,22 +741,25 @@ async fn online_migrate_shard_moves_active_workload_and_updates_routing_atomical
     let workload_id = WorkloadId(55);
     send_worker_msg(
         &mut c_write,
-        &WorkerMessage::DeployWorkload(DeploymentRequest {
-            version: 1,
-            workload_id,
-            namespace: "public".to_owned(),
-            workload_name: "active-mig-view".to_owned(),
-            plan_json: "{}".to_owned(),
-            join_strategy: JoinStrategy::Auto,
-            schemas: vec![],
-            frontier: 0,
-            storage_root: "/tmp/shared-store".to_owned(),
-            sink_operator_id: OperatorId(10),
-            output_columns: vec!["val".to_owned()],
-            primary_key: vec![0],
-            merge_key_columns: vec![0],
-            routing_columns: BTreeMap::from([("src".to_owned(), 0)]),
-        }),
+        &WorkerMessage::DeployWorkloadSharded {
+            request: DeploymentRequest {
+                version: 1,
+                workload_id,
+                namespace: "public".to_owned(),
+                workload_name: "active-mig-view".to_owned(),
+                plan_json: "{}".to_owned(),
+                join_strategy: JoinStrategy::Auto,
+                schemas: vec![],
+                frontier: 0,
+                storage_root: "/tmp/shared-store".to_owned(),
+                sink_operator_id: OperatorId(10),
+                output_columns: vec!["val".to_owned()],
+                primary_key: vec![0],
+                merge_key_columns: vec![0],
+                routing_columns: BTreeMap::from([("src".to_owned(), 0)]),
+            },
+            shard_count: 2,
+        },
     )
     .await;
 
@@ -778,6 +817,10 @@ async fn online_migrate_shard_moves_active_workload_and_updates_routing_atomical
         .into_inner()
         .operation
         .unwrap();
+
+    let idle_operation_id =
+        acknowledge_idle_anchor(&mut w1_reader, &mut w1_write, workload_id, &donor_lease).await;
+    assert_eq!(idle_operation_id, accepted.operation_id);
 
     // 1. Donor receives PrepareShardTransfer and acknowledges flush/close
     let (op_id, prep_lease) = match read_control_msg_skipping_topology(&mut w1_reader).await {
@@ -970,22 +1013,25 @@ async fn online_drain_worker_moves_active_workload_to_healthy_recipient() {
     let workload_id = WorkloadId(77);
     send_worker_msg(
         &mut c_write,
-        &WorkerMessage::DeployWorkload(DeploymentRequest {
-            version: 1,
-            workload_id,
-            namespace: "public".to_owned(),
-            workload_name: "active-drain-view".to_owned(),
-            plan_json: "{}".to_owned(),
-            join_strategy: JoinStrategy::Auto,
-            schemas: vec![],
-            frontier: 0,
-            storage_root: "/tmp/shared-store".to_owned(),
-            sink_operator_id: OperatorId(12),
-            output_columns: vec!["val".to_owned()],
-            primary_key: vec![0],
-            merge_key_columns: vec![0],
-            routing_columns: BTreeMap::from([("src".to_owned(), 0)]),
-        }),
+        &WorkerMessage::DeployWorkloadSharded {
+            request: DeploymentRequest {
+                version: 1,
+                workload_id,
+                namespace: "public".to_owned(),
+                workload_name: "active-drain-view".to_owned(),
+                plan_json: "{}".to_owned(),
+                join_strategy: JoinStrategy::Auto,
+                schemas: vec![],
+                frontier: 0,
+                storage_root: "/tmp/shared-store".to_owned(),
+                sink_operator_id: OperatorId(12),
+                output_columns: vec!["val".to_owned()],
+                primary_key: vec![0],
+                merge_key_columns: vec![0],
+                routing_columns: BTreeMap::from([("src".to_owned(), 0)]),
+            },
+            shard_count: 2,
+        },
     )
     .await;
 
@@ -1042,16 +1088,30 @@ async fn online_drain_worker_moves_active_workload_to_healthy_recipient() {
         .operation
         .unwrap();
 
-    // Worker 1 receives BeginDrain and acknowledges flush
-    assert!(matches!(
-        read_control_msg_skipping_topology(&mut w1_reader).await,
-        ControlMessage::BeginDrain(req) if req.worker_id == WorkerId(1)
-    ));
+    // A drain is now a parent operation. Its child migration must verify
+    // the anchor and close the donor writer before moving the lease.
+    let migration_id =
+        acknowledge_idle_anchor(&mut w1_reader, &mut w1_write, workload_id, &drained_lease).await;
+    assert_ne!(migration_id, accepted.operation_id);
+    let (op_id, prep_lease) = match read_control_msg_skipping_topology(&mut w1_reader).await {
+        ControlMessage::PrepareShardTransfer {
+            operation_id,
+            lease,
+        } => (operation_id, lease),
+        other => panic!("expected PrepareShardTransfer during drain, got {other:?}"),
+    };
+    assert_eq!(op_id, migration_id);
+    assert_eq!(prep_lease, drained_lease);
     send_worker_msg(
         &mut w1_write,
-        &WorkerMessage::DrainAck {
+        &WorkerMessage::ShardTransferAck {
+            operation_id: op_id,
+            stage: "donor".to_owned(),
             worker_id: WorkerId(1),
-            shards_remaining: 0,
+            shard_id: drained_lease.shard_id,
+            lease_token: drained_lease.lease_token,
+            success: true,
+            error: None,
         },
     )
     .await;
@@ -1064,6 +1124,7 @@ async fn online_drain_worker_moves_active_workload_to_healthy_recipient() {
         } => (lease, operation_id.expect("drain must carry operation_id")),
         other => panic!("expected ShardAssigned on recipient worker 2, got {other:?}"),
     };
+    assert_eq!(ack_op_id, migration_id);
     assert_eq!(new_lease.shard_id, drained_lease.shard_id);
     assert_eq!(new_lease.worker_id, WorkerId(2));
     assert!(new_lease.lease_token.0 > drained_lease.lease_token.0);
@@ -1087,6 +1148,17 @@ async fn online_drain_worker_moves_active_workload_to_healthy_recipient() {
     };
     assert_eq!(drained_descriptor.workload_id, workload_id);
     assert_eq!(drained_descriptor.shard, new_lease);
+    let parent = mgmt_client
+        .get_operation(GetOperationRequest {
+            protocol_version: 1,
+            operation_id: accepted.operation_id.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .operation
+        .unwrap();
+    assert_eq!(parent.state, "running");
     send_worker_msg(
         &mut w2_write,
         &WorkerMessage::DeploymentReady {
@@ -1105,6 +1177,10 @@ async fn online_drain_worker_moves_active_workload_to_healthy_recipient() {
     assert_eq!(completed.state, "succeeded");
     assert_eq!(completed.progress, "100%");
     assert_eq!(completed.phase, "completed");
+    assert!(matches!(
+        read_control_msg_skipping_topology(&mut w1_reader).await,
+        ControlMessage::BeginDrain(req) if req.worker_id == WorkerId(1)
+    ));
 
     control.shutdown();
 }

@@ -1,5 +1,25 @@
 # RockStream Formal Verification Plan (FizzBee)
 
+## Issue 403: automatic dispatch at committed membership frontiers
+
+Automatic elasticity adds a guarded entry to the existing M4/M6 handoff, not a
+second lease transition. Admission requires an exact complete workload epoch
+under the current lease incarnation for every virtual shard. Missing/stale
+members, duplicate epochs and exhausted epoch counters cannot authorize a move;
+membership changes reset the policy window. The durable MigrateShard request
+records the triggering generation/frontier and expected donor fence before
+dispatch. Restart uses the canonical operation reconciler, and lease transfer
+rechecks both leadership and donor identity. Workload activation increments the
+direct-routing topology epoch. The source-completion and automatic-dispatch
+regressions exercise these guards and exact stored request contents. M4 single
+ownership and M6 recovery invariants remain the protocol safety gate; the
+multi-process elasticity/freshness qualification is separate empirical evidence.
+The same entry guard also handles draining donors. A drain does not close all
+writers up front: each shard uses the canonical migration executor, and worker
+decommission is guarded by an empty ownership set. CPU samples are advisory and
+cannot change the commit clock. Retrying a terminal failed move creates a new
+frontier-scoped operation identity and still requires the original donor fence.
+
 **Status**: v1.0 — authoritative MDD specification for formal verification of
 RockStream's distributed coordination protocols.
 
@@ -2147,3 +2167,18 @@ capability transport delivery is claimed.
 ## Bounded pgoutput transport and streaming transaction decoding (#349)
 
 `PostgresCdcSource` bounds in-memory binary `COPY OUT` transport frames and decodes active transactions incrementally rather than re-decoding the entire buffered transaction on every event poll. This is a connector transport and memory-bounding optimization that preserves the M1/M3 source checkpoint LSN frontier, transaction boundary atomicity, and restart replay semantics.
+
+## Explicit idle drain admission and durable anchor barrier (#403)
+
+An explicit worker drain may propose an idle-boundary `MigrateShard` without a
+new source epoch. It does not advance or synthesize a committed frontier. The
+canonical executor atomically checks current leases, source/direct admissions,
+read waiters and readiness while installing its handoff marker. New admissions
+observe the same mutex and cannot cross the marker. Each affected workload's
+current durable anchor must then acknowledge empty owned/routing pending
+journals under the execution gate; an expired in-memory capability is not an
+empty-journal proof. Donor closure holds all local execution gates, invalidates
+queued references, and then uses the existing close/lease-CAS/open/ready
+sequence. These are additional guards on the existing M4 handoff transition,
+not new lease authority. Regression tests check exact durable idle requests,
+blocked admissions, old-fence preservation, and both pending-journal failures.

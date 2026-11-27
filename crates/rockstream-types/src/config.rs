@@ -699,6 +699,32 @@ pub struct ControlSection {
     pub shared_storage: Option<String>,
     #[serde(default)]
     pub raft: Option<RaftSection>,
+    /// Automatic movement of existing virtual shards at committed source frontiers.
+    #[serde(default)]
+    pub elasticity: ElasticityConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ElasticityConfig {
+    pub enabled: bool,
+    pub initial_virtual_shards: usize,
+    pub hysteresis_frontiers: u32,
+    pub minimum_residency_ms: u64,
+    /// Memory headroom difference, in basis points (2000 means 20%).
+    pub minimum_headroom_gap_bps: u16,
+}
+
+impl Default for ElasticityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            initial_virtual_shards: 32,
+            hysteresis_frontiers: 3,
+            minimum_residency_ms: 60_000,
+            minimum_headroom_gap_bps: 2000,
+        }
+    }
 }
 
 fn default_control_listen_addr() -> Option<String> {
@@ -717,6 +743,7 @@ impl Default for ControlSection {
             url: None,
             shared_storage: None,
             raft: None,
+            elasticity: ElasticityConfig::default(),
         }
     }
 }

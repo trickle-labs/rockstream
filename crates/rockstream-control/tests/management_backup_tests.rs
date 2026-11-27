@@ -315,9 +315,11 @@ async fn create_backup_reconciles_persisted_exporting_record_from_manifest() {
 
     let management_addr = management_addr().await;
     let auth = ManagementAuth::new(std::slice::from_ref(&destination_text)).await;
+    let startup_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let service = auth.protect_control(
         ControlService::new(TopologyCatalog::new())
             .with_single_worker_local_backup_source_store(source.clone(), WorkerId(1))
+            .with_backup_startup_gate(startup_ready.clone())
             .with_management(
                 management_addr.clone(),
                 source.clone(),
@@ -330,6 +332,39 @@ async fn create_backup_reconciles_persisted_exporting_record_from_manifest() {
         .await
         .unwrap();
     let mut client = auth.client(management_addr.parse().unwrap()).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let operation = client
+                .get_operation(GetOperationRequest {
+                    protocol_version: 1,
+                    operation_id: "restart-backup-operation".to_owned(),
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .operation
+                .unwrap();
+            assert_ne!(operation.state, "succeeded");
+            assert_ne!(operation.state, "failed");
+            if operation.state == "waiting"
+                && operation
+                    .next_steps
+                    .iter()
+                    .any(|step| step == "embedded shard startup is not complete")
+            {
+                assert_eq!(operation.phase, "backup_checkpoint:44");
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("recovered backup should wait for embedded shard startup");
+    assert!(!destination
+        .path()
+        .join("checkpoint-exports/management-restart-backup-operation/commit")
+        .exists());
+    startup_ready.store(true, std::sync::atomic::Ordering::Release);
     let operation = await_succeeded(&mut client, "restart-backup-operation").await;
     assert_eq!(operation.operation_id, "restart-backup-operation");
     assert_eq!(operation.kind, "create_backup");

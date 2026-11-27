@@ -520,6 +520,16 @@ async fn wait_for_backup_success(
     operation_id: &str,
     pki: &TestPki,
 ) -> ManagementOperationInfo {
+    wait_for_backup_success_with_recovery(binary, management, operation_id, pki, None).await
+}
+
+async fn wait_for_backup_success_with_recovery(
+    binary: &Path,
+    management: SocketAddr,
+    operation_id: &str,
+    pki: &TestPki,
+    recovered_checkpoint: Option<&str>,
+) -> ManagementOperationInfo {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let output = run_operation_show(binary, management, operation_id, pki);
@@ -546,6 +556,19 @@ async fn wait_for_backup_success(
                 expected_operation("running", "70%", &operation.phase)
             }
             "succeeded" => expected_operation("succeeded", "100%", "completed"),
+            // Only restart recovery may report this transient startup barrier.
+            // Other waiting reasons remain failures, and the original deadline
+            // and exact terminal-success assertions still apply.
+            "waiting" if recovered_checkpoint.is_some() => {
+                let phase = format!(
+                    "backup_checkpoint:{}",
+                    recovered_checkpoint.expect("recovered checkpoint")
+                );
+                let mut expected = expected_operation("waiting", "", &phase);
+                expected.error_code = "RS-3610".to_owned();
+                expected.next_steps = vec!["embedded shard startup is not complete".to_owned()];
+                expected
+            }
             "failed" | "cancelled" | "waiting" => {
                 let transcript = String::from_utf8_lossy(&output.stdout);
                 panic!("backup operation ended unexpectedly: {transcript}")
@@ -933,7 +956,7 @@ async fn release_management_backup_idempotency_survives_role_all_restart() {
     let operation_id = accepted.operation_id.clone();
     let mut first_management_client = management_client(first_management, &pki).await;
     let export_deadline = Instant::now() + Duration::from_secs(10);
-    loop {
+    let recovered_checkpoint = loop {
         let operation = first_management_client
             .get_operation(GetOperationRequest {
                 protocol_version: 1,
@@ -944,8 +967,9 @@ async fn release_management_backup_idempotency_survives_role_all_restart() {
             .into_inner()
             .operation
             .expect("accepted backup operation record");
-        if operation.phase.starts_with("backup_exporting:") {
-            break;
+        if let Some(checkpoint) = operation.phase.strip_prefix("backup_exporting:") {
+            assert!(checkpoint.parse::<u64>().expect("numeric checkpoint ID") > 0);
+            break checkpoint.to_owned();
         }
         assert_ne!(
             operation.state, "succeeded",
@@ -956,7 +980,7 @@ async fn release_management_backup_idempotency_survives_role_all_restart() {
             "backup did not enter export before hard kill: {operation:?}"
         );
         tokio::time::sleep(Duration::from_millis(1)).await;
-    }
+    };
     drop(first_management_client);
     drop(first_client);
     first_node
@@ -985,7 +1009,14 @@ async fn release_management_backup_idempotency_survives_role_all_restart() {
     );
     let second_client = connect_gateway(second_listen).await;
     wait_for_registered_worker(binary, second_management, 1, &pki).await;
-    let completed = wait_for_backup_success(binary, second_management, &operation_id, &pki).await;
+    let completed = wait_for_backup_success_with_recovery(
+        binary,
+        second_management,
+        &operation_id,
+        &pki,
+        Some(&recovered_checkpoint),
+    )
+    .await;
     assert_eq!(completed.state, "succeeded");
     drop(second_client);
     second_node
