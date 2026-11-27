@@ -1674,6 +1674,246 @@ async fn release_control_rejects_client_certificate_for_worker_registration() {
 }
 
 #[tokio::test]
+async fn management_authorization_is_isolated_between_process_instances() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let temp = tempfile::tempdir().unwrap();
+    let pki = rockstream_test_support::pki::TestPki::generate();
+    let fingerprint = certificate_sha256(&pki.secondary_cli_cert_path);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let from_ms = Some(now_ms.saturating_sub(60_000));
+    let to_ms = Some(now_ms.saturating_add(300_000));
+    let audit_range = PolicyScope::AuditRange { from_ms, to_ms };
+    let mut observer_a = mtls_operator_with_fingerprint(fingerprint);
+    observer_a.preset_grants.clear();
+    observer_a.scoped_grants.push(ScopedActionGrant {
+        action: SecurityAction::SecurityAuditRead,
+        scope: audit_range.clone(),
+    });
+    let mut observer_b = mtls_operator_with_fingerprint(fingerprint);
+    observer_b.preset_grants.clear();
+    assert_eq!(observer_a.id, observer_b.id);
+    assert_eq!(observer_a.revision, observer_b.revision);
+    assert_eq!(observer_a.login_methods, observer_b.login_methods);
+
+    let storage_a = temp.path().join("deployment-a/control-storage");
+    let storage_b = temp.path().join("deployment-b/control-storage");
+    let control_a = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let management_a = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let control_b = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let management_b = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut process_a = start_control_process_with_operator(
+        temp.path(),
+        &storage_a,
+        control_a,
+        management_a,
+        &pki,
+        None,
+        false,
+        Some(observer_a.clone()),
+        true,
+        false,
+    )
+    .await;
+    wait_for_gateway(&mut process_a.0, control_a).await;
+    let mut process_b = start_control_process_with_operator(
+        temp.path(),
+        &storage_b,
+        control_b,
+        management_b,
+        &pki,
+        None,
+        false,
+        Some(observer_b.clone()),
+        true,
+        false,
+    )
+    .await;
+    wait_for_gateway(&mut process_b.0, control_b).await;
+
+    let mut client_a = management_client_with_identity(
+        management_a,
+        &pki,
+        &pki.secondary_cli_cert_path,
+        &pki.secondary_cli_key_path,
+    )
+    .await
+    .unwrap();
+    let mut client_b = management_client_with_identity(
+        management_b,
+        &pki,
+        &pki.secondary_cli_cert_path,
+        &pki.secondary_cli_key_path,
+    )
+    .await
+    .unwrap();
+    let catalog_a = DurableCatalogStore::recover(
+        rockstream_storage::build_runtime_object_store(
+            &storage_a.join("gateway-shard"),
+            "gateway-shard",
+        )
+        .unwrap(),
+        "gateway",
+    )
+    .await
+    .unwrap();
+    let catalog_b = DurableCatalogStore::recover(
+        rockstream_storage::build_runtime_object_store(
+            &storage_b.join("gateway-shard"),
+            "gateway-shard",
+        )
+        .unwrap(),
+        "gateway",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        catalog_a
+            .get_security_principal(observer_a.id)
+            .await
+            .unwrap(),
+        Some(observer_a.clone())
+    );
+    assert_eq!(
+        catalog_b
+            .get_security_principal(observer_b.id)
+            .await
+            .unwrap(),
+        Some(observer_b.clone())
+    );
+    let audit_before_b = catalog_b.list_security_audit_records().await.unwrap();
+
+    let audit_request = || ListSecurityAuditRecordsRequest {
+        protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+        from_timestamp_ms: from_ms,
+        to_timestamp_ms: to_ms,
+        page_size: 100,
+        page_token: String::new(),
+    };
+    let allowed_before = client_a
+        .list_security_audit_records(audit_request())
+        .await
+        .unwrap()
+        .into_inner();
+    catalog_a.refresh().await.unwrap();
+    let audit_after_first_a = catalog_a.list_security_audit_records().await.unwrap();
+    let mut expected_audit = audit_after_first_a.clone();
+    expected_audit.retain(|record| {
+        from_ms.is_none_or(|from| record.timestamp_ms >= from)
+            && to_ms.is_none_or(|to| record.timestamp_ms <= to)
+    });
+    expected_audit.sort_by(|left, right| {
+        (left.timestamp_ms, left.event_id.as_str())
+            .cmp(&(right.timestamp_ms, right.event_id.as_str()))
+    });
+    assert_eq!(
+        allowed_before.protocol_version,
+        rockstream_management_proto::PROTOCOL_VERSION
+    );
+    assert_eq!(
+        allowed_before.source_version,
+        format!("security-audit-records:v{SECURITY_AUDIT_FORMAT_VERSION}")
+    );
+    assert!(chrono::DateTime::parse_from_rfc3339(&allowed_before.observed_at).is_ok());
+    assert_eq!(
+        allowed_before.records_json,
+        expected_audit
+            .iter()
+            .map(|record| serde_json::to_string(record).unwrap())
+            .collect::<Vec<_>>()
+    );
+    assert!(allowed_before.next_page_token.is_empty());
+
+    let denial = client_b
+        .list_security_audit_records(audit_request())
+        .await
+        .unwrap_err();
+    assert_eq!(denial.code(), tonic::Code::PermissionDenied);
+    assert_eq!(denial.message(), "management action is not authorized");
+
+    let mut allowed_after = client_a
+        .list_security_audit_records(audit_request())
+        .await
+        .unwrap()
+        .into_inner();
+    allowed_after.observed_at = allowed_before.observed_at.clone();
+    assert_eq!(allowed_after, allowed_before);
+    catalog_a.refresh().await.unwrap();
+    catalog_b.refresh().await.unwrap();
+    assert_eq!(
+        catalog_a
+            .get_security_principal(observer_a.id)
+            .await
+            .unwrap(),
+        Some(observer_a)
+    );
+    assert_eq!(
+        catalog_b
+            .get_security_principal(observer_b.id)
+            .await
+            .unwrap(),
+        Some(observer_b)
+    );
+    assert_eq!(
+        catalog_a.list_security_audit_records().await.unwrap(),
+        audit_after_first_a
+    );
+    let audit_after_b = catalog_b.list_security_audit_records().await.unwrap();
+    assert_eq!(audit_after_b.len(), audit_before_b.len() + 2);
+    assert!(audit_after_b.starts_with(&audit_before_b));
+    let success_record = &audit_after_b[audit_before_b.len()];
+    assert!(success_record.event_id.starts_with("management-authn-"));
+    assert!(success_record.timestamp_ms > 0);
+    assert_eq!(
+        success_record,
+        &SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: success_record.event_id.clone(),
+            timestamp_ms: success_record.timestamp_ms,
+            actor: AuditIdentity::Verified("principal:2".to_owned()),
+            target: AuditField::Known("management-api".to_owned()),
+            scope: AuditField::NotApplicable,
+            action: SecurityAuditClass::AuthenticationSuccess,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::Known(1),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
+    );
+    let denial_record = &audit_after_b[audit_before_b.len() + 1];
+    assert!(denial_record.event_id.starts_with("management-denial-"));
+    assert!(denial_record.timestamp_ms > 0);
+    assert_eq!(
+        denial_record,
+        &SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: denial_record.event_id.clone(),
+            timestamp_ms: denial_record.timestamp_ms,
+            actor: AuditIdentity::Verified("principal:2".to_owned()),
+            target: AuditField::Known("SecurityAuditRead".to_owned()),
+            scope: AuditField::Known(serde_json::to_string(&audit_range).unwrap()),
+            action: SecurityAuditClass::AuthorizationDenial,
+            outcome: SecurityAuditOutcome::Denied,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::Known(1),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }
+    );
+
+    process_a.0.kill().unwrap();
+    process_a.0.wait().unwrap();
+    process_b.0.kill().unwrap();
+    process_b.0.wait().unwrap();
+}
+
+#[tokio::test]
 async fn delegated_actor_policy_is_rechecked_by_release_control_process() {
     let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
