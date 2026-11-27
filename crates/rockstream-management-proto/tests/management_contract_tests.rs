@@ -1,7 +1,7 @@
 use rockstream_management_proto::{ensure_protocol_version, v1, PROTOCOL_VERSION};
 
 #[test]
-fn management_v1_contract_has_all_nineteen_methods() {
+fn management_v1_contract_has_all_twenty_one_methods() {
     let proto = include_str!("../proto/management/v1/management.proto");
     let service = proto
         .split("service ManagementService {")
@@ -27,6 +27,8 @@ fn management_v1_contract_has_all_nineteen_methods() {
             "rpc ListOperations(ListOperationsRequest) returns (ListOperationsResponse);",
             "rpc ListSecurityAuditRecords(ListSecurityAuditRecordsRequest) returns (ListSecurityAuditRecordsResponse);",
             "rpc ListSecurityPrincipals(ListSecurityPrincipalsRequest) returns (ListSecurityPrincipalsResponse);",
+            "rpc CreateServicePrincipal(CreateServicePrincipalRequest) returns (CreateServicePrincipalResponse);",
+            "rpc DeleteSecurityPrincipal(DeleteSecurityPrincipalRequest) returns (DeleteSecurityPrincipalResponse);",
             "rpc SetSecurityPrincipalGrants(SetSecurityPrincipalGrantsRequest) returns (SetSecurityPrincipalGrantsResponse);",
             "rpc GetOperation(GetOperationRequest) returns (GetOperationResponse);",
             "rpc GetConfigSummary(GetConfigSummaryRequest) returns (GetConfigSummaryResponse);",
@@ -78,6 +80,10 @@ fn every_request_and_response_carries_protocol_version() {
         v1::ListOperationsResponse,
         v1::ListSecurityPrincipalsRequest,
         v1::ListSecurityPrincipalsResponse,
+        v1::CreateServicePrincipalRequest,
+        v1::CreateServicePrincipalResponse,
+        v1::DeleteSecurityPrincipalRequest,
+        v1::DeleteSecurityPrincipalResponse,
         v1::SetSecurityPrincipalGrantsRequest,
         v1::SetSecurityPrincipalGrantsResponse,
         v1::GetOperationRequest,
@@ -173,6 +179,18 @@ impl v1::management_service_server::ManagementService for TestService {
         &self,
         _: tonic::Request<v1::ListSecurityPrincipalsRequest>,
     ) -> Result<tonic::Response<v1::ListSecurityPrincipalsResponse>, tonic::Status> {
+        Err(rockstream_management_proto::unavailable_status())
+    }
+    async fn create_service_principal(
+        &self,
+        _: tonic::Request<v1::CreateServicePrincipalRequest>,
+    ) -> Result<tonic::Response<v1::CreateServicePrincipalResponse>, tonic::Status> {
+        Err(rockstream_management_proto::unavailable_status())
+    }
+    async fn delete_security_principal(
+        &self,
+        _: tonic::Request<v1::DeleteSecurityPrincipalRequest>,
+    ) -> Result<tonic::Response<v1::DeleteSecurityPrincipalResponse>, tonic::Status> {
         Err(rockstream_management_proto::unavailable_status())
     }
     async fn set_security_principal_grants(

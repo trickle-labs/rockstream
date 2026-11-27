@@ -6,9 +6,9 @@ use rockstream_control::{
     SecretRotationOperationRequest, ShardManager, TopologyCatalog,
 };
 use rockstream_management_proto::v1::{
-    CancelOperationRequest, CreateBackupRequest, DrainWorkerRequest, GetCapabilitiesRequest,
-    GetClusterStatusRequest, GetConfigSummaryRequest, GetHealthRequest, GetNodeRequest,
-    GetOperationRequest, GetShardRequest, ListNodesRequest, ListOperationsRequest,
+    CancelOperationRequest, CreateBackupRequest, CreateServicePrincipalRequest, DrainWorkerRequest,
+    GetCapabilitiesRequest, GetClusterStatusRequest, GetConfigSummaryRequest, GetHealthRequest,
+    GetNodeRequest, GetOperationRequest, GetShardRequest, ListNodesRequest, ListOperationsRequest,
     ListSecurityPrincipalsRequest, ListShardsRequest, MigrateShardRequest, Operation,
     SetSecurityPrincipalGrantsRequest,
 };
@@ -324,6 +324,7 @@ async fn management_principal_listing_pages_grants_without_exposing_login_creden
                     management_action("namespace_create", "\"cluster\""),
                     management_action("index_manage", "\"cluster\""),
                 ],
+                service_ids: Vec::new(),
             }],
             next_page_token: "1".to_owned(),
         }
@@ -406,6 +407,7 @@ async fn management_principal_listing_pages_grants_without_exposing_login_creden
                         "{\"secret\":{\"namespace\":\"sales\",\"name\":\"warehouse\",\"consumer\":2}}",
                     ),
                 ],
+                service_ids: Vec::new(),
             }],
             next_page_token: String::new(),
         }
@@ -1477,6 +1479,18 @@ async fn management_rejects_incompatible_versions_before_reading_state() {
         get_capabilities,
         GetCapabilitiesRequest {
             protocol_version: 2
+        }
+    );
+    assert_incompatible!(
+        create_service_principal,
+        CreateServicePrincipalRequest {
+            protocol_version: 2,
+            principal_id: 0,
+            display_name: String::new(),
+            service_id: String::new(),
+            expected_grantor_revision: 0,
+            idempotency_key: String::new(),
+            scoped_grants: Vec::new(),
         }
     );
     assert_incompatible!(

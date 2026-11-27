@@ -735,6 +735,8 @@ async fn release_management_backup_commits_and_restores_real_shard_data() {
             "GetShard",
             "ListOperations",
             "ListSecurityPrincipals",
+            "CreateServicePrincipal",
+            "DeleteSecurityPrincipal",
             "SetSecurityPrincipalGrants",
             "GetOperation",
             "GetConfigSummary",

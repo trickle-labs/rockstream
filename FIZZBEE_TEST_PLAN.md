@@ -755,6 +755,29 @@ the raw message. `client::data_plane_tests::invalid_control_message_log_has_exac
 asserts the complete log record. No coordinator or worker state transitions
 change, so the existing model assumptions remain unchanged.
 
+PR #477 (issue #302) adds management creation of scoped service principals.
+The request requires cluster grant-management authority, the reviewed grantor
+revision, and a canonical UUID bound to the request fingerprint; the durable
+catalog records the new principal with its success audit records.
+`service_principal_creation_is_revision_checked_idempotent_and_audited` checks
+stale revisions, exact principal and audit contents, replay, changed-request
+rejection, and operator denial. This management path does not change the
+coordinator, worker, lease, or epoch transitions modeled by M1–M7.
+
+PR #479 (issue #302) adds revision-checked service-principal deletion through
+the management API. A canonical request UUID binds the reviewed target and
+grantor revisions, deployment, and verified certificate identity; the durable
+catalog records the removal with its grant-change and completion audit events.
+`principal_deletion_is_revision_checked_idempotent_and_audited` checks stale
+revisions, last-administrator protection, operator denial, exact audit
+contents, concurrent and replayed requests, changed-request rejection, and
+replay after reopening the catalog. The release-process test
+`service_principal_deletion_survives_release_process_restart` also kills and
+restarts the control process between creation, deletion, and exact replay, then
+checks that replay leaves the complete deletion-correlated audit records
+unchanged. This security-catalog mutation does not change the coordinator,
+worker, lease, or epoch transitions modeled by M1–M7.
+
 PR #420 (issue #400) completes the direct distributed execution path across
 `rockstream-control`, `rockstream-runtime`, `rockstream-storage`, and
 `rockstream-sql`. Control-plane `GetWorkloadTopology` exposes a versioned

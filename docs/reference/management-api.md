@@ -23,7 +23,9 @@ The protocol version is `1`. Every request carries `protocol_version`. The serve
 | `GetShard` | Returns one current shard lease or `NOT_FOUND`. |
 | `ListOperations` | Returns a page of retained operation records. |
 | `GetOperation` | Returns one operation or `NOT_FOUND`. |
-| `ListSecurityPrincipals` | Returns safe principal, fixed-preset, scoped-grant, and effective-permission data to a principal authorized for grant management. Login credentials are omitted. |
+| `ListSecurityPrincipals` | Returns safe principal, service-identity, fixed-preset, scoped-grant, and effective-permission data to a principal authorized for grant management. Login credentials are omitted. |
+| `CreateServicePrincipal` | Creates an enabled service-only principal with scoped grants after checking the reviewed grantor revision. The principal and correlated grant/completion audit records commit together; retry the same canonical UUID after a lost response. |
+| `DeleteSecurityPrincipal` | Deletes a principal after checking the reviewed target and grantor revisions. The deletion and correlated grant/completion audit records commit together; the response's `operation_id` identifies that catalog transaction. Retry the same canonical UUID after a lost response. The last active mTLS administrator cannot be deleted. |
 | `SetSecurityPrincipalGrants` | Replaces an existing principal's grants after checking the reviewed target and grantor revisions. Persists the operation before applying the change and commits the grant record with its audit event. |
 | `GetConfigSummary` | Returns effective configuration values and redaction flags. |
 | `GetCapabilities` | Returns the methods attached to this server. |
@@ -97,7 +99,7 @@ The server admits at most 64 concurrent management requests and 64 ACK waiters f
 
 ## Idempotency and cancellation
 
-`DrainWorker`, `MigrateShard`, and `CreateBackup` accept an `idempotency_key`. `SetSecurityPrincipalGrants` and SQL `ALTER SECRET` use a canonical client-generated UUID as the operation ID. For secret rotation, set `rockstream.idempotency_key` in the SQL session before the mutation. The server binds the UUID to the authenticated actor, deployment, secret scope, and a digest of the submitted values; it does not persist those values in the operation record. An exact retry returns the original result. A changed request under the same key is rejected without applying another mutation. A submitting principal or a principal with current `operation_history_read` authority can use `GetOperation` to recover the safe result when the gateway and management service share the operation store. Retry SQL with the original UUID and request; never resubmit the mutation with a new key.
+`DrainWorker`, `MigrateShard`, and `CreateBackup` accept an `idempotency_key`. `SetSecurityPrincipalGrants`, `DeleteSecurityPrincipal`, and SQL `ALTER SECRET` use a canonical client-generated UUID as the idempotency key. For secret rotation, set `rockstream.idempotency_key` in the SQL session before the mutation. The server binds the UUID to the authenticated actor, deployment, secret scope, and a digest of the submitted values; it does not persist those values in the operation record. An exact retry returns the original result. A changed request under the same key is rejected without applying another mutation. A submitting principal or a principal with current `operation_history_read` authority can use `GetOperation` to recover the safe result when the gateway and management service share the operation store. Retry SQL with the original UUID and request; never resubmit the mutation with a new key.
 
 The valid status transitions are:
 
@@ -120,6 +122,6 @@ Cancellation is allowed before lease transfer. A migration cancelled during dono
 
 Management RPC errors retain their gRPC status. The CLI currently maps management status errors to `RS-0003`, so automation cannot distinguish every gRPC failure through the CLI output.
 
-`SetSecurityPrincipalGrants` updates grants on an existing principal. Principal creation, deletion, login-method changes, password changes, and their bootstrap workflows have separate interfaces and are not implemented by this RPC. The CLI's local identity flags do not authenticate a caller to the management service.
+`CreateServicePrincipal` creates a service identity with scoped grants and no presets. Interactive login-method changes, password changes, and bootstrap recovery use separate interfaces. The CLI's local identity flags do not authenticate a caller to the management service.
 
 The server has no authoritative process-health telemetry, so `GetHealth` returns `unknown`. This is the qualified behavior for v0.66; the limitation remains explicit until health telemetry is implemented.
