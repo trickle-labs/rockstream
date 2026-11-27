@@ -110,6 +110,8 @@ pub struct CursorState {
     pub rows: Vec<Vec<u8>>,
     /// Current read position (0-indexed).
     pub position: usize,
+    /// Relation whose current authorization is required for FETCH.
+    pub authorized_relation_name: Option<String>,
 }
 
 /// Session-scoped NOTICE queued for the next query response.

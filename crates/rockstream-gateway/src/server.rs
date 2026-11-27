@@ -9490,7 +9490,7 @@ impl GatewayHandler {
 
         // FETCH [FORWARD] n FROM <name> | FETCH ALL FROM <name>
         if ql.starts_with("fetch ") {
-            return self.handle_fetch_cursor(q, &ql, conn_id);
+            return self.handle_fetch_cursor(q, &ql, conn_id).await;
         }
 
         // MOVE [FORWARD] n FROM <name> | MOVE ALL FROM <name>
@@ -14332,9 +14332,14 @@ impl GatewayHandler {
                     ),
                 )))]);
             }
-            session
-                .cursors
-                .insert(cursor_name.clone(), CursorState { rows, position: 0 });
+            session.cursors.insert(
+                cursor_name.clone(),
+                CursorState {
+                    rows,
+                    position: 0,
+                    authorized_relation_name: view_name,
+                },
+            );
         }
 
         Ok(vec![promote_response(Response::Execution(Tag::new(
@@ -14342,7 +14347,7 @@ impl GatewayHandler {
         )))])
     }
 
-    fn handle_fetch_cursor(
+    async fn handle_fetch_cursor(
         &self,
         _q: &str,
         ql: &str,
@@ -14395,6 +14400,20 @@ impl GatewayHandler {
         } else {
             count_str.parse().unwrap_or(0)
         };
+
+        let authorized_relation_name = self
+            .sessions
+            .get(conn_id_str)
+            .and_then(|session| session.cursors.get(&cursor_name))
+            .and_then(|cursor| cursor.authorized_relation_name.clone());
+        if let Some(view_name) = authorized_relation_name {
+            if let Some(denied) = self
+                .select_access_error_response(&view_name, Some(conn_id_str))
+                .await?
+            {
+                return Ok(denied);
+            }
+        }
 
         // Fetch and advance under one lock so concurrent cursor operations
         // cannot duplicate pages or reposition a cursor reopened by CLOSE.
@@ -27171,7 +27190,7 @@ mod v073_subscription_policy_tests {
     use super::*;
 
     #[tokio::test]
-    async fn live_subscriptions_reauthorize_across_catalog_instances_and_keep_other_principals_streaming(
+    async fn live_subscriptions_and_cursors_reauthorize_across_catalog_instances_and_keep_other_principals_streaming(
     ) {
         use crate::catalog_stubs::CatalogView;
         use crate::change_log::ChangeEntry;
@@ -27287,6 +27306,21 @@ mod v073_subscription_policy_tests {
             .principal = Principal::ScramUser {
             username: "subscription-reader".to_string(),
         };
+        let cursor_sql = "DECLARE reader_cursor CURSOR FOR SELECT value FROM v072_live_auth";
+        let cursor_lower = cursor_sql.to_lowercase();
+        handler
+            .handle_declare_cursor(cursor_sql, &cursor_lower, Some(reader_conn_id))
+            .await
+            .unwrap();
+        {
+            let mut cursor_session = handler.sessions.get_mut(reader_conn_id).unwrap();
+            let cursor = cursor_session.cursors.get_mut("reader_cursor").unwrap();
+            assert_eq!(
+                cursor.authorized_relation_name.as_deref(),
+                Some("v072_live_auth")
+            );
+            cursor.rows.push(b"live".to_vec());
+        }
         let mut admin_rows = subscribe(&handler, &admin_conn_id).await;
         let mut reader_rows = subscribe(&handler, reader_conn_id).await;
 
@@ -27341,6 +27375,33 @@ mod v073_subscription_policy_tests {
             )
             .unwrap();
         tokio::time::sleep(SECURITY_POLICY_REFRESH_INTERVAL + Duration::from_millis(100)).await;
+
+        let fetch = handler
+            .handle_fetch_cursor("", "fetch all from reader_cursor", Some(reader_conn_id))
+            .await
+            .unwrap();
+        match fetch.as_slice() {
+            [Response::Error(error)] => {
+                assert_eq!(error.severity, "ERROR");
+                assert_eq!(error.code, "42501");
+                assert_eq!(
+                    error.message,
+                    "[RS-2401] auth.permission_denied: principal 'subscription-reader' is not authorized for action 'DataRead' on public.v072_live_auth. next_steps: Request an authorized scoped grant, then retry."
+                );
+            }
+            other => panic!("revoked cursor fetch must be denied without rows: {other:?}"),
+        }
+        assert_eq!(
+            handler
+                .sessions
+                .get(reader_conn_id)
+                .unwrap()
+                .cursors
+                .get("reader_cursor")
+                .unwrap()
+                .position,
+            0
+        );
 
         let row = tokio::time::timeout(Duration::from_secs(2), admin_rows.next())
             .await
