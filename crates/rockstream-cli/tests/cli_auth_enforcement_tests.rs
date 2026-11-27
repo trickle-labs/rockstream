@@ -159,6 +159,28 @@ async fn gateway_start_fails_closed_when_durable_catalog_recovery_fails() {
     );
 }
 
+#[tokio::test]
+async fn configured_mtls_auth_mode_fails_closed_without_gateway_tls() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = tmp.path().join("mtls");
+    let mut node_config = NodeConfig::default();
+    node_config.auth.mode = "mtls".to_string();
+    let mut opts = test_options(storage.clone(), "off", Some("127.0.0.1:0".to_string()));
+    opts.node_config = Some(node_config);
+
+    let error = start_gateway(&opts)
+        .await
+        .expect_err("off must not mask configured mTLS");
+    assert_eq!(
+        error.to_string(),
+        "RS-0002 mTLS requires gateway TLS certificate, key, and client CA paths\n  next steps: Configure gateway.tls.cert_path, key_path, and ca_cert_path."
+    );
+    assert!(
+        !storage.exists(),
+        "failed mTLS startup created gateway storage"
+    );
+}
+
 #[test]
 fn oidc_missing_configuration_fails_before_storage_or_listener_start() {
     let tmp = tempfile::tempdir().unwrap();
