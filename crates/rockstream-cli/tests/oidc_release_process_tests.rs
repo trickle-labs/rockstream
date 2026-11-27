@@ -3202,14 +3202,7 @@ async fn delegated_gateway_sql_rechecks_control_policy_and_recovers_lost_grant_r
             }
         );
     }
-    let subscription_scope = AuditField::Known(
-        serde_json::to_string(&PolicyScope::Resource {
-            namespace: "public".to_owned(),
-            kind: ResourceKind::Table,
-            name: "active_subscription".to_owned(),
-        })
-        .unwrap(),
-    );
+    let subscription_scope = AuditField::Known(serde_json::to_string(&subscription_scope).unwrap());
     let subscription_denials = records
         .iter()
         .filter(|record| {
