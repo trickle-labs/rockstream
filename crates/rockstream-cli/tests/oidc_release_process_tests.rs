@@ -90,17 +90,24 @@ fn free_port() -> u16 {
         .port()
 }
 
-async fn serve_jwks(listener: TcpListener, requests: usize) {
+async fn serve_jwks(listener: TcpListener, requests: usize, transient_failures: usize) {
     let mut jwks: serde_json::Value = serde_json::from_str(TEST_JWKS).unwrap();
     jwks["keys"]
         .as_array_mut()
         .unwrap()
         .push(serde_json::from_str(EXPIRED_JWK).unwrap());
     let body = serde_json::to_vec(&jwks).unwrap();
-    for _ in 0..requests {
+    for request_index in 0..requests {
         let (mut stream, _) = listener.accept().await.unwrap();
         let mut request = [0; 2048];
         let _ = stream.read(&mut request).await.unwrap();
+        if request_index < transient_failures {
+            stream
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            continue;
+        }
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
@@ -2206,7 +2213,7 @@ async fn delegated_gateway_sql_rechecks_control_policy_and_recovers_lost_grant_r
     let jwks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let jwks_addr = jwks_listener.local_addr().unwrap();
     let jwks_url = format!("http://{jwks_addr}/jwks");
-    let jwks_task = tokio::spawn(serve_jwks(jwks_listener, 1));
+    let jwks_task = tokio::spawn(serve_jwks(jwks_listener, 1, 0));
     let gateway_address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
     let mut gateway_process = start_delegated_oidc_gateway_process(
         &gateway_working_dir,
@@ -4985,7 +4992,7 @@ async fn oidc_password_auth_runs_in_release_process_and_audits_after_restart() {
     let jwks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let jwks_addr = jwks_listener.local_addr().unwrap();
     let jwks_url = format!("http://{jwks_addr}/jwks");
-    let jwks_task = tokio::spawn(serve_jwks(jwks_listener, 3));
+    let jwks_task = tokio::spawn(serve_jwks(jwks_listener, 4, 1));
 
     let address: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
     let mut process = start_gateway_process(
@@ -5304,42 +5311,12 @@ async fn oidc_password_auth_runs_in_release_process_and_audits_after_restart() {
     assert!(!serialized_audit.contains(&wrong_algorithm_token));
 }
 
-#[tokio::test]
-async fn oidc_startup_rejects_unavailable_jwks_before_listening() {
-    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
-    let temp = tempfile::tempdir().unwrap();
-    let storage = temp.path().join("oidc-startup-storage");
-
-    let mut tls_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-    tls_params
-        .subject_alt_names
-        .push(rcgen::SanType::IpAddress("127.0.0.1".parse().unwrap()));
-    let tls_key = rcgen::KeyPair::generate().unwrap();
-    let tls_cert = tls_params.self_signed(&tls_key).unwrap();
-    let cert_path = temp.path().join("gateway.pem");
-    let key_path = temp.path().join("gateway-key.pem");
-    std::fs::write(&cert_path, tls_cert.pem()).unwrap();
-    std::fs::write(&key_path, tls_key.serialize_pem()).unwrap();
-
-    let jwks_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let jwks_address = jwks_listener.local_addr().unwrap();
-    drop(jwks_listener);
-    let address: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-    assert_ne!(address.port(), jwks_address.port());
-
-    let jwks_url = format!("http://{jwks_address}/jwks");
-    let mut process = start_gateway_process(
-        temp.path(),
-        &storage,
-        address,
-        &cert_path,
-        &key_path,
-        "oidc",
-        None,
-        "https://issuer.example",
-        "rockstream",
-        &jwks_url,
-    );
+async fn assert_oidc_startup_rejected_before_listening(
+    process: &mut RunningGateway,
+    address: std::net::SocketAddr,
+    jwks_url: &str,
+    jwks_error: &str,
+) {
     let deadline = Instant::now() + Duration::from_secs(30);
     let status = loop {
         if let Some(status) = process.0.try_wait().unwrap() {
@@ -5377,13 +5354,88 @@ async fn oidc_startup_rejects_unavailable_jwks_before_listening() {
     let normalized = stderr.replace(correlation_id, "<correlation_id>");
     assert_eq!(
         normalized.trim_end(),
-        "[RS-0003] storage.unavailable: Storage unavailable (detail=OIDC verifier initialization failed: [RS-2400] auth.unauthenticated: OIDC JWKS request failed) (correlation_id=<correlation_id> context=detail=OIDC verifier initialization failed: [RS-2400] auth.unauthenticated: OIDC JWKS request failed) next_steps: Verify storage directory permissions and disk space.\n  next steps: Restore access to the configured JWKS endpoint before starting the gateway."
+        format!(
+            "[RS-0003] storage.unavailable: Storage unavailable (detail=OIDC verifier initialization failed: [RS-2400] auth.unauthenticated: {jwks_error}) (correlation_id=<correlation_id> context=detail=OIDC verifier initialization failed: [RS-2400] auth.unauthenticated: {jwks_error}) next_steps: Verify storage directory permissions and disk space.\n  next steps: Restore access to the configured JWKS endpoint before starting the gateway."
+        )
     );
     assert!(
-        !stderr.contains(&jwks_url),
+        !stderr.contains(jwks_url),
         "diagnostic exposed the JWKS URL"
     );
     assert!(tokio::net::TcpStream::connect(address).await.is_err());
+}
+
+#[tokio::test]
+async fn oidc_startup_rejects_unavailable_jwks_before_listening() {
+    let _port_lock = RELEASE_PROCESS_PORT_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("oidc-startup-storage");
+
+    let mut tls_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    tls_params
+        .subject_alt_names
+        .push(rcgen::SanType::IpAddress("127.0.0.1".parse().unwrap()));
+    let tls_key = rcgen::KeyPair::generate().unwrap();
+    let tls_cert = tls_params.self_signed(&tls_key).unwrap();
+    let cert_path = temp.path().join("gateway.pem");
+    let key_path = temp.path().join("gateway-key.pem");
+    std::fs::write(&cert_path, tls_cert.pem()).unwrap();
+    std::fs::write(&key_path, tls_key.serialize_pem()).unwrap();
+
+    let jwks_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let jwks_address = jwks_listener.local_addr().unwrap();
+    drop(jwks_listener);
+    let address: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    assert_ne!(address.port(), jwks_address.port());
+
+    let jwks_url = format!("http://{jwks_address}/jwks");
+    let mut process = start_gateway_process(
+        temp.path(),
+        &storage,
+        address,
+        &cert_path,
+        &key_path,
+        "oidc",
+        None,
+        "https://issuer.example",
+        "rockstream",
+        &jwks_url,
+    );
+    assert_oidc_startup_rejected_before_listening(
+        &mut process,
+        address,
+        &jwks_url,
+        "OIDC JWKS request failed",
+    )
+    .await;
+    drop(process);
+
+    let jwks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let jwks_address = jwks_listener.local_addr().unwrap();
+    let jwks_url = format!("http://{jwks_address}/jwks");
+    let jwks_task = tokio::spawn(serve_jwks(jwks_listener, 2, 2));
+    let retry_storage = temp.path().join("oidc-retry-storage");
+    let address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut process = start_gateway_process(
+        temp.path(),
+        &retry_storage,
+        address,
+        &cert_path,
+        &key_path,
+        "oidc",
+        None,
+        "https://issuer.example",
+        "rockstream",
+        &jwks_url,
+    );
+    assert_oidc_startup_rejected_before_listening(
+        &mut process,
+        address,
+        &jwks_url,
+        "OIDC JWKS endpoint returned an unsuccessful status",
+    )
+    .await;
+    jwks_task.await.unwrap();
 }
 
 #[tokio::test]
@@ -8340,25 +8392,89 @@ async fn operator_only_management_access_keeps_artifacts_and_denies_backup_creat
     );
 
     let idempotency_key = uuid::Uuid::new_v4().to_string();
-    let artifact = client
-        .generate_support_artifact(GenerateSupportArtifactRequest {
-            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
-            node_id: String::new(),
-            idempotency_key: idempotency_key.clone(),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(artifact.opaque_id, idempotency_key);
-    let generated_at_ms = artifact.expires_at_ms - 600_000;
+    let started_at_ms = chrono::Utc::now().timestamp_millis().max(1) as u64;
+    let management_cli = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_rockstream"));
+        command
+            .arg("--json")
+            .arg("--management")
+            .arg(management_address.to_string())
+            .arg("--tls-ca-cert-path")
+            .arg(&pki.ca_cert_path)
+            .arg("--tls-cert-path")
+            .arg(&pki.secondary_cli_cert_path)
+            .arg("--tls-key-path")
+            .arg(&pki.secondary_cli_key_path);
+        command
+    };
+    let create = management_cli()
+        .args(["support", "artifact", "create", "--idempotency-key"])
+        .arg(&idempotency_key)
+        .output()
+        .unwrap();
+    assert!(
+        create.status.success(),
+        "support artifact create failed: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    let created: rockstream_cli::output::ManagementSupportArtifactInfo =
+        serde_json::from_slice(&create.stdout).unwrap();
+    assert_eq!(created.opaque_id, idempotency_key);
+    assert!(created.expires_at_ms > started_at_ms);
+    let expected_created = rockstream_cli::output::ManagementSupportArtifactInfo {
+        opaque_id: idempotency_key.clone(),
+        expires_at_ms: created.expires_at_ms,
+        downloaded_to: None,
+        size_bytes: None,
+    };
+    assert_eq!(created, expected_created);
+    assert_eq!(
+        String::from_utf8(create.stdout).unwrap(),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&expected_created).unwrap()
+        )
+    );
+
+    let artifact_path = temp.path().join("operator-support-artifact.json");
+    let download = management_cli()
+        .args(["support", "artifact", "download"])
+        .arg(&idempotency_key)
+        .arg("--out")
+        .arg(&artifact_path)
+        .output()
+        .unwrap();
+    assert!(
+        download.status.success(),
+        "support artifact download failed: {}",
+        String::from_utf8_lossy(&download.stderr)
+    );
+    let content = std::fs::read(&artifact_path).unwrap();
+    let generated_at_ms = created.expires_at_ms - 600_000;
     let expected_content = format!(
         "{{\"format_version\":1,\"generated_at_ms\":{generated_at_ms},\"scope\":\"cluster\",\"source_version\":\"rockstream:{}\",\"topology_revision\":1,\"active_operations\":1,\"retained_operations\":1,\"node\":null}}",
         env!("CARGO_PKG_VERSION")
     );
-    let (content, expires_at_ms) =
-        download_support_artifact(&mut client, &artifact.opaque_id).await;
-    assert_eq!(String::from_utf8(content).unwrap(), expected_content);
-    assert_eq!(expires_at_ms, artifact.expires_at_ms);
+    assert_eq!(
+        String::from_utf8(content.clone()).unwrap(),
+        expected_content
+    );
+    let expected_downloaded = rockstream_cli::output::ManagementSupportArtifactInfo {
+        opaque_id: idempotency_key,
+        expires_at_ms: created.expires_at_ms,
+        downloaded_to: Some(artifact_path.to_string_lossy().into_owned()),
+        size_bytes: Some(content.len() as u64),
+    };
+    let downloaded: rockstream_cli::output::ManagementSupportArtifactInfo =
+        serde_json::from_slice(&download.stdout).unwrap();
+    assert_eq!(downloaded, expected_downloaded);
+    assert_eq!(
+        String::from_utf8(download.stdout).unwrap(),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&expected_downloaded).unwrap()
+        )
+    );
 
     let principal_request = rockstream_management_proto::v1::ListSecurityPrincipalsRequest {
         protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
