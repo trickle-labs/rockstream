@@ -306,7 +306,10 @@ async fn test_explain_analyze_uses_distributed_stats_for_each_view_and_operator(
             !output.contains("Live worker statistics unavailable"),
             "{output}"
         );
-        assert!(output.contains("Adaptive routing and elasticity:"), "{output}");
+        assert!(
+            output.contains("Adaptive routing and elasticity:"),
+            "{output}"
+        );
         if events.is_empty() {
             assert!(
                 output.contains("No runtime decisions observed by this control process."),
