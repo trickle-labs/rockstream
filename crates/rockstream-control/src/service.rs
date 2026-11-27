@@ -3359,6 +3359,38 @@ impl ManagementBackupRuntime {
             return;
         }
 
+        let generation = format!("management-{operation_id}");
+        let exporter = crate::checkpoint_export::CheckpointExportService::new();
+        let prepared = match exporter
+            .validate_generation(destination_store.clone(), &generation)
+            .await
+        {
+            Ok(_) => None,
+            Err(crate::checkpoint_export::CheckpointExportError::Integrity(message))
+                if message.contains("terminal commit marker is missing") =>
+            {
+                match exporter
+                    .prepare_live_export(&self.source, &destination_store, &checkpoint, &generation)
+                    .await
+                {
+                    Ok(prepared) => Some(prepared),
+                    Err(error) => {
+                        let _ = self.gc_pins.release_pin(&pin_id).await;
+                        self.handle_export_error(operation_id, error).await;
+                        return;
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = self.gc_pins.release_pin(&pin_id).await;
+                self.handle_export_error(operation_id, error).await;
+                return;
+            }
+        };
+
+        // The exporting phase is durable only after live metadata has been
+        // captured and sealed. A restart can resume the same checkpoint and
+        // inventory without re-reading mutable lease or catalog state.
         let export_phase = format!("backup_exporting:{}", checkpoint_id.0);
         if self
             .operations
@@ -3379,32 +3411,11 @@ impl ManagementBackupRuntime {
             let _ = self.gc_pins.release_pin(&pin_id).await;
             return;
         }
-        let generation = format!("management-{operation_id}");
-        let exporter = crate::checkpoint_export::CheckpointExportService::new();
-        match exporter
-            .validate_generation(destination_store.clone(), &generation)
-            .await
-        {
-            Ok(_) => {}
-            Err(crate::checkpoint_export::CheckpointExportError::Integrity(message))
-                if message.contains("terminal commit marker is missing") =>
+        if let Some(prepared) = prepared {
+            if let Err(error) = exporter
+                .export_prepared_live(self.source.clone(), destination_store.clone(), prepared)
+                .await
             {
-                if let Err(error) = exporter
-                    .export_prefix(
-                        self.source.clone(),
-                        destination_store.clone(),
-                        checkpoint,
-                        generation.clone(),
-                        &object_store::path::Path::from(""),
-                    )
-                    .await
-                {
-                    let _ = self.gc_pins.release_pin(&pin_id).await;
-                    self.handle_export_error(operation_id, error).await;
-                    return;
-                }
-            }
-            Err(error) => {
                 let _ = self.gc_pins.release_pin(&pin_id).await;
                 self.handle_export_error(operation_id, error).await;
                 return;
