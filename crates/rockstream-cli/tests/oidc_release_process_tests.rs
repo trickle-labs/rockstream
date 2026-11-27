@@ -4616,7 +4616,11 @@ async fn management_grant_persists_across_restart_and_storage_outage_rejects_mut
                             },
                         )
                         .collect(),
-                    service_ids: Vec::new(),
+                    service_ids: if principal_id == 2 {
+                        vec!["release-audit-outage-target".to_owned()]
+                    } else {
+                        Vec::new()
+                    },
                 }
             })
             .collect(),
