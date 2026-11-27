@@ -2258,6 +2258,7 @@ async fn delegated_gateway_sql_rechecks_control_policy_and_recovers_lost_grant_r
         .password(VALID_TOKEN)
         .dbname("test")
         .ssl_mode(tokio_postgres::config::SslMode::Require);
+    let pooled_tls = client_tls.clone();
     let (client, connection) = config
         .connect(tokio_postgres_rustls::MakeRustlsConnect::new(client_tls))
         .await
@@ -2982,6 +2983,28 @@ async fn delegated_gateway_sql_rechecks_control_policy_and_recovers_lost_grant_r
     assert_eq!(grant_operation.phase, "security_policy_committed");
     tokio::time::sleep(Duration::from_secs(2)).await;
 
+    let mut pooled_config = tokio_postgres::Config::new();
+    pooled_config
+        .host("127.0.0.1")
+        .port(gateway_address.port())
+        .user("alice")
+        .password(VALID_TOKEN)
+        .dbname("test")
+        .ssl_mode(tokio_postgres::config::SslMode::Require);
+    let (pooled_client, pooled_connection) = pooled_config
+        .connect(tokio_postgres_rustls::MakeRustlsConnect::new(pooled_tls))
+        .await
+        .expect("second OIDC session should connect for the same principal");
+    let pooled_connection_task = tokio::spawn(pooled_connection);
+    let allowed_pooled_rows = pooled_client
+        .query("SELECT id FROM active_subscription", &[])
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get::<_, i64>(0))
+        .collect::<Vec<_>>();
+    assert_eq!(allowed_pooled_rows, Vec::<i64>::new());
+
     let mut subscription = Box::pin(
         client
             .simple_query_raw("SUBSCRIBE active_subscription AS OF NOW WITH SNAPSHOT")
@@ -3058,6 +3081,25 @@ async fn delegated_gateway_sql_rechecks_control_policy_and_recovers_lost_grant_r
     );
     assert!(subscription.next().await.is_none());
 
+    let pooled_denial = pooled_client
+        .query("SELECT id FROM active_subscription", &[])
+        .await
+        .expect_err("revocation must deny a second established session");
+    assert_eq!(pooled_denial.as_db_error().unwrap().code().code(), "42501");
+    assert_eq!(
+        pooled_denial.as_db_error().unwrap().message(),
+        "[RS-2401] auth.permission_denied: principal 'alice' is not authorized for action 'DataRead' on public.active_subscription. next_steps: Request an authorized scoped grant, then retry."
+    );
+    assert_eq!(
+        pooled_client
+            .query_one("SELECT 1 AS value", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        1_i64,
+        "revocation must preserve the second authenticated session"
+    );
+
     let mut principal_after_subscription_revocation = scoped_actor.clone();
     principal_after_subscription_revocation.revision = 5;
     let mut principals_after_subscription_revocation = principals_after_scoped_grant.clone();
@@ -3072,6 +3114,8 @@ async fn delegated_gateway_sql_rechecks_control_policy_and_recovers_lost_grant_r
 
     control_catalog.refresh().await.unwrap();
     let audit_before_shutdown = control_catalog.list_security_audit_records().await.unwrap();
+    drop(pooled_client);
+    pooled_connection_task.abort();
     drop(client);
     connection_task.abort();
     jwks_task.await.unwrap();
@@ -3174,32 +3218,37 @@ async fn delegated_gateway_sql_rechecks_control_policy_and_recovers_lost_grant_r
                 && record.outcome == SecurityAuditOutcome::Denied
         })
         .collect::<Vec<_>>();
-    assert_eq!(subscription_denials.len(), 1);
-    let subscription_denial = subscription_denials[0];
-    assert!(subscription_denial.event_id.starts_with("gateway-authz-"));
-    assert!(subscription_denial.timestamp_ms > 0);
-    assert!(matches!(
-        &subscription_denial.correlation,
-        AuditCorrelation::Observed(value) if !value.is_empty()
-    ));
-    assert_eq!(
-        subscription_denial,
-        &SecurityAuditRecord {
-            format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
-            event_id: subscription_denial.event_id.clone(),
-            timestamp_ms: subscription_denial.timestamp_ms,
-            actor: actor.clone(),
-            target: AuditField::Known("public.active_subscription".to_owned()),
-            scope: subscription_scope,
-            action: SecurityAuditClass::AuthorizationDenial,
-            outcome: SecurityAuditOutcome::Denied,
-            correlation: subscription_denial.correlation.clone(),
-            operation_id: AuditField::NotApplicable,
-            policy_revision: AuditField::Known(5),
-            before_state: AuditField::NotApplicable,
-            after_state: AuditField::NotApplicable,
-        }
+    assert_eq!(subscription_denials.len(), 2);
+    assert_ne!(
+        subscription_denials[0].correlation,
+        subscription_denials[1].correlation
     );
+    for subscription_denial in subscription_denials {
+        assert!(subscription_denial.event_id.starts_with("gateway-authz-"));
+        assert!(subscription_denial.timestamp_ms > 0);
+        assert!(matches!(
+            &subscription_denial.correlation,
+            AuditCorrelation::Observed(value) if !value.is_empty()
+        ));
+        assert_eq!(
+            subscription_denial,
+            &SecurityAuditRecord {
+                format_version: rockstream_types::authorization::SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: subscription_denial.event_id.clone(),
+                timestamp_ms: subscription_denial.timestamp_ms,
+                actor: actor.clone(),
+                target: AuditField::Known("public.active_subscription".to_owned()),
+                scope: subscription_scope.clone(),
+                action: SecurityAuditClass::AuthorizationDenial,
+                outcome: SecurityAuditOutcome::Denied,
+                correlation: subscription_denial.correlation.clone(),
+                operation_id: AuditField::NotApplicable,
+                policy_revision: AuditField::Known(5),
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::NotApplicable,
+            }
+        );
+    }
     let denial = records
         .iter()
         .find(|record| record.target == AuditField::Known("ViewAuthor".to_owned()))
