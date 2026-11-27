@@ -9494,6 +9494,10 @@ async fn operator_scoped_backup_grant_keeps_support_artifact_sanitized() {
     let backup_scope = PolicyScope::BackupDestination {
         destination: backup_destination.to_string_lossy().into_owned(),
     };
+    let data_scope = PolicyScope::Namespace {
+        namespace: "public".to_owned(),
+    };
+    let data_scope_json = serde_json::to_string(&data_scope).unwrap();
     let denied_key = uuid::Uuid::new_v4().to_string();
     let denial = client
         .create_backup(CreateBackupRequest {
@@ -9542,10 +9546,16 @@ async fn operator_scoped_backup_grant_keeps_support_artifact_sanitized() {
             expected_revision: 1,
             expected_grantor_revision: 1,
             idempotency_key: grant_operation_id.clone(),
-            preset_grants: vec![SecurityPresetGrant {
-                preset: "operator".to_owned(),
-                scope_json: serde_json::to_string(&PolicyScope::Cluster).unwrap(),
-            }],
+            preset_grants: vec![
+                SecurityPresetGrant {
+                    preset: "operator".to_owned(),
+                    scope_json: serde_json::to_string(&PolicyScope::Cluster).unwrap(),
+                },
+                SecurityPresetGrant {
+                    preset: "data_reader".to_owned(),
+                    scope_json: data_scope_json.clone(),
+                },
+            ],
             scoped_grants: vec![SecurityActionGrant {
                 action: "backup_create".to_owned(),
                 scope_json: serde_json::to_string(&backup_scope).unwrap(),
@@ -9564,7 +9574,10 @@ async fn operator_scoped_backup_grant_keeps_support_artifact_sanitized() {
         serde_json::json!({
             "principal_id": 2,
             "revision": 2,
-            "preset_grants": [{"preset": "operator", "scope": "cluster"}],
+            "preset_grants": [
+                {"preset": "operator", "scope": "cluster"},
+                {"preset": "data_reader", "scope": {"namespace": {"namespace": "public"}}}
+            ],
             "scoped_grants": [{
                 "action": "backup_create",
                 "scope": {"backup_destination": {"destination": backup_destination.to_string_lossy().to_string()}}
@@ -9578,17 +9591,38 @@ async fn operator_scoped_backup_grant_keeps_support_artifact_sanitized() {
                 {"action": "diagnostics_read", "scope": "cluster"},
                 {"action": "support_generate", "scope": "cluster"},
                 {"action": "support_download", "scope": "cluster"},
+                {"action": "metadata_inspect", "scope": {"namespace": {"namespace": "public"}}},
+                {"action": "data_read", "scope": {"namespace": {"namespace": "public"}}},
+                {"action": "data_subscribe", "scope": {"namespace": {"namespace": "public"}}},
                 {"action": "backup_create", "scope": {"backup_destination": {"destination": backup_destination.to_string_lossy().to_string()}}}
             ]
         })
     );
     let mut expected_operator = operator_before;
     expected_operator.revision = 2;
+    expected_operator.preset_grants.push(SecurityPresetGrant {
+        preset: "data_reader".to_owned(),
+        scope_json: data_scope_json.clone(),
+    });
     let backup_scope_json = serde_json::to_string(&backup_scope).unwrap();
     expected_operator.scoped_grants = vec![SecurityActionGrant {
         action: "backup_create".to_owned(),
         scope_json: backup_scope_json.clone(),
     }];
+    expected_operator.effective_permissions.extend([
+        SecurityActionGrant {
+            action: "metadata_inspect".to_owned(),
+            scope_json: data_scope_json.clone(),
+        },
+        SecurityActionGrant {
+            action: "data_read".to_owned(),
+            scope_json: data_scope_json.clone(),
+        },
+        SecurityActionGrant {
+            action: "data_subscribe".to_owned(),
+            scope_json: data_scope_json,
+        },
+    ]);
     expected_operator
         .effective_permissions
         .push(SecurityActionGrant {
