@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use futures::StreamExt;
-use object_store::{path::Path, ObjectStore, ObjectStoreExt};
+use object_store::{path::Path, ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 use rockstream_types::checkpoint::{CheckpointId, ClusterCheckpoint};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -89,6 +89,38 @@ struct ExportGuard {
     require_latest: bool,
     require_manifest: bool,
     metadata_baseline: Option<(Path, BTreeMap<Path, String>)>,
+    captured_metadata: BTreeMap<Path, CapturedMetadata>,
+}
+
+/// A sealed live-export inventory pins the exact object names and the bytes of
+/// mutable metadata before the first inventory copy. A retry never substitutes
+/// newly acquired lease state (or new catalog entries) for the captured bytes.
+#[derive(Debug, Serialize, Deserialize)]
+struct LiveExportSeal {
+    generation: String,
+    checkpoint: ClusterCheckpoint,
+    snapshot_id: Uuid,
+    object_count: u64,
+    inventory_digest: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LiveExportEntry {
+    source: String,
+    metadata: Option<(u64, String)>,
+}
+
+struct CapturedMetadata {
+    path: Path,
+    byte_len: u64,
+    sha256: String,
+}
+
+pub(crate) struct PreparedLiveExport {
+    generation: String,
+    checkpoint: ClusterCheckpoint,
+    objects: Vec<Path>,
+    metadata: BTreeMap<Path, CapturedMetadata>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -314,6 +346,7 @@ impl CheckpointExportService {
                 require_latest,
                 require_manifest: true,
                 metadata_baseline: Some((prefix.clone(), metadata_baseline)),
+                ..Default::default()
             },
         )
         .await
@@ -337,6 +370,243 @@ impl CheckpointExportService {
             generation,
             prefix,
             false,
+        )
+        .await
+    }
+
+    /// Prepare a management backup from live storage. Unlike an immutable
+    /// prefix export, this captures mutable metadata into the destination and
+    /// seals the ordered inventory before allowing the copy phase to begin.
+    pub(crate) async fn prepare_live_export(
+        &self,
+        source: &Arc<dyn ObjectStore>,
+        destination: &Arc<dyn ObjectStore>,
+        checkpoint: &ClusterCheckpoint,
+        generation: &str,
+    ) -> Result<PreparedLiveExport, CheckpointExportError> {
+        validate_generation(generation)?;
+        let _permit = self
+            .permit
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| CheckpointExportError::InFlight)?;
+        rockstream_types::metrics::set_checkpoint_export_objects_in_flight(1);
+        let result = self
+            .prepare_live_export_inner(source, destination, checkpoint, generation)
+            .await;
+        rockstream_types::metrics::set_checkpoint_export_objects_in_flight(0);
+        result
+    }
+
+    async fn prepare_live_export_inner(
+        &self,
+        source: &Arc<dyn ObjectStore>,
+        destination: &Arc<dyn ObjectStore>,
+        checkpoint: &ClusterCheckpoint,
+        generation: &str,
+    ) -> Result<PreparedLiveExport, CheckpointExportError> {
+        let seal_path = live_export_seal_path(generation);
+        let mut seal = self
+            .read_json::<LiveExportSeal>(destination, &seal_path)
+            .await?;
+        if seal.is_none() {
+            // Old incomplete exports have no authenticated snapshot to resume.
+            // Never overwrite their inventory with a new metadata generation.
+            match destination.head(&generation_path(generation)).await {
+                Ok(_) => {
+                    seal = self
+                        .read_json::<LiveExportSeal>(destination, &seal_path)
+                        .await?;
+                    if seal.is_none() {
+                        return Err(CheckpointExportError::Integrity(
+                            "incomplete live export has no sealed metadata snapshot".to_string(),
+                        ));
+                    }
+                }
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(error) => {
+                    return Err(CheckpointExportError::ObjectStore(error.to_string()));
+                }
+            }
+        }
+
+        let seal = match seal {
+            Some(seal) => seal,
+            None => {
+                let prefix = Path::from("");
+                let baseline = self.snapshot_live_metadata(source, &prefix).await?;
+                let objects = Self::list_checkpoint_objects(source, checkpoint, &prefix).await?;
+                let inventoried_metadata: BTreeSet<&Path> = objects
+                    .iter()
+                    .filter(|path| is_unversioned_export_metadata(path))
+                    .collect();
+                let selected_metadata: BTreeSet<&Path> = baseline.keys().collect();
+                if inventoried_metadata != selected_metadata {
+                    return Err(CheckpointExportError::Integrity(
+                        "unversioned metadata changed between live snapshot and inventory"
+                            .to_string(),
+                    ));
+                }
+
+                // Each attempt gets its own staging namespace. A concurrent
+                // exporter can publish the seal first but cannot overwrite
+                // another attempt's staged objects or inventory records.
+                let snapshot_id = Uuid::new_v4();
+                let mut digest = Sha256::new();
+                for (index, path) in objects.iter().enumerate() {
+                    let index = index as u64;
+                    let metadata = if let Some(expected_digest) = baseline.get(path) {
+                        let staged = live_export_object_path(generation, snapshot_id, index);
+                        let (byte_len, sha256) = self
+                            .stream_copy_and_hash(source, path, destination, &staged)
+                            .await?;
+                        if &sha256 != expected_digest
+                            || self.stream_hash_and_size(destination, &staged).await?
+                                != (byte_len, sha256.clone())
+                        {
+                            return Err(CheckpointExportError::Integrity(format!(
+                                "live metadata {path} changed or failed staging validation"
+                            )));
+                        }
+                        Some((byte_len, sha256))
+                    } else {
+                        None
+                    };
+                    let entry = LiveExportEntry {
+                        source: path.to_string(),
+                        metadata,
+                    };
+                    update_digest(&mut digest, &entry)?;
+                    self.put_json(
+                        destination,
+                        &live_export_entry_path(generation, snapshot_id, index),
+                        &entry,
+                    )
+                    .await?;
+                }
+                let current = self.snapshot_live_metadata(source, &prefix).await?;
+                if let Some(path) = first_changed_metadata_path(&baseline, &current) {
+                    return Err(CheckpointExportError::Integrity(format!(
+                        "unversioned control/catalog/source metadata changed during snapshot: {path}"
+                    )));
+                }
+                let candidate = LiveExportSeal {
+                    generation: generation.to_owned(),
+                    checkpoint: checkpoint.clone(),
+                    snapshot_id,
+                    object_count: objects.len() as u64,
+                    inventory_digest: hex::encode(digest.finalize()),
+                };
+                let bytes = serde_json::to_vec(&candidate)
+                    .map_err(|error| CheckpointExportError::Integrity(error.to_string()))?;
+                if bytes.len() as u64 > MAX_CHECKPOINT_EXPORT_RECORD_BYTES {
+                    return Err(CheckpointExportError::Integrity(
+                        "live export seal exceeds record byte limit".to_string(),
+                    ));
+                }
+                match destination
+                    .put_opts(
+                        &seal_path,
+                        bytes.into(),
+                        PutOptions {
+                            mode: PutMode::Create,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                {
+                    Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => {}
+                    Err(error) => {
+                        return Err(CheckpointExportError::ObjectStore(error.to_string()));
+                    }
+                }
+                self.read_json::<LiveExportSeal>(destination, &seal_path)
+                    .await?
+                    .ok_or_else(|| {
+                        CheckpointExportError::Integrity("live export seal is missing".to_string())
+                    })?
+            }
+        };
+        if seal.generation != generation || seal.checkpoint != *checkpoint {
+            return Err(CheckpointExportError::Integrity(
+                "sealed live export belongs to a different checkpoint".to_string(),
+            ));
+        }
+
+        let mut objects = Vec::new();
+        let mut metadata = BTreeMap::new();
+        let mut digest = Sha256::new();
+        for index in 0..seal.object_count {
+            let entry = self
+                .read_json::<LiveExportEntry>(
+                    destination,
+                    &live_export_entry_path(generation, seal.snapshot_id, index),
+                )
+                .await?
+                .ok_or_else(|| {
+                    CheckpointExportError::Integrity(format!(
+                        "sealed live export entry {index} is missing"
+                    ))
+                })?;
+            update_digest(&mut digest, &entry)?;
+            let path = Path::parse(&entry.source).map_err(|error| {
+                CheckpointExportError::Integrity(format!("invalid sealed source path: {error}"))
+            })?;
+            if path.as_ref().is_empty()
+                || objects.last().is_some_and(|previous| previous >= &path)
+                || is_uncheckpointed_operational_path(&path)
+                || !is_selected_checkpoint_metadata(&path, checkpoint)
+                || path.as_ref().starts_with("checkpoint-exports/")
+                || path.as_ref().starts_with("restore-generations/")
+                || path.as_ref() == "control/bootstrap/active-generation"
+                || entry.metadata.is_some() != is_unversioned_export_metadata(&path)
+            {
+                return Err(CheckpointExportError::Integrity(format!(
+                    "invalid sealed live export entry {index}"
+                )));
+            }
+            if let Some((byte_len, sha256)) = entry.metadata {
+                metadata.insert(
+                    path.clone(),
+                    CapturedMetadata {
+                        path: live_export_object_path(generation, seal.snapshot_id, index),
+                        byte_len,
+                        sha256,
+                    },
+                );
+            }
+            objects.push(path);
+        }
+        if hex::encode(digest.finalize()) != seal.inventory_digest {
+            return Err(CheckpointExportError::Integrity(
+                "sealed live export inventory digest does not match".to_string(),
+            ));
+        }
+        Ok(PreparedLiveExport {
+            generation: generation.to_owned(),
+            checkpoint: checkpoint.clone(),
+            objects,
+            metadata,
+        })
+    }
+
+    pub(crate) async fn export_prepared_live(
+        &self,
+        source: Arc<dyn ObjectStore>,
+        destination: Arc<dyn ObjectStore>,
+        prepared: PreparedLiveExport,
+    ) -> Result<CheckpointExportOutcome, CheckpointExportError> {
+        self.export_objects_with_guard(
+            source,
+            destination,
+            prepared.checkpoint,
+            prepared.generation,
+            prepared.objects,
+            ExportGuard {
+                require_manifest: true,
+                captured_metadata: prepared.metadata,
+                ..Default::default()
+            },
         )
         .await
     }
@@ -815,6 +1085,7 @@ impl CheckpointExportService {
             require_latest,
             require_manifest,
             metadata_baseline,
+            captured_metadata,
         } = guard;
         match destination.head(&commit_path(&generation)).await {
             Ok(_) => {
@@ -911,13 +1182,26 @@ impl CheckpointExportService {
             let dest_path = object_path(&generation, index as u64);
             let destination_name = dest_path.to_string();
             let record_path = inventory_path(&generation, index as u64);
+            let captured = captured_metadata.get(&source_path);
+            let (object_source, object_source_path) = captured.map_or(
+                (&source, &source_path),
+                |metadata| (&destination, &metadata.path),
+            );
 
             let record = if let Some(existing) = self
                 .read_json::<InventoryRecord>(&destination, &record_path)
                 .await?
             {
-                let (source_len, source_sha) =
-                    self.stream_hash_and_size(&source, &source_path).await?;
+                let (source_len, source_sha) = self
+                    .stream_hash_and_size(object_source, object_source_path)
+                    .await?;
+                if captured.is_some_and(|metadata| {
+                    metadata.byte_len != source_len || metadata.sha256 != source_sha
+                }) {
+                    return Err(CheckpointExportError::Integrity(format!(
+                        "sealed metadata {source_path} failed validation during resume"
+                    )));
+                }
                 let expected = InventoryRecord {
                     source: source_name,
                     destination: destination_name,
@@ -942,8 +1226,20 @@ impl CheckpointExportService {
                 existing
             } else {
                 let (copied_len, copied_sha) = self
-                    .stream_copy_and_hash(&source, &source_path, &destination, &dest_path)
+                    .stream_copy_and_hash(
+                        object_source,
+                        object_source_path,
+                        &destination,
+                        &dest_path,
+                    )
                     .await?;
+                if captured.is_some_and(|metadata| {
+                    metadata.byte_len != copied_len || metadata.sha256 != copied_sha
+                }) {
+                    return Err(CheckpointExportError::Integrity(format!(
+                        "sealed metadata {source_path} failed copy validation"
+                    )));
+                }
                 let record = InventoryRecord {
                     source: source_name,
                     destination: destination_name,
@@ -1535,6 +1831,22 @@ fn validate_generation(generation: &str) -> Result<(), CheckpointExportError> {
     Ok(())
 }
 
+fn live_export_seal_path(generation: &str) -> Path {
+    Path::from(format!("{EXPORT_PREFIX}/{generation}/live-export-seal"))
+}
+
+fn live_export_entry_path(generation: &str, snapshot_id: Uuid, index: u64) -> Path {
+    Path::from(format!(
+        "{EXPORT_PREFIX}/{generation}/live-snapshots/{snapshot_id}/entries/{index:020}"
+    ))
+}
+
+fn live_export_object_path(generation: &str, snapshot_id: Uuid, index: u64) -> Path {
+    Path::from(format!(
+        "{EXPORT_PREFIX}/{generation}/live-snapshots/{snapshot_id}/objects/{index:020}"
+    ))
+}
+
 fn inventory_path(generation: &str, index: u64) -> Path {
     Path::from(format!(
         "{EXPORT_PREFIX}/{generation}/inventory/{index:020}"
@@ -1559,9 +1871,9 @@ fn digest_bytes(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-fn update_digest(
+fn update_digest<T: Serialize>(
     digest: &mut Sha256,
-    record: &InventoryRecord,
+    record: &T,
 ) -> Result<(), CheckpointExportError> {
     let bytes = serde_json::to_vec(record)
         .map_err(|error| CheckpointExportError::Integrity(error.to_string()))?;
@@ -1608,6 +1920,165 @@ mod tests {
             first_changed_metadata_path(&baseline, &BTreeMap::new()),
             Some(&path)
         );
+    }
+
+    #[tokio::test]
+    async fn live_export_resume_uses_sealed_metadata_after_lease_reacquisition() {
+        let source: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let destination: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let checkpoint = checkpoint();
+        crate::checkpoint_store::CheckpointManifestStore::new(source.clone())
+            .save_manifest(&checkpoint, false, None)
+            .await
+            .unwrap();
+        let state_path = Path::from("control/shard_manager/state.json");
+        let original = bytes::Bytes::from_static(b"original lease state");
+        source
+            .put(&state_path, original.clone().into())
+            .await
+            .unwrap();
+
+        let generation = "live-restart";
+        let service = CheckpointExportService::new();
+        let prepared = service
+            .prepare_live_export(&source, &destination, &checkpoint, generation)
+            .await
+            .unwrap();
+        assert!(destination.head(&commit_path(generation)).await.is_err());
+        let index = prepared
+            .objects
+            .iter()
+            .position(|path| path == &state_path)
+            .unwrap() as u64;
+        let captured = &prepared.metadata[&state_path];
+
+        // Model a crash after the metadata object and its inventory record
+        // were durably written, but before terminal commit.
+        service
+            .put_json(
+                &destination,
+                &generation_path(generation),
+                &GenerationRecord {
+                    checkpoint_id: checkpoint.checkpoint_id,
+                    generation: generation.to_owned(),
+                    checkpoint: checkpoint.clone(),
+                    object_count: prepared.objects.len() as u64,
+                    requires_checkpoint_manifest: true,
+                },
+            )
+            .await
+            .unwrap();
+        let final_path = object_path(generation, index);
+        destination
+            .put(&final_path, original.clone().into())
+            .await
+            .unwrap();
+        service
+            .put_json(
+                &destination,
+                &inventory_path(generation, index),
+                &InventoryRecord {
+                    source: state_path.to_string(),
+                    destination: final_path.to_string(),
+                    byte_len: captured.byte_len,
+                    sha256: captured.sha256.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        drop(prepared);
+        drop(service);
+
+        source
+            .put(
+                &state_path,
+                bytes::Bytes::from_static(b"new fencing token").into(),
+            )
+            .await
+            .unwrap();
+        let added = Path::from("catalog/added-after-crash");
+        source
+            .put(
+                &added,
+                bytes::Bytes::from_static(b"new catalog record").into(),
+            )
+            .await
+            .unwrap();
+        let restarted = CheckpointExportService::new();
+        let prepared = restarted
+            .prepare_live_export(&source, &destination, &checkpoint, generation)
+            .await
+            .unwrap();
+        assert!(!prepared.objects.contains(&added));
+        let outcome = restarted
+            .export_prepared_live(source, destination.clone(), prepared)
+            .await
+            .unwrap();
+        assert_eq!(outcome.checkpoint_id, checkpoint.checkpoint_id.0);
+        assert_eq!(outcome.object_count, 2);
+        assert_eq!(
+            destination
+                .get(&final_path)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+            original
+        );
+        assert_eq!(
+            restarted
+                .validate_generation(destination, generation)
+                .await
+                .unwrap(),
+            outcome
+        );
+    }
+
+    #[tokio::test]
+    async fn live_export_resume_rejects_corrupt_staged_metadata() {
+        let source: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let destination: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let checkpoint = checkpoint();
+        crate::checkpoint_store::CheckpointManifestStore::new(source.clone())
+            .save_manifest(&checkpoint, false, None)
+            .await
+            .unwrap();
+        let state_path = Path::from("control/shard_manager/state.json");
+        source
+            .put(
+                &state_path,
+                bytes::Bytes::from_static(b"lease state").into(),
+            )
+            .await
+            .unwrap();
+        let generation = "live-corrupt";
+        let service = CheckpointExportService::new();
+        let prepared = service
+            .prepare_live_export(&source, &destination, &checkpoint, generation)
+            .await
+            .unwrap();
+        destination
+            .put(
+                &prepared.metadata[&state_path].path,
+                bytes::Bytes::from_static(b"corruption").into(),
+            )
+            .await
+            .unwrap();
+        let restarted = CheckpointExportService::new();
+        let prepared = restarted
+            .prepare_live_export(&source, &destination, &checkpoint, generation)
+            .await
+            .unwrap();
+        let error = restarted
+            .export_prepared_live(source, destination.clone(), prepared)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("sealed metadata"));
+        assert!(matches!(
+            destination.head(&commit_path(generation)).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
     }
 
     #[tokio::test]
