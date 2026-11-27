@@ -184,6 +184,10 @@ that grant does not provide user, data, support, or grant-management authority.
 A user-delegated operation must also pass the acting user's current scoped
 policy.
 
+Each protected SQL operation on an established pgwire session checks current
+grants. Revocation denies the affected operation without closing the session;
+if the required denial audit cannot be persisted, the session is invalidated.
+
 Active `SUBSCRIBE` streams recheck the caller's current read authorization at
 one-second intervals before delivering pending or live rows. In durable
 security mode, a revoked grant produces a durable denial audit and closes that
