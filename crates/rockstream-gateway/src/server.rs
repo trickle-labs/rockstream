@@ -2791,6 +2791,7 @@ impl GatewayHandler {
                 | WorkerMessage::AuthorizeSourceEpoch { .. }
                 | WorkerMessage::ReadWorkload { .. }
                 | WorkerMessage::ReadOperatorStats { .. }
+                | WorkerMessage::ReadAdaptiveDiagnostics { .. }
         ) {
             return Err("[RS-2401] actor assertion may only authorize a data-plane request".into());
         }
@@ -8438,7 +8439,7 @@ impl GatewayHandler {
                 };
 
             let frontend = self.build_explain_frontend()?;
-            let explain_text = if is_estimate {
+            let mut explain_text = if is_estimate {
                 let mut canonical_arrs = Vec::new();
                 for (view_name, info) in self.catalog.list_view_arrangements() {
                     let arr_id_str = info
@@ -8608,6 +8609,63 @@ impl GatewayHandler {
                         .map_err(|e| PgWireError::ApiError(Box::new(e)))?
                 }
             };
+
+            if level == ExplainLevel::Analyze {
+                if let (Some(view), Some(data_plane)) = (
+                    requested_view.as_ref(),
+                    self.distributed_data_plane.as_ref(),
+                ) {
+                    let workload_id = WorkloadId(stable_name_id("workload", &view.name));
+                    let namespace = conn_id
+                        .and_then(|id| {
+                            self.sessions
+                                .get(id)
+                                .map(|session| session.current_namespace.clone())
+                        })
+                        .unwrap_or_else(|| "public".to_owned());
+                    let request =
+                        rockstream_types::topology::WorkerMessage::ReadAdaptiveDiagnostics {
+                            workload_id,
+                        };
+                    let assertion = self
+                        .actor_assertion_for_request(
+                            conn_id,
+                            SecurityAction::DataRead,
+                            PolicyScope::Resource {
+                                namespace,
+                                kind: ResourceKind::View,
+                                name: view.name.clone(),
+                            },
+                            &request,
+                        )
+                        .await
+                        .map_err(|detail| {
+                            PgWireError::ApiError(Box::new(
+                                GatewayError::QueryTimeExecutionFailed { detail },
+                            ))
+                        })?;
+                    let events = data_plane
+                        .adaptive_diagnostics(workload_id, assertion.as_deref())
+                        .await
+                        .map_err(|error| {
+                            PgWireError::ApiError(Box::new(
+                                GatewayError::QueryTimeExecutionFailed {
+                                    detail: format!("read adaptive routing diagnostics: {error}"),
+                                },
+                            ))
+                        })?;
+                    explain_text.push_str("\nAdaptive routing and elasticity:");
+                    if events.is_empty() {
+                        explain_text
+                            .push_str("\n  No runtime decisions observed by this control process.");
+                    } else {
+                        for event in events {
+                            explain_text.push_str("\n  ");
+                            explain_text.push_str(&event.to_string());
+                        }
+                    }
+                }
+            }
 
             let schema = Arc::new(vec![FieldInfo::new(
                 "QUERY PLAN".to_string(),

@@ -1,0 +1,64 @@
+name: Automatic skew and elasticity qualification
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "crates/rockstream-cli/**"
+      - "crates/rockstream-control/**"
+      - "crates/rockstream-runtime/**"
+      - "crates/rockstream-storage/**"
+      - "crates/rockstream-types/**"
+      - "crates/rockstream-ops/**"
+      - "crates/rockstream-gateway/**"
+      - "Cargo.lock"
+      - ".github/workflows/automatic-skew-qualification.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: automatic-skew-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  processes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      ROCKSTREAM_REQUIRE_DOCKER: "1"
+      ROCKSTREAM_SKEW_EVIDENCE_PATH: ${{ github.workspace }}/target/automatic-skew/latency.json
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+      - uses: Swatinem/rust-cache@v2
+      - name: Require real shared storage support
+        run: docker info
+      - name: Run exact routing, admission, and recovery tests
+        run: |
+          cargo test --locked -p rockstream-runtime --lib skew_
+          cargo test --locked -p rockstream-runtime --lib direct_grant
+          cargo test --locked -p rockstream-runtime --lib client::data_plane_tests
+          cargo test --locked -p rockstream-control --lib service::tests::
+          cargo test --locked -p rockstream-gateway --lib distributed_workload_snapshot_tests
+          cargo test --locked -p rockstream-ops --lib weighted_join_restore_preserves_exact_retractions
+          cargo test --locked -p rockstream-storage --lib heat_cache
+      - name: Qualify real worker processes, crash replay, p99, and 2 to 4 to 2 movement
+        run: cargo test --locked --release -p rockstream-cli --test automatic_skew_process_tests -- --include-ignored --test-threads=1
+      - name: Require measured latency evidence
+        run: test -s "$ROCKSTREAM_SKEW_EVIDENCE_PATH"
+      - name: Record source revision for measured evidence
+        if: always()
+        run: |
+          mkdir -p target/automatic-skew
+          git rev-parse HEAD > target/automatic-skew/source-revision.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: automatic-skew-process-evidence
+          path: target/automatic-skew/
+          if-no-files-found: error

@@ -324,6 +324,10 @@ pub enum ControlMessage {
         grant: crate::direct_epoch::DirectEpochGrant,
         topology: crate::data_plane::WorkloadTopologySnapshot,
     },
+    AdaptiveDiagnostics {
+        workload_id: crate::ids::WorkloadId,
+        events: Vec<serde_json::Value>,
+    },
     WorkloadSnapshot {
         snapshot: crate::data_plane::WorkloadSnapshot,
     },
@@ -920,6 +924,9 @@ pub const DATA_PLANE_DELEGATION_VERSION: u16 = 1;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkerMessage {
+    ReadAdaptiveDiagnostics {
+        workload_id: crate::ids::WorkloadId,
+    },
     AuthorizeSourceEpoch {
         metadata: crate::direct_epoch::SourceEpochMetadata,
     },

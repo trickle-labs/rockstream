@@ -452,6 +452,21 @@ pub(crate) async fn handle_command(
         .await
         .map_err(|error| error.to_string())?;
     if let Some((finish, grant_was_installed)) = completed {
+        let kind = finish
+            .record
+            .plan
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("passthrough");
+        let decision = serde_json::json!({
+            "kind":kind,
+            "heavy_key_digests": finish.record.plan.get("heavy_keys").and_then(Value::as_array).map(|keys| keys.iter().map(|key| format!("{:x}", Sha256::digest(key.to_string().as_bytes()))).collect::<Vec<_>>()).unwrap_or_default(),
+            "hot_key_factor":finish.record.plan.get("hot_key_factor"),
+            "promotion_epochs":finish.record.plan.get("promotion_epochs"),
+            "bucket_input_rows":finish.record.plan.get("bucket_input_rows"),
+            "fallback_key_count":finish.record.plan.get("single_owner_fallback_keys").and_then(Value::as_array).map_or(0, Vec::len),
+            "joins":finish.record.plan.get("diagnostics"),
+        });
         let message = rockstream_types::topology::WorkerMessage::RoutingEpochCommitted {
             worker_id: deployment.descriptor.shard.worker_id,
             workload_id: command.workload_id,
@@ -461,7 +476,7 @@ pub(crate) async fn handle_command(
             generation: finish.record.generation,
             request_id: finish.record.request_id.clone(),
             input_digest: finish.record.input_digest,
-            decision: serde_json::Value::Null,
+            decision,
             shard_leases: finish.shard_leases,
         };
         if grant_was_installed {
