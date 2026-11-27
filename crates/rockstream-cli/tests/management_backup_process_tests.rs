@@ -1201,16 +1201,22 @@ async fn release_management_backups_allocate_distinct_checkpoints_concurrently()
     );
     seed_backup_value(&storage, 0).await;
     let management = free_addr();
+    let listen_addr = free_addr();
     let mut node = start_embedded(
         binary,
         &storage,
-        free_addr(),
+        listen_addr,
         Some(management),
         None,
         None,
         &pki,
     );
     wait_for_management(management, &mut node, 1, &pki).await;
+    connect_gateway(listen_addr)
+        .await
+        .simple_query("CREATE TABLE backup_startup_ready (id BIGINT PRIMARY KEY)")
+        .await
+        .expect("embedded shard finishes startup");
     let (first, second) = tokio::join!(
         submit_backup_request(
             management,
