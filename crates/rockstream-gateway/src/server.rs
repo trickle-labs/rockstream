@@ -10205,13 +10205,25 @@ impl GatewayHandler {
         relation_name: &str,
         conn_id: Option<&str>,
     ) -> PgWireResult<Option<Vec<Response<'static>>>> {
+        self.select_access_error_response_in_namespace(relation_name, conn_id, None)
+            .await
+    }
+
+    async fn select_access_error_response_in_namespace(
+        &self,
+        relation_name: &str,
+        conn_id: Option<&str>,
+        namespace_override: Option<&str>,
+    ) -> PgWireResult<Option<Vec<Response<'static>>>> {
         let session = conn_id.and_then(|id| {
             self.sessions
                 .get(id)
                 .map(|session| (session.principal.clone(), session.current_namespace.clone()))
         });
         let principal = session.as_ref().map(|(principal, _)| principal);
-        let session_namespace = session.as_ref().map(|(_, namespace)| namespace.as_str());
+        let session_namespace = namespace_override
+            .map(str::to_owned)
+            .or_else(|| session.as_ref().map(|(_, namespace)| namespace.clone()));
         let durable_policy_required =
             self.auth_mode != AuthMode::Off || self.catalog.get_durable_store().is_some();
 
@@ -10221,6 +10233,7 @@ impl GatewayHandler {
             }
 
             let policy_scope = session_namespace
+                .as_deref()
                 .and_then(|namespace| self.read_policy_scope(relation_name, namespace));
             let matching_principal = match principal {
                 Some(authenticated) if !authenticated.is_system() => self
@@ -10243,15 +10256,18 @@ impl GatewayHandler {
                 }
                 _ => false,
             };
-            let cross_namespace = match (policy_scope.as_ref(), session_namespace) {
+            let cross_namespace = match (policy_scope.as_ref(), session_namespace.as_deref()) {
                 (Some((_, _, target_namespace)), Some(session_namespace)) => {
                     target_namespace != session_namespace
                 }
                 _ => false,
             };
-            let cross_scope = session_namespace.map(|namespace| PolicyScope::Namespace {
-                namespace: namespace.to_string(),
-            });
+            let cross_scope =
+                session_namespace
+                    .as_deref()
+                    .map(|namespace| PolicyScope::Namespace {
+                        namespace: namespace.to_string(),
+                    });
             let cross_namespace_allowed = !cross_namespace
                 || matching_principal
                     .as_ref()
@@ -10320,8 +10336,10 @@ impl GatewayHandler {
 
         // Compatibility path for auth-off fixtures that exercise the legacy
         // ACL store. Release authentication modes always use durable policy.
-        let (principal, session_namespace) =
-            session.unwrap_or((Principal::System, "public".to_string()));
+        let principal = session
+            .map(|(principal, _)| principal)
+            .unwrap_or(Principal::System);
+        let session_namespace = session_namespace.unwrap_or_else(|| "public".to_string());
         use rockstream_types::acl::Role;
         if !principal.is_system() {
             if let Err(error) = self.acl_store.check(
@@ -14201,6 +14219,11 @@ impl GatewayHandler {
         // the pre-v0.72 cursor dispatcher and is used by supported drivers.
         // Retain that compatibility path; only relation reads need view ACL.
         let view_name = extract_view_name_from_select(inner_sql);
+        let authorization_namespace = self
+            .sessions
+            .get(conn_id_str)
+            .map(|session| session.current_namespace.clone())
+            .unwrap_or_else(|| "public".to_string());
         if let Some(name) = view_name.as_deref() {
             if let Some(denied) = self.select_access_error_response(name, conn_id).await? {
                 return Ok(denied);
@@ -14338,6 +14361,7 @@ impl GatewayHandler {
                     rows,
                     position: 0,
                     authorized_relation_name: view_name,
+                    authorization_namespace,
                 },
             );
         }
@@ -14401,14 +14425,21 @@ impl GatewayHandler {
             count_str.parse().unwrap_or(0)
         };
 
-        let authorized_relation_name = self
-            .sessions
-            .get(conn_id_str)
-            .and_then(|session| session.cursors.get(&cursor_name))
-            .and_then(|cursor| cursor.authorized_relation_name.clone());
-        if let Some(view_name) = authorized_relation_name {
+        let authorization_context = self.sessions.get(conn_id_str).and_then(|session| {
+            session.cursors.get(&cursor_name).map(|cursor| {
+                (
+                    cursor.authorized_relation_name.clone(),
+                    cursor.authorization_namespace.clone(),
+                )
+            })
+        });
+        if let Some((Some(relation_name), authorization_namespace)) = authorization_context {
             if let Some(denied) = self
-                .select_access_error_response(&view_name, Some(conn_id_str))
+                .select_access_error_response_in_namespace(
+                    &relation_name,
+                    Some(conn_id_str),
+                    Some(&authorization_namespace),
+                )
                 .await?
             {
                 return Ok(denied);
@@ -27197,7 +27228,9 @@ mod v073_subscription_policy_tests {
         use rockstream_storage::catalog::{
             CatalogMutation, CatalogStore, CatalogTxn, DurableCatalogStore,
         };
-        use rockstream_types::authorization::{PermissionPreset, ScopedPresetGrant};
+        use rockstream_types::authorization::{
+            PermissionPreset, PolicyScope, ScopedActionGrant, ScopedPresetGrant, SecurityAction,
+        };
         use rockstream_types::ids::PrincipalId;
 
         async fn subscribe(
@@ -27324,9 +27357,20 @@ mod v073_subscription_policy_tests {
         let mut admin_rows = subscribe(&handler, &admin_conn_id).await;
         let mut reader_rows = subscribe(&handler, reader_conn_id).await;
 
-        reader.enabled = false;
+        reader.enabled = true;
         reader.revision = 2;
-        reader.preset_grants.clear();
+        reader.preset_grants = vec![ScopedPresetGrant {
+            preset: PermissionPreset::DataReader,
+            scope: PolicyScope::Namespace {
+                namespace: "other".to_string(),
+            },
+        }];
+        reader.scoped_grants = vec![ScopedActionGrant {
+            action: SecurityAction::NamespaceCrossAccess,
+            scope: PolicyScope::Namespace {
+                namespace: "other".to_string(),
+            },
+        }];
         let revoked_policy =
             serde_json::to_string(&(reader.enabled, &reader.preset_grants, &reader.scoped_grants))
                 .unwrap();
@@ -27374,6 +27418,11 @@ mod v073_subscription_policy_tests {
                 }],
             )
             .unwrap();
+        handler
+            .sessions
+            .get_mut(reader_conn_id)
+            .unwrap()
+            .current_namespace = "other".to_string();
         tokio::time::sleep(SECURITY_POLICY_REFRESH_INTERVAL + Duration::from_millis(100)).await;
 
         let fetch = handler
@@ -27402,6 +27451,11 @@ mod v073_subscription_policy_tests {
                 .position,
             0
         );
+        handler
+            .sessions
+            .get_mut(reader_conn_id)
+            .unwrap()
+            .current_namespace = "public".to_string();
 
         let row = tokio::time::timeout(Duration::from_secs(2), admin_rows.next())
             .await

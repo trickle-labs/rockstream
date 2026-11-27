@@ -112,6 +112,8 @@ pub struct CursorState {
     pub position: usize,
     /// Relation whose current authorization is required for FETCH.
     pub authorized_relation_name: Option<String>,
+    /// Session namespace used to authorize the original relation read.
+    pub authorization_namespace: String,
 }
 
 /// Session-scoped NOTICE queued for the next query response.
