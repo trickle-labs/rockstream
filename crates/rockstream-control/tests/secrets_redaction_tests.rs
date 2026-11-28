@@ -20,6 +20,8 @@ async fn secret_literal_is_absent_from_audit_and_metadata_artifacts() {
     .with_audit_log(audit.clone());
     let literal = "literal-secret-that-must-not-leak";
     let encoded_literal = STANDARD.encode(literal);
+    let private_key = "-----BEGIN PRIVATE KEY-----\nsynthetic-private-key-material\n-----END PRIVATE KEY-----";
+    let encoded_private_key = STANDARD.encode(private_key);
     store
         .create_secret(
             0,
@@ -28,6 +30,8 @@ async fn secret_literal_is_absent_from_audit_and_metadata_artifacts() {
             HashMap::from([
                 (String::from("token"), literal.to_string()),
                 (String::from("encoded"), encoded_literal.clone()),
+                (String::from("private_key"), private_key.to_string()),
+                (String::from("encoded_private_key"), encoded_private_key.clone()),
             ]),
             "admin",
         )
@@ -66,7 +70,12 @@ async fn secret_literal_is_absent_from_audit_and_metadata_artifacts() {
     expected_audit_bytes.push(b'\n');
     let audit_bytes = std::fs::read(&audit_path).unwrap();
     assert_eq!(audit_bytes, expected_audit_bytes);
-    for forbidden in [literal.as_bytes(), encoded_literal.as_bytes()] {
+    for forbidden in [
+        literal.as_bytes(),
+        encoded_literal.as_bytes(),
+        private_key.as_bytes(),
+        encoded_private_key.as_bytes(),
+    ] {
         assert!(!audit_bytes
             .windows(forbidden.len())
             .any(|window| window == forbidden));
@@ -90,7 +99,12 @@ async fn secret_literal_is_absent_from_audit_and_metadata_artifacts() {
         })
     );
     let metadata_bytes = serde_json::to_vec(&metadata).unwrap();
-    for forbidden in [literal.as_bytes(), encoded_literal.as_bytes()] {
+    for forbidden in [
+        literal.as_bytes(),
+        encoded_literal.as_bytes(),
+        private_key.as_bytes(),
+        encoded_private_key.as_bytes(),
+    ] {
         assert!(!metadata_bytes
             .windows(forbidden.len())
             .any(|window| window == forbidden));
