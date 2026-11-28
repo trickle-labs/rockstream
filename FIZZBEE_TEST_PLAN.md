@@ -759,6 +759,10 @@ statistics; the runtime client checks the returned workload identity.
 The history is observational, not a source of lease ownership or commit
 authority, and empty history after restart does not imply no prior decisions.
 
+Periodic recovery scans only nonterminal `OperationKind::MigrateShard` records
+with a durable `automatic: true` request; it ignores other operation kinds, so
+drain operations cannot be routed through migration recovery.
+
 The idle-drain retry in `AutomaticRebalanceRuntime::finish_drains` resumes a
 durable pending/waiting idle migration by its existing operation ID and
 target, only when no other nonterminal migration exists. It delegates to the
