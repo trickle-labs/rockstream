@@ -467,11 +467,7 @@ async fn online_backup_succeeds_with_active_workload_and_concurrent_writes() {
         ControlService::new(TopologyCatalog::new())
             .with_shard_manager(ShardManager::new())
             .with_single_worker_local_backup_source_store(source_store.clone(), WorkerId(21))
-            .with_management(
-                management_addr,
-                source_store.clone(),
-                NodeConfig::default(),
-            ),
+            .with_management(management_addr, source_store.clone(), NodeConfig::default()),
     );
     let control = control
         .with_insecure_dev_mode()
@@ -675,11 +671,7 @@ async fn online_migrate_shard_moves_active_workload_and_updates_routing_atomical
     let control = auth.protect_control(
         ControlService::new(TopologyCatalog::new())
             .with_shard_manager(ShardManager::new())
-            .with_management(
-                management_addr,
-                mgmt_store.clone(),
-                NodeConfig::default(),
-            ),
+            .with_management(management_addr, mgmt_store.clone(), NodeConfig::default()),
     );
     let control = control
         .with_insecure_dev_mode()
