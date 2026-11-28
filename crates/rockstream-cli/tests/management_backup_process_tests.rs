@@ -145,16 +145,17 @@ async fn wait_for_backup_shard_ready(addr: SocketAddr) -> Client {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let mut last_error = None;
     loop {
+        // Startup and peer registration can still be writing the catalog.
         match tokio::time::timeout_at(
             deadline,
             client.simple_query(
-                "CREATE TABLE IF NOT EXISTS backup_startup_ready (id BIGINT PRIMARY KEY)",
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
             ),
         )
         .await
         {
             Ok(Ok(_)) => return client,
-            Ok(Err(error)) => last_error = Some(error.to_string()),
+            Ok(Err(error)) => last_error = Some(format!("{error:?}")),
             Err(_) => panic!(
                 "embedded shard did not finish startup: {}",
                 last_error.as_deref().unwrap_or("readiness probe timed out")
