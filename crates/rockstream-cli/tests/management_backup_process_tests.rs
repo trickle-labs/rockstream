@@ -23,6 +23,9 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 
+static RESERVED_ADDRS: std::sync::Mutex<Vec<(SocketAddr, TcpListener)>> =
+    std::sync::Mutex::new(Vec::new());
+
 #[path = "common/management_auth.rs"]
 mod management_auth;
 
@@ -42,7 +45,21 @@ impl Drop for RunningNode {
 
 fn free_addr() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("read ephemeral port")
+    let addr = listener.local_addr().expect("read ephemeral port");
+    RESERVED_ADDRS
+        .lock()
+        .expect("lock reserved test ports")
+        .push((addr, listener));
+    addr
+}
+
+fn release_addr(addr: SocketAddr) {
+    let mut reserved = RESERVED_ADDRS.lock().expect("lock reserved test ports");
+    let index = reserved
+        .iter()
+        .position(|(reserved, _)| *reserved == addr)
+        .expect("test address reservation");
+    drop(reserved.swap_remove(index));
 }
 
 fn start_embedded(
@@ -88,6 +105,10 @@ fn start_embedded(
         .get(&worker_id.unwrap_or(1))
         .expect("test PKI has the embedded worker identity");
     add_identity_tls_args(&mut command, certificate, key, pki);
+    release_addr(listen_addr);
+    if let Some(addr) = management_addr {
+        release_addr(addr);
+    }
     RunningNode(command.spawn().expect("start embedded role-all node"))
 }
 
@@ -1121,10 +1142,12 @@ async fn release_management_backup_idempotency_is_atomic_across_processes() {
         "all",
         &[&destination, &different_destination],
     );
+    let first_listen = free_addr();
+    let second_listen = free_addr();
     let mut first_node = start_embedded(
         binary,
         &first_storage,
-        free_addr(),
+        first_listen,
         Some(first_management),
         Some(&shared_storage),
         Some(1),
@@ -1133,7 +1156,7 @@ async fn release_management_backup_idempotency_is_atomic_across_processes() {
     let mut second_node = start_embedded(
         binary,
         &second_storage,
-        free_addr(),
+        second_listen,
         Some(second_management),
         Some(&shared_storage),
         Some(2),
@@ -1141,6 +1164,16 @@ async fn release_management_backup_idempotency_is_atomic_across_processes() {
     );
     wait_for_management(first_management, &mut first_node, 1, &pki).await;
     wait_for_management(second_management, &mut second_node, 1, &pki).await;
+    connect_gateway(first_listen)
+        .await
+        .simple_query("CREATE TABLE backup_startup_ready (id BIGINT PRIMARY KEY)")
+        .await
+        .expect("first embedded shard finishes startup");
+    connect_gateway(second_listen)
+        .await
+        .simple_query("CREATE TABLE backup_startup_ready (id BIGINT PRIMARY KEY)")
+        .await
+        .expect("second embedded shard finishes startup");
 
     let (first, second) = tokio::join!(
         submit_backup_request(first_management, &destination, idempotency_key, &pki),
