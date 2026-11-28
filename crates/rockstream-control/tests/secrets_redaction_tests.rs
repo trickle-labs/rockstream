@@ -20,7 +20,8 @@ async fn secret_literal_is_absent_from_audit_and_metadata_artifacts() {
     .with_audit_log(audit.clone());
     let literal = "literal-secret-that-must-not-leak";
     let encoded_literal = STANDARD.encode(literal);
-    let private_key = "-----BEGIN PRIVATE KEY-----\nsynthetic-private-key-material\n-----END PRIVATE KEY-----";
+    let private_key =
+        "-----BEGIN PRIVATE KEY-----\nsynthetic-private-key-material\n-----END PRIVATE KEY-----";
     let encoded_private_key = STANDARD.encode(private_key);
     store
         .create_secret(
@@ -31,7 +32,10 @@ async fn secret_literal_is_absent_from_audit_and_metadata_artifacts() {
                 (String::from("token"), literal.to_string()),
                 (String::from("encoded"), encoded_literal.clone()),
                 (String::from("private_key"), private_key.to_string()),
-                (String::from("encoded_private_key"), encoded_private_key.clone()),
+                (
+                    String::from("encoded_private_key"),
+                    encoded_private_key.clone(),
+                ),
             ]),
             "admin",
         )

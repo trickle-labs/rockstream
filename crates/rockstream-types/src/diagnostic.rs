@@ -1,6 +1,8 @@
 //! Bounded runtime diagnostics shared by every public renderer.
 
 use crate::error_code::{ErrorCode, ErrorDescriptor};
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
@@ -331,7 +333,7 @@ fn is_sensitive_json_key(key: &str) -> bool {
 }
 
 fn redact_secrets_text(input: &str) -> String {
-    if input.contains("-----BEGIN") {
+    if input.contains("-----BEGIN") || contains_encoded_private_key(input) {
         return "[REDACTED_PRIVATE_KEY_MATERIAL]".to_string();
     }
     let mut output = input.to_string();
@@ -372,8 +374,27 @@ fn redact_secrets_text(input: &str) -> String {
     output
 }
 
+fn contains_encoded_private_key(input: &str) -> bool {
+    if input.len() < 40 {
+        return false;
+    }
+
+    let mut decoded = [0; 64];
+    let mut reader = base64::read::DecoderReader::new(input.as_bytes(), &BASE64_STANDARD);
+    let Ok(len) = std::io::Read::read(&mut reader, &mut decoded) else {
+        return false;
+    };
+    let decoded = &decoded[..len];
+    decoded
+        .windows(b"-----BEGIN ".len())
+        .any(|window| window == b"-----BEGIN ")
+        && decoded
+            .windows(b"PRIVATE KEY-----".len())
+            .any(|window| window == b"PRIVATE KEY-----")
+}
+
 fn count_redaction_markers(input: &str, redacted: &str) -> usize {
-    if input.contains("-----BEGIN") {
+    if input.contains("-----BEGIN") || contains_encoded_private_key(input) {
         1
     } else {
         redacted

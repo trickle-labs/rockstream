@@ -5511,6 +5511,7 @@ version = "0.72.0"
 dependencies = [
  "antichain",
  "arrow",
+ "base64 0.22.1",
  "bytes",
  "dashmap",
  "hex",
