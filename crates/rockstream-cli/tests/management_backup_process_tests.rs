@@ -142,11 +142,26 @@ async fn connect_gateway(addr: SocketAddr) -> Client {
 
 async fn wait_for_backup_shard_ready(addr: SocketAddr) -> Client {
     let client = connect_gateway(addr).await;
-    client
-        .simple_query("CREATE TABLE IF NOT EXISTS backup_startup_ready (id BIGINT PRIMARY KEY)")
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut last_error = None;
+    loop {
+        match tokio::time::timeout_at(
+            deadline,
+            client.simple_query(
+                "CREATE TABLE IF NOT EXISTS backup_startup_ready (id BIGINT PRIMARY KEY)",
+            ),
+        )
         .await
-        .expect("embedded shard finishes startup");
-    client
+        {
+            Ok(Ok(_)) => return client,
+            Ok(Err(error)) => last_error = Some(error.to_string()),
+            Err(_) => panic!(
+                "embedded shard did not finish startup: {}",
+                last_error.as_deref().unwrap_or("readiness probe timed out")
+            ),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 async fn wait_for_management(
