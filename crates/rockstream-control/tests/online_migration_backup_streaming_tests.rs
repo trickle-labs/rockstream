@@ -34,18 +34,11 @@ use rockstream_types::topology::{
 };
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 
 #[path = "common/management_auth.rs"]
 mod management_auth;
 use management_auth::ManagementAuth;
-
-async fn free_addr() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    addr.to_string()
-}
 
 fn local_store(path: &std::path::Path) -> Arc<dyn ObjectStore> {
     Arc::new(object_store::local::LocalFileSystem::new_with_prefix(path).unwrap())
@@ -468,14 +461,14 @@ async fn online_backup_succeeds_with_active_workload_and_concurrent_writes() {
     let restored_dir = tempfile::tempdir().unwrap();
     let auth = ManagementAuth::new(&[destination.path().display().to_string()]).await;
     let source_store = local_store(storage.path());
-    let management_addr = free_addr().await;
+    let management_addr = "127.0.0.1:0";
 
     let control = auth.protect_control(
         ControlService::new(TopologyCatalog::new())
             .with_shard_manager(ShardManager::new())
             .with_single_worker_local_backup_source_store(source_store.clone(), WorkerId(21))
             .with_management(
-                management_addr.clone(),
+                management_addr,
                 source_store.clone(),
                 NodeConfig::default(),
             ),
@@ -485,6 +478,7 @@ async fn online_backup_succeeds_with_active_workload_and_concurrent_writes() {
         .start("127.0.0.1:0")
         .await
         .unwrap();
+    let management_addr = control.management_addr().unwrap();
     let control_url = control.addr.to_string();
 
     let (worker, worker_task) =
@@ -566,7 +560,7 @@ async fn online_backup_succeeds_with_active_workload_and_concurrent_writes() {
     db.flush().await.unwrap();
 
     // Trigger online CreateBackup while the workload is active
-    let mut mgmt_client = auth.client(management_addr.parse().unwrap()).await;
+    let mut mgmt_client = auth.client(management_addr).await;
     let accepted = mgmt_client
         .create_backup(CreateBackupRequest {
             protocol_version: 1,
@@ -677,12 +671,12 @@ async fn acknowledge_idle_anchor(
 async fn online_migrate_shard_moves_active_workload_and_updates_routing_atomically() {
     let mgmt_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let auth = ManagementAuth::new(&[]).await;
-    let management_addr = free_addr().await;
+    let management_addr = "127.0.0.1:0";
     let control = auth.protect_control(
         ControlService::new(TopologyCatalog::new())
             .with_shard_manager(ShardManager::new())
             .with_management(
-                management_addr.clone(),
+                management_addr,
                 mgmt_store.clone(),
                 NodeConfig::default(),
             ),
@@ -692,6 +686,7 @@ async fn online_migrate_shard_moves_active_workload_and_updates_routing_atomical
         .start("127.0.0.1:0")
         .await
         .unwrap();
+    let management_addr = control.management_addr().unwrap();
 
     let shared_caps = WorkerCapabilities {
         shared_shard_store_id: Some([7_u8; 32]),
@@ -804,7 +799,7 @@ async fn online_migrate_shard_moves_active_workload_and_updates_routing_atomical
     let donor_lease = w1_shard.expect("worker 1 must own a workload shard");
 
     // Trigger online MigrateShard from worker 1 -> worker 2 while workload is active!
-    let mut mgmt_client = auth.client(management_addr.parse().unwrap()).await;
+    let mut mgmt_client = auth.client(management_addr).await;
     let accepted = mgmt_client
         .migrate_shard(MigrateShardRequest {
             protocol_version: 1,
@@ -954,17 +949,18 @@ async fn online_migrate_shard_moves_active_workload_and_updates_routing_atomical
 async fn online_drain_worker_moves_active_workload_to_healthy_recipient() {
     let mgmt_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let auth = ManagementAuth::new(&[]).await;
-    let management_addr = free_addr().await;
+    let management_addr = "127.0.0.1:0";
     let control = auth.protect_control(
         ControlService::new(TopologyCatalog::new())
             .with_shard_manager(ShardManager::new())
-            .with_management(management_addr.clone(), mgmt_store, NodeConfig::default()),
+            .with_management(management_addr, mgmt_store, NodeConfig::default()),
     );
     let control = control
         .with_insecure_dev_mode()
         .start("127.0.0.1:0")
         .await
         .unwrap();
+    let management_addr = control.management_addr().unwrap();
 
     let shared_caps = WorkerCapabilities {
         shared_shard_store_id: Some([9_u8; 32]),
@@ -1075,7 +1071,7 @@ async fn online_drain_worker_moves_active_workload_to_healthy_recipient() {
     let drained_lease = w1_shard.unwrap();
 
     // Drain worker 1 online while workload is active
-    let mut mgmt_client = auth.client(management_addr.parse().unwrap()).await;
+    let mut mgmt_client = auth.client(management_addr).await;
     let accepted = mgmt_client
         .drain_worker(DrainWorkerRequest {
             protocol_version: 1,
