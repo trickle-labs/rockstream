@@ -748,6 +748,12 @@ model; no new FizzBee transition or invariant is asserted.
 
 ### 3.6 Cross-Cutting Coverage Assertions
 
+Management listener setup binds the requested address before clients use it.
+When an ephemeral port is requested, integration tests read the bound endpoint
+from `ControlServiceHandle::management_addr` before sending requests. This is
+address discovery only; it adds no coordination transition or invariant to
+M1–M7.
+
 PR #443 (issue #403) adds workload-scoped observations of committed routing
 and automatic movement decisions. A `RoutingEpochCommitted` message carries
 the generation, epoch and bounded diagnostic summary only after the existing

@@ -870,6 +870,11 @@ pub struct ControlServiceHandle {
 }
 
 impl ControlServiceHandle {
+    /// Bound management listener address, if the management API is enabled.
+    pub fn management_addr(&self) -> Option<SocketAddr> {
+        self.management.as_ref().map(|management| management.addr)
+    }
+
     pub fn automatic_elasticity_enabled(&self) -> bool {
         self.automatic_elasticity_enabled
     }
