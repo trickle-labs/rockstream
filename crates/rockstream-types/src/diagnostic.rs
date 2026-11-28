@@ -2,7 +2,6 @@
 
 use crate::error_code::{ErrorCode, ErrorDescriptor};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use base64::Engine;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
