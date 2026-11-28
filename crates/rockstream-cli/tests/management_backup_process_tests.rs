@@ -23,6 +23,9 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 
+static RESERVED_ADDRS: std::sync::Mutex<Vec<(SocketAddr, TcpListener)>> =
+    std::sync::Mutex::new(Vec::new());
+
 #[path = "common/management_auth.rs"]
 mod management_auth;
 
@@ -42,7 +45,21 @@ impl Drop for RunningNode {
 
 fn free_addr() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("read ephemeral port")
+    let addr = listener.local_addr().expect("read ephemeral port");
+    RESERVED_ADDRS
+        .lock()
+        .expect("lock reserved test ports")
+        .push((addr, listener));
+    addr
+}
+
+fn release_addr(addr: SocketAddr) {
+    let mut reserved = RESERVED_ADDRS.lock().expect("lock reserved test ports");
+    let index = reserved
+        .iter()
+        .position(|(reserved, _)| *reserved == addr)
+        .expect("test address reservation");
+    drop(reserved.swap_remove(index));
 }
 
 fn start_embedded(
@@ -88,6 +105,10 @@ fn start_embedded(
         .get(&worker_id.unwrap_or(1))
         .expect("test PKI has the embedded worker identity");
     add_identity_tls_args(&mut command, certificate, key, pki);
+    release_addr(listen_addr);
+    if let Some(addr) = management_addr {
+        release_addr(addr);
+    }
     RunningNode(command.spawn().expect("start embedded role-all node"))
 }
 
@@ -1115,8 +1136,6 @@ async fn release_management_backup_idempotency_is_atomic_across_processes() {
     let destination = root.path().join("backup");
     let different_destination = root.path().join("different-backup");
     let idempotency_key = "06600000-0000-4000-8000-000000000003";
-    let first_listen = free_addr();
-    let second_listen = free_addr();
     let pki = TestPki::generate();
     preprovision_backup_administrator(
         binary,
@@ -1132,6 +1151,8 @@ async fn release_management_backup_idempotency_is_atomic_across_processes() {
         "all",
         &[&destination, &different_destination],
     );
+    let first_listen = free_addr();
+    let second_listen = free_addr();
     let mut first_node = start_embedded(
         binary,
         &first_storage,

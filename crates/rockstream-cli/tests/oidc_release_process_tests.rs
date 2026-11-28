@@ -1270,13 +1270,6 @@ async fn start_control_process_with_operator_and_crash_after(
     RunningGateway(child)
 }
 
-async fn management_client(
-    address: std::net::SocketAddr,
-    pki: &rockstream_test_support::pki::TestPki,
-) -> Result<ManagementServiceClient<tonic::transport::Channel>, String> {
-    management_client_with_identity(address, pki, &pki.cli_cert_path, &pki.cli_key_path).await
-}
-
 async fn management_client_with_identity(
     address: std::net::SocketAddr,
     pki: &rockstream_test_support::pki::TestPki,
@@ -1367,9 +1360,19 @@ async fn wait_for_management_client(
     address: std::net::SocketAddr,
     pki: &rockstream_test_support::pki::TestPki,
 ) -> ManagementServiceClient<tonic::transport::Channel> {
+    wait_for_management_client_with_identity(address, pki, &pki.cli_cert_path, &pki.cli_key_path)
+        .await
+}
+
+async fn wait_for_management_client_with_identity(
+    address: std::net::SocketAddr,
+    pki: &rockstream_test_support::pki::TestPki,
+    cert_path: &Path,
+    key_path: &Path,
+) -> ManagementServiceClient<tonic::transport::Channel> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        match management_client(address, pki).await {
+        match management_client_with_identity(address, pki, cert_path, key_path).await {
             Ok(client) => return client,
             Err(_) if Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1751,22 +1754,20 @@ async fn management_authorization_is_isolated_between_process_instances() {
     .await;
     wait_for_gateway(&mut process_b.0, control_b).await;
 
-    let mut client_a = management_client_with_identity(
+    let mut client_a = wait_for_management_client_with_identity(
         management_a,
         &pki,
         &pki.secondary_cli_cert_path,
         &pki.secondary_cli_key_path,
     )
-    .await
-    .unwrap();
-    let mut client_b = management_client_with_identity(
+    .await;
+    let mut client_b = wait_for_management_client_with_identity(
         management_b,
         &pki,
         &pki.secondary_cli_cert_path,
         &pki.secondary_cli_key_path,
     )
-    .await
-    .unwrap();
+    .await;
     let catalog_a = DurableCatalogStore::recover(
         rockstream_storage::build_runtime_object_store(
             &storage_a.join("gateway-shard"),
@@ -9538,6 +9539,10 @@ async fn operator_scoped_backup_grant_keeps_support_artifact_sanitized() {
     let backup_scope = PolicyScope::BackupDestination {
         destination: backup_destination.to_string_lossy().into_owned(),
     };
+    let data_scope = PolicyScope::Namespace {
+        namespace: "public".to_owned(),
+    };
+    let data_scope_json = serde_json::to_string(&data_scope).unwrap();
     let denied_key = uuid::Uuid::new_v4().to_string();
     let denial = client
         .create_backup(CreateBackupRequest {
@@ -9586,10 +9591,16 @@ async fn operator_scoped_backup_grant_keeps_support_artifact_sanitized() {
             expected_revision: 1,
             expected_grantor_revision: 1,
             idempotency_key: grant_operation_id.clone(),
-            preset_grants: vec![SecurityPresetGrant {
-                preset: "operator".to_owned(),
-                scope_json: serde_json::to_string(&PolicyScope::Cluster).unwrap(),
-            }],
+            preset_grants: vec![
+                SecurityPresetGrant {
+                    preset: "operator".to_owned(),
+                    scope_json: serde_json::to_string(&PolicyScope::Cluster).unwrap(),
+                },
+                SecurityPresetGrant {
+                    preset: "data_reader".to_owned(),
+                    scope_json: data_scope_json.clone(),
+                },
+            ],
             scoped_grants: vec![SecurityActionGrant {
                 action: "backup_create".to_owned(),
                 scope_json: serde_json::to_string(&backup_scope).unwrap(),
@@ -9608,7 +9619,10 @@ async fn operator_scoped_backup_grant_keeps_support_artifact_sanitized() {
         serde_json::json!({
             "principal_id": 2,
             "revision": 2,
-            "preset_grants": [{"preset": "operator", "scope": "cluster"}],
+            "preset_grants": [
+                {"preset": "operator", "scope": "cluster"},
+                {"preset": "data_reader", "scope": {"namespace": {"namespace": "public"}}}
+            ],
             "scoped_grants": [{
                 "action": "backup_create",
                 "scope": {"backup_destination": {"destination": backup_destination.to_string_lossy().to_string()}}
@@ -9622,17 +9636,38 @@ async fn operator_scoped_backup_grant_keeps_support_artifact_sanitized() {
                 {"action": "diagnostics_read", "scope": "cluster"},
                 {"action": "support_generate", "scope": "cluster"},
                 {"action": "support_download", "scope": "cluster"},
+                {"action": "metadata_inspect", "scope": {"namespace": {"namespace": "public"}}},
+                {"action": "data_read", "scope": {"namespace": {"namespace": "public"}}},
+                {"action": "data_subscribe", "scope": {"namespace": {"namespace": "public"}}},
                 {"action": "backup_create", "scope": {"backup_destination": {"destination": backup_destination.to_string_lossy().to_string()}}}
             ]
         })
     );
     let mut expected_operator = operator_before;
     expected_operator.revision = 2;
+    expected_operator.preset_grants.push(SecurityPresetGrant {
+        preset: "data_reader".to_owned(),
+        scope_json: data_scope_json.clone(),
+    });
     let backup_scope_json = serde_json::to_string(&backup_scope).unwrap();
     expected_operator.scoped_grants = vec![SecurityActionGrant {
         action: "backup_create".to_owned(),
         scope_json: backup_scope_json.clone(),
     }];
+    expected_operator.effective_permissions.extend([
+        SecurityActionGrant {
+            action: "metadata_inspect".to_owned(),
+            scope_json: data_scope_json.clone(),
+        },
+        SecurityActionGrant {
+            action: "data_read".to_owned(),
+            scope_json: data_scope_json.clone(),
+        },
+        SecurityActionGrant {
+            action: "data_subscribe".to_owned(),
+            scope_json: data_scope_json,
+        },
+    ]);
     expected_operator
         .effective_permissions
         .push(SecurityActionGrant {
