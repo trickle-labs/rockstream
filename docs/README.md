@@ -10,6 +10,8 @@ Choose a path by what you need to do:
 - Apply the [schema-evolution cookbook](schema-evolution.md) when a view or
   PostgreSQL source changes.
 - Read the [history](history.md) and [architecture decisions](adr/README.md).
+- Explore the proposed [software-farm design](software-farm.md), starting with
+  the Hunter and the Gardener.
 
 ## Reference
 
