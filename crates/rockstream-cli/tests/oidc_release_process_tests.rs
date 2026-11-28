@@ -1253,13 +1253,6 @@ async fn start_control_process_with_operator_and_crash_after(
     RunningGateway(child)
 }
 
-async fn management_client(
-    address: std::net::SocketAddr,
-    pki: &rockstream_test_support::pki::TestPki,
-) -> Result<ManagementServiceClient<tonic::transport::Channel>, String> {
-    management_client_with_identity(address, pki, &pki.cli_cert_path, &pki.cli_key_path).await
-}
-
 async fn management_client_with_identity(
     address: std::net::SocketAddr,
     pki: &rockstream_test_support::pki::TestPki,
@@ -1350,9 +1343,19 @@ async fn wait_for_management_client(
     address: std::net::SocketAddr,
     pki: &rockstream_test_support::pki::TestPki,
 ) -> ManagementServiceClient<tonic::transport::Channel> {
+    wait_for_management_client_with_identity(address, pki, &pki.cli_cert_path, &pki.cli_key_path)
+        .await
+}
+
+async fn wait_for_management_client_with_identity(
+    address: std::net::SocketAddr,
+    pki: &rockstream_test_support::pki::TestPki,
+    cert_path: &Path,
+    key_path: &Path,
+) -> ManagementServiceClient<tonic::transport::Channel> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        match management_client(address, pki).await {
+        match management_client_with_identity(address, pki, cert_path, key_path).await {
             Ok(client) => return client,
             Err(_) if Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1734,22 +1737,20 @@ async fn management_authorization_is_isolated_between_process_instances() {
     .await;
     wait_for_gateway(&mut process_b.0, control_b).await;
 
-    let mut client_a = management_client_with_identity(
+    let mut client_a = wait_for_management_client_with_identity(
         management_a,
         &pki,
         &pki.secondary_cli_cert_path,
         &pki.secondary_cli_key_path,
     )
-    .await
-    .unwrap();
-    let mut client_b = management_client_with_identity(
+    .await;
+    let mut client_b = wait_for_management_client_with_identity(
         management_b,
         &pki,
         &pki.secondary_cli_cert_path,
         &pki.secondary_cli_key_path,
     )
-    .await
-    .unwrap();
+    .await;
     let catalog_a = DurableCatalogStore::recover(
         rockstream_storage::build_runtime_object_store(
             &storage_a.join("gateway-shard"),
