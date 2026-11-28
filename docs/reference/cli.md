@@ -1731,7 +1731,7 @@ Options
 
 | Name | Short | Long | Value | Required | Default | Values | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| auth | — | --auth | AUTH | no | — | off, scram, md5, oidc, mtls | Authentication mode. SCRAM requires an enabled durable login; OIDC uses RS256, limits tokens to 16 KiB, and requires its issuer, audience, TLS, and JWKS settings; mTLS requires its gateway credentials. MD5 is rejected. Omitted uses `[auth].mode` |
+| auth | — | --auth | AUTH | no | — | off, scram, md5, oidc, mtls | Authentication mode. SCRAM requires an enabled durable login; OIDC requires an issuer, audience, JWKS URL, and gateway TLS. OIDC accepts RS256 tokens up to 16 KiB and JWKS responses up to 1 MiB and 100 keys. Key cache TTL is at most 60 seconds (honoring shorter issuer lifetimes); fetches time out after 5 seconds and retry transient transport, 429, or server failures once after 250 milliseconds. Expired keys are never used. mTLS requires its gateway credentials; MD5 is rejected. Omitted uses `[auth].mode` |
 | availability_zone | — | --availability-zone | AVAILABILITY_ZONE | no | — | — | Availability zone advertised during worker registration |
 | checkpoint_retention_count | — | --checkpoint-retention-count | CHECKPOINT_RETENTION_COUNT | no | — | — |  |
 | control | — | --control | CONTROL | no | — | — | Control service URL (required for the worker, frontier, and compactor roles) |
