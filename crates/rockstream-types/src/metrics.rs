@@ -2681,6 +2681,14 @@ pub fn is_security_audit_degraded() -> bool {
     with_registry(|reg| reg.security_audit_degraded)
 }
 
+fn prometheus_label(value: &str) -> String {
+    crate::diagnostic::redact_secrets(value)
+        .replace("\\", "\\\\")
+        .replace("\"", "\\\"")
+        .replace("\n", "\\n")
+        .replace("\r", "\\n")
+}
+
 pub fn generate_prometheus_metrics() -> String {
     let mut out = String::new();
     with_registry(|reg| {
@@ -2690,12 +2698,12 @@ pub fn generate_prometheus_metrics() -> String {
         out.push_str("# TYPE rockstream_build_info gauge\n");
         out.push_str(&format!(
             "rockstream_build_info{{version=\"{}\",commit_sha=\"{}\",build_timestamp=\"{}\",compiler_version=\"{}\",lockfile_digest=\"{}\",features=\"{}\"}} 1\n\n",
-            id.semantic_version,
-            id.commit_sha,
-            id.build_timestamp_rfc3339,
-            id.compiler_version,
-            id.lockfile_digest,
-            id.enabled_features.join(",")
+            prometheus_label(&id.semantic_version),
+            prometheus_label(&id.commit_sha),
+            prometheus_label(&id.build_timestamp_rfc3339),
+            prometheus_label(&id.compiler_version),
+            prometheus_label(&id.lockfile_digest),
+            prometheus_label(&id.enabled_features.join(","))
         ));
 
         out.push_str(
@@ -2771,7 +2779,7 @@ pub fn generate_prometheus_metrics() -> String {
             out.push_str(&format!(
                 "merge_law_applied_total{{law_id=\"{}\",law_name=\"{}\",law_version=\"{}\"}} {}\n",
                 k.law_id.0,
-                k.law_name,
+                prometheus_label(k.law_name),
                 k.law_version,
                 c.get()
             ));
@@ -2785,7 +2793,7 @@ pub fn generate_prometheus_metrics() -> String {
             out.push_str(&format!(
                 "merge_law_fallback_total{{law_id=\"{}\",law_name=\"{}\",law_version=\"{}\"}} {}\n",
                 k.law_id.0,
-                k.law_name,
+                prometheus_label(k.law_name),
                 k.law_version,
                 c.get()
             ));
@@ -2846,7 +2854,7 @@ pub fn generate_prometheus_metrics() -> String {
         for (workload, c) in &reg.workload_memory_bytes {
             out.push_str(&format!(
                 "workload_memory_bytes{{workload_name=\"{}\"}} {}\n",
-                workload,
+                prometheus_label(workload),
                 c.get()
             ));
         }
@@ -2918,7 +2926,8 @@ pub fn generate_prometheus_metrics() -> String {
             };
             out.push_str(&format!(
                 "segment_cache_hit_ratio{{worker_id=\"{}\"}} {:.6}\n",
-                worker_id, ratio
+                prometheus_label(&worker_id),
+                ratio
             ));
         }
         out.push('\n');
@@ -2931,7 +2940,7 @@ pub fn generate_prometheus_metrics() -> String {
         for (worker_id, c) in &reg.segment_cache_bytes_used {
             out.push_str(&format!(
                 "segment_cache_bytes_used{{worker_id=\"{}\"}} {}\n",
-                worker_id,
+                prometheus_label(worker_id),
                 c.get()
             ));
         }
@@ -2943,7 +2952,8 @@ pub fn generate_prometheus_metrics() -> String {
         for (pipeline_id, bytes) in reg.pipeline_state_bytes.iter() {
             out.push_str(&format!(
                 "pipeline_state_bytes{{pipeline_id=\"{}\"}} {}\n",
-                pipeline_id, bytes
+                prometheus_label(pipeline_id),
+                bytes
             ));
         }
         let other = reg.pipeline_state_bytes_other.load(Ordering::Relaxed);
@@ -2969,7 +2979,7 @@ pub fn generate_prometheus_metrics() -> String {
         for (view_name, c) in &reg.freshness_lag_ms {
             out.push_str(&format!(
                 "freshness_lag_ms{{view_name=\"{}\"}} {}\n",
-                view_name,
+                prometheus_label(view_name),
                 c.get()
             ));
         }
@@ -3002,7 +3012,7 @@ pub fn generate_prometheus_metrics() -> String {
         for (mode, c) in &reg.session_staleness_exceeded_total {
             out.push_str(&format!(
                 "session_staleness_exceeded_total{{mode=\"{}\"}} {}\n",
-                mode,
+                prometheus_label(mode),
                 c.get()
             ));
         }
@@ -3013,7 +3023,7 @@ pub fn generate_prometheus_metrics() -> String {
         for (mode, c) in &reg.session_frontier_age_ms {
             out.push_str(&format!(
                 "session_frontier_age_ms{{mode=\"{}\"}} {}\n",
-                mode,
+                prometheus_label(mode),
                 c.get()
             ));
         }
@@ -3024,7 +3034,7 @@ pub fn generate_prometheus_metrics() -> String {
         for (target, c) in &reg.shard_bloom_filter_bytes_used {
             out.push_str(&format!(
                 "shard_bloom_filter_bytes_used{{target=\"{}\"}} {}\n",
-                target,
+                prometheus_label(target),
                 c.get()
             ));
         }
@@ -3087,7 +3097,7 @@ pub fn generate_prometheus_metrics() -> String {
             for s in &stall_snapshots {
                 out.push_str(&format!(
                     "rockstream_operator_frontier_epoch{{view_name=\"{}\",op_id=\"{}\",shard_id=\"{}\"}} {}\n",
-                    s.view_name, s.op_id.0, s.shard_id, s.frontier_epoch
+                    prometheus_label(&s.view_name), s.op_id.0, s.shard_id, s.frontier_epoch
                 ));
             }
             out.push('\n');
@@ -3098,7 +3108,7 @@ pub fn generate_prometheus_metrics() -> String {
                 if s.is_slowest_input {
                     out.push_str(&format!(
                         "rockstream_pipeline_slowest_input_epoch{{view_name=\"{}\",op_id=\"{}\",shard_id=\"{}\"}} {}\n",
-                        s.view_name, s.op_id.0, s.shard_id, s.frontier_epoch
+                        prometheus_label(&s.view_name), s.op_id.0, s.shard_id, s.frontier_epoch
                     ));
                 }
             }
@@ -3109,7 +3119,7 @@ pub fn generate_prometheus_metrics() -> String {
             for s in &stall_snapshots {
                 out.push_str(&format!(
                     "rockstream_pipeline_holding_back_frontier{{view_name=\"{}\",op_id=\"{}\",shard_id=\"{}\"}} {}\n",
-                    s.view_name, s.op_id.0, s.shard_id, if s.is_holding_back_commit { 1 } else { 0 }
+                    prometheus_label(&s.view_name), s.op_id.0, s.shard_id, if s.is_holding_back_commit { 1 } else { 0 }
                 ));
             }
             out.push('\n');
@@ -3233,7 +3243,8 @@ pub fn generate_prometheus_metrics() -> String {
         for (view_name, lag) in &reg.view_stage_lags {
             out.push_str(&format!(
                 "view_freshness_lag_source_ms{{view_name=\"{}\"}} {}\n",
-                view_name, lag.source_lag_ms
+                prometheus_label(view_name),
+                lag.source_lag_ms
             ));
         }
         out.push('\n');
@@ -3243,7 +3254,8 @@ pub fn generate_prometheus_metrics() -> String {
         for (view_name, lag) in &reg.view_stage_lags {
             out.push_str(&format!(
                 "view_freshness_lag_decode_ms{{view_name=\"{}\"}} {}\n",
-                view_name, lag.decode_lag_ms
+                prometheus_label(view_name),
+                lag.decode_lag_ms
             ));
         }
         out.push('\n');
@@ -3253,7 +3265,8 @@ pub fn generate_prometheus_metrics() -> String {
         for (view_name, lag) in &reg.view_stage_lags {
             out.push_str(&format!(
                 "view_freshness_lag_compute_ms{{view_name=\"{}\"}} {}\n",
-                view_name, lag.compute_lag_ms
+                prometheus_label(view_name),
+                lag.compute_lag_ms
             ));
         }
         out.push('\n');
@@ -3263,7 +3276,8 @@ pub fn generate_prometheus_metrics() -> String {
         for (view_name, lag) in &reg.view_stage_lags {
             out.push_str(&format!(
                 "view_freshness_lag_checkpoint_alignment_ms{{view_name=\"{}\"}} {}\n",
-                view_name, lag.alignment_lag_ms
+                prometheus_label(view_name),
+                lag.alignment_lag_ms
             ));
         }
         out.push('\n');
@@ -3273,7 +3287,8 @@ pub fn generate_prometheus_metrics() -> String {
         for (view_name, lag) in &reg.view_stage_lags {
             out.push_str(&format!(
                 "view_freshness_lag_sink_commit_ms{{view_name=\"{}\"}} {}\n",
-                view_name, lag.sink_lag_ms
+                prometheus_label(view_name),
+                lag.sink_lag_ms
             ));
         }
         out.push('\n');
@@ -3283,7 +3298,8 @@ pub fn generate_prometheus_metrics() -> String {
         for (view_name, lag) in &reg.view_stage_lags {
             out.push_str(&format!(
                 "view_freshness_lag_spill_ms{{view_name=\"{}\"}} {}\n",
-                view_name, lag.spill_lag_ms
+                prometheus_label(view_name),
+                lag.spill_lag_ms
             ));
         }
         out.push('\n');
@@ -3293,7 +3309,8 @@ pub fn generate_prometheus_metrics() -> String {
         for (view_name, lag) in &reg.view_stage_lags {
             out.push_str(&format!(
                 "view_freshness_lag_storage_pressure_ms{{view_name=\"{}\"}} {}\n",
-                view_name, lag.storage_pressure_ms
+                prometheus_label(view_name),
+                lag.storage_pressure_ms
             ));
         }
         out.push('\n');
@@ -3303,7 +3320,8 @@ pub fn generate_prometheus_metrics() -> String {
         for (view_name, lag) in &reg.view_stage_lags {
             out.push_str(&format!(
                 "view_freshness_lag_end_to_end_ms{{view_name=\"{}\"}} {}\n",
-                view_name, lag.total_lag_ms
+                prometheus_label(view_name),
+                lag.total_lag_ms
             ));
         }
         out.push('\n');
@@ -3576,7 +3594,9 @@ pub fn generate_prometheus_metrics() -> String {
         for ((source, format), (rows, _)) in &ingest {
             out.push_str(&format!(
                 "rockstream_ingest_rows_total{{source=\"{}\",format=\"{}\"}} {}\n",
-                source, format, rows
+                prometheus_label(source),
+                prometheus_label(format),
+                rows
             ));
         }
         if reg.ingest_rows_other > 0 {
@@ -3592,7 +3612,9 @@ pub fn generate_prometheus_metrics() -> String {
         for ((source, format), (_, bytes)) in &ingest {
             out.push_str(&format!(
                 "rockstream_ingest_bytes_total{{source=\"{}\",format=\"{}\"}} {}\n",
-                source, format, bytes
+                prometheus_label(source),
+                prometheus_label(format),
+                bytes
             ));
         }
         if reg.ingest_bytes_other > 0 {
@@ -3610,7 +3632,9 @@ pub fn generate_prometheus_metrics() -> String {
         for ((view, operator), rows) in &exec {
             out.push_str(&format!(
                 "rockstream_execution_rows_total{{view=\"{}\",operator=\"{}\"}} {}\n",
-                view, operator, rows
+                prometheus_label(view),
+                prometheus_label(operator),
+                rows
             ));
         }
         if reg.execution_rows_other > 0 {
@@ -3628,7 +3652,9 @@ pub fn generate_prometheus_metrics() -> String {
         for ((workload, phase), duration) in &epochs {
             out.push_str(&format!(
                 "rockstream_epoch_duration_seconds{{workload=\"{}\",phase=\"{}\"}} {}\n",
-                workload, phase, duration
+                prometheus_label(workload),
+                prometheus_label(phase),
+                duration
             ));
         }
         if let Some(dur) = reg.epoch_durations_other {
@@ -3643,7 +3669,8 @@ pub fn generate_prometheus_metrics() -> String {
         for (view, lag) in &lags {
             out.push_str(&format!(
                 "rockstream_frontier_lag_seconds{{view=\"{}\"}} {}\n",
-                view, lag
+                prometheus_label(view),
+                lag
             ));
         }
         if let Some(lag) = reg.frontier_lags_other {
@@ -3661,7 +3688,9 @@ pub fn generate_prometheus_metrics() -> String {
         for ((view, backend), bytes) in &state_bytes {
             out.push_str(&format!(
                 "rockstream_state_bytes{{view=\"{}\",backend=\"{}\"}} {}\n",
-                view, backend, bytes
+                prometheus_label(view),
+                prometheus_label(backend),
+                bytes
             ));
         }
         if let Some(b) = reg.view_state_bytes_other {
@@ -3679,7 +3708,9 @@ pub fn generate_prometheus_metrics() -> String {
         for ((worker, category), bytes) in &mem_bytes {
             out.push_str(&format!(
                 "rockstream_memory_bytes{{worker=\"{}\",category=\"{}\"}} {}\n",
-                worker, category, bytes
+                prometheus_label(worker),
+                prometheus_label(category),
+                bytes
             ));
         }
         if let Some(b) = reg.worker_memory_bytes_other {
@@ -3699,7 +3730,9 @@ pub fn generate_prometheus_metrics() -> String {
         for ((sender, receiver), bytes) in &ex_bytes {
             out.push_str(&format!(
                 "rockstream_exchange_bytes_total{{sender=\"{}\",receiver=\"{}\"}} {}\n",
-                sender, receiver, bytes
+                prometheus_label(sender),
+                prometheus_label(receiver),
+                bytes
             ));
         }
         if reg.exchange_bytes_other > 0 {
@@ -3716,7 +3749,9 @@ pub fn generate_prometheus_metrics() -> String {
         for ((worker, channel), ratio) in &ex_bp {
             out.push_str(&format!(
                 "rockstream_exchange_backpressure{{worker=\"{}\",channel=\"{}\"}} {}\n",
-                worker, channel, ratio
+                prometheus_label(worker),
+                prometheus_label(channel),
+                ratio
             ));
         }
         if let Some(r) = reg.exchange_backpressure_other {
@@ -3731,7 +3766,9 @@ pub fn generate_prometheus_metrics() -> String {
         for ((shard, tier), duration) in &cp_dur {
             out.push_str(&format!(
                 "rockstream_checkpoint_duration_seconds{{shard=\"{}\",tier=\"{}\"}} {}\n",
-                shard, tier, duration
+                prometheus_label(shard),
+                prometheus_label(tier),
+                duration
             ));
         }
         if let Some(d) = reg.checkpoint_duration_other {
@@ -3748,7 +3785,8 @@ pub fn generate_prometheus_metrics() -> String {
         for (migration_id, rows) in &mig_rows {
             out.push_str(&format!(
                 "rockstream_migration_rows_copied_total{{migration_id=\"{}\"}} {}\n",
-                migration_id, rows
+                prometheus_label(migration_id),
+                rows
             ));
         }
         if reg.migration_rows_other > 0 {
@@ -3768,7 +3806,9 @@ pub fn generate_prometheus_metrics() -> String {
         for ((source, partition), records) in &conn_lag {
             out.push_str(&format!(
                 "rockstream_connector_lag_records{{source=\"{}\",partition=\"{}\"}} {}\n",
-                source, partition, records
+                prometheus_label(source),
+                prometheus_label(partition),
+                records
             ));
         }
         if let Some(l) = reg.connector_lag_other {
@@ -3783,7 +3823,8 @@ pub fn generate_prometheus_metrics() -> String {
         for (code, count) in &diag_err {
             out.push_str(&format!(
                 "rockstream_errors_total{{code=\"{}\"}} {}\n",
-                code, count
+                prometheus_label(code),
+                count
             ));
         }
         if reg.diagnostic_errors_other > 0 {
@@ -4303,6 +4344,38 @@ mod tests {
         assert!(metrics.contains("write_amplification_ratio"));
         assert!(metrics.contains("segment_cache_hit_ratio"));
         assert!(metrics.contains("segment_cache_bytes_used"));
+    }
+
+    #[test]
+    fn prometheus_labels_redact_secrets_and_escape_control_characters() {
+        let _g = TEST_LOCK.lock().unwrap();
+        reset_all();
+
+        let view_name = "token=metric-fixture-secret\nview\"name\\tail";
+        record_operator_frontier(view_name, OperatorId(7), 2, 42, true);
+        set_frontier_lag_seconds(view_name, 1.5);
+        let metrics = generate_prometheus_metrics();
+        let lines: Vec<_> = metrics
+            .lines()
+            .filter(|line| {
+                line.starts_with("rockstream_operator_frontier_epoch{")
+                    || line.starts_with("rockstream_pipeline_slowest_input_epoch{")
+                    || line.starts_with("rockstream_pipeline_holding_back_frontier{")
+                    || line.starts_with("rockstream_frontier_lag_seconds{")
+            })
+            .collect();
+
+        assert_eq!(
+            lines,
+            vec![
+                r#"rockstream_operator_frontier_epoch{view_name="token=[REDACTED]\nview\"name\\tail",op_id="7",shard_id="2"} 42"#,
+                r#"rockstream_pipeline_slowest_input_epoch{view_name="token=[REDACTED]\nview\"name\\tail",op_id="7",shard_id="2"} 42"#,
+                r#"rockstream_pipeline_holding_back_frontier{view_name="token=[REDACTED]\nview\"name\\tail",op_id="7",shard_id="2"} 0"#,
+                r#"rockstream_frontier_lag_seconds{view="token=[REDACTED]\nview\"name\\tail"} 1.5"#,
+            ]
+        );
+        assert!(!metrics.contains("metric-fixture-secret"));
+        reset_all();
     }
 
     #[test]
