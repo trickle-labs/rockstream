@@ -10163,6 +10163,14 @@ impl GatewayHandler {
             Ok(batches) => batches,
             Err(error) => return Ok(query_time_error_response(error)),
         };
+        for relation_name in referenced_tables {
+            if let Some(error_responses) = self
+                .select_access_error_response(relation_name, conn_id)
+                .await?
+            {
+                return Ok(error_responses);
+            }
+        }
         Ok(datafusion_batches_to_query_response(
             &batches,
             self.query_read_authorization(referenced_tables.to_vec(), conn_id),
@@ -10645,6 +10653,12 @@ impl GatewayHandler {
                 }
                 row_results.push(encoder.finish());
             }
+        }
+        if let Some(error_responses) = self
+            .select_access_error_response(view_name, conn_id)
+            .await?
+        {
+            return Ok(error_responses);
         }
         let data_stream = reauthorize_query_rows(
             stream::iter(row_results).boxed(),
