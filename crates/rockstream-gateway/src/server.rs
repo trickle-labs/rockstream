@@ -9891,7 +9891,7 @@ impl GatewayHandler {
         if batches.is_empty() {
             batches.push(RecordBatch::new_empty(output_schema));
         }
-        datafusion_batches_to_query_response(&batches)
+        datafusion_batches_to_query_response(&batches, None)
     }
 
     /// Try to serve a SELECT via an index arrangement point lookup.
@@ -10163,7 +10163,10 @@ impl GatewayHandler {
             Ok(batches) => batches,
             Err(error) => return Ok(query_time_error_response(error)),
         };
-        Ok(datafusion_batches_to_query_response(&batches))
+        Ok(datafusion_batches_to_query_response(
+            &batches,
+            self.query_read_authorization(referenced_tables.to_vec(), conn_id),
+        ))
     }
 
     async fn query_time_shard_topology(&self) -> Result<QueryTimeShardTopology, GatewayError> {
@@ -10210,6 +10213,34 @@ impl GatewayHandler {
     ) -> PgWireResult<Option<Vec<Response<'static>>>> {
         self.select_access_error_response_in_namespace(relation_name, conn_id, None)
             .await
+    }
+
+    fn query_read_authorization(
+        &self,
+        relation_names: Vec<String>,
+        conn_id: Option<&str>,
+    ) -> Option<QueryReadAuthorization> {
+        if relation_names.is_empty()
+            || (self.auth_mode == AuthMode::Off && self.catalog.get_durable_store().is_none())
+        {
+            return None;
+        }
+        if self.auth_mode == AuthMode::Off
+            && conn_id
+                .and_then(|id| {
+                    self.sessions
+                        .get(id)
+                        .map(|session| session.principal.is_system())
+                })
+                .unwrap_or(false)
+        {
+            return None;
+        }
+        Some((
+            self.self_ref.lock().clone(),
+            relation_names,
+            conn_id.map(str::to_owned),
+        ))
     }
 
     async fn select_access_error_response_in_namespace(
@@ -10615,7 +10646,10 @@ impl GatewayHandler {
                 row_results.push(encoder.finish());
             }
         }
-        let data_stream = stream::iter(row_results);
+        let data_stream = reauthorize_query_rows(
+            stream::iter(row_results).boxed(),
+            self.query_read_authorization(vec![view_name.to_owned()], conn_id),
+        );
 
         Ok(vec![Response::Query(QueryResponse::new(
             schema,
@@ -19809,7 +19843,88 @@ fn account_fallback_query_batch(
     Ok((rows, bytes))
 }
 
-fn datafusion_batches_to_query_response(batches: &[RecordBatch]) -> Vec<Response<'static>> {
+type QueryReadAuthorization = (Weak<GatewayHandler>, Vec<String>, Option<String>);
+
+fn reauthorize_query_rows(
+    data_rows: futures::stream::BoxStream<'static, PgWireResult<pgwire::messages::data::DataRow>>,
+    authorization: Option<QueryReadAuthorization>,
+) -> futures::stream::BoxStream<'static, PgWireResult<pgwire::messages::data::DataRow>> {
+    let Some((handler_ref, relation_names, conn_id)) = authorization else {
+        return data_rows;
+    };
+    Box::pin(stream::unfold(
+        (
+            data_rows,
+            handler_ref,
+            relation_names,
+            conn_id,
+            tokio::time::Instant::now(),
+            false,
+        ),
+        |(mut data_rows, handler_ref, relation_names, conn_id, mut check_at, failed)| async move {
+            if failed {
+                return None;
+            }
+            if tokio::time::Instant::now() >= check_at {
+                check_at = tokio::time::Instant::now() + SECURITY_POLICY_REFRESH_INTERVAL;
+                let handler = handler_ref.upgrade()?;
+                let mut authorization_error = None;
+                for relation_name in &relation_names {
+                    match handler
+                        .select_access_error_response(relation_name, conn_id.as_deref())
+                        .await
+                    {
+                        Ok(None) => {}
+                        Ok(Some(denied)) => {
+                            authorization_error = Some(match denied.into_iter().next() {
+                                Some(Response::Error(error)) => PgWireError::UserError(error),
+                                _ => PgWireError::ApiError(Box::new(std::io::Error::other(
+                                    "query reauthorization returned no error response",
+                                ))),
+                            });
+                            break;
+                        }
+                        Err(error) => {
+                            authorization_error = Some(error);
+                            break;
+                        }
+                    }
+                }
+                if let Some(error) = authorization_error {
+                    return Some((
+                        Err(error),
+                        (
+                            data_rows,
+                            handler_ref,
+                            relation_names,
+                            conn_id,
+                            check_at,
+                            true,
+                        ),
+                    ));
+                }
+            }
+            let item = data_rows.next().await?;
+            let failed = item.is_err();
+            Some((
+                item,
+                (
+                    data_rows,
+                    handler_ref,
+                    relation_names,
+                    conn_id,
+                    check_at,
+                    failed,
+                ),
+            ))
+        },
+    ))
+}
+
+fn datafusion_batches_to_query_response(
+    batches: &[RecordBatch],
+    authorization: Option<QueryReadAuthorization>,
+) -> Vec<Response<'static>> {
     use chrono::TimeZone;
     use datafusion::arrow::array::{
         Array, BooleanArray, Date32Array, Float32Array, Float64Array, Int16Array, Int32Array,
@@ -19820,14 +19935,19 @@ fn datafusion_batches_to_query_response(batches: &[RecordBatch]) -> Vec<Response
     if batches.is_empty() {
         let schema = Arc::new(Vec::<FieldInfo>::new());
         let schema_ref = schema.clone();
-        let data_stream = stream::iter(Vec::<Vec<Option<String>>>::new()).map(move |row_vals| {
-            let mut encoder = DataRowEncoder::new(schema_ref.clone());
-            for (col_idx, val) in row_vals.iter().enumerate() {
-                let datatype = schema_ref[col_idx].datatype();
-                encode_typed_field(&mut encoder, datatype, val.as_deref())?;
-            }
-            encoder.finish()
-        });
+        let data_stream = reauthorize_query_rows(
+            stream::iter(Vec::<Vec<Option<String>>>::new())
+                .map(move |row_vals| {
+                    let mut encoder = DataRowEncoder::new(schema_ref.clone());
+                    for (col_idx, val) in row_vals.iter().enumerate() {
+                        let datatype = schema_ref[col_idx].datatype();
+                        encode_typed_field(&mut encoder, datatype, val.as_deref())?;
+                    }
+                    encoder.finish()
+                })
+                .boxed(),
+            authorization,
+        );
         return vec![Response::Query(QueryResponse::new(schema, data_stream))];
     }
 
@@ -19967,19 +20087,24 @@ fn datafusion_batches_to_query_response(batches: &[RecordBatch]) -> Vec<Response
     }
 
     let schema_ref = schema.clone();
-    let data_stream = stream::iter(encoded_rows).map(move |row_vals| {
-        let mut encoder = DataRowEncoder::new(schema_ref.clone());
-        for (col_idx, val) in row_vals.iter().enumerate() {
-            let datatype = schema_ref[col_idx].datatype();
-            encode_typed_field_with_format(
-                &mut encoder,
-                datatype,
-                val.as_deref(),
-                Some(schema_ref[col_idx].format()),
-            )?;
-        }
-        encoder.finish()
-    });
+    let data_stream = reauthorize_query_rows(
+        stream::iter(encoded_rows)
+            .map(move |row_vals| {
+                let mut encoder = DataRowEncoder::new(schema_ref.clone());
+                for (col_idx, val) in row_vals.iter().enumerate() {
+                    let datatype = schema_ref[col_idx].datatype();
+                    encode_typed_field_with_format(
+                        &mut encoder,
+                        datatype,
+                        val.as_deref(),
+                        Some(schema_ref[col_idx].format()),
+                    )?;
+                }
+                encoder.finish()
+            })
+            .boxed(),
+        authorization,
+    );
 
     vec![Response::Query(QueryResponse::new(schema, data_stream))]
 }
@@ -27224,7 +27349,7 @@ mod v073_subscription_policy_tests {
     use super::*;
 
     #[tokio::test]
-    async fn live_subscriptions_and_cursors_reauthorize_across_catalog_instances_and_keep_other_principals_streaming(
+    async fn live_queries_subscriptions_and_cursors_reauthorize_across_catalog_instances_and_keep_other_principals_streaming(
     ) {
         use crate::catalog_stubs::CatalogView;
         use crate::change_log::ChangeEntry;
@@ -27340,6 +27465,15 @@ mod v073_subscription_policy_tests {
             .principal = Principal::ScramUser {
             username: "subscription-reader".to_string(),
         };
+        let mut reader_query_rows = match handler
+            .read_view_response("v072_live_auth", None, vec![], Some(reader_conn_id))
+            .await
+            .unwrap()
+            .pop()
+        {
+            Some(Response::Query(response)) => response.data_rows(),
+            _ => panic!("authorized query must return a row stream"),
+        };
         let cursor_sql = "DECLARE reader_cursor CURSOR FOR SELECT value FROM v072_live_auth";
         let cursor_lower = cursor_sql.to_lowercase();
         handler
@@ -27452,6 +27586,24 @@ mod v073_subscription_policy_tests {
             .get_mut(reader_conn_id)
             .unwrap()
             .current_namespace = "public".to_string();
+
+        let query_error = tokio::time::timeout(Duration::from_secs(2), reader_query_rows.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        match query_error {
+            PgWireError::UserError(error) => {
+                assert_eq!(error.severity, "ERROR");
+                assert_eq!(error.code, "42501");
+                assert_eq!(
+                    error.message,
+                    "[RS-2401] auth.permission_denied: principal 'subscription-reader' is not authorized for action 'DataRead' on public.v072_live_auth. next_steps: Request an authorized scoped grant, then retry."
+                );
+            }
+            error => panic!("revoked query stream must return a user denial: {error:?}"),
+        }
+        assert!(reader_query_rows.next().await.is_none());
 
         let row = tokio::time::timeout(Duration::from_secs(2), admin_rows.next())
             .await
