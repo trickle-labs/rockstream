@@ -1399,6 +1399,7 @@ impl ControlService {
                                 if runtime.raft.as_ref().is_some_and(|raft| !raft.is_leader()) { continue; }
                                 let Ok(records) = runtime.operations.nonterminal().await else { continue; };
                                 for mut record in records {
+                                    if record.kind() != crate::management_store::OperationKind::MigrateShard { continue; }
                                     let Some(request) = record.request().cloned().filter(|request| request.get("automatic").and_then(serde_json::Value::as_bool) == Some(true)) else { continue; };
                                     if runtime.started.lock().await.contains(record.operation_id()) { continue; }
                                     if record.status() == OperationStatus::Running {
@@ -9669,6 +9670,7 @@ mod tests {
             })
             .unwrap()
         );
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
         let record = operations
             .get(&format!("auto-drain-1-{}", lease.lease_token.0))
             .await
