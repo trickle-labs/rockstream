@@ -235,7 +235,13 @@ pub enum Command {
         #[arg(long)]
         control: Option<String>,
 
-        /// Authentication mode. SCRAM requires an enabled durable login; OIDC uses RS256, limits tokens to 16 KiB, and requires its issuer, audience, TLS, and JWKS settings; mTLS requires its gateway credentials. MD5 is rejected. Omitted uses `[auth].mode`.
+        /// Authentication mode. SCRAM requires an enabled durable login; OIDC requires an issuer,
+        /// audience, JWKS URL, and gateway TLS. OIDC accepts RS256 tokens up to 16 KiB and JWKS
+        /// responses up to 1 MiB and 100 keys. Key cache TTL is at most 60 seconds (honoring
+        /// shorter issuer lifetimes); fetches time out after 5 seconds and retry transient
+        /// transport, 429, or server failures once after 250 milliseconds. Expired keys are never
+        /// used. mTLS requires its gateway credentials; MD5 is rejected. Omitted uses
+        /// `[auth].mode`.
         #[arg(long, value_enum)]
         auth: Option<AuthMode>,
 
