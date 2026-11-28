@@ -48,6 +48,9 @@ bytes = "1"
 prost = "0.13"
 tonic = { version = "0.12", features = ["tls", "tls-roots"] }
 futures = "0.3"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 criterion = { version = "0.5", features = ["html_reports"] }

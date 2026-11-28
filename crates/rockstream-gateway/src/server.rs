@@ -23818,16 +23818,43 @@ struct ParsedAlterSource {
 }
 
 async fn serve_webhook_connection(
-    mut socket: tokio::net::TcpStream,
+    socket: tokio::net::TcpStream,
     _: Arc<GatewayHandler>,
 ) -> std::io::Result<()> {
-    use tokio::io::AsyncWriteExt;
+    use bytes::Bytes;
+    use http_body_util::{BodyExt, Full};
+    use hyper::{body::Incoming, service::service_fn, Request, Response, StatusCode};
+    use std::convert::Infallible;
+
     const BODY: &str = "[RS-4017] connector.removed: HTTP/webhook sources have been removed. Next steps: use an external HTTP-to-Kafka (or HTTP-to-PostgreSQL) adapter outside RockStream.\n";
-    let response = format!(
-        "HTTP/1.1 410 Gone\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{BODY}",
-        BODY.len(),
-    );
-    socket.write_all(response.as_bytes()).await
+    let service = service_fn(|request: Request<Incoming>| async move {
+        let mut body = request.into_body();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(frame) = body.frame().await {
+                if frame.is_err() {
+                    break;
+                }
+            }
+        })
+        .await;
+
+        let mut response = Response::new(Full::new(Bytes::from_static(BODY.as_bytes())));
+        *response.status_mut() = StatusCode::GONE;
+        response.headers_mut().insert(
+            hyper::header::CONTENT_TYPE,
+            hyper::header::HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
+        response.headers_mut().insert(
+            hyper::header::CONNECTION,
+            hyper::header::HeaderValue::from_static("close"),
+        );
+        Ok::<_, Infallible>(response)
+    });
+
+    hyper::server::conn::http1::Builder::new()
+        .serve_connection(hyper_util::rt::TokioIo::new(socket), service)
+        .await
+        .map_err(std::io::Error::other)
 }
 
 fn parse_alter_source_ddl(q: &str) -> Result<ParsedAlterSource, String> {
