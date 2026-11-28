@@ -1084,6 +1084,10 @@ expired-artifact denial and cleanup after restart. The enforced profile is
 eviction. MinIO tests cover shared cross-process budget and request contention.
 These are focused implementation and release-process checks; broader sustained
 pressure qualification and assembled #307 evidence remain outstanding.
+For supported artifact stores, startup removes expired artifacts before the
+management listener binds; the control listener binds after management startup
+returns. This changes readiness ordering without adding a distributed state
+transition.
 
 The v0.73 principal, grant, and audit changes persist reviewed policy revisions
 with their mutation audit records through the durable catalog. The
