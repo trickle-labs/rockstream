@@ -646,10 +646,6 @@ impl ControlService {
         } else {
             Vec::new()
         };
-        let listener = TcpListener::bind(bind_addr).await?;
-        let addr = listener.local_addr()?;
-        tracing::info!(addr = %addr, "control service listening");
-
         let operation_store = self
             .management
             .as_ref()
@@ -737,6 +733,10 @@ impl ControlService {
         } else {
             None
         };
+
+        let listener = TcpListener::bind(bind_addr).await?;
+        let addr = listener.local_addr()?;
+        tracing::info!(addr = %addr, "control service listening");
 
         let (shutdown_tx, _) = broadcast::channel(1);
         let shutdown_tx2 = shutdown_tx.clone();
