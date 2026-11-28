@@ -471,6 +471,41 @@ def build_artifacts(package: dict, targets: list[dict], features: list[str], env
     return got
 
 
+def failure_summary(result: dict) -> str:
+    """Bounded actionable identifiers, never raw captured test output."""
+    def literal(value: str) -> str:
+        # Escape controls, HTML delimiters and backticks in untrusted test names.
+        return "`" + json.dumps(value[:300], ensure_ascii=True).replace(
+            "`", "\\u0060").replace("<", "\\u003c").replace(">", "\\u003e") + "`"
+
+    failed_targets = [t for t in result["targets"] if t["status"] in ("failed", "blocked")]
+    failed_cases = [case for t in result["targets"] for case in t["tests"]
+                    if case["outcome"] in ("failed", "unexpected_skip", "not_run")]
+    lines = [
+        "### CI test accounting failed",
+        "",
+        "Job: " + literal(result["job"]),
+        "Revision: " + literal(result["revision"]),
+        "",
+        "Reproduce the accounted job from the same candidate checkout:",
+        "",
+        "    python3 scripts/ci-test-inventory.py run --job " + result["job"],
+        "",
+        f"Failed or blocked targets: {len(failed_targets)}; failed, skipped or unrun cases: {len(failed_cases)}.",
+        "",
+    ]
+    for target in failed_targets[:20]:
+        lines.append("- " + literal(target_id(target["package"], target["kind"], target["name"]))
+                     + " — " + target["status"])
+    for case in failed_cases[:40]:
+        lines.append("- " + literal(case["id"]) + " — " + case["outcome"])
+    if len(failed_targets) > 20 or len(failed_cases) > 40:
+        lines.append("- Additional identifiers are in the accounting artifact.")
+    lines.extend(["", "See the uploaded CI test-accounting JSON for exact case reasons and "
+                  "captured assertion output, where available. Raw output is not copied into this summary."])
+    return "\n".join(lines) + "\n"
+
+
 def run_job(job: str, packages: dict, targets: dict, owner: dict, policy: dict, out: Path) -> int:
     spec = policy["jobs"][job]
     selected = selected_targets(job, targets, owner, policy)
@@ -599,6 +634,13 @@ def run_job(job: str, packages: dict, targets: dict, owner: dict, policy: dict, 
         print(f"CI test evidence: {out} ({result['status']})", flush=True)
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)
+        if errors and os.environ.get("GITHUB_STEP_SUMMARY"):
+            # Summary output is diagnostic, never a replacement for gate status or artifacts.
+            try:
+                with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+                    summary.write(failure_summary(result))
+            except OSError as exc:
+                print(f"Unable to write CI failure summary: {exc}", file=sys.stderr)
     return 1 if errors else 0
 
 

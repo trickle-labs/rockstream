@@ -47,30 +47,59 @@ run_bad() {
   }
 }
 
+# Derive the expected location from the unique mutation, not from the
+# changing production document's historical line numbers. The checker must
+# still reject the mutation with the exact full diagnostic.
+mutate_once() {
+  python3 -c '
+from pathlib import Path
+import sys
+p, old, new = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+text = p.read_text()
+if text.count(old) != 1:
+    raise SystemExit(f"Expected exactly one mutation anchor in {p.name}: {old!r}")
+line = text[:text.index(old)].count("\n") + 1
+p.write_text(text.replace(old, new, 1))
+print(line)
+' "$TMP_ROOT/$1" "$2" "$3"
+}
+
+append_claim() {
+  python3 -c '
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+text = p.read_text()
+prefix = text + "\n"
+p.write_text(prefix + "<!-- claim: missing proof -->\n")
+print(prefix.count("\n") + 1)
+' "$TMP_ROOT/$1"
+}
+
 bash "$CHECKER" "$ROOT" >/dev/null || fail "real documentation did not pass"
 
 setup_tree
-python3 -c 'from pathlib import Path; p=Path("'$TMP_ROOT'/docs/README.md"); p.write_text(p.read_text().replace("reference/cli.md", "reference/missing.md", 1))'
-run_bad missing_link "missing documentation target: docs/README.md:16 -> reference/missing.md"
+line="$(mutate_once docs/README.md 'reference/cli.md' 'reference/missing.md')"
+run_bad missing_link "missing documentation target: docs/README.md:$line -> reference/missing.md"
 
 setup_tree
-python3 -c 'from pathlib import Path; p=Path("'$TMP_ROOT'/docs/operator.md"); p.write_text(p.read_text().replace("README.md#reference", "README.md#missing"))'
-run_bad missing_anchor "missing documentation anchor: docs/operator.md:14 -> README.md#missing"
+line="$(mutate_once docs/operator.md 'README.md#reference' 'README.md#missing')"
+run_bad missing_anchor "missing documentation anchor: docs/operator.md:$line -> README.md#missing"
 
 setup_tree
-python3 -c 'from pathlib import Path; p=Path("'$TMP_ROOT'/docs/schema-evolution.md"); p.write_text(p.read_text() + "\n<!-- claim: missing proof -->\n")'
-run_bad unsupported_claim "unsupported documentation claim: docs/schema-evolution.md:47"
+line="$(append_claim docs/schema-evolution.md)"
+run_bad unsupported_claim "unsupported documentation claim: docs/schema-evolution.md:$line"
 
 setup_tree
-python3 -c 'from pathlib import Path; p=Path("'$TMP_ROOT'/docs/README.md"); p.write_text(p.read_text().replace("A **view** is", "A **pipeline** is", 1))'
-run_bad obsolete_term "obsolete term 'pipeline'; use 'view' at docs/README.md:29"
+line="$(mutate_once docs/README.md 'A **view** is' 'A **pipeline** is')"
+run_bad obsolete_term "obsolete term 'pipeline'; use 'view' at docs/README.md:$line"
 
 setup_tree
-python3 -c 'from pathlib import Path; p=Path("'$TMP_ROOT'/docs/test-commands.md"); p.write_text(p.read_text().replace("make fmt", "make missing", 1))'
+mutate_once docs/test-commands.md 'make fmt' 'make missing' >/dev/null
 run_bad missing_command "undocumented or nonexistent contributor command: 'make missing'"
 
 setup_tree
-python3 -c 'from pathlib import Path; p=Path("'$TMP_ROOT'/docs/reference/cli.md"); p.write_text(p.read_text().replace("# CLI reference", "# stale", 1))'
+mutate_once docs/reference/cli.md '# CLI reference' '# stale' >/dev/null
 run_bad stale_reference "stale generated documentation: docs/reference/cli.md"
 
 echo "OK: check-documentation.sh self-test passed."

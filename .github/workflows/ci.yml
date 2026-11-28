@@ -46,6 +46,15 @@ jobs:
           name: ci-selection
           path: target/ci-selection.json
           if-no-files-found: error
+      - uses: dtolnay/rust-toolchain@master
+        if: steps.select.outputs.scope == 'full'
+        with:
+          toolchain: "1.95"
+          components: rustfmt
+      - name: Cheap preflight before qualification fan-out
+        env:
+          CI_SCOPE: ${{ steps.select.outputs.scope }}
+        run: bash scripts/ci-preflight.sh "$CI_SCOPE"
 
   control-plane-ha:
     name: Control-plane HA smoke
@@ -95,9 +104,6 @@ jobs:
         if: needs.ci-policy.outputs.scope == 'full'
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
-      - name: cargo fmt
-        if: needs.ci-policy.outputs.scope == 'full'
-        run: cargo fmt --all --check
       - name: cargo clippy
         if: needs.ci-policy.outputs.scope == 'full'
         # async_trait emits must_use on futures, which current Clippy also flags as redundant.
@@ -118,10 +124,6 @@ jobs:
         run: bash scripts/check-threat-model-links.test.sh
       - name: dependency-audit checker self-test
         run: bash scripts/check-dependency-audit.test.sh
-      - name: documentation admission gate
-        run: bash scripts/check-documentation.sh
-      - name: documentation checker self-test
-        run: bash scripts/check-documentation.test.sh
       - name: error-code enforcement
         run: bash scripts/check-error-codes.sh
       - name: error-code checker self-test
@@ -168,6 +170,10 @@ jobs:
         run: python3 -B scripts/run-benchmark-gate.test.py
       - name: CI lane and image self-tests
         run: python3 scripts/ci-policy.test.py
+      - name: CI preflight self-tests
+        run: python3 -B scripts/ci-preflight.test.py
+      - name: CI timing-report self-tests
+        run: python3 -B scripts/ci-run-metrics.test.py
       - name: CI prose-only scope and required-check self-tests
         run: python3 -B scripts/ci-scope.test.py
       - name: Validate Cargo test target assignment

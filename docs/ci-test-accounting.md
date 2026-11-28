@@ -2,6 +2,34 @@
 
 This page defines the test safety-gate contract. The source of truth for assignment is [`scripts/ci-test-matrix.json`](../scripts/ci-test-matrix.json), validated against **live Cargo metadata**, not a checked-in target count.
 
+## Fast feedback and measurement (#458)
+
+The CI selection job runs the shared `make pr-preflight` implementation
+(formatting for full scope, documentation admission and its self-test for both
+scopes) before the expensive jobs become runnable. A failed preflight makes
+the selection job fail; the final `Check` must still reject the failed
+selection and missing qualification. No successful candidate's test inventory
+or qualification policy changes. The other quality checks remain required.
+The accounting runner writes a bounded failure summary with target/case IDs
+and the reproduction command; exact captured reasons remain in the accounting
+artifact rather than being duplicated in a public summary.
+
+Measure one explicit Actions attempt without scheduling another runner:
+
+```sh
+set -o pipefail
+gh api "repos/trickle-labs/rockstream/actions/runs/$RUN_ID/attempts/$ATTEMPT/jobs?per_page=100" --paginate --slurp | python3 scripts/ci-run-metrics.py
+```
+
+The report rejects partial/duplicate pagination and mixed attempts. Job queue
+time is creation-to-start (including scheduling delays); execution time is
+start-to-completion. Sums are across jobs, not workflow wall time or billed
+minutes. Skipped, cancelled and unfinished jobs are counted but excluded from
+timing aggregates, so these are observed occupied seconds, not total resource
+consumption for aborted runs. Missing or invalid timestamps are explicitly
+reported, never treated as zero. Compare representative completed attempts and
+track trigger-to-green separately using run metadata.
+
 ## Assignment and execution
 
 `python3 scripts/ci-test-inventory.py check --out target/ci-test-results/assignment.json` discovers workspace packages and testable Cargo lib, binary, and integration targets, checks ownership, verifies feature and service requirements, and rejects unowned or stale simulation targets. Simulation integration targets have **explicit names**; other workspace test targets use package ownership. An added simulation target without an explicit group fails the PR gate. All testable targets of a newly introduced workspace package require an assignment. Non-test Cargo artifacts (examples, benchmarks, build scripts, the fuzz harness) are outside this libtest inventory.

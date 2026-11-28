@@ -24,6 +24,33 @@ POLICY = json.loads((ROOT / "scripts/ci-test-matrix.json").read_text())
 
 
 class GateSelfTests(unittest.TestCase):
+    def test_failure_summary_identifies_cases_without_captured_output(self):
+        result = {
+            "job": "pr-gateway-components", "revision": "candidate",
+            "targets": [
+                {"package": "rockstream-gateway", "kind": "test", "name": "connector_removal_tests",
+                 "status": "failed", "tests": [
+                    {"id": "rockstream-gateway::test/connector_removal_tests::removes_connector",
+                     "outcome": "failed", "reason": "do-not-copy-raw-output"},
+                    {"id": "passing", "outcome": "passed", "reason": None},
+                 ]},
+                {"package": "rockstream-gateway", "kind": "lib", "name": "rockstream_gateway",
+                 "status": "blocked", "tests": [], "reason": "do-not-copy-raw-output"},
+            ],
+        }
+        self.assertEqual(gate.failure_summary(result), "\n".join([
+            "### CI test accounting failed", "",
+            'Job: `"pr-gateway-components"`', 'Revision: `"candidate"`', "",
+            "Reproduce the accounted job from the same candidate checkout:", "",
+            "    python3 scripts/ci-test-inventory.py run --job pr-gateway-components", "",
+            "Failed or blocked targets: 2; failed, skipped or unrun cases: 1.", "",
+            '- `"rockstream-gateway/test:connector_removal_tests"` — failed',
+            '- `"rockstream-gateway/lib:rockstream_gateway"` — blocked',
+            '- `"rockstream-gateway::test/connector_removal_tests::removes_connector"` — failed',
+            "", "See the uploaded CI test-accounting JSON for exact case reasons and captured "
+            "assertion output, where available. Raw output is not copied into this summary.", "",
+        ]))
+
     def test_gateway_conformance_feature_and_target_matrix(self):
         manifest = tomllib.loads((ROOT / "crates/rockstream-gateway/Cargo.toml").read_text())
         self.assertEqual(manifest["features"], {"testcontainers": []})

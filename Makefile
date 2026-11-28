@@ -16,6 +16,11 @@ clippy:
 fmt:
 	cargo fmt --all --check
 
+.PHONY: pr-preflight
+# Cheap local checks shared with the CI selection job. Not full qualification.
+pr-preflight:
+	bash scripts/ci-preflight.sh full
+
 # Check documentation links, generated references, claims, terminology, and commands.
 documentation:
 	bash scripts/check-documentation.sh

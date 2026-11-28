@@ -25,6 +25,7 @@ fn contributor_workflows_name_executable_commands() {
         vec![
             "make build",
             "make fmt",
+            "make pr-preflight",
             "make clippy",
             "make test",
             "make error-codes",
@@ -50,6 +51,7 @@ fn maintainer_taxonomy_matches_repo_commands() {
     let makefile = fs::read_to_string(repo_root().join("Makefile")).unwrap();
     let policy = fs::read_to_string(repo_root().join("DEPENDENCY_POLICY.md")).unwrap();
     let ci = fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).unwrap();
+    let preflight = fs::read_to_string(repo_root().join("scripts/ci-preflight.sh")).unwrap();
     let scheduled =
         fs::read_to_string(repo_root().join(".github/workflows/dependency-audit.yml")).unwrap();
 
@@ -77,7 +79,8 @@ fn maintainer_taxonomy_matches_repo_commands() {
             .unwrap()
             .contains("$ make check")
     );
-    assert!(ci.contains("bash scripts/check-documentation.sh"));
+    assert!(ci.contains("bash scripts/ci-preflight.sh"));
+    assert!(preflight.contains("bash scripts/check-documentation.sh"));
     assert!(scheduled.contains("cron: \"37 3 * * *\""));
 }
 
