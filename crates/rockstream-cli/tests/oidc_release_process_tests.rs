@@ -118,6 +118,23 @@ async fn serve_jwks(listener: TcpListener, requests: usize, transient_failures: 
     }
 }
 
+async fn serve_chunked_oversized_jwks(listener: TcpListener) {
+    let (mut stream, _) = listener.accept().await.unwrap();
+    let mut request = [0; 2048];
+    let _ = stream.read(&mut request).await.unwrap();
+    stream
+        .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let body = vec![b' '; 1024 * 1024 + 1];
+    stream
+        .write_all(format!("{:X}\r\n", body.len()).as_bytes())
+        .await
+        .unwrap();
+    stream.write_all(&body).await.unwrap();
+    stream.write_all(b"\r\n0\r\n\r\n").await.unwrap();
+}
+
 async fn write_frontend_message(stream: &mut tokio::net::TcpStream, tag: u8, payload: &[u8]) {
     let length = u32::try_from(payload.len() + 4).unwrap();
     stream.write_all(&[tag]).await.unwrap();
@@ -6132,6 +6149,33 @@ async fn oidc_startup_rejects_unavailable_jwks_before_listening() {
         address,
         &jwks_url,
         "OIDC JWKS endpoint returned an unsuccessful status",
+    )
+    .await;
+    jwks_task.await.unwrap();
+
+    let jwks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let jwks_address = jwks_listener.local_addr().unwrap();
+    let jwks_url = format!("http://{jwks_address}/jwks");
+    let jwks_task = tokio::spawn(serve_chunked_oversized_jwks(jwks_listener));
+    let oversized_storage = temp.path().join("oidc-oversized-jwks-storage");
+    let address = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut process = start_gateway_process(
+        temp.path(),
+        &oversized_storage,
+        address,
+        &cert_path,
+        &key_path,
+        "oidc",
+        None,
+        "https://issuer.example",
+        "rockstream",
+        &jwks_url,
+    );
+    assert_oidc_startup_rejected_before_listening(
+        &mut process,
+        address,
+        &jwks_url,
+        "OIDC JWKS response exceeds the 1 MiB limit",
     )
     .await;
     jwks_task.await.unwrap();

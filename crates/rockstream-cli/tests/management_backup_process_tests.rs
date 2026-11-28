@@ -140,6 +140,31 @@ async fn connect_gateway(addr: SocketAddr) -> Client {
     }
 }
 
+async fn wait_for_backup_shard_ready(addr: SocketAddr) -> Client {
+    let client = connect_gateway(addr).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut last_error = None;
+    loop {
+        // Startup and peer registration can still be writing the catalog.
+        match tokio::time::timeout_at(
+            deadline,
+            client.simple_query(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
+            ),
+        )
+        .await
+        {
+            Ok(Ok(_)) => return client,
+            Ok(Err(error)) => last_error = Some(format!("{error:?}")),
+            Err(_) => panic!(
+                "embedded shard did not finish startup: {}",
+                last_error.as_deref().unwrap_or("readiness probe timed out")
+            ),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 async fn wait_for_management(
     management: SocketAddr,
     node: &mut RunningNode,
@@ -969,7 +994,7 @@ async fn release_management_backup_idempotency_survives_role_all_restart() {
         None,
         &pki,
     );
-    let first_client = connect_gateway(first_listen).await;
+    let first_client = wait_for_backup_shard_ready(first_listen).await;
     let accepted =
         submit_backup_request(first_management, &destination, idempotency_key, &pki).await;
     assert_eq!(
@@ -1030,7 +1055,7 @@ async fn release_management_backup_idempotency_survives_role_all_restart() {
         None,
         &pki,
     );
-    let second_client = connect_gateway(second_listen).await;
+    let second_client = wait_for_backup_shard_ready(second_listen).await;
     wait_for_registered_worker(binary, second_management, 1, &pki).await;
     let completed = wait_for_backup_success_with_recovery(
         binary,
@@ -1063,7 +1088,7 @@ async fn release_management_backup_idempotency_survives_role_all_restart() {
         None,
         &pki,
     );
-    let third_client = connect_gateway(third_listen).await;
+    let third_client = wait_for_backup_shard_ready(third_listen).await;
     wait_for_registered_worker(binary, third_management, 1, &pki).await;
 
     let retried =
@@ -1164,16 +1189,8 @@ async fn release_management_backup_idempotency_is_atomic_across_processes() {
     );
     wait_for_management(first_management, &mut first_node, 1, &pki).await;
     wait_for_management(second_management, &mut second_node, 1, &pki).await;
-    connect_gateway(first_listen)
-        .await
-        .simple_query("CREATE TABLE backup_startup_ready (id BIGINT PRIMARY KEY)")
-        .await
-        .expect("first embedded shard finishes startup");
-    connect_gateway(second_listen)
-        .await
-        .simple_query("CREATE TABLE backup_startup_ready (id BIGINT PRIMARY KEY)")
-        .await
-        .expect("second embedded shard finishes startup");
+    let _first_gateway = wait_for_backup_shard_ready(first_listen).await;
+    let _second_gateway = wait_for_backup_shard_ready(second_listen).await;
 
     let (first, second) = tokio::join!(
         submit_backup_request(first_management, &destination, idempotency_key, &pki),
@@ -1234,16 +1251,18 @@ async fn release_management_backups_allocate_distinct_checkpoints_concurrently()
     );
     seed_backup_value(&storage, 0).await;
     let management = free_addr();
+    let listen_addr = free_addr();
     let mut node = start_embedded(
         binary,
         &storage,
-        free_addr(),
+        listen_addr,
         Some(management),
         None,
         None,
         &pki,
     );
     wait_for_management(management, &mut node, 1, &pki).await;
+    let _gateway = wait_for_backup_shard_ready(listen_addr).await;
     let (first, second) = tokio::join!(
         submit_backup_request(
             management,
