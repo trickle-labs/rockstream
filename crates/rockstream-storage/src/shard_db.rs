@@ -165,6 +165,7 @@ pub struct ShardDb {
     migration_pending: bool,
     storage_context: Option<Arc<crate::storage_context::WorkerStorageContext>>,
     concurrency_governor: Option<Arc<crate::concurrency_governor::ConcurrencyGovernor>>,
+    physical_writes: Arc<crate::metered_store::PhysicalWriteTracker>,
     disk_cache_dir: Option<std::path::PathBuf>,
     cleanup_on_drop: bool,
     fail_writes: Arc<std::sync::atomic::AtomicBool>,
@@ -174,6 +175,10 @@ pub struct ShardDb {
     pause_view_output_once: TestPause,
     #[cfg(feature = "test-utils")]
     pause_after_view_write_once: TestPause,
+    #[cfg(feature = "test-utils")]
+    pause_source_ack_once: TestPause,
+    #[cfg(feature = "test-utils")]
+    pause_pgoutput_change_once: TestPause,
     #[cfg(feature = "test-utils")]
     pause_flush_once: TestPause,
     #[cfg(feature = "test-utils")]
@@ -198,6 +203,7 @@ pub struct ShardDbBuilder {
     cleanup_on_drop: bool,
     filter_bits_per_key: Option<u32>,
     filter_policies: Option<Vec<Arc<dyn slatedb::filter_policy::FilterPolicy>>>,
+    inline_compaction: bool,
 }
 
 /// Specification for a partial aggregation query.
@@ -228,7 +234,17 @@ impl ShardDbBuilder {
             cleanup_on_drop: false,
             filter_bits_per_key: None,
             filter_policies: None,
+            inline_compaction: true,
         }
+    }
+
+    /// Enable or disable inline SlateDB LSM compaction inside this writer process.
+    ///
+    /// Defaults to `true` (zero-config for `--role all` and small clusters).
+    /// Set to `false` when offloading compaction to `--role compactor`.
+    pub fn with_inline_compaction(mut self, enabled: bool) -> Self {
+        self.inline_compaction = enabled;
+        self
     }
 
     /// Set custom database settings.
@@ -432,11 +448,22 @@ impl ShardDbBuilder {
         }
 
         let db_cache = if let Some(ref ctx) = self.storage_context {
+            ctx.register_shard();
             ctx.db_cache()
         } else {
             crate::slatedb_metrics::instrumented_db_cache(&worker_id)
         };
-        let mut builder = Db::builder(self.path.as_str(), self.object_store.clone())
+        let physical_writes = Arc::new(crate::metered_store::PhysicalWriteTracker::new());
+        let metered_store: Arc<dyn ObjectStore> =
+            Arc::new(crate::metered_store::MeteredObjectStore::new(
+                self.path.clone(),
+                self.object_store.clone(),
+                Arc::clone(&physical_writes),
+            ));
+        if !self.inline_compaction {
+            self.settings.compactor_options = None;
+        }
+        let mut builder = Db::builder(self.path.as_str(), metered_store)
             .with_settings(self.settings)
             .with_merge_operator(Arc::new(SumCountMergeOperator))
             .with_db_cache(db_cache);
@@ -516,6 +543,7 @@ impl ShardDbBuilder {
             migration_pending,
             storage_context: self.storage_context,
             concurrency_governor: self.concurrency_governor,
+            physical_writes,
             disk_cache_dir: self.disk_cache_dir,
             cleanup_on_drop: self.cleanup_on_drop,
             fail_writes: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -525,6 +553,10 @@ impl ShardDbBuilder {
             pause_view_output_once: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(feature = "test-utils")]
             pause_after_view_write_once: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(feature = "test-utils")]
+            pause_source_ack_once: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(feature = "test-utils")]
+            pause_pgoutput_change_once: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(feature = "test-utils")]
             pause_flush_once: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(feature = "test-utils")]
@@ -546,9 +578,27 @@ impl Drop for ShardDb {
 }
 
 impl ShardDb {
+    /// Whether two handles refer to the same open database instance.
+    ///
+    /// Cloning a ShardDb shares its writer and epoch state; separately opened
+    /// databases may have the same path and must not be treated as aliases.
+    pub fn same_open_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.last_epoch, &other.last_epoch)
+    }
+
     /// Return the shared storage context if configured for this shard.
     pub fn storage_context(&self) -> Option<&Arc<crate::storage_context::WorkerStorageContext>> {
         self.storage_context.as_ref()
+    }
+
+    /// Snapshot actual physical WAL, SST, manifest, and GET I/O counters for this shard.
+    pub fn physical_write_stats(&self) -> rockstream_types::metrics::PhysicalPersistenceCounters {
+        self.physical_writes.snapshot()
+    }
+
+    /// Reset per-shard physical I/O counters (e.g. before measuring a single epoch commit).
+    pub fn reset_physical_write_stats(&self) {
+        self.physical_writes.reset();
     }
 
     /// Return the concurrency governor if configured for this shard.
@@ -1309,6 +1359,16 @@ impl ShardDb {
         Ok(())
     }
 
+    /// Flush the active memtable to an L0 SSTable in durable object storage.
+    pub async fn flush_memtable(&self) -> Result<(), StorageError> {
+        self.db
+            .flush_with_options(slatedb::config::FlushOptions {
+                flush_type: slatedb::config::FlushType::MemTable,
+            })
+            .await?;
+        Ok(())
+    }
+
     /// Inject write failures for testing.
     pub fn set_fail_writes(&self, fail: bool) {
         self.fail_writes.store(fail, Ordering::SeqCst);
@@ -1328,6 +1388,54 @@ impl ShardDb {
         release: Arc<tokio::sync::Notify>,
     ) {
         *self.pause_view_output_once.lock().unwrap() = Some((entered, release));
+    }
+
+    /// Arm a one-shot cut after the replayable PostgreSQL source M3 write
+    /// has been flushed but before the source acknowledgement. The caller
+    /// must abort the owning task to model a crash; simply releasing the
+    /// barrier is not a recovery test.
+    #[cfg(feature = "test-utils")]
+    pub fn pause_next_source_ack(
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self.pause_source_ack_once.lock().unwrap() = Some((entered, release));
+    }
+
+    /// Real-source M3/ACK cut. A no-op without the storage test-utils feature.
+    pub async fn await_source_ack_cut_for_test(&self) {
+        #[cfg(feature = "test-utils")]
+        {
+            let pause = self.pause_source_ack_once.lock().unwrap().take();
+            if let Some((entered, release)) = pause {
+                entered.notify_one();
+                release.notified().await;
+            }
+        }
+    }
+
+    /// Stop one real pgoutput stream immediately after buffering its first
+    /// row change, before reading the next message and before M3. A test
+    /// may terminate the PostgreSQL backend while this barrier is held.
+    #[cfg(feature = "test-utils")]
+    pub fn pause_next_pgoutput_change(
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self.pause_pgoutput_change_once.lock().unwrap() = Some((entered, release));
+    }
+
+    pub async fn await_pgoutput_change_cut_for_test(&self) {
+        #[cfg(feature = "test-utils")]
+        {
+            let pause = self.pause_pgoutput_change_once.lock().unwrap().take();
+            if let Some((entered, release)) = pause {
+                entered.notify_one();
+                release.notified().await;
+            }
+        }
     }
 
     /// Pause the next flush for cancellation tests.
@@ -1523,6 +1631,57 @@ impl ShardDb {
         self.put(&key, &epoch.to_be_bytes()).await?;
         self.flush().await?;
         Ok(ShardFrontierReport { shard_id, epoch })
+    }
+
+    /// Persist a monotonic lease fencing token at the storage boundary
+    /// (Issue #400 R4).
+    ///
+    /// If a strictly higher `LeaseToken` is already recorded in this shard,
+    /// fails closed with `RS-1702` without mutating state.
+    pub async fn fence_lease_token(
+        &self,
+        token: rockstream_types::ids::LeaseToken,
+    ) -> Result<(), StorageError> {
+        let key = ShardKeyEncoder::meta_key(b"lease-fence-token");
+        if let Some(existing) = self.get(&key).await? {
+            if existing.len() == 8 {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&existing);
+                let current = u64::from_be_bytes(buf);
+                if token.0 < current {
+                    return Err(StorageError::StaleLeaseToken {
+                        provided: token.0,
+                        current,
+                    });
+                }
+            }
+        }
+        self.put(&key, &token.0.to_be_bytes()).await?;
+        self.flush().await?;
+        Ok(())
+    }
+
+    /// Verify that `token` is not fenced by a strictly higher persisted
+    /// `LeaseToken` in this shard's storage (control-free hot-path fencing).
+    pub async fn verify_lease_token(
+        &self,
+        token: rockstream_types::ids::LeaseToken,
+    ) -> Result<(), StorageError> {
+        let key = ShardKeyEncoder::meta_key(b"lease-fence-token");
+        if let Some(existing) = self.get(&key).await? {
+            if existing.len() == 8 {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&existing);
+                let current = u64::from_be_bytes(buf);
+                if token.0 < current {
+                    return Err(StorageError::StaleLeaseToken {
+                        provided: token.0,
+                        current,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Create a SlateDB checkpoint for this shard and return a [`CheckpointHandle`].

@@ -14,11 +14,14 @@
 
 pub mod arrangement_catalog;
 pub mod catalog;
+pub mod compactor;
 pub mod concurrency_governor;
 pub mod error;
 pub mod format_migration;
+pub mod heat_cache;
 pub mod keys;
 pub mod merge_registry;
+pub mod metered_store;
 pub mod reader;
 pub mod shard_db;
 pub mod storage_context;
@@ -38,6 +41,7 @@ pub use merge_registry::{
     resolve_law_operand, LawOperandError, LawOperandView, MergeOperatorRegistry, MergeTag,
     SumCountMergeOperator,
 };
+pub use metered_store::{MeteredObjectStore, PhysicalWriteTracker};
 pub use reader::ShardReader;
 pub use rockstream_types::config::StorageUrl;
 pub use rockstream_types::{EpochStateDelta, OperatorEpochMetrics, StateMutation};

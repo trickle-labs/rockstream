@@ -497,7 +497,7 @@ fn estimate_node(plan: &PlanNode, ctx: &CapacityEstimateContext, out: &mut Vec<E
             });
         }
 
-        PlanNode::Exchange { child, kind } => {
+        PlanNode::Exchange { child, kind, .. } => {
             estimate_node(child, ctx, out);
             out.push(EstimateRow {
                 operator_kind: format!("Exchange[{kind:?}]"),

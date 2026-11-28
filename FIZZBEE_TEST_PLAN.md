@@ -1,5 +1,39 @@
 # RockStream Formal Verification Plan (FizzBee)
 
+## Issue 403: automatic dispatch at committed membership frontiers
+
+Automatic elasticity adds a guarded entry to the existing M4/M6 handoff, not a
+second lease transition. Admission requires an exact complete workload epoch
+under the current lease incarnation for every virtual shard. Missing/stale
+members, duplicate epochs and exhausted epoch counters cannot authorize a move;
+membership changes reset the policy window. The durable MigrateShard request
+records the triggering generation/frontier and expected donor fence before
+dispatch. Restart uses the canonical operation reconciler, and lease transfer
+rechecks both leadership and donor identity. Workload activation increments the
+direct-routing topology epoch. The source-completion and automatic-dispatch
+regressions exercise these guards and exact stored request contents. M4 single
+ownership and M6 recovery invariants remain the protocol safety gate; the
+multi-process elasticity/freshness qualification is separate empirical evidence.
+The same entry guard also handles draining donors. A drain does not close all
+writers up front: each shard uses the canonical migration executor, and worker
+decommission is guarded by an empty ownership set. CPU samples are advisory and
+cannot change the commit clock. Retrying a terminal failed move creates a new
+frontier-scoped operation identity and still requires the original donor fence.
+
+## Issue 403: advisory cache preparation before ownership
+
+The migration and legacy drain executors send `WarmShardCache` to the recipient
+under the donor's current fence before lease transfer. The recipient opens only
+raw ObjectStore references: it cannot acquire a SlateDB writer or advance a
+frontier during this stage. Cache preparation has one range in flight, a 4 MiB
+I/O cap, a two-second worker deadline, and a three-second control deadline.
+Object-associated heat is confined to the shard's authorized storage scopes;
+malformed, future and expired hints are dropped. Cache misses or failures are
+advisory and cannot alter M4/M6 ownership decisions. Exact-byte cache and backend
+I/O regressions verify warming reaches the same cache used by foreground SST
+reads. The handshake regression verifies the donor fence remains current until
+preparation is acknowledged. No new durable ownership state is introduced.
+
 **Status**: v1.0 — authoritative MDD specification for formal verification of
 RockStream's distributed coordination protocols.
 
@@ -714,6 +748,138 @@ model; no new FizzBee transition or invariant is asserted.
 
 ### 3.6 Cross-Cutting Coverage Assertions
 
+Management listener setup binds the requested address before clients use it.
+When an ephemeral port is requested, integration tests read the bound endpoint
+from `ControlServiceHandle::management_addr` before sending requests. This is
+address discovery only; it adds no coordination transition or invariant to
+M1–M7.
+
+PR #443 (issue #403) adds workload-scoped observations of committed routing
+and automatic movement decisions. A `RoutingEpochCommitted` message carries
+the generation, epoch and bounded diagnostic summary only after the existing
+durable routing completion; heavy-key identifiers are hashed. The control
+handler retains a bounded recent history (32 events and 256 KiB per workload)
+and attempts to append committed decisions to the audit. The delegated
+`ReadAdaptiveDiagnostics` request uses the same view-read scope as operator
+statistics; the runtime client checks the returned workload identity.
+The history is observational, not a source of lease ownership or commit
+authority, and empty history after restart does not imply no prior decisions.
+
+Periodic recovery scans only nonterminal `OperationKind::MigrateShard` records
+with a durable `automatic: true` request; it ignores other operation kinds, so
+drain operations cannot be routed through migration recovery.
+
+The idle-drain retry in `AutomaticRebalanceRuntime::finish_drains` resumes a
+durable pending/waiting idle migration by its existing operation ID and
+target, only when no other nonterminal migration exists. It delegates to the
+existing fenced migration executor; it does not introduce a new ownership
+transition or relax the durable anchor barrier. The service regression
+`explicit_drain_proposes_unused_leases_and_retries_failed_idle_moves`
+exercises the retry through the scheduler, including repeated polls while
+the donor is unavailable. These changes refine the implementation boundary
+of M4/M6; the existing models do not represent diagnostic history, audit
+delivery, or scheduling retry cadence. No new formal guarantee is claimed.
+
+`crates/rockstream-gateway/tests/explain_analyze_opstats_tests.rs` checks
+per-view and per-operator statistics alongside the matching adaptive history
+and explicit empty-history output.
+`crates/rockstream-cli/tests/automatic_skew_process_tests.rs` exercises exact
+oracle results, signed retractions, crash replay, non-admitted fallback,
+release p99, and real MinIO 2→4→2 membership changes. CPU distribution,
+cache-hit rates after live cutover, and transient-load hysteresis under the
+real process workload still need separate operational evidence.
+
+
+PR #455 (issue #303) changes only malformed control-message diagnostics in
+`crates/rockstream-runtime/src/client.rs`: the read loop still skips invalid
+lines, while logs retain the error code, decoder error, and byte length without
+the raw message. `client::data_plane_tests::invalid_control_message_log_has_exact_redacted_output`
+asserts the complete log record. No coordinator or worker state transitions
+change, so the existing model assumptions remain unchanged.
+
+PR #477 (issue #302) adds management creation of scoped service principals.
+The request requires cluster grant-management authority, the reviewed grantor
+revision, and a canonical UUID bound to the request fingerprint; the durable
+catalog records the new principal with its success audit records.
+`service_principal_creation_is_revision_checked_idempotent_and_audited` checks
+stale revisions, exact principal and audit contents, replay, changed-request
+rejection, and operator denial. This management path does not change the
+coordinator, worker, lease, or epoch transitions modeled by M1–M7.
+
+PR #479 (issue #302) adds revision-checked service-principal deletion through
+the management API. A canonical request UUID binds the reviewed target and
+grantor revisions, deployment, and verified certificate identity; the durable
+catalog records the removal with its grant-change and completion audit events.
+`principal_deletion_is_revision_checked_idempotent_and_audited` checks stale
+revisions, last-administrator protection, operator denial, exact audit
+contents, concurrent and replayed requests, changed-request rejection, and
+replay after reopening the catalog. The release-process test
+`service_principal_deletion_survives_release_process_restart` also kills and
+restarts the control process between creation, deletion, and exact replay, then
+checks that replay leaves the complete deletion-correlated audit records
+unchanged. This security-catalog mutation does not change the coordinator,
+worker, lease, or epoch transitions modeled by M1–M7.
+
+PR #420 (issue #400) completes the direct distributed execution path across
+`rockstream-control`, `rockstream-runtime`, `rockstream-storage`, and
+`rockstream-sql`. Control-plane `GetWorkloadTopology` exposes a versioned
+`WorkloadTopologySnapshot` (`topology_epoch`, routing columns, schemas, shard
+placements, and worker endpoints) so `DataPlaneClient` partitions rows and
+native `ArrowZSet` batches client-side and streams Arrow IPC `ShuffleFrame`s
+directly to shard owners over `ShuffleClientPool` without routing row payloads
+through `ControlService`. `ConnectorLeaseManager` enforces single-owner
+connector leases (`RS-1701` / `RS-1702`) across gateway replicas.
+`ShardManager::allocate_shard_ids` and `PlacementAlgorithm::assign_shards`
+decouple logical shard counts from worker counts without `workload_id * 16`
+collisions. On the worker hot path, synchronous per-frame `FenceWrite` RPCs are
+replaced by local lease checks plus durable storage-boundary monotonic lease
+fencing (`ShardDb::fence_lease_token` / `ShardDb::verify_lease_token`,
+`RS-1702`), allowing active direct ingestion to continue across control-node
+restarts while rejecting stale-lease writers without mutating committed state.
+Workload deployment also wires bounded application `ExchangeInlet` channels
+into each CLI worker's shared `ExchangeRegistry`.
+
+The corresponding implementation checks are
+`crates/rockstream-control/tests/direct_distributed_execution_400_tests.rs`
+(R1–R6 end-to-end: zero control row payloads, worker exchange inlets,
+single-owner connector leases, distributed SQL planning & `EXPLAIN
+INCREMENTAL`, control-outage ingestion continuity, storage-boundary
+stale-lease fencing, >16-shard collision-free allocation, and stale-topology
+redirect), `crates/rockstream-runtime/tests/worker_heartbeat_and_lease_tests.rs`
+(listener teardown and lease reassignment), and
+`crates/rockstream-cli/tests/r1_real_worker_data_plane_tests.rs` (real CLI
+worker process recovery and dispatch failure boundaries). These extend the
+existing M4 lease fencing and M5/M7 topology assumptions; they are
+implementation-level assertions rather than new FizzBee model transitions.
+
+PR #412 (issue #401) separates shared-object-store read serving and LSM
+compaction from stateful incremental-view-maintenance workers. Control-plane
+`DiscoverShards` exposes each current lease owner, token, object-store prefix,
+and the committed frontier to stateless gateways and dedicated compactors.
+The gateway opens managed-checkpoint SlateDB readers against discovered shard
+stores, refreshes the serving frontier from committed snapshots, and rejects
+queries that cannot satisfy an explicitly requested freshness epoch within a
+bounded wait. Admission limits bound queued and active reads, memory estimates,
+and estimated scanned rows independently of ingestion. In remote-compaction
+mode, workers avoid scheduling inline compaction; the compactor role discovers
+and compacts the same shard stores. Managed checkpoints and
+`CompactionHorizonGuard` are intended to retain SST state needed by serving
+readers, historical queries, backups, and replay dependencies.
+
+The corresponding implementation checks are
+`crates/rockstream-gateway/tests/stateless_serving_tests.rs` (bootstrap,
+frontier freshness, overload, and retention),
+`crates/rockstream-storage/tests/disaggregated_compaction_tests.rs`
+(compaction debt and horizon safeguards),
+`crates/rockstream-cli/tests/compactor_and_gateway_role_tests.rs` (role
+selection and standalone fallback), and
+`crates/rockstream-sim/tests/storage_pressure_admission_tests.rs` (pressure
+behavior). They complement the existing M4 lease fencing and M1/M3 committed
+epoch assumptions; none of M1–M7 currently models asynchronous manifest
+visibility, reader checkpoint renewal, compactor crashes, or SST garbage
+collection. The cited tests are implementation-level assertions, not a
+formal proof that arbitrary reader lag or object-store outages remain safe.
+
 Issue #321 applies M1-S1 to the local SQL path by placing base rows,
 compiled-view output, operator checkpoints, and the shard frontier in one
 write batch. A failed or interrupted commit must restore in-memory operator
@@ -722,6 +888,21 @@ failure, retry, and restart with exact base and view rows; cancellation tests
 exercise the recovery gate. M1 abstracts the batch and does not model compiled
 operators, gateway cancellation, source shuffle ownership, or management
 authentication. Those boundaries require separate qualification.
+
+The gateway records pending source dispatch in the base-row batch and clears it
+after all source requests complete; reads and subsequent writes fail if a
+gateway restarts with that record. Distributed reads also fail when snapshots
+do not contain worker output, rather than report an empty result. The owned
+shuffle path records a source epoch on its anchor before dispatch and
+clears that record only after all target shards report committed execution.
+The process regression stops the gateway with a source request outstanding and
+checks the exact input and post-restart failure.
+Worker execution records distinguish matching committed replays from conflicting
+input. Distributed view reads fail while execution is incomplete or requires
+recovery. The coordinator, gateway, and runtime tests cover ordering, failure,
+restart, closed-inlet delivery, and exact replay. M1 does not model the journal or the
+transport-to-worker handoff; the bare credit-only transport and independent-host
+recovery remain unqualified by these tests.
 
 Issue #303's #309 slice binds control-worker registration to the authenticated
 certificate identity. `control_worker_mtls_tests.rs` covers missing, expired,
@@ -746,6 +927,39 @@ existing audit commit and recovery outcomes; they add no M1–M7 transition or
 authorization rule. `security_audit_metrics_tests.rs::durable_audit_metrics_follow_commit_and_restart`
 and `security_audit_health_tests.rs::audit_storage_degradation_is_visible_without_failing_ready_health`
 check the metric and health surfaces.
+
+PR #445 (issue #305) adds the management `ListSecurityAuditRecords` endpoint
+over the existing durable audit catalog. The handler authorizes
+`SecurityAuditRead` for the requested `AuditRange` and policy revision, binds
+page tokens to that range, and returns bounded versioned-JSON pages. Its
+authorization-denial audit append changes no M1–M7 coordination transition.
+`management.rs::security_audit_history_is_range_authorized_and_paginated`
+checks exact page records, range-bound token rejection, denial status, and the
+normalized denial audit record. This management-query evidence does not
+qualify audit retention, storage-full recovery, or the complete v0.73 audit
+contract.
+
+Issue #304 wires `sasl_plain` references into SQL Kafka sinks. Resolution checks
+the durable consumer grant and secret version; a replacement transactional
+producer is initialized only between sink transactions, before the next view
+delivery. This reuses M3's fencing and durable checkpoint rules without adding
+a sink-state transition. The Docker release test
+`kafka_sasl_secret_rotation_preserves_multiview_checkpoints_and_other_consumers`
+checks pending rows across live rotation, old-credential revocation, exact sink
+results, transaction sequence, and restart recovery. M3 abstracts secret
+authorization and version lookup, so this release test is the concrete evidence
+for that boundary; the remaining #304 policy and bounded-resource criteria stay
+open.
+
+The worker audit append handoff bounds pending acknowledgements by the worker
+message-channel capacity, matches replies to registered request IDs, and clears
+waiters after acknowledgement, enqueue failure, timeout, cancellation, or
+transport shutdown. Only a successful durable acknowledgement lets the append
+return success; capacity exhaustion and other failed outcomes fail closed. The
+runtime tests check the pending/capacity metrics, saturation, and capacity
+recovery after cancellation and acknowledgement. M1–M7 do not model this waiter
+map or channel state, so this is implementation evidence rather than formal
+proof of the append transport or the durable audit store.
 
 `runtime/src/exchange` now provides a worker mTLS listener and client pool.
 `shuffle_mtls_tests.rs` covers invalid peer credentials, worker identity and
@@ -842,6 +1056,23 @@ The `sink_secret_reference_blocks_secret_drop_until_sink_drop` regression in
 `crates/rockstream-gateway/src/server.rs` verifies that a sink binding blocks
 deletion until `DROP SINK` removes it.
 
+PR #450 adds a 1 MiB serialized worker-secret payload cap and a per-worker cache
+cap of 1,024 entries and 64 MiB across active and pending generations.
+`secrets_lifecycle_tests.rs::worker_secret_payload_limit_accepts_exact_bound_and_rejects_overflow`
+and `worker_secret_resolution_tests.rs::worker_accepts_maximum_payload_and_rejects_one_byte_over`
+check exact-bound and overflow rejection without changing the stored secret or
+retained-byte metric. `worker_secret_resolution_tests.rs::worker_resolves_exact_payload_in_memory_and_rejects_wrong_identity`
+checks active/pending promotion, and
+`runtime/src/secrets.rs::cache_byte_admission_counts_active_and_pending_generations`
+checks cache byte-accounting arithmetic, and
+`runtime/src/secrets.rs::expired_cache_entry_does_not_block_replacement_admission`
+verifies that an expired active payload releases its recorded bytes before a
+fresh token is admitted. These worker-local resource bounds add no M1–M7
+coordination transition; the formal models still do not represent cache bytes
+or token admission. This is partial #304 resource-bound evidence, not
+release-process cache-pressure, cancellation/expiry recovery, or complete
+secret-rotation qualification.
+
 Issue #306 keeps release support artifacts sanitized and addresses downloads by
 opaque artifact ID bound to the authenticated principal and scope. The release
 tests compare the complete generated JSON, verify operator-only artifact access
@@ -870,7 +1101,11 @@ record binds the client idempotency key to one generation; its reservation and
 payload are persisted before terminal success, and the completion audit must be
 appended before success or artifact bytes are returned. Restart reconciliation
 reuses that operation and pending audit, while bounded cleanup removes expired
-artifacts. `support_artifact_reconciles_durable_boundaries_after_process_exit`,
+artifacts. If completion loses a transition race to failure or cancellation, the
+request removes its late artifact write; storage-generation checks preserve a
+concurrent replacement. Terminal state and its pending completion audit are
+persisted atomically; retries flush pending audit before returning an artifact.
+`support_artifact_reconciles_durable_boundaries_after_process_exit`,
 `support_artifact_completion_audit_failure_preserves_result_across_processes`,
 and `support_artifact_runs_in_release_process_and_recovers_after_restart` check
 the complete operation, audit, and artifact state across crash and restart
@@ -878,8 +1113,16 @@ boundaries. Cleanup runs every second and caps each sweep at 29 seconds, leaving
 time for two passes and a cleanup tick within the 60-second deletion bound;
 `minio_cleanup_at_the_artifact_count_limit_finishes_within_the_bound` exercises
 the maximum count, and `cleanup_rescans_artifacts_that_expire_during_a_sweep`
-checks expiry during cleanup. M1–M7 do not model this management workflow;
-these tests are implementation evidence, not formal proof.
+checks expiry during cleanup. Each reservation records an object generation in
+ledger format v2; legacy format-v1 entries keep their original object path.
+Retries use a fresh generation path, so expiry and orphan cleanup delete only
+the generation they observed and cannot remove a concurrent retry's object;
+restart cleanup removes unreferenced late writes. M1–M7 do not model this
+management workflow; these tests are implementation evidence, not formal proof.
+Support-artifact fill metrics publish the ledger's retained artifact count and
+recorded bytes alongside their configured limits; `support_artifact_usage_reports_exact_ledger_fill`
+asserts the exact `(2, 18)` count/byte result. This observability adds no
+artifact transition or M1–M7 invariant.
 
 PR #388 (issue #302) hardens the durable catalog audit-append retry
 boundary against concurrent writers. The secret-store rotation audit writer
@@ -899,6 +1142,41 @@ records, and advances the catalog revision. This is a catalog revision/retry
 boundary outside the M1–M7 worker, lease, frontier, and sink state machines;
 the tests do not establish unbounded contention liveness, crash durability,
 or assembled release-process qualification.
+
+Issue #350 (PR #397) qualifies the four shared-slot PostgreSQL `pgoutput`
+recovery boundaries in `crates/rockstream-gateway/tests/cdc_transaction_atomicity_tests.rs`:
+pre-M3 crash (`restart-before-m3`), durable-M3/pre-slot-ACK crash
+(`restart-after-m3-before-slot-ack`), mid-envelope three-table replication
+disconnect/reconnect (`three-table-disconnect-resume`), and incompatible schema
+rejection before commit (`schema-change-before-commit`). When a transport
+disconnect occurs mid-envelope, `SharedPgOutputCoordinator::discard_interrupted_envelope`
+clears both spilled and in-memory uncommitted change buffers before
+`SourceRuntimeCoordinator::reopen_pgoutput_after_disconnect` reconnects under
+the same fenced owner lease. This refines the M3 shared-slot recovery boundary
+without altering the abstract FizzBee state machines.
+
+Issue #348 (PR #396) enforces a coordinator-owned `pending_ack` and
+`blocked_reason` gate in `SourceRuntimeCoordinator`. After a durable M3 source
+commit succeeds, `pending_ack` blocks new snapshot or delta polling and M3
+commits until `acknowledge_recovered` reconciles the committed epoch and offset
+with the upstream source and awaits `resume`. During PostgreSQL `pgoutput`
+recovery, `open_pgoutput`, table validation, confirmed-LSN inspection, and
+credential rotation remain permitted under the active owner lease so the slot
+can be opened and validated before `acknowledge_recovered` clears `pending_ack`.
+This refines the M3 post-commit source-acknowledgement recovery boundary without
+adding new formal transitions.
+
+PR #408 (issue #303) upgrades the control-worker data-plane read protocol to
+`ProtocolVersion::V4` (`WORKLOAD_SNAPSHOT_VERSION = 1`). When the gateway reads
+a distributed workload snapshot, `ControlService` verifies that all deployment
+shards are ready, checks each shard's active `ShardManager` lease owner and
+token, and fans `ControlMessage::ReadWorkload` out to the owning workers. Each
+worker verifies its local deployment and active shard lease before materializing
+the durable SlateDB view rows and returning `WorkerMessage::WorkloadReadReport`.
+Control rejects incomplete or lease-mismatched reports and returns the complete
+snapshot to the gateway, preserving duplicate multiplicities and NULL values.
+This read-path coordination does not alter the M1–M7 commit, frontier, sink, or
+lease state machines.
 
 Issue #305 strengthens the file-backed audit append boundary in
 `crates/rockstream-control/src/audit.rs`. `FileAuditLog::append` writes each
@@ -1196,6 +1474,33 @@ sequential and both barrier-synchronized concurrent schedules are asserted by
 in `crates/rockstream-control/src/checkpoint.rs`: exactly one complete callback,
 matching latest committed manifest, and zero remaining alignment credits.
 
+Issue #402 aligns worker execution, storage persistence, and resource control
+with O(affected data) work without altering the abstract M1–M7 coordination
+state machines. In `rockstream-storage`, `MergeTag::SumCount` (`0x05`) extends
+the ADR 0004 merge operator across `ShardDb` and every `ShardReader` path so
+aggregate sum/count deltas persist via blind merge operands within the existing
+M1 atomic `WriteBatch` commit boundary, while `MeteredObjectStore` and
+`PhysicalWriteTracker` on `ShardDb` / `StorageContext` measure physical
+object-store bytes without changing durable prefixes or commit ordering. In
+`rockstream-runtime`, `WorkerResourceController` and RSS-calibrated
+`SourcePressureController` account for process RSS, local disk usage, and
+shared SlateDB cache budgets; `FairChunkScheduler` cooperatively schedules
+`ResumableChunkedOp` tasks (such as `ResumableJoinEpoch`, which commits
+arrangement updates atomically only upon completion and leaves arrangements
+unchanged on cancellation); `ShardActorRegistry::register_owned` runs
+single-owner pipelines without per-batch `Mutex` contention; and
+`partition_batch_by_capsule` reuses pre-encoded `BatchKeyCapsule` hashes for
+exchange routing. Exactness, recovery, blind-merge persistence, budget
+calibration, and cancellation rollback are verified by
+`crates/rockstream-storage/tests/issue_402_adr0004_merge_proof_tests.rs`,
+`crates/rockstream-ops/tests/issue_402_scale_invariance_tests.rs`,
+`crates/rockstream-ops/tests/issue_402_fusion_lock_profile_tests.rs`, and
+`crates/rockstream-runtime/tests/issue_402_rss_fairness_stress_tests.rs`.
+These are worker-local storage, execution, and scheduling refinements under the
+DC.2 coupling rule; epoch-commit atomicity, frontier publication, and fencing
+transitions in `formal/m1_epoch_commit.fizz`–`formal/m7_control_plane_ha.fizz`
+remain unchanged.
+
 The v0.59.9 physical-commit-group extension is modeled by M1-S8 in
 `formal/m1_epoch_commit.fizz`: logical epochs may stage independently, but the
 published physical frontier advances only after a complete group is durable.
@@ -1239,6 +1544,75 @@ paired process-level assertion is
 management workflow is outside the M1–M7 FizzBee state machines, but is
 documented here to keep the runtime protocol and verification inventory
 synchronized.
+
+PR #411 (issues #406 and #352) extends the management protocol to operate
+during active workloads without relaxing shard ownership. `MigrateShard` and
+`DrainWorker` use a bounded source-delta handoff barrier while the donor
+flushes/closes its shard, the lease transfers, the recipient reopens the shard
+and redeploys active workloads, and routing is atomically updated to the new
+owner and lease token. Recovery, rollback, and pre-transfer cancellation share
+the handoff path. This preserves M4's single-authority lease fencing and M6's
+cutover/verification obligations; the implementation-level routing barrier and
+workload redeployment add no new abstract M4/M6 FizzBee action or invariant.
+`online_migrate_shard_moves_active_workload_and_updates_routing_atomically`
+and `online_drain_worker_moves_active_workload_to_healthy_recipient` in
+`crates/rockstream-control/tests/online_migration_backup_streaming_tests.rs`
+exercise the concrete live-worker handoffs.
+
+PR #429 (issue #403) adds `ElasticRebalancePolicy` as a deterministic,
+read-only proposal: it considers healthy active workers with finite headroom,
+compatible protocol and storage formats, and the same shared shard store; it
+requires minimum donor residency and either shard-count imbalance or sustained
+headroom pressure. It proposes one move only after distinct increasing
+frontiers within one membership generation, with a stable operation ID. The
+existing migration executor still revalidates ownership and performs the
+handoff. `transfer_if_owner` compares shard, worker, and lease token while
+preserving the latest mutable heat hint and minting a new fencing token, so
+telemetry updates do not stale a valid handoff and stale owners remain fenced.
+`elastic_scale_out_proposes_one_move_after_distinct_committed_frontiers`,
+`elastic_policy_resets_on_membership_change_and_respects_residency`, and
+`heat_updates_do_not_invalidate_a_fenced_handoff` cover these implementation
+boundaries; the proposal adds no M4/M6 ownership action or invariant.
+
+Issue #403 heavy/light join routing records a prepared source epoch before
+fanout and applies its per-key and salted-row point mutations only after every
+target acknowledges the durable epoch. Promotion retains historical high-side
+rows on their original shard and installs the bounded low-side snapshot in the
+same worker commit as the first salted delta. Replay includes that snapshot in
+the execution identity; a changed replay cannot seed it twice. A key's high
+side and shard identities remain fixed while live; the bounded bootstrap
+snapshot is discarded after promotion and later low deltas stream normally.
+Source-row ledger storage uses point records, so its total cardinality is
+independent of the per-epoch memory budget. Arithmetic admission proves
+absolute weighted join contribution bounds before SUM/COUNT regrouping. If an
+epoch loses that admission, exact per-key sufficient summaries retract the
+previous partial outputs and install a canonical output at the original
+owner. The fallback checks each joined row's multiplication against paged
+opposite-arrangement extrema; wide cancellation cannot hide scalar overflow.
+The canonical mode remains durable even through an empty key so old local
+arrangements are never executed again without an explicit cleanup generation.
+`skew_join::tests` checks exact factorized output through promotion, historical
+and salted retractions, both choices of high side, and changed-input replay.
+The same tests check cancellation into canonical fallback, subsequent
+retractions, journal restoration, and rejection of scalar overflow.
+`weighted_join_restore_preserves_exact_retractions` also checks multiplicity
+across eager and lazy classic-arrangement restoration. These concrete routing,
+payload-budget, and arithmetic boundaries are not invariants proved by M1–M7;
+the existing models only cover their fencing and commit coordination boundary.
+
+`CreateBackup` now pins each active shard's durable checkpoint snapshot and
+optional workload-specific object prefix without stopping concurrent writes.
+Its export excludes control manifests newer than the selected checkpoint,
+streams large object inventories and object bytes with bounded buffers, and
+validates hashes before restore; durable GC pins protect selected checkpoints
+and compaction horizons until release. These snapshot, object-store, and
+GC-lifetime details remain outside the M1–M7 coordination abstractions.
+`online_backup_succeeds_with_active_workload_and_concurrent_writes`,
+`concurrent_newer_control_manifest_is_excluded_and_rejected_on_tamper`,
+`gc_pin_protects_active_backup_and_compaction_horizon_until_release`, and
+`large_inventory_and_large_object_streaming_export_and_restore` in the same
+integration suite check the implementation boundaries, rather than claiming
+additional FizzBee proof.
 
 Postgres CDC polling consumes one credit for every queued change in a complete
 transaction, including changes at or before the caller's offset that are
@@ -1291,6 +1665,35 @@ guarantee matrix covered by
 `crates/rockstream-connectors/tests/postgres_cdc_guarantee_matrix_tests.rs` and
 `crates/rockstream-gateway/tests/source_ddl_postgres_kafka_tests.rs`.
 
+Issue #347 refines the **PostgreSQL CDC initial snapshot-to-WAL handoff**:
+`capture_source_snapshot` and `capture_pgoutput_snapshot` now create a
+`pgoutput` logical replication slot through a replication-mode connection with
+an exported snapshot. Before scanning any relation, the read-only
+repeatable-read SQL transaction binds that exported MVCC snapshot via
+`SET TRANSACTION SNAPSHOT`, and the source records the slot's atomic
+`consistent_point` as the snapshot LSN. This replaces the non-atomic pairing
+of an independently opened snapshot transaction and
+`pg_current_wal_lsn()`. All imported relations share the same snapshot and
+fence; changes committed before slot creation appear in the snapshot, while
+subsequent commits are consumed from WAL after the fence, rather than being
+missed or replayed twice.
+
+**Safety / recovery boundary:** an active slot is rejected rather than
+replaced (RS-4013), and a missing checkpointed slot remains fail-closed
+(RS-4011). Snapshot capture must complete before normal CDC processing;
+a checkpointed restart resumes from durable source progress rather than
+creating a new bootstrap snapshot. This refines M3's source progress and
+checkpoint-coupled commit assumptions but does not extend the M1–M7 FizzBee
+models to PostgreSQL MVCC snapshots, replication slots, or WAL records.
+The exact-once handoff obligation is checked against real PostgreSQL by
+`postgres_cdc_synchronized_snapshot_handoff_is_exact_across_restart`
+in `crates/rockstream-connectors/tests/postgres_cdc_guarantee_matrix_tests.rs`
+and `pgoutput_gateway_synchronized_snapshot_handoff_multi_relation_and_restart_exact`
+in `crates/rockstream-gateway/tests/cdc_transaction_atomicity_tests.rs`.
+Together they exercise in-flight commits at slot creation, concurrent
+INSERT/UPDATE/DELETE after snapshot binding, multi-relation gateway/view
+materialization, and checkpointed restart without gaps or duplicates.
+
 Issue #339 extends that **external PostgreSQL pgoutput boundary** with
 transactional `TRUNCATE` semantics. A decoded `T` message retains the enclosing
 XID, relation IDs, and CASCADE / RESTART IDENTITY flags; the source-wide gateway
@@ -1340,6 +1743,18 @@ SQL catalog tables (`rockstream_catalog.*`). While diagnostic inspection and
 metrics export are outside the internal M1–M7 FizzBee consensus models, health
 and status evaluations reflect durable shard/worker state and are verified by
 integration test suites and deterministic simulation tests.
+
+PR #453 (issue #304) bounds KEK rotation staging at 1,000,000 entries and 64
+MiB of serialized values (including the durable audit outbox record), and caps
+secret-store rotation-lock admissions at 64. An over-limit item is rejected
+before it is added to the durable batch or applied to in-memory secrets. The
+`secret_store.rs` tests `kek_rotation_staging_accepts_exact_limits_and_rejects_overflow`,
+`secret_rotation_waiter_overflow_reports_exact_error_and_fill`, and
+`kek_rotation_staging_gauges_clear_after_drop` check the exact boundary and
+error, waiter fill and rejection, and staging-gauge reset. These are
+implementation-level resource-admission assertions: M1–M7 do not model secret
+rotation or store waiters, so this slice adds no FizzBee transition. Connector
+credential-rotation continuity remains open.
 
 A failing `exists` assertion means the fault is not being explored and the
 corresponding `always` proofs are untrustworthy — treated as a build failure.
@@ -1536,8 +1951,9 @@ gate:
 - **DC.2** — Any change to a coordination protocol in `DESIGN.md` requires the
   corresponding `.fizz` model and the Section 3.6 mapping table to be updated in
   the same PR. CI fails if a coordination-crate change lands without a
-  corresponding model touch (enforced by a path-coupling check, analogous to the
-  [DESIGN.md §17.2](DESIGN.md) `buggify!()`-review rule).
+  corresponding model touch, except for diffs confined to trailing inline
+  `#[cfg(test)] mod tests` modules (enforced by a path-coupling check, analogous
+  to the [DESIGN.md §17.2](DESIGN.md) `buggify!()`-review rule).
 - **DC.3** — Every FizzBee counterexample is archived in `formal/findings.md`
   with its trace and its paired `SimRuntime` regression seed, and is replayed on
   every build forever ([DESIGN.md §17.6](DESIGN.md)).
@@ -1778,3 +2194,71 @@ complete/truncated/row-over-budget responses and v3 logical-key/failure behavior
 ## v0.72 CLI checkpoint export integrity (#221)
 
 The CLI backup operation selects one committed control checkpoint and must enumerate its required immutable shard manifest, WAL and SST objects before exporting. A merely visible-prefix inventory is insufficient: missing referenced shard storage must fail with a checkpoint-integrity error and must not create a terminal success marker. The management and CLI export paths now share the existing checkpoint-aware inventory; this does not alter M3 cluster checkpoint durability, lease fencing or the committed checkpoint itself. Concrete coverage: `cli_prefix_export_rejects_missing_committed_shard_objects_before_success` deletes a real checkpointed shard before CLI export and requires failure without a commit marker; `lfs_export_restore_fresh_cluster_is_bit_identical` preserves the positive committed state recovery contract. Checkpoint-export error-code aliasing has been corrected: RS-3613 identifies export-in-progress and RS-3614 identifies export/restore failure; RS-5035 remains the cataloged skew-SLO error. This is an operator diagnostics change, not a new checkpoint durability claim.
+
+## Raft heartbeat lease age bounding (#351)
+
+`RaftControlGroup` bounds leader authority by the initiation timestamp (`round_started_at`) of each heartbeat round rather than the response completion timestamp. A delayed quorum acknowledgement whose round began more than `ELECTION_TIMEOUT_MIN` ago cannot refresh `last_quorum_ack`, and the leader steps down when no fresh majority proof remains. This tightens local leader self-fencing to match the M4 monotonic fencing contract without changing durable Raft term/vote persistence or shard lease token monotonicity.
+
+## Consistent control manifest selection during checkpoint export (#352)
+
+`CheckpointExporter` pins the control-plane SlateDB manifest that was visible when the selected `ClusterCheckpoint` was loaded rather than copying a newer control manifest that commits mid-inventory. This ensures the exported control manifest and shard object inventory represent a single consistent committed checkpoint cut under M3 recovery.
+
+## Durable skew-routing epoch boundary (#403)
+
+The source router now persists the input digest, immutable shard assignment,
+and concrete operand admission before dispatch. A pending routing generation
+cannot be replaced by a different request. The completed generation and its
+point-ledger mutations are one durable batch, published only after every
+participant acknowledges an application commit. Replaying an unfinished epoch
+therefore preserves assignment while the existing M1 execution digests prevent
+double application. These routing decisions do not grant new lease authority;
+M4 storage fencing and the M6 ownership handoff still govern writers.
+
+The additional concrete checks are `prepare_replay_and_finish_preserve_exact_generation_and_point_state`,
+`pending_routing_survives_reopen_and_rejects_a_different_replay`,
+`promotion_uses_four_workers_and_canonical_epoch_output_matches_unsplit_retractions`,
+and `inadmissible_hot_key_stays_on_canonical_owner_and_is_explained` in
+`rockstream-runtime`. These are implementation checks, not a claim that the
+existing FizzBee models include a new routing-journal liveness proof.
+
+Direct gateway capabilities bind each routing mutation to the authorized
+workload, source, request ID, epoch, original input digest, and exact shard
+lease membership. Partial and final batches are transformed subsets, so their
+source/request scope is checked while the journal retains the original input
+digest. A workload admission read guard lasts through the execution receipt;
+replacement installation takes its write guard before checking every local
+execution gate and pending durable journal. Waiting commands revalidate expiry
+after admission. This prevents a pre-expiry queued command from appearing
+after a replacement's idle check.
+
+Completed retries reissue `Finish` so a fresh control reservation can be
+released. Successful completion revokes matching capabilities; a failed grant
+installation revokes only that attempt ID, preserving earlier retry grants.
+Denials use the existing bounded, durably acknowledged security audit transport
+and include only fixed-size frame identifiers. The concrete tests
+`routing_mutations_require_exact_authorized_input_and_membership`,
+`replacement_drains_admitted_commands_and_waiters_revalidate_expiry`,
+`direct_grant_installation_checks_durable_pending_after_draining_execution`,
+`rollback_revokes_only_attempted_grant_and_completion_releases_the_workload`,
+and `direct_epoch_denial_audit_is_bounded_and_waits_for_durable_receipt` cover
+these adapter obligations. No new FizzBee proof of async lock fairness or
+capability transport delivery is claimed.
+
+## Bounded pgoutput transport and streaming transaction decoding (#349)
+
+`PostgresCdcSource` bounds in-memory binary `COPY OUT` transport frames and decodes active transactions incrementally rather than re-decoding the entire buffered transaction on every event poll. This is a connector transport and memory-bounding optimization that preserves the M1/M3 source checkpoint LSN frontier, transaction boundary atomicity, and restart replay semantics.
+
+## Explicit idle drain admission and durable anchor barrier (#403)
+
+An explicit worker drain may propose an idle-boundary `MigrateShard` without a
+new source epoch. It does not advance or synthesize a committed frontier. The
+canonical executor atomically checks current leases, source/direct admissions,
+read waiters and readiness while installing its handoff marker. New admissions
+observe the same mutex and cannot cross the marker. Each affected workload's
+current durable anchor must then acknowledge empty owned/routing pending
+journals under the execution gate; an expired in-memory capability is not an
+empty-journal proof. Donor closure holds all local execution gates, invalidates
+queued references, and then uses the existing close/lease-CAS/open/ready
+sequence. These are additional guards on the existing M4 handoff transition,
+not new lease authority. Regression tests check exact durable idle requests,
+blocked admissions, old-fence preservation, and both pending-journal failures.

@@ -14,11 +14,11 @@
         "subcommands": [
           {
             "name": "backup",
-            "about": "Point-in-time durable backup operations (create, inspect, verify)",
+            "about": "Create backups through authenticated management; inspect or verify local backup files",
             "subcommands": [
               {
                 "name": "create",
-                "about": "Create a full point-in-time backup",
+                "about": "Create a full point-in-time backup through authenticated management",
                 "options": [
                   {
                     "name": "destination",
@@ -159,7 +159,7 @@
           },
           {
             "name": "checkpoint",
-            "about": "Checkpoint administration and manual triggering",
+            "about": "Checkpoint administration (currently unavailable: no authenticated management endpoint)",
             "subcommands": [
               {
                 "name": "export",
@@ -654,7 +654,7 @@
           },
           {
             "name": "restore",
-            "about": "Restore a database backup into a clean or authorized destination",
+            "about": "Unavailable until the CLI exposes an authenticated backup-restore endpoint",
             "options": [
               {
                 "name": "source",
@@ -736,11 +736,11 @@
       },
       {
         "name": "audit",
-        "about": "Audit log inspection commands",
+        "about": "Local audit-history commands are unavailable; use authenticated `SHOW SECURITY AUDIT`",
         "subcommands": [
           {
             "name": "query",
-            "about": "Query audit log events matching a filter",
+            "about": "Unavailable for local logs; use authenticated `SHOW SECURITY AUDIT`",
             "options": [
               {
                 "name": "filter",
@@ -785,7 +785,7 @@
           },
           {
             "name": "tail",
-            "about": "Tail recent audit log events",
+            "about": "Unavailable for local logs; use authenticated `SHOW SECURITY AUDIT`",
             "options": [
               {
                 "name": "max",
@@ -877,7 +877,7 @@
       },
       {
         "name": "checkpoint",
-        "about": "Checkpoint inspection commands",
+        "about": "Checkpoint commands (currently unavailable: no authenticated management endpoint)",
         "subcommands": [
           {
             "name": "export",
@@ -3908,7 +3908,7 @@
           {
             "name": "auth",
             "long": "auth",
-            "help": "Authentication mode. SCRAM requires an enabled durable login; OIDC and mTLS require their configuration. MD5 is rejected. Omitted uses `[auth].mode`",
+            "help": "Authentication mode. SCRAM requires an enabled durable login; OIDC requires an issuer, audience, JWKS URL, and gateway TLS. OIDC accepts RS256 tokens up to 16 KiB and JWKS responses up to 1 MiB and 100 keys. Key cache TTL is at most 60 seconds (honoring shorter issuer lifetimes); fetches time out after 5 seconds and retry transient transport, 429, or server failures once after 250 milliseconds. Expired keys are never used. mTLS requires its gateway credentials; MD5 is rejected. Omitted uses `[auth].mode`",
             "required": false,
             "value_name": "AUTH",
             "possible_values": [
@@ -3936,7 +3936,7 @@
           {
             "name": "control",
             "long": "control",
-            "help": "Control service URL (required for the worker and frontier roles)",
+            "help": "Control service URL (required for the worker, frontier, and compactor roles)",
             "required": false,
             "value_name": "CONTROL"
           },
@@ -4093,7 +4093,8 @@
               "all",
               "gateway",
               "worker",
-              "control"
+              "control",
+              "compactor"
             ]
           },
           {
@@ -4201,7 +4202,7 @@
       },
       {
         "name": "support",
-        "about": "Diagnostic support commands",
+        "about": "Generate actor-bound support artifacts through the authenticated management API",
         "subcommands": [
           {
             "name": "artifact",
@@ -4322,7 +4323,7 @@
           },
           {
             "name": "bundle",
-            "about": "Generate on-demand diagnostic support bundle",
+            "about": "Unavailable without authenticated support authorization; use `support artifact create`",
             "options": [
               {
                 "name": "out",
@@ -4373,7 +4374,7 @@
           },
           {
             "name": "diagnose",
-            "about": "Look up one runtime diagnostic and write its support bundle",
+            "about": "Unavailable without authenticated diagnostic authorization; use `support artifact create`",
             "options": [
               {
                 "name": "code",
@@ -5094,7 +5095,7 @@
         "key": "auth.mode",
         "data_type": "String",
         "default_value": "off",
-        "description": "Explicit --auth selects off, SCRAM, OIDC, or gateway mTLS. SCRAM requires an enabled durable login; OIDC and gateway mTLS require their settings. MD5 is rejected.",
+        "description": "Explicit --auth selects off, SCRAM, OIDC, or gateway mTLS. SCRAM requires an enabled durable login; OIDC uses RS256 with a 16 KiB token limit; gateway mTLS requires its settings. MD5 is rejected.",
         "deprecated": false,
         "env_var": "ROCKSTREAM_AUTH_MODE",
         "source_origin": "rockstream-types::config::AuthSection"
@@ -5121,7 +5122,7 @@
         "key": "auth.oidc_jwks_url",
         "data_type": "Option<String>",
         "default_value": "None",
-        "description": "HTTPS or loopback HTTP JWKS endpoint used to verify RS256 tokens; required when auth.mode is oidc",
+        "description": "HTTPS or loopback HTTP JWKS endpoint for RS256 tokens; response limit 1 MiB and 100 keys, cache TTL at most 60 seconds honoring shorter issuer lifetime, 5-second fetch timeout, and one retry after 250 milliseconds for transient failures; required when auth.mode is oidc",
         "deprecated": false,
         "env_var": "ROCKSTREAM_AUTH_OIDC_JWKS_URL",
         "source_origin": "rockstream-types::config::AuthSection"
@@ -6591,6 +6592,22 @@
         "labels": [],
         "stability": "stable",
         "description": "Number of retained security audit records"
+      },
+      {
+        "name": "security_audit_transport_capacity",
+        "metric_type": "gauge",
+        "unit": "count",
+        "labels": [],
+        "stability": "stable",
+        "description": "Maximum in-flight worker security audit acknowledgements"
+      },
+      {
+        "name": "security_audit_transport_pending",
+        "metric_type": "gauge",
+        "unit": "count",
+        "labels": [],
+        "stability": "stable",
+        "description": "Worker security audit requests awaiting durable acknowledgement"
       },
       {
         "name": "storage_flush_latency_ms",

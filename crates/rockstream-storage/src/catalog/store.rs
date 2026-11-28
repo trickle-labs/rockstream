@@ -1041,12 +1041,7 @@ fn ensure_txn_security_audit_budget(
         .mutations
         .iter()
         .filter_map(security_audit_record)
-        .filter(|record| {
-            !state
-                .security_audit_records
-                .iter()
-                .any(|existing| existing.event_id == record.event_id)
-        })
+        .filter(|record| !state.security_audit_by_id.contains_key(&record.event_id))
         .collect::<Vec<_>>();
     if new_records
         .iter()
@@ -1098,11 +1093,7 @@ fn validate_security_mutations(
 ) -> Result<(), CatalogError> {
     let mut principals = state.security_principals.clone();
     let mut changed_principals = HashSet::new();
-    let mut audit_ids: HashSet<&str> = state
-        .security_audit_records
-        .iter()
-        .map(|record| record.event_id.as_str())
-        .collect();
+    let mut audit_ids = HashSet::new();
     let mut has_principal_change = false;
     let mut has_bootstrap = false;
 
@@ -1211,7 +1202,9 @@ fn validate_security_mutations(
                     Some(principal_audit_state(principal)),
                     is_first_administrator,
                 )?;
-                if !audit_ids.insert(audit.event_id.as_str()) {
+                if state.security_audit_by_id.contains_key(&audit.event_id)
+                    || !audit_ids.insert(audit.event_id.as_str())
+                {
                     return Err(invalid_security_policy(
                         "audit event identity is already present",
                     ));
@@ -1250,7 +1243,9 @@ fn validate_security_mutations(
                     None,
                     false,
                 )?;
-                if !audit_ids.insert(audit.event_id.as_str()) {
+                if state.security_audit_by_id.contains_key(&audit.event_id)
+                    || !audit_ids.insert(audit.event_id.as_str())
+                {
                     return Err(invalid_security_policy(
                         "audit event identity is already present",
                     ));
@@ -1309,7 +1304,9 @@ fn validate_security_mutations(
                     old,
                     principal,
                 )?;
-                if !audit_ids.insert(audit.event_id.as_str()) {
+                if state.security_audit_by_id.contains_key(&audit.event_id)
+                    || !audit_ids.insert(audit.event_id.as_str())
+                {
                     return Err(invalid_security_policy(
                         "audit event identity is already present",
                     ));
@@ -1322,11 +1319,12 @@ fn validate_security_mutations(
                         "invalid security audit record: {error}"
                     ))
                 })?;
-                if !audit_ids.insert(record.event_id.as_str())
-                    && !state
-                        .security_audit_records
-                        .iter()
-                        .any(|existing| existing == record)
+                let existing = state
+                    .security_audit_by_id
+                    .get(&record.event_id)
+                    .and_then(|index| state.security_audit_records.get(*index));
+                if existing.is_some_and(|existing| existing != record)
+                    || (!audit_ids.insert(record.event_id.as_str()) && existing.is_none())
                 {
                     return Err(invalid_security_policy(
                         "audit event identity is already present",
@@ -2185,6 +2183,57 @@ mod security_audit_budget_tests {
             before_state: AuditField::NotApplicable,
             after_state: AuditField::NotApplicable,
         }
+    }
+
+    #[test]
+    fn audit_event_id_index_preserves_replay_and_duplicate_validation() {
+        let existing = audit_record("existing", 1);
+        let mut state = CatalogInnerState {
+            security_audit_records: vec![existing.clone()],
+            ..CatalogInnerState::default()
+        };
+        rebuild_security_audit_index(&mut state).unwrap();
+
+        let replay = CatalogTxn::new(
+            1,
+            1,
+            vec![CatalogMutation::AppendSecurityAudit(existing.clone())],
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_security_mutations(&state, &replay),
+            Ok(())
+        ));
+
+        let mut conflicting = existing;
+        conflicting.timestamp_ms = 2;
+        let conflict = CatalogTxn::new(
+            1,
+            2,
+            vec![CatalogMutation::AppendSecurityAudit(conflicting)],
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_security_mutations(&state, &conflict),
+            Err(CatalogError::InvalidSecurityPolicy(message))
+                if message == "audit event identity is already present"
+        ));
+
+        let duplicate = audit_record("new", 3);
+        let repeated = CatalogTxn::new(
+            1,
+            3,
+            vec![
+                CatalogMutation::AppendSecurityAudit(duplicate.clone()),
+                CatalogMutation::AppendSecurityAudit(duplicate),
+            ],
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_security_mutations(&CatalogInnerState::default(), &repeated),
+            Err(CatalogError::InvalidSecurityPolicy(message))
+                if message == "audit event identity is already present"
+        ));
     }
 
     #[test]

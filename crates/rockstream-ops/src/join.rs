@@ -37,18 +37,20 @@
 //! pairs on each side of the join.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use rockstream_storage::{JoinSide, ShardDb, ShardKeyEncoder, WriteBatch};
 use rockstream_types::ids::OperatorId;
-use rockstream_types::KeyCapsule;
+use rockstream_types::BatchKeyCapsule;
 
+use crate::chunked::{ChunkBudget, ChunkStats, ChunkStepResult, ResumableChunkedOp};
 use crate::error::OpError;
 use crate::zset::ArrowZSet;
 
@@ -207,6 +209,7 @@ impl JoinState {
         join_key: Vec<u8>,
         row_id: u128,
         row_bytes: Vec<u8>,
+        weight: i64,
     ) {
         let arr = match side {
             JoinSide::Left => &mut self.left_arr,
@@ -217,10 +220,7 @@ impl JoinState {
         let inserted = {
             let bucket = arr.entry(join_key.clone()).or_default();
             if let std::collections::hash_map::Entry::Vacant(entry) = bucket.entry(row_id) {
-                entry.insert(ArrRow {
-                    row_bytes,
-                    weight: 1,
-                });
+                entry.insert(ArrRow { row_bytes, weight });
                 true
             } else {
                 false
@@ -266,18 +266,79 @@ impl JoinState {
 
 // ─── Staged delta ─────────────────────────────────────────────────────────────
 
+/// Adapter providing [`ExactSizeIterator`] when total run length is known up front.
+struct ExactLenIter<I> {
+    iter: I,
+    remaining: usize,
+}
+
+impl<I: Iterator> ExactLenIter<I> {
+    fn new(iter: I, remaining: usize) -> Self {
+        Self { iter, remaining }
+    }
+}
+
+impl<I: Iterator> Iterator for ExactLenIter<I> {
+    type Item = I::Item;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let item = self.iter.next()?;
+        self.remaining = self.remaining.saturating_sub(1);
+        Some(item)
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl<I: Iterator> ExactSizeIterator for ExactLenIter<I> {
+    #[inline]
+    fn len(&self) -> usize {
+        self.remaining
+    }
+}
+
+#[derive(Debug)]
+struct StagedRow {
+    join_key: Vec<u8>,
+    join_key_hash: u128,
+    row_id: u128,
+    row_bytes: Vec<u8>,
+    weight: i64,
+}
+
+struct ColumnarRightBucket {
+    cols: Vec<Vec<i64>>,
+    weights: Vec<i64>,
+}
+
 /// One side's staged delta for an epoch.
 #[derive(Debug, Default)]
 struct StagedDelta {
-    /// (join_key, row_id, row_bytes, weight)
-    rows: Vec<(Vec<u8>, u128, Vec<u8>, i64)>,
+    rows: Vec<StagedRow>,
     staged_bytes: u64,
 }
 
 impl StagedDelta {
-    fn push(&mut self, join_key: Vec<u8>, row_id: u128, row_bytes: Vec<u8>, weight: i64) {
+    fn push(
+        &mut self,
+        join_key: Vec<u8>,
+        join_key_hash: u128,
+        row_id: u128,
+        row_bytes: Vec<u8>,
+        weight: i64,
+    ) {
         self.staged_bytes += (join_key.len() + 16 + row_bytes.len() + 8) as u64;
-        self.rows.push((join_key, row_id, row_bytes, weight));
+        self.rows.push(StagedRow {
+            join_key,
+            join_key_hash,
+            row_id,
+            row_bytes,
+            weight,
+        });
     }
 
     #[allow(dead_code)]
@@ -287,40 +348,481 @@ impl StagedDelta {
     }
 }
 
+// ─── JoinStateCore (single-owner, zero-Mutex) ────────────────────────────────
+
+/// Single-owner, lock-free (`&mut self`) state core for [`JoinOp`].
+///
+/// Consolidates all arrangement state, staged deltas, dirty sets, and demand-load
+/// tracking with zero internal `Mutex`es for single-owner shard actors.
+pub struct JoinStateCore {
+    op_id: OperatorId,
+    left_key_cols: Vec<usize>,
+    right_key_cols: Vec<usize>,
+    left_n_cols: usize,
+    right_n_cols: usize,
+    state: JoinState,
+    left_staged: StagedDelta,
+    right_staged: StagedDelta,
+    dirty_left: HashSet<(Vec<u8>, u128)>,
+    dirty_right: HashSet<(Vec<u8>, u128)>,
+    db: Option<Arc<ShardDb>>,
+    state_loaded: bool,
+    loaded_left_keys: HashSet<Vec<u8>>,
+    loaded_right_keys: HashSet<Vec<u8>>,
+    /// Propagate output `BatchKeyCapsule` when at least one side of the current
+    /// epoch carried a pre-attached key capsule (fused/prepacked pipeline).
+    propagate_output_capsule: bool,
+}
+
+impl JoinStateCore {
+    pub fn with_schema(
+        op_id: OperatorId,
+        left_key_cols: Vec<usize>,
+        right_key_cols: Vec<usize>,
+        left_n_cols: usize,
+        right_n_cols: usize,
+    ) -> Self {
+        Self {
+            op_id,
+            left_key_cols,
+            right_key_cols,
+            left_n_cols,
+            right_n_cols,
+            state: JoinState::new(),
+            left_staged: StagedDelta::default(),
+            right_staged: StagedDelta::default(),
+            dirty_left: HashSet::new(),
+            dirty_right: HashSet::new(),
+            db: None,
+            state_loaded: false,
+            loaded_left_keys: HashSet::new(),
+            loaded_right_keys: HashSet::new(),
+            propagate_output_capsule: false,
+        }
+    }
+
+    pub fn op_id(&self) -> OperatorId {
+        self.op_id
+    }
+
+    pub fn set_db(&mut self, db: Arc<ShardDb>) {
+        self.db = Some(db);
+        self.state_loaded = false;
+        self.loaded_left_keys.clear();
+        self.loaded_right_keys.clear();
+    }
+
+    pub fn db(&self) -> Option<Arc<ShardDb>> {
+        self.db.clone()
+    }
+
+    pub fn left_entry_count(&self) -> usize {
+        self.state.left_entry_count()
+    }
+
+    pub fn right_entry_count(&self) -> usize {
+        self.state.right_entry_count()
+    }
+
+    pub fn state_bytes(&self) -> u64 {
+        self.state.state_bytes() + self.left_staged.staged_bytes + self.right_staged.staged_bytes
+    }
+
+    /// Stage the left delta using once-per-batch `BatchKeyCapsule` (zero mutex locking).
+    pub fn process_left_delta_mut(&mut self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
+        let schema = join_output_schema_n(self.left_n_cols, self.right_n_cols);
+        if delta.is_empty() {
+            return Ok(ArrowZSet::empty(schema));
+        }
+        let input_has_capsule = delta.key_capsule_for(&self.left_key_cols).is_some();
+        self.propagate_output_capsule |= input_has_capsule;
+        let propagate = self.propagate_output_capsule;
+        let capsule = delta.get_or_build_key_capsule(&self.left_key_cols)?;
+        let left_arrs: Vec<&Int64Array> = delta
+            .data
+            .columns()
+            .iter()
+            .map(|col| col.as_any().downcast_ref::<Int64Array>().expect("Int64"))
+            .collect();
+        let mut left_cols: Vec<Vec<i64>> = vec![Vec::new(); self.left_n_cols];
+        let mut right_cols: Vec<Vec<i64>> = vec![Vec::new(); self.right_n_cols];
+        let mut out_weights: Vec<i64> = Vec::new();
+        let mut out_key_runs: Vec<(usize, u128, usize)> = Vec::new();
+
+        for (row_idx, &w) in delta.weights.iter().enumerate().take(delta.num_rows()) {
+            if capsule.row_contains_null(row_idx) {
+                continue;
+            }
+            let join_key_slice = capsule.row_bytes(row_idx);
+            let join_key_hash = capsule.row_hash_u128(row_idx);
+            let mut row_bytes = Vec::with_capacity(left_arrs.len() * 8);
+            for arr in &left_arrs {
+                row_bytes.extend_from_slice(&arr.value(row_idx).to_be_bytes());
+            }
+            let row_id = stable_row_id(self.op_id.0, join_key_slice, &row_bytes);
+
+            let mut matches = 0usize;
+            for (right_row_bytes, r_weight) in self.state.probe_right(join_key_slice) {
+                for (i, arr) in left_arrs.iter().take(self.left_n_cols).enumerate() {
+                    left_cols[i].push(arr.value(row_idx));
+                }
+                JoinOp::push_serialized_row(right_row_bytes, &mut right_cols);
+                out_weights.push(w * r_weight);
+                matches += 1;
+            }
+            if propagate && matches > 0 {
+                out_key_runs.push((row_idx, join_key_hash, matches));
+            }
+
+            self.left_staged
+                .push(join_key_slice.to_vec(), join_key_hash, row_id, row_bytes, w);
+        }
+
+        let batch = JoinOp::make_output_batch(left_cols, right_cols, &schema)?;
+        let mut out = ArrowZSet::new(batch, out_weights);
+        if propagate && !out.is_empty() {
+            let total = out.num_rows();
+            let propagated = BatchKeyCapsule::from_encoded_slices(
+                self.left_key_cols.clone(),
+                ExactLenIter::new(
+                    out_key_runs.iter().flat_map(|&(src_row, h128, count)| {
+                        std::iter::repeat_n((capsule.row_bytes(src_row), h128, false), count)
+                    }),
+                    total,
+                ),
+            );
+            out.push_key_capsule(Arc::new(propagated));
+        }
+        debug!(
+            op = "JoinOp",
+            op_id = self.op_id.0,
+            "left delta: {} rows → {} join outputs",
+            delta.num_rows(),
+            out.num_rows()
+        );
+        Ok(out)
+    }
+
+    /// Stage the right delta using once-per-batch `BatchKeyCapsule` (zero mutex locking).
+    pub fn process_right_delta_mut(&mut self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
+        let schema = join_output_schema_n(self.left_n_cols, self.right_n_cols);
+        if delta.is_empty() {
+            return Ok(ArrowZSet::empty(schema));
+        }
+        let input_has_capsule = delta.key_capsule_for(&self.right_key_cols).is_some();
+        self.propagate_output_capsule |= input_has_capsule;
+        let propagate = self.propagate_output_capsule;
+        let capsule = delta.get_or_build_key_capsule(&self.right_key_cols)?;
+        let right_arrs: Vec<&Int64Array> = delta
+            .data
+            .columns()
+            .iter()
+            .map(|col| col.as_any().downcast_ref::<Int64Array>().expect("Int64"))
+            .collect();
+        let mut left_cols: Vec<Vec<i64>> = vec![Vec::new(); self.left_n_cols];
+        let mut right_cols: Vec<Vec<i64>> = vec![Vec::new(); self.right_n_cols];
+        let mut out_weights: Vec<i64> = Vec::new();
+        let mut out_key_runs: Vec<(usize, u128, usize)> = Vec::new();
+
+        for (row_idx, &w) in delta.weights.iter().enumerate().take(delta.num_rows()) {
+            if capsule.row_contains_null(row_idx) {
+                continue;
+            }
+            let join_key_slice = capsule.row_bytes(row_idx);
+            let join_key_hash = capsule.row_hash_u128(row_idx);
+            let mut row_bytes = Vec::with_capacity(right_arrs.len() * 8);
+            for arr in &right_arrs {
+                row_bytes.extend_from_slice(&arr.value(row_idx).to_be_bytes());
+            }
+            let row_id = stable_row_id(self.op_id.0, join_key_slice, &row_bytes);
+
+            let mut matches = 0usize;
+            for (left_row_bytes, l_weight) in self.state.probe_left(join_key_slice) {
+                JoinOp::push_serialized_row(left_row_bytes, &mut left_cols);
+                for (i, arr) in right_arrs.iter().take(self.right_n_cols).enumerate() {
+                    right_cols[i].push(arr.value(row_idx));
+                }
+                out_weights.push(l_weight * w);
+                matches += 1;
+            }
+            if propagate && matches > 0 {
+                out_key_runs.push((row_idx, join_key_hash, matches));
+            }
+
+            self.right_staged
+                .push(join_key_slice.to_vec(), join_key_hash, row_id, row_bytes, w);
+        }
+
+        let batch = JoinOp::make_output_batch(left_cols, right_cols, &schema)?;
+        let mut out = ArrowZSet::new(batch, out_weights);
+        if propagate && !out.is_empty() {
+            let total = out.num_rows();
+            let propagated = BatchKeyCapsule::from_encoded_slices(
+                self.left_key_cols.clone(),
+                ExactLenIter::new(
+                    out_key_runs.iter().flat_map(|&(src_row, h128, count)| {
+                        std::iter::repeat_n((capsule.row_bytes(src_row), h128, false), count)
+                    }),
+                    total,
+                ),
+            );
+            out.push_key_capsule(Arc::new(propagated));
+        }
+        debug!(
+            op = "JoinOp",
+            op_id = self.op_id.0,
+            "right delta: {} rows → {} join outputs",
+            delta.num_rows(),
+            out.num_rows()
+        );
+        Ok(out)
+    }
+
+    /// Compute `ΔL ⋈ ΔR`, apply staged deltas to arrangements, and return correction output.
+    pub fn commit_epoch_mut(&mut self) -> Result<ArrowZSet, OpError> {
+        let schema = join_output_schema_n(self.left_n_cols, self.right_n_cols);
+        let propagate_capsule = std::mem::take(&mut self.propagate_output_capsule);
+
+        // Group staged right rows into columnar buckets so ΔL ⋈ ΔR appends whole
+        // column slices via fill/memcpy instead of per-match Vec allocations.
+        let mut right_by_key: HashMap<&[u8], ColumnarRightBucket> = HashMap::new();
+        for row in &self.right_staged.rows {
+            let bucket = right_by_key
+                .entry(row.join_key.as_slice())
+                .or_insert_with(|| ColumnarRightBucket {
+                    cols: vec![Vec::new(); self.right_n_cols],
+                    weights: Vec::new(),
+                });
+            JoinOp::push_serialized_row(&row.row_bytes, &mut bucket.cols);
+            bucket.weights.push(row.weight);
+        }
+
+        let total_out: usize = self
+            .left_staged
+            .rows
+            .iter()
+            .filter_map(|row| {
+                right_by_key
+                    .get(row.join_key.as_slice())
+                    .map(|bucket| bucket.weights.len())
+            })
+            .sum();
+
+        let mut left_cols: Vec<Vec<i64>> = (0..self.left_n_cols)
+            .map(|_| Vec::with_capacity(total_out))
+            .collect();
+        let mut right_cols: Vec<Vec<i64>> = (0..self.right_n_cols)
+            .map(|_| Vec::with_capacity(total_out))
+            .collect();
+        let mut out_weights: Vec<i64> = Vec::with_capacity(total_out);
+        let mut out_key_runs: Vec<(usize, usize)> = if propagate_capsule {
+            Vec::with_capacity(self.left_staged.rows.len())
+        } else {
+            Vec::new()
+        };
+
+        for (left_idx, row) in self.left_staged.rows.iter().enumerate() {
+            if let Some(bucket) = right_by_key.get(row.join_key.as_slice()) {
+                let n = bucket.weights.len();
+                for (col, chunk) in left_cols
+                    .iter_mut()
+                    .zip(row.row_bytes.as_chunks::<8>().0.iter())
+                {
+                    let val = i64::from_be_bytes(*chunk);
+                    col.resize(col.len() + n, val);
+                }
+                for (dst, src) in right_cols.iter_mut().zip(bucket.cols.iter()) {
+                    dst.extend_from_slice(src);
+                }
+                let lw = row.weight;
+                if lw == 1 {
+                    out_weights.extend_from_slice(&bucket.weights);
+                } else {
+                    out_weights.extend(bucket.weights.iter().map(|&r_w| lw * r_w));
+                }
+                if propagate_capsule {
+                    out_key_runs.push((left_idx, n));
+                }
+            }
+        }
+        drop(right_by_key);
+
+        let propagated_capsule = if propagate_capsule && total_out > 0 {
+            Some(Arc::new(BatchKeyCapsule::from_encoded_slices(
+                self.left_key_cols.clone(),
+                ExactLenIter::new(
+                    out_key_runs.iter().flat_map(|&(left_idx, count)| {
+                        let row = &self.left_staged.rows[left_idx];
+                        std::iter::repeat_n(
+                            (row.join_key.as_slice(), row.join_key_hash, false),
+                            count,
+                        )
+                    }),
+                    total_out,
+                ),
+            )))
+        } else {
+            None
+        };
+
+        for row in self.left_staged.rows.drain(..) {
+            self.dirty_left.insert((row.join_key.clone(), row.row_id));
+            self.state
+                .update_left(row.join_key, row.row_id, row.row_bytes, row.weight);
+        }
+        for row in self.right_staged.rows.drain(..) {
+            self.dirty_right.insert((row.join_key.clone(), row.row_id));
+            self.state
+                .update_right(row.join_key, row.row_id, row.row_bytes, row.weight);
+        }
+        self.left_staged.staged_bytes = 0;
+        self.right_staged.staged_bytes = 0;
+
+        let batch = JoinOp::make_output_batch(left_cols, right_cols, &schema)?;
+        let mut out = ArrowZSet::new(batch, out_weights);
+        if let Some(propagated) = propagated_capsule {
+            out.push_key_capsule(propagated);
+        }
+        Ok(out)
+    }
+
+    pub fn process_epoch_with_counters_mut(
+        &mut self,
+        left: ArrowZSet,
+        right: ArrowZSet,
+    ) -> Result<(ArrowZSet, crate::governor::DeltaAmplificationCounters), OpError> {
+        let input_deltas = (left.num_rows() + right.num_rows()) as u64;
+        let left_out = self.process_left_delta_mut(left)?;
+        let right_out = self.process_right_delta_mut(right)?;
+        let arrangement_probes =
+            (self.left_staged.rows.len() + self.right_staged.rows.len()) as u64;
+        let state_writes = self
+            .left_staged
+            .rows
+            .iter()
+            .chain(&self.right_staged.rows)
+            .filter(|row| row.weight != 0)
+            .count() as u64;
+        let correction = self.commit_epoch_mut()?;
+        let out_schema = join_output_schema_n(self.left_n_cols, self.right_n_cols);
+        let output = concat_zsets(vec![left_out, right_out, correction], out_schema)?;
+        Ok((
+            output,
+            crate::governor::DeltaAmplificationCounters {
+                input_deltas,
+                probes: arrangement_probes,
+                shuffled_bytes: 0,
+                intermediate_tuples: 0,
+                output_deltas: 0,
+                state_writes,
+            },
+        ))
+    }
+
+    pub fn process_epoch_mut(
+        &mut self,
+        left: ArrowZSet,
+        right: ArrowZSet,
+    ) -> Result<ArrowZSet, OpError> {
+        self.process_epoch_with_counters_mut(left, right)
+            .map(|(output, _)| output)
+    }
+
+    pub fn append_state_mut(&mut self, target: &mut WriteBatch) -> Result<(), OpError> {
+        let mut batch = WriteBatch::new();
+        for (join_key, row_id) in self.dirty_left.drain() {
+            let key =
+                ShardKeyEncoder::join_arr_key(JoinSide::Left, self.op_id.0, &join_key, row_id);
+            let weight_key = join_weight_key(&key);
+            if let Some(arr_row) = self
+                .state
+                .left_arr
+                .get(&join_key)
+                .and_then(|b| b.get(&row_id))
+            {
+                if arr_row.weight > 0 {
+                    batch.put(&key, &arr_row.row_bytes);
+                    batch.put(&weight_key, &arr_row.weight.to_be_bytes());
+                } else {
+                    batch.delete(&key);
+                    batch.delete(&weight_key);
+                }
+            } else {
+                batch.delete(&key);
+                batch.delete(&weight_key);
+            }
+        }
+        for (join_key, row_id) in self.dirty_right.drain() {
+            let key =
+                ShardKeyEncoder::join_arr_key(JoinSide::Right, self.op_id.0, &join_key, row_id);
+            let weight_key = join_weight_key(&key);
+            if let Some(arr_row) = self
+                .state
+                .right_arr
+                .get(&join_key)
+                .and_then(|b| b.get(&row_id))
+            {
+                if arr_row.weight > 0 {
+                    batch.put(&key, &arr_row.row_bytes);
+                    batch.put(&weight_key, &arr_row.weight.to_be_bytes());
+                } else {
+                    batch.delete(&key);
+                    batch.delete(&weight_key);
+                }
+            } else {
+                batch.delete(&key);
+                batch.delete(&weight_key);
+            }
+        }
+        target.merge_from(batch);
+        Ok(())
+    }
+}
+
+// Keep the existing arrangement value encoding readable. The multiplicity is
+// a versioned point sidecar committed in the same WriteBatch as that row.
+// Legacy rows without a sidecar retain their historical unit-weight meaning.
+fn join_weight_key(arrangement_key: &[u8]) -> Vec<u8> {
+    let mut key = ShardKeyEncoder::meta_key(b"join-weight/v1/");
+    key.extend_from_slice(arrangement_key);
+    key
+}
+
+async fn persisted_join_weight(db: &ShardDb, arrangement_key: &[u8]) -> Result<i64, OpError> {
+    let Some(value) = db
+        .get(&join_weight_key(arrangement_key))
+        .await
+        .map_err(OpError::storage)?
+    else {
+        return Ok(1);
+    };
+    let bytes: [u8; 8] = value
+        .as_ref()
+        .try_into()
+        .map_err(|_| OpError::storage_error("invalid persisted join multiplicity"))?;
+    let weight = i64::from_be_bytes(bytes);
+    if weight <= 0 {
+        return Err(OpError::storage_error(
+            "persisted join multiplicity is not positive",
+        ));
+    }
+    Ok(weight)
+}
+
 // ─── JoinOp ───────────────────────────────────────────────────────────────────
 
-/// Incremental inner equi-join operator (v0.8 — IVM-4).
+/// Incremental inner equi-join operator (v0.8 — IVM-4; consolidated single-owner core for #402).
 ///
-/// Probes pre-change arrangements during delta processing; applies staged
-/// updates atomically at `commit_epoch()`.
-///
-/// # Schema
-///
-/// `JoinOp` is schema-generic: it works with any number of Int64 columns.
-/// `left_n_cols` / `right_n_cols` control the output schema.
-/// Default (from `JoinOp::new`): 2 left columns, 2 right columns.
-/// Use `JoinOp::with_schema` for variable-width inputs (e.g. chained joins).
+/// Consolidates all mutable join state into a single [`JoinStateCore`] so shard
+/// actors execute via `&mut self` (`process_epoch_mut`, `into_core`) with zero
+/// hot-path mutex locking, while legacy `&self` callers acquire one uncontended lock.
 pub struct JoinOp {
     op_id: OperatorId,
-    /// Column indices in the left input used as the join key.
     left_key_cols: Vec<usize>,
-    /// Column indices in the right input used as the join key.
     right_key_cols: Vec<usize>,
-    /// Number of columns in the left input schema.
     left_n_cols: usize,
-    /// Number of columns in the right input schema.
     right_n_cols: usize,
-    state: Mutex<JoinState>,
-    /// Staged left delta for the current epoch (not yet applied to arrangements).
-    left_staged: Mutex<StagedDelta>,
-    /// Staged right delta for the current epoch.
-    right_staged: Mutex<StagedDelta>,
-    dirty_left: Mutex<HashSet<(Vec<u8>, u128)>>,
-    dirty_right: Mutex<HashSet<(Vec<u8>, u128)>>,
-    db: Mutex<Option<Arc<ShardDb>>>,
-    state_loaded: AtomicBool,
-    loaded_left_keys: Mutex<HashSet<Vec<u8>>>,
-    loaded_right_keys: Mutex<HashSet<Vec<u8>>>,
+    core: Mutex<JoinStateCore>,
 }
 
 impl JoinOp {
@@ -330,8 +832,6 @@ impl JoinOp {
     }
 
     /// Create a `JoinOp` with explicit column counts for variable-width schemas.
-    ///
-    /// Used when one side has more than 2 columns (e.g. chained join output).
     pub fn with_schema(
         op_id: OperatorId,
         left_key_cols: Vec<usize>,
@@ -339,41 +839,54 @@ impl JoinOp {
         left_n_cols: usize,
         right_n_cols: usize,
     ) -> Self {
+        let core = JoinStateCore::with_schema(
+            op_id,
+            left_key_cols.clone(),
+            right_key_cols.clone(),
+            left_n_cols,
+            right_n_cols,
+        );
         JoinOp {
             op_id,
             left_key_cols,
             right_key_cols,
             left_n_cols,
             right_n_cols,
-            state: Mutex::new(JoinState::new()),
-            left_staged: Mutex::new(StagedDelta::default()),
-            right_staged: Mutex::new(StagedDelta::default()),
-            dirty_left: Mutex::new(HashSet::new()),
-            dirty_right: Mutex::new(HashSet::new()),
-            db: Mutex::new(None),
-            state_loaded: AtomicBool::new(false),
-            loaded_left_keys: Mutex::new(HashSet::new()),
-            loaded_right_keys: Mutex::new(HashSet::new()),
+            core: Mutex::new(core),
+        }
+    }
+
+    /// Unwrap this `JoinOp` into a lock-free single-owner [`JoinStateCore`].
+    pub fn into_core(self) -> JoinStateCore {
+        self.core.into_inner().unwrap()
+    }
+
+    /// Wrap an owned lock-free [`JoinStateCore`].
+    pub fn from_core(core: JoinStateCore) -> Self {
+        Self {
+            op_id: core.op_id,
+            left_key_cols: core.left_key_cols.clone(),
+            right_key_cols: core.right_key_cols.clone(),
+            left_n_cols: core.left_n_cols,
+            right_n_cols: core.right_n_cols,
+            core: Mutex::new(core),
         }
     }
 
     /// Attach a ShardDb for arrangement lookups and tiered caching.
-    pub fn with_db(self, db: Arc<ShardDb>) -> Self {
-        self.set_db(db);
+    pub fn with_db(mut self, db: Arc<ShardDb>) -> Self {
+        self.core.get_mut().unwrap().set_db(db);
         self
     }
 
     /// Set a ShardDb for arrangement lookups and tiered caching.
     pub fn set_db(&self, db: Arc<ShardDb>) {
-        *self.db.lock().unwrap() = Some(db);
-        self.state_loaded.store(false, Ordering::Release);
-        self.loaded_left_keys.lock().unwrap().clear();
-        self.loaded_right_keys.lock().unwrap().clear();
+        self.core.lock().unwrap().set_db(db);
     }
 
     /// Access the attached ShardDb if configured.
     pub fn db(&self) -> Option<Arc<ShardDb>> {
-        self.db.lock().unwrap().clone()
+        self.core.lock().unwrap().db()
     }
 
     async fn ensure_arrangement_key_loaded(
@@ -381,28 +894,34 @@ impl JoinOp {
         side: JoinSide,
         join_key: &[u8],
     ) -> Result<(), OpError> {
-        if self.state_loaded.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let Some(db) = self.db.lock().unwrap().clone() else {
-            return Ok(());
+        let db = {
+            let core = self.core.lock().unwrap();
+            if core.state_loaded {
+                return Ok(());
+            }
+            let already_loaded = match side {
+                JoinSide::Left => core.loaded_left_keys.contains(join_key),
+                JoinSide::Right => core.loaded_right_keys.contains(join_key),
+            };
+            if already_loaded {
+                return Ok(());
+            }
+            let Some(db) = core.db.clone() else {
+                return Ok(());
+            };
+            db
         };
-        let loaded_keys = match side {
-            JoinSide::Left => &self.loaded_left_keys,
-            JoinSide::Right => &self.loaded_right_keys,
-        };
-        if loaded_keys.lock().unwrap().contains(join_key) {
-            return Ok(());
-        }
 
         let prefix = ShardKeyEncoder::join_arr_key_prefix(side, self.op_id.0, join_key);
         let entries = db.scan_prefix(&prefix).await.map_err(OpError::storage)?;
-        let dirty = match side {
-            JoinSide::Left => self.dirty_left.lock().unwrap(),
-            JoinSide::Right => self.dirty_right.lock().unwrap(),
-        };
-        let mut state = self.state.lock().unwrap();
+        let mut weighted_entries = Vec::with_capacity(entries.len());
         for (key, value) in entries {
+            let weight = persisted_join_weight(&db, &key).await?;
+            weighted_entries.push((key, value, weight));
+        }
+
+        let mut core = self.core.lock().unwrap();
+        for (key, value, weight) in weighted_entries {
             if key.len() < 11 + 16 {
                 continue;
             }
@@ -411,12 +930,24 @@ impl JoinOp {
                     .try_into()
                     .map_err(|_| OpError::storage_error("invalid join arrangement row id"))?,
             );
-            if dirty.contains(&(join_key.to_vec(), row_id)) {
+            let is_dirty = match side {
+                JoinSide::Left => core.dirty_left.contains(&(join_key.to_vec(), row_id)),
+                JoinSide::Right => core.dirty_right.contains(&(join_key.to_vec(), row_id)),
+            };
+            if is_dirty {
                 continue;
             }
-            state.insert_persisted(side, join_key.to_vec(), row_id, value.to_vec());
+            core.state
+                .insert_persisted(side, join_key.to_vec(), row_id, value.to_vec(), weight);
         }
-        loaded_keys.lock().unwrap().insert(join_key.to_vec());
+        match side {
+            JoinSide::Left => {
+                core.loaded_left_keys.insert(join_key.to_vec());
+            }
+            JoinSide::Right => {
+                core.loaded_right_keys.insert(join_key.to_vec());
+            }
+        }
         Ok(())
     }
 
@@ -426,13 +957,17 @@ impl JoinOp {
         delta: &ArrowZSet,
         key_cols: &[usize],
     ) -> Result<(), OpError> {
-        if self.state_loaded.load(Ordering::Acquire) || self.db().is_none() {
-            return Ok(());
+        {
+            let core = self.core.lock().unwrap();
+            if core.state_loaded || core.db.is_none() || delta.is_empty() {
+                return Ok(());
+            }
         }
+        let capsule = delta.get_or_build_key_capsule(key_cols)?;
         let mut keys = HashSet::new();
         for row_idx in 0..delta.num_rows() {
-            if let Some(join_key) = Self::extract_key(&delta.data, row_idx, key_cols)? {
-                keys.insert(join_key);
+            if !capsule.row_contains_null(row_idx) {
+                keys.insert(capsule.row_bytes(row_idx).to_vec());
             }
         }
         for join_key in keys {
@@ -441,79 +976,58 @@ impl JoinOp {
         Ok(())
     }
 
-    /// Look up matching arrangement rows for a given join key against an arrangement.
-    /// Checks in-memory state first; if `db` is attached and no in-memory matches exist,
-    /// probes SlateDB arrangement using `join_arr_key_prefix`. SlateDB evaluates
-    /// Bloom filters and the local NVMe cache tier to minimize remote S3 GET amplification.
     pub async fn probe_arrangement(
         &self,
         side: JoinSide,
         join_key: &[u8],
     ) -> Result<Vec<(Vec<u8>, i64)>, OpError> {
         self.ensure_arrangement_key_loaded(side, join_key).await?;
-        let in_mem: Vec<(Vec<u8>, i64)> = {
-            let state = self.state.lock().unwrap();
-            match side {
-                JoinSide::Left => state
-                    .probe_left(join_key)
-                    .map(|(r, w)| (r.clone(), w))
-                    .collect(),
-                JoinSide::Right => state
-                    .probe_right(join_key)
-                    .map(|(r, w)| (r.clone(), w))
-                    .collect(),
-            }
+        let core = self.core.lock().unwrap();
+        let in_mem: Vec<(Vec<u8>, i64)> = match side {
+            JoinSide::Left => core
+                .state
+                .probe_left(join_key)
+                .map(|(r, w)| (r.clone(), w))
+                .collect(),
+            JoinSide::Right => core
+                .state
+                .probe_right(join_key)
+                .map(|(r, w)| (r.clone(), w))
+                .collect(),
         };
         Ok(in_mem)
     }
 
-    /// Point lookup a single row in an arrangement by exact join key and row ID.
-    /// Returns the row bytes if present.
-    /// Uses SlateDB's `db.get(&key)` which directly leverages Bloom filters to reject
-    /// absent rows with 0 S3 GETs, and local NVMe block caching to read hot blocks locally.
     pub async fn point_lookup_arrangement(
         &self,
         side: JoinSide,
         join_key: &[u8],
         row_id: u128,
     ) -> Result<Option<Vec<u8>>, OpError> {
-        {
-            let state = self.state.lock().unwrap();
+        let db_opt = {
+            let core = self.core.lock().unwrap();
             let arr = match side {
-                JoinSide::Left => &state.left_arr,
-                JoinSide::Right => &state.right_arr,
+                JoinSide::Left => &core.state.left_arr,
+                JoinSide::Right => &core.state.right_arr,
             };
             if let Some(bucket) = arr.get(join_key) {
                 if let Some(row) = bucket.get(&row_id) {
-                    if row.weight > 0 {
-                        return Ok(Some(row.row_bytes.clone()));
-                    } else {
-                        return Ok(None);
-                    }
+                    return Ok((row.weight > 0).then(|| row.row_bytes.clone()));
                 }
             }
-        }
-
-        if self.state_loaded.load(Ordering::Acquire) {
-            return Ok(None);
-        }
-        let is_dirty = match side {
-            JoinSide::Left => self
-                .dirty_left
-                .lock()
-                .unwrap()
-                .contains(&(join_key.to_vec(), row_id)),
-            JoinSide::Right => self
-                .dirty_right
-                .lock()
-                .unwrap()
-                .contains(&(join_key.to_vec(), row_id)),
+            if core.state_loaded {
+                return Ok(None);
+            }
+            let is_dirty = match side {
+                JoinSide::Left => core.dirty_left.contains(&(join_key.to_vec(), row_id)),
+                JoinSide::Right => core.dirty_right.contains(&(join_key.to_vec(), row_id)),
+            };
+            if is_dirty {
+                return Ok(None);
+            }
+            core.db.clone()
         };
-        if is_dirty {
-            return Ok(None);
-        }
 
-        let db_opt = self.db.lock().unwrap().clone();
         if let Some(db) = db_opt {
             let key = ShardKeyEncoder::join_arr_key(side, self.op_id.0, join_key, row_id);
             let opt = db.get(&key).await.map_err(OpError::storage)?;
@@ -523,34 +1037,23 @@ impl JoinOp {
         Ok(None)
     }
 
-    /// Process an epoch after loading any arrangement keys that are missing from
-    /// the in-memory cache. The synchronous API remains the fast path for fully
-    /// restored joins; this method is used by storage-backed live pipelines.
     pub async fn process_epoch_with_storage(
         &self,
         left: ArrowZSet,
         right: ArrowZSet,
     ) -> Result<(ArrowZSet, crate::governor::DeltaAmplificationCounters), OpError> {
+        // The modified side must be loaded too: applying a retraction to an
+        // unloaded row would otherwise replace its persisted positive weight
+        // with a negative provisional delta and delete live copies.
+        self.load_arrangement_keys(JoinSide::Left, &left, &self.left_key_cols)
+            .await?;
         self.load_arrangement_keys(JoinSide::Right, &left, &self.left_key_cols)
             .await?;
         self.load_arrangement_keys(JoinSide::Left, &right, &self.right_key_cols)
             .await?;
+        self.load_arrangement_keys(JoinSide::Right, &right, &self.right_key_cols)
+            .await?;
         self.process_epoch_with_counters(left, right)
-    }
-
-    /// Extract the join key bytes from a row (as big-endian i64 bytes concatenated).
-    fn extract_key(
-        row: &RecordBatch,
-        row_idx: usize,
-        key_cols: &[usize],
-    ) -> Result<Option<Vec<u8>>, OpError> {
-        let arrays: Vec<&dyn arrow::array::Array> = key_cols
-            .iter()
-            .map(|column| row.column(*column).as_ref())
-            .collect();
-        let capsule = KeyCapsule::from_arrays(&arrays, row_idx)
-            .map_err(|error| OpError::unsupported_plan_node(error.to_string()))?;
-        Ok((!capsule.contains_null()).then(|| capsule.typed_bytes().to_vec()))
     }
 
     /// Serialize all columns of a row (excluding any weight column) as bytes.
@@ -574,12 +1077,18 @@ impl JoinOp {
             .collect()
     }
 
+    /// Append a serialized row's Int64 values directly into columnar output buffers.
+    #[inline]
+    fn push_serialized_row(bytes: &[u8], cols: &mut [Vec<i64>]) {
+        for (col, chunk) in cols.iter_mut().zip(bytes.as_chunks::<8>().0.iter()) {
+            col.push(i64::from_be_bytes(*chunk));
+        }
+    }
+
     /// Build the output `RecordBatch` from collected column values.
-    ///
-    /// Output has `left_n_cols + right_n_cols` Int64 columns.
     fn make_output_batch(
-        left_row_vals: Vec<Vec<i64>>,  // left_n_cols vecs
-        right_row_vals: Vec<Vec<i64>>, // right_n_cols vecs
+        left_row_vals: Vec<Vec<i64>>,
+        right_row_vals: Vec<Vec<i64>>,
         schema: &SchemaRef,
     ) -> Result<RecordBatch, OpError> {
         let mut cols: Vec<ArrayRef> = Vec::new();
@@ -592,175 +1101,42 @@ impl JoinOp {
         RecordBatch::try_new(Arc::clone(schema), cols).map_err(OpError::arrow)
     }
 
-    /// Stage the left delta for this epoch.
-    ///
-    /// Probes `R₀` (pre-change right arrangement) and emits `ΔL ⋈ R₀`.
-    /// The staged rows are stored for the `ΔL ⋈ ΔR` correction in `commit_epoch`.
+    /// Zero-lock single-owner left delta processing (`&mut self`).
+    pub fn process_left_delta_mut(&mut self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
+        self.core.get_mut().unwrap().process_left_delta_mut(delta)
+    }
+
+    /// Zero-lock single-owner right delta processing (`&mut self`).
+    pub fn process_right_delta_mut(&mut self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
+        self.core.get_mut().unwrap().process_right_delta_mut(delta)
+    }
+
+    /// Zero-lock single-owner epoch commit (`&mut self`).
+    pub fn commit_epoch_mut(&mut self) -> Result<ArrowZSet, OpError> {
+        self.core.get_mut().unwrap().commit_epoch_mut()
+    }
+
+    /// Zero-lock single-owner full epoch execution (`&mut self`).
+    pub fn process_epoch_mut(
+        &mut self,
+        left: ArrowZSet,
+        right: ArrowZSet,
+    ) -> Result<ArrowZSet, OpError> {
+        self.core.get_mut().unwrap().process_epoch_mut(left, right)
+    }
+
     pub fn process_left_delta(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
-        let state = self.state.lock().unwrap();
-        let mut staged = self.left_staged.lock().unwrap();
-
-        let schema = join_output_schema_n(self.left_n_cols, self.right_n_cols);
-        let mut left_cols: Vec<Vec<i64>> = vec![Vec::new(); self.left_n_cols];
-        let mut right_cols: Vec<Vec<i64>> = vec![Vec::new(); self.right_n_cols];
-        let mut out_weights: Vec<i64> = Vec::new();
-
-        for row_idx in 0..delta.num_rows() {
-            let w = delta.weights[row_idx];
-            let Some(join_key) = Self::extract_key(&delta.data, row_idx, &self.left_key_cols)?
-            else {
-                continue;
-            };
-            let row_bytes = Self::serialize_row(&delta.data, row_idx);
-            let row_id = stable_row_id(self.op_id.0, &join_key, &row_bytes);
-
-            // Probe R₀: emit ΔL ⋈ R₀ with weight = w * r_weight
-            for (right_row_bytes, r_weight) in state.probe_right(&join_key) {
-                let left_vals = Self::deserialize_row(&row_bytes, self.left_n_cols);
-                let right_vals = Self::deserialize_row(right_row_bytes, self.right_n_cols);
-                for (i, v) in left_vals.iter().enumerate() {
-                    left_cols[i].push(*v);
-                }
-                for (i, v) in right_vals.iter().enumerate() {
-                    right_cols[i].push(*v);
-                }
-                out_weights.push(w * r_weight);
-            }
-
-            // Stage this delta for commit and ΔL⋈ΔR correction.
-            staged.push(join_key, row_id, row_bytes, w);
-        }
-
-        let batch = Self::make_output_batch(left_cols, right_cols, &schema)?;
-        debug!(
-            op = "JoinOp",
-            op_id = self.op_id.0,
-            "left delta: {} rows → {} join outputs",
-            delta.num_rows(),
-            batch.num_rows()
-        );
-        Ok(ArrowZSet::new(batch, out_weights))
+        self.core.lock().unwrap().process_left_delta_mut(delta)
     }
 
-    /// Stage the right delta for this epoch.
-    ///
-    /// Probes `L₀` (pre-change left arrangement) and emits `L₀ ⋈ ΔR`.
-    /// The staged rows are stored for the `ΔL ⋈ ΔR` correction in `commit_epoch`.
     pub fn process_right_delta(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
-        let state = self.state.lock().unwrap();
-        let mut staged = self.right_staged.lock().unwrap();
-
-        let schema = join_output_schema_n(self.left_n_cols, self.right_n_cols);
-        let mut left_cols: Vec<Vec<i64>> = vec![Vec::new(); self.left_n_cols];
-        let mut right_cols: Vec<Vec<i64>> = vec![Vec::new(); self.right_n_cols];
-        let mut out_weights: Vec<i64> = Vec::new();
-
-        for row_idx in 0..delta.num_rows() {
-            let w = delta.weights[row_idx];
-            let Some(join_key) = Self::extract_key(&delta.data, row_idx, &self.right_key_cols)?
-            else {
-                continue;
-            };
-            let row_bytes = Self::serialize_row(&delta.data, row_idx);
-            let row_id = stable_row_id(self.op_id.0, &join_key, &row_bytes);
-
-            // Probe L₀: emit L₀ ⋈ ΔR with weight = l_weight * w
-            for (left_row_bytes, l_weight) in state.probe_left(&join_key) {
-                let left_vals = Self::deserialize_row(left_row_bytes, self.left_n_cols);
-                let right_vals = Self::deserialize_row(&row_bytes, self.right_n_cols);
-                for (i, v) in left_vals.iter().enumerate() {
-                    left_cols[i].push(*v);
-                }
-                for (i, v) in right_vals.iter().enumerate() {
-                    right_cols[i].push(*v);
-                }
-                out_weights.push(l_weight * w);
-            }
-
-            // Stage for commit and ΔL⋈ΔR correction.
-            staged.push(join_key, row_id, row_bytes, w);
-        }
-
-        let batch = Self::make_output_batch(left_cols, right_cols, &schema)?;
-        debug!(
-            op = "JoinOp",
-            op_id = self.op_id.0,
-            "right delta: {} rows → {} join outputs",
-            delta.num_rows(),
-            batch.num_rows()
-        );
-        Ok(ArrowZSet::new(batch, out_weights))
+        self.core.lock().unwrap().process_right_delta_mut(delta)
     }
 
-    /// Compute `ΔL ⋈ ΔR`, apply staged deltas to arrangements, and return
-    /// the combined output delta for this epoch.
-    ///
-    /// Clears the staged deltas.  Must be called exactly once per epoch after
-    /// all `process_left_delta` and `process_right_delta` calls.
     pub fn commit_epoch(&self) -> Result<ArrowZSet, OpError> {
-        let mut state = self.state.lock().unwrap();
-        let mut left_s = self.left_staged.lock().unwrap();
-        let mut right_s = self.right_staged.lock().unwrap();
-
-        let schema = join_output_schema_n(self.left_n_cols, self.right_n_cols);
-        let mut left_cols: Vec<Vec<i64>> = vec![Vec::new(); self.left_n_cols];
-        let mut right_cols: Vec<Vec<i64>> = vec![Vec::new(); self.right_n_cols];
-        let mut out_weights: Vec<i64> = Vec::new();
-
-        // Decode each staged row *once*, not once per matching pair. A
-        // many-to-many epoch can produce millions of output pairs from a
-        // comparatively small delta; allocating temporary Vecs for every
-        // pair dominated the join performance benchmark and memory churn.
-        // Borrow the staged join keys until correction output is complete.
-        let mut right_by_key: HashMap<&[u8], Vec<(Vec<i64>, i64)>> = HashMap::new();
-        for (join_key, _row_id, row_bytes, weight) in &right_s.rows {
-            right_by_key
-                .entry(join_key.as_slice())
-                .or_default()
-                .push((Self::deserialize_row(row_bytes, self.right_n_cols), *weight));
-        }
-
-        // ΔL ⋈ ΔR correction: preserve every pair and its bilinear weight.
-        for (join_key, _row_id, left_bytes, l_w) in &left_s.rows {
-            if let Some(right_rows) = right_by_key.get(join_key.as_slice()) {
-                let left_vals = Self::deserialize_row(left_bytes, self.left_n_cols);
-                for (right_vals, r_w) in right_rows {
-                    for (i, v) in left_vals.iter().enumerate() {
-                        left_cols[i].push(*v);
-                    }
-                    for (i, v) in right_vals.iter().enumerate() {
-                        right_cols[i].push(*v);
-                    }
-                    out_weights.push(l_w * r_w); // bilinear weight product
-                }
-            }
-        }
-
-        // The borrowed key slices must no longer reference right_s before
-        // its staged rows are drained into the persistent arrangement.
-        drop(right_by_key);
-
-        // Apply staged deltas to arrangements and track modified rows.
-        let mut dirty_left = self.dirty_left.lock().unwrap();
-        let mut dirty_right = self.dirty_right.lock().unwrap();
-        for (join_key, row_id, row_bytes, w) in left_s.rows.drain(..) {
-            dirty_left.insert((join_key.clone(), row_id));
-            state.update_left(join_key, row_id, row_bytes, w);
-        }
-        for (join_key, row_id, row_bytes, w) in right_s.rows.drain(..) {
-            dirty_right.insert((join_key.clone(), row_id));
-            state.update_right(join_key, row_id, row_bytes, w);
-        }
-        left_s.staged_bytes = 0;
-        right_s.staged_bytes = 0;
-
-        let batch = Self::make_output_batch(left_cols, right_cols, &schema)?;
-        Ok(ArrowZSet::new(batch, out_weights))
+        self.core.lock().unwrap().commit_epoch_mut()
     }
 
-    /// Run a full epoch: process left and right deltas, then commit.
-    ///
-    /// Returns the combined `ΔL ⋈ R₀ + L₀ ⋈ ΔR + ΔL ⋈ ΔR` output.
     pub fn process_epoch(&self, left: ArrowZSet, right: ArrowZSet) -> Result<ArrowZSet, OpError> {
         self.process_epoch_with_counters(left, right)
             .map(|(output, _)| output)
@@ -771,100 +1147,40 @@ impl JoinOp {
         left: ArrowZSet,
         right: ArrowZSet,
     ) -> Result<(ArrowZSet, crate::governor::DeltaAmplificationCounters), OpError> {
-        let input_deltas = (left.num_rows() + right.num_rows()) as u64;
-        let left_out = self.process_left_delta(left)?;
-        let right_out = self.process_right_delta(right)?;
-        let (arrangement_probes, state_writes) = {
-            let left_staged = self.left_staged.lock().unwrap();
-            let right_staged = self.right_staged.lock().unwrap();
-            (
-                (left_staged.rows.len() + right_staged.rows.len()) as u64,
-                left_staged
-                    .rows
-                    .iter()
-                    .chain(&right_staged.rows)
-                    .filter(|(_, _, _, weight)| *weight != 0)
-                    .count() as u64,
-            )
-        };
-        let correction = self.commit_epoch()?;
-        let out_schema = join_output_schema_n(self.left_n_cols, self.right_n_cols);
-        let output = concat_zsets(vec![left_out, right_out, correction], out_schema)?;
-        Ok((
-            output,
-            crate::governor::DeltaAmplificationCounters {
-                input_deltas,
-                probes: arrangement_probes,
-                shuffled_bytes: 0,
-                intermediate_tuples: 0,
-                output_deltas: 0,
-                state_writes,
-            },
-        ))
+        self.core
+            .lock()
+            .unwrap()
+            .process_epoch_with_counters_mut(left, right)
+    }
+
+    /// Begin a resumable CPU/byte-budgeted chunked epoch execution on this shared `JoinOp`
+    /// (Issue #402 R4). State is only committed when all phases finish without cancellation.
+    pub fn begin_chunked_epoch(
+        self: &Arc<Self>,
+        left: ArrowZSet,
+        right: ArrowZSet,
+    ) -> Result<ResumableJoinEpoch, OpError> {
+        ResumableJoinEpoch::new_shared(Arc::clone(self), left, right)
     }
 
     /// Fill-level metric for the left arrangement.
     pub fn left_entry_count(&self) -> usize {
-        self.state.lock().unwrap().left_entry_count()
+        self.core.lock().unwrap().left_entry_count()
     }
 
     /// Fill-level metric for the right arrangement.
     pub fn right_entry_count(&self) -> usize {
-        self.state.lock().unwrap().right_entry_count()
+        self.core.lock().unwrap().right_entry_count()
     }
 
     /// State bytes metric.
     pub fn state_bytes(&self) -> u64 {
-        let state = self.state.lock().unwrap();
-        let left_s = self.left_staged.lock().unwrap();
-        let right_s = self.right_staged.lock().unwrap();
-        state.state_bytes() + left_s.staged_bytes + right_s.staged_bytes
+        self.core.lock().unwrap().state_bytes()
     }
 
     /// Persist dirty arrangement state deltas to a `ShardDb` using only point puts/deletes.
-    ///
-    /// Persists only keys that changed or were removed during the epoch, ensuring
-    /// O(|Δ|) write amplification instead of O(|arrangement|).
-    /// No range deletion is used. Keys are `join_arr_key(side, op_id, ...)`.
     pub fn append_state(&self, target: &mut WriteBatch) -> Result<(), OpError> {
-        let mut batch = WriteBatch::new();
-
-        {
-            let state = self.state.lock().unwrap();
-            let mut dirty_left = self.dirty_left.lock().unwrap();
-            let mut dirty_right = self.dirty_right.lock().unwrap();
-
-            for (join_key, row_id) in dirty_left.drain() {
-                let key =
-                    ShardKeyEncoder::join_arr_key(JoinSide::Left, self.op_id.0, &join_key, row_id);
-                if let Some(arr_row) = state.left_arr.get(&join_key).and_then(|b| b.get(&row_id)) {
-                    if arr_row.weight > 0 {
-                        batch.put(&key, &arr_row.row_bytes);
-                    } else {
-                        batch.delete(&key);
-                    }
-                } else {
-                    batch.delete(&key);
-                }
-            }
-
-            for (join_key, row_id) in dirty_right.drain() {
-                let key =
-                    ShardKeyEncoder::join_arr_key(JoinSide::Right, self.op_id.0, &join_key, row_id);
-                if let Some(arr_row) = state.right_arr.get(&join_key).and_then(|b| b.get(&row_id)) {
-                    if arr_row.weight > 0 {
-                        batch.put(&key, &arr_row.row_bytes);
-                    } else {
-                        batch.delete(&key);
-                    }
-                } else {
-                    batch.delete(&key);
-                }
-            }
-        }
-
-        target.merge_from(batch);
-        Ok(())
+        self.core.lock().unwrap().append_state_mut(target)
     }
 
     pub async fn persist_state(&self, db: &ShardDb) -> Result<(), OpError> {
@@ -877,85 +1193,13 @@ impl JoinOp {
     }
 
     /// Load arrangement state from a `ShardDb` (crash-replay).
-    ///
-    /// Scans left/right arrangement prefixes; no range deletion.
-    ///
-    /// `left_key_cols` / `right_key_cols` default to `[0]` (single key column).
-    /// Call `with_key_cols` on the result to override if needed.
     pub async fn load_from_storage(db: &ShardDb, op_id: OperatorId) -> Result<Self, OpError> {
-        let mut st = JoinState::new();
-
-        // key format: [0x01][JL/JR:2][op_id:8][join_key_bytes][row_id:16]
-        // header = 1+2+8 = 11 bytes; row_id = last 16 bytes
-
-        // Load left arrangement.
-        let left_prefix = ShardKeyEncoder::join_arr_op_prefix(JoinSide::Left, op_id.0);
-        let left_entries = db
-            .scan_prefix(&left_prefix)
-            .await
-            .map_err(OpError::storage)?;
-        for (key, value) in left_entries {
-            if key.len() < 11 + 16 {
-                continue;
-            }
-            let join_key = key[11..key.len() - 16].to_vec();
-            let row_id = u128::from_be_bytes(key[key.len() - 16..].try_into().unwrap_or([0u8; 16]));
-            let row_bytes = value.to_vec();
-            st.left_arr.entry(join_key).or_default().insert(
-                row_id,
-                ArrRow {
-                    row_bytes,
-                    weight: 1,
-                },
-            );
-        }
-
-        // Load right arrangement.
-        let right_prefix = ShardKeyEncoder::join_arr_op_prefix(JoinSide::Right, op_id.0);
-        let right_entries = db
-            .scan_prefix(&right_prefix)
-            .await
-            .map_err(OpError::storage)?;
-        for (key, value) in right_entries {
-            if key.len() < 11 + 16 {
-                continue;
-            }
-            let join_key = key[11..key.len() - 16].to_vec();
-            let row_id = u128::from_be_bytes(key[key.len() - 16..].try_into().unwrap_or([0u8; 16]));
-            let row_bytes = value.to_vec();
-            st.right_arr.entry(join_key).or_default().insert(
-                row_id,
-                ArrRow {
-                    row_bytes,
-                    weight: 1,
-                },
-            );
-        }
-
-        Ok(JoinOp {
-            op_id,
-            left_key_cols: vec![0],
-            right_key_cols: vec![0],
-            left_n_cols: 2,
-            right_n_cols: 2,
-            state: Mutex::new(st),
-            left_staged: Mutex::new(StagedDelta::default()),
-            right_staged: Mutex::new(StagedDelta::default()),
-            dirty_left: Mutex::new(HashSet::new()),
-            dirty_right: Mutex::new(HashSet::new()),
-            db: Mutex::new(Some(Arc::new(db.clone()))),
-            state_loaded: AtomicBool::new(true),
-            loaded_left_keys: Mutex::new(HashSet::new()),
-            loaded_right_keys: Mutex::new(HashSet::new()),
-        })
+        let op = Self::new(op_id, vec![0], vec![0]);
+        op.restore_in_place(db).await?;
+        Ok(op)
     }
 
-    /// Load persisted left/right arrangement state from `db` into this
-    /// already-constructed instance in place (used by
-    /// `GatewayHandler::recover_compiled_views` to restore a recompiled
-    /// join view's dual arrangements after a process restart — keeps the
-    /// same `Arc<JoinOp>` already installed in the pipeline, unlike
-    /// `load_from_storage`'s freshly-returned instance).
+    /// Load persisted left/right arrangement state from `db` into this instance in place.
     pub async fn restore_in_place(&self, db: &ShardDb) -> Result<(), OpError> {
         let mut st = JoinState::new();
 
@@ -971,13 +1215,11 @@ impl JoinOp {
             let join_key = key[11..key.len() - 16].to_vec();
             let row_id = u128::from_be_bytes(key[key.len() - 16..].try_into().unwrap_or([0u8; 16]));
             let row_bytes = value.to_vec();
-            st.left_arr.entry(join_key).or_default().insert(
-                row_id,
-                ArrRow {
-                    row_bytes,
-                    weight: 1,
-                },
-            );
+            let weight = persisted_join_weight(db, &key).await?;
+            st.left_arr
+                .entry(join_key)
+                .or_default()
+                .insert(row_id, ArrRow { row_bytes, weight });
         }
 
         let right_prefix = ShardKeyEncoder::join_arr_op_prefix(JoinSide::Right, self.op_id.0);
@@ -992,26 +1234,450 @@ impl JoinOp {
             let join_key = key[11..key.len() - 16].to_vec();
             let row_id = u128::from_be_bytes(key[key.len() - 16..].try_into().unwrap_or([0u8; 16]));
             let row_bytes = value.to_vec();
-            st.right_arr.entry(join_key).or_default().insert(
-                row_id,
-                ArrRow {
-                    row_bytes,
-                    weight: 1,
-                },
-            );
+            let weight = persisted_join_weight(db, &key).await?;
+            st.right_arr
+                .entry(join_key)
+                .or_default()
+                .insert(row_id, ArrRow { row_bytes, weight });
         }
 
-        *self.state.lock().expect("JoinOp mutex poisoned") = st;
-        self.set_db(Arc::new(db.clone()));
-        self.state_loaded.store(true, Ordering::Release);
-        self.loaded_left_keys.lock().unwrap().clear();
-        self.loaded_right_keys.lock().unwrap().clear();
+        let mut core = self.core.lock().expect("JoinOp mutex poisoned");
+        core.state = st;
+        core.db = Some(Arc::new(db.clone()));
+        core.state_loaded = true;
+        core.loaded_left_keys.clear();
+        core.loaded_right_keys.clear();
         Ok(())
     }
 
     /// Operator ID.
     pub fn op_id(&self) -> OperatorId {
         self.op_id
+    }
+}
+
+// ─── Resumable Chunked Join Epoch (Issue #402 R4) ───────────────────────────
+
+struct PreparedJoinRow {
+    join_key: Vec<u8>,
+    row_id: u128,
+    row_bytes: Vec<u8>,
+    vals: Vec<i64>,
+    weight: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinChunkPhase {
+    LeftProbe,
+    RightProbe,
+    DeltaCorrection,
+    Done,
+}
+
+enum JoinChunkTarget {
+    Owned(Box<JoinStateCore>),
+    Shared(Arc<JoinOp>),
+}
+
+/// Resumable CPU/byte-budgeted execution of a high-fanout [`JoinOp`] epoch.
+///
+/// Advances across `ΔL ⋈ R₀`, `L₀ ⋈ ΔR`, and `ΔL ⋈ ΔR` in bounded chunks so
+/// sibling freshness-critical views can preempt between chunks. Commits staged
+/// arrangement updates atomically only upon completion; cancellation rolls back
+/// cleanly with zero arrangement mutation.
+pub struct ResumableJoinEpoch {
+    target: JoinChunkTarget,
+    left_n_cols: usize,
+    right_n_cols: usize,
+    out_schema: SchemaRef,
+    left_rows: Vec<PreparedJoinRow>,
+    right_rows: Vec<PreparedJoinRow>,
+    right_by_key: HashMap<Vec<u8>, Vec<(Vec<i64>, i64)>>,
+    phase: JoinChunkPhase,
+    row_idx: usize,
+    match_idx: usize,
+    active_matches: Vec<(Vec<i64>, i64)>,
+    active_matches_row: Option<(JoinChunkPhase, usize)>,
+}
+
+impl ResumableJoinEpoch {
+    pub fn new_shared(op: Arc<JoinOp>, left: ArrowZSet, right: ArrowZSet) -> Result<Self, OpError> {
+        let (op_id, left_key_cols, right_key_cols, left_n_cols, right_n_cols) = (
+            op.op_id,
+            op.left_key_cols.clone(),
+            op.right_key_cols.clone(),
+            op.left_n_cols,
+            op.right_n_cols,
+        );
+        Self::build(
+            JoinChunkTarget::Shared(op),
+            op_id,
+            &left_key_cols,
+            &right_key_cols,
+            left_n_cols,
+            right_n_cols,
+            left,
+            right,
+        )
+    }
+
+    pub fn new_owned(
+        core: JoinStateCore,
+        left: ArrowZSet,
+        right: ArrowZSet,
+    ) -> Result<Self, OpError> {
+        let op_id = core.op_id;
+        let left_key_cols = core.left_key_cols.clone();
+        let right_key_cols = core.right_key_cols.clone();
+        let left_n_cols = core.left_n_cols;
+        let right_n_cols = core.right_n_cols;
+        Self::build(
+            JoinChunkTarget::Owned(Box::new(core)),
+            op_id,
+            &left_key_cols,
+            &right_key_cols,
+            left_n_cols,
+            right_n_cols,
+            left,
+            right,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        target: JoinChunkTarget,
+        op_id: OperatorId,
+        left_key_cols: &[usize],
+        right_key_cols: &[usize],
+        left_n_cols: usize,
+        right_n_cols: usize,
+        left: ArrowZSet,
+        right: ArrowZSet,
+    ) -> Result<Self, OpError> {
+        left.validate()?;
+        right.validate()?;
+        let left_rows = Self::prepare_rows(op_id, &left, left_key_cols, left_n_cols)?;
+        let right_rows = Self::prepare_rows(op_id, &right, right_key_cols, right_n_cols)?;
+        let mut right_by_key: HashMap<Vec<u8>, Vec<(Vec<i64>, i64)>> = HashMap::new();
+        for row in &right_rows {
+            right_by_key
+                .entry(row.join_key.clone())
+                .or_default()
+                .push((row.vals.clone(), row.weight));
+        }
+        Ok(Self {
+            target,
+            left_n_cols,
+            right_n_cols,
+            out_schema: join_output_schema_n(left_n_cols, right_n_cols),
+            left_rows,
+            right_rows,
+            right_by_key,
+            phase: JoinChunkPhase::LeftProbe,
+            row_idx: 0,
+            match_idx: 0,
+            active_matches: Vec::new(),
+            active_matches_row: None,
+        })
+    }
+
+    fn prepare_rows(
+        op_id: OperatorId,
+        delta: &ArrowZSet,
+        key_cols: &[usize],
+        n_cols: usize,
+    ) -> Result<Vec<PreparedJoinRow>, OpError> {
+        if delta.is_empty() {
+            return Ok(Vec::new());
+        }
+        let capsule = delta.get_or_build_key_capsule(key_cols)?;
+        let mut rows = Vec::with_capacity(delta.num_rows());
+        for row_idx in 0..delta.num_rows() {
+            if capsule.row_contains_null(row_idx) {
+                continue;
+            }
+            let join_key = capsule.row_bytes(row_idx).to_vec();
+            let row_bytes = JoinOp::serialize_row(&delta.data, row_idx);
+            let row_id = stable_row_id(op_id.0, &join_key, &row_bytes);
+            let vals = JoinOp::deserialize_row(&row_bytes, n_cols);
+            rows.push(PreparedJoinRow {
+                join_key,
+                row_id,
+                row_bytes,
+                vals,
+                weight: delta.weights[row_idx],
+            });
+        }
+        Ok(rows)
+    }
+
+    /// Recover the owned [`JoinStateCore`] after completion or cancellation.
+    pub fn into_core(self) -> Option<JoinStateCore> {
+        match self.target {
+            JoinChunkTarget::Owned(core) => Some(*core),
+            JoinChunkTarget::Shared(_) => None,
+        }
+    }
+
+    fn with_core<R>(&mut self, f: impl FnOnce(&mut JoinStateCore) -> R) -> R {
+        match &mut self.target {
+            JoinChunkTarget::Owned(core) => f(core),
+            JoinChunkTarget::Shared(op) => {
+                let mut guard = op.core.lock().unwrap();
+                f(&mut guard)
+            }
+        }
+    }
+
+    /// Advance this join epoch by at most one [`ChunkBudget`], honoring `cancel`.
+    pub fn step(
+        &mut self,
+        budget: &ChunkBudget,
+        cancel: &CancellationToken,
+    ) -> Result<ChunkStepResult<ArrowZSet>, OpError> {
+        let started = Instant::now();
+        let row_byte_est = (self.left_n_cols + self.right_n_cols + 1) * 8;
+        let mut left_cols: Vec<Vec<i64>> = vec![Vec::new(); self.left_n_cols];
+        let mut right_cols: Vec<Vec<i64>> = vec![Vec::new(); self.right_n_cols];
+        let mut out_weights: Vec<i64> = Vec::new();
+        let mut probes = 0usize;
+
+        let check_budget = |rows: usize, probes: usize| -> bool {
+            rows >= budget.max_output_rows
+                || rows.saturating_mul(row_byte_est) >= budget.max_output_bytes
+                || probes >= budget.max_probes
+                || started.elapsed() >= budget.max_cpu_time
+        };
+
+        let mut yielded = false;
+
+        loop {
+            if cancel.is_cancelled() {
+                self.phase = JoinChunkPhase::Done;
+                self.active_matches.clear();
+                return Ok(ChunkStepResult::Cancelled {
+                    stats: ChunkStats {
+                        output_rows: 0,
+                        output_bytes: 0,
+                        probes,
+                        cpu_time: started.elapsed(),
+                    },
+                });
+            }
+
+            match self.phase {
+                JoinChunkPhase::LeftProbe => {
+                    if self.row_idx >= self.left_rows.len() {
+                        self.phase = JoinChunkPhase::RightProbe;
+                        self.row_idx = 0;
+                        self.match_idx = 0;
+                        self.active_matches.clear();
+                        self.active_matches_row = None;
+                        continue;
+                    }
+                    if self.active_matches_row != Some((JoinChunkPhase::LeftProbe, self.row_idx)) {
+                        let key = self.left_rows[self.row_idx].join_key.clone();
+                        let r_n = self.right_n_cols;
+                        let matches = self.with_core(|core| {
+                            core.state
+                                .probe_right(&key)
+                                .map(|(rb, rw)| (JoinOp::deserialize_row(rb, r_n), rw))
+                                .collect::<Vec<_>>()
+                        });
+                        self.active_matches = matches;
+                        self.active_matches_row = Some((JoinChunkPhase::LeftProbe, self.row_idx));
+                        self.match_idx = 0;
+                        probes += 1;
+                    }
+                    let l_row = &self.left_rows[self.row_idx];
+                    while self.match_idx < self.active_matches.len() {
+                        if cancel.is_cancelled() {
+                            break;
+                        }
+                        let (r_vals, r_w) = &self.active_matches[self.match_idx];
+                        for (i, v) in l_row.vals.iter().enumerate() {
+                            left_cols[i].push(*v);
+                        }
+                        for (i, v) in r_vals.iter().enumerate() {
+                            right_cols[i].push(*v);
+                        }
+                        out_weights.push(l_row.weight * *r_w);
+                        self.match_idx += 1;
+                        if check_budget(out_weights.len(), probes) {
+                            yielded = true;
+                            break;
+                        }
+                    }
+                    if cancel.is_cancelled() {
+                        continue;
+                    }
+                    if self.match_idx >= self.active_matches.len() {
+                        self.row_idx += 1;
+                        self.match_idx = 0;
+                        self.active_matches.clear();
+                        self.active_matches_row = None;
+                    }
+                    if yielded || check_budget(out_weights.len(), probes) {
+                        break;
+                    }
+                }
+                JoinChunkPhase::RightProbe => {
+                    if self.row_idx >= self.right_rows.len() {
+                        self.phase = JoinChunkPhase::DeltaCorrection;
+                        self.row_idx = 0;
+                        self.match_idx = 0;
+                        self.active_matches.clear();
+                        self.active_matches_row = None;
+                        continue;
+                    }
+                    if self.active_matches_row != Some((JoinChunkPhase::RightProbe, self.row_idx)) {
+                        let key = self.right_rows[self.row_idx].join_key.clone();
+                        let l_n = self.left_n_cols;
+                        let matches = self.with_core(|core| {
+                            core.state
+                                .probe_left(&key)
+                                .map(|(lb, lw)| (JoinOp::deserialize_row(lb, l_n), lw))
+                                .collect::<Vec<_>>()
+                        });
+                        self.active_matches = matches;
+                        self.active_matches_row = Some((JoinChunkPhase::RightProbe, self.row_idx));
+                        self.match_idx = 0;
+                        probes += 1;
+                    }
+                    let r_row = &self.right_rows[self.row_idx];
+                    while self.match_idx < self.active_matches.len() {
+                        if cancel.is_cancelled() {
+                            break;
+                        }
+                        let (l_vals, l_w) = &self.active_matches[self.match_idx];
+                        for (i, v) in l_vals.iter().enumerate() {
+                            left_cols[i].push(*v);
+                        }
+                        for (i, v) in r_row.vals.iter().enumerate() {
+                            right_cols[i].push(*v);
+                        }
+                        out_weights.push(*l_w * r_row.weight);
+                        self.match_idx += 1;
+                        if check_budget(out_weights.len(), probes) {
+                            yielded = true;
+                            break;
+                        }
+                    }
+                    if cancel.is_cancelled() {
+                        continue;
+                    }
+                    if self.match_idx >= self.active_matches.len() {
+                        self.row_idx += 1;
+                        self.match_idx = 0;
+                        self.active_matches.clear();
+                        self.active_matches_row = None;
+                    }
+                    if yielded || check_budget(out_weights.len(), probes) {
+                        break;
+                    }
+                }
+                JoinChunkPhase::DeltaCorrection => {
+                    if self.row_idx >= self.left_rows.len() {
+                        // All 3 phases finished without cancellation — commit staged state atomically!
+                        let left_rows = std::mem::take(&mut self.left_rows);
+                        let right_rows = std::mem::take(&mut self.right_rows);
+                        self.with_core(|core| {
+                            for row in left_rows {
+                                core.dirty_left.insert((row.join_key.clone(), row.row_id));
+                                core.state.update_left(
+                                    row.join_key,
+                                    row.row_id,
+                                    row.row_bytes,
+                                    row.weight,
+                                );
+                            }
+                            for row in right_rows {
+                                core.dirty_right.insert((row.join_key.clone(), row.row_id));
+                                core.state.update_right(
+                                    row.join_key,
+                                    row.row_id,
+                                    row.row_bytes,
+                                    row.weight,
+                                );
+                            }
+                        });
+                        self.phase = JoinChunkPhase::Done;
+                        break;
+                    }
+                    let l_row = &self.left_rows[self.row_idx];
+                    if let Some(matches) = self.right_by_key.get(&l_row.join_key) {
+                        if self.match_idx == 0 {
+                            probes += 1;
+                        }
+                        while self.match_idx < matches.len() {
+                            if cancel.is_cancelled() {
+                                break;
+                            }
+                            let (r_vals, r_w) = &matches[self.match_idx];
+                            for (i, v) in l_row.vals.iter().enumerate() {
+                                left_cols[i].push(*v);
+                            }
+                            for (i, v) in r_vals.iter().enumerate() {
+                                right_cols[i].push(*v);
+                            }
+                            out_weights.push(l_row.weight * *r_w);
+                            self.match_idx += 1;
+                            if check_budget(out_weights.len(), probes) {
+                                yielded = true;
+                                break;
+                            }
+                        }
+                        if cancel.is_cancelled() {
+                            continue;
+                        }
+                        if self.match_idx >= matches.len() {
+                            self.row_idx += 1;
+                            self.match_idx = 0;
+                        }
+                    } else {
+                        self.row_idx += 1;
+                        self.match_idx = 0;
+                    }
+                    if yielded || check_budget(out_weights.len(), probes) {
+                        break;
+                    }
+                }
+                JoinChunkPhase::Done => break,
+            }
+        }
+
+        let output_rows = out_weights.len();
+        let output_bytes = output_rows.saturating_mul(row_byte_est);
+        let batch = JoinOp::make_output_batch(left_cols, right_cols, &self.out_schema)?;
+        let zset = ArrowZSet::new(batch, out_weights);
+        let stats = ChunkStats {
+            output_rows,
+            output_bytes,
+            probes,
+            cpu_time: started.elapsed(),
+        };
+
+        if self.phase == JoinChunkPhase::Done {
+            Ok(ChunkStepResult::Completed {
+                final_output: zset,
+                stats,
+            })
+        } else {
+            Ok(ChunkStepResult::Yielded {
+                partial_output: zset,
+                stats,
+            })
+        }
+    }
+}
+
+impl ResumableChunkedOp for ResumableJoinEpoch {
+    fn step_chunk(
+        &mut self,
+        budget: &ChunkBudget,
+        cancel: &CancellationToken,
+    ) -> Result<ChunkStepResult<ArrowZSet>, OpError> {
+        self.step(budget, cancel)
     }
 }
 
@@ -1047,6 +1713,7 @@ pub fn concat_zsets(
         return Ok(batches.remove(0));
     }
     let schema = batches[0].schema();
+    let frontier = batches.iter().rev().find_map(|b| b.frontier.clone());
     let mut all_weights: Vec<i64> = Vec::new();
     let record_batches: Vec<RecordBatch> = batches
         .iter()
@@ -1057,7 +1724,35 @@ pub fn concat_zsets(
         .collect();
     let refs: Vec<&RecordBatch> = record_batches.iter().collect();
     let merged = arrow::compute::concat_batches(&schema, refs).map_err(OpError::arrow)?;
-    Ok(ArrowZSet::new(merged, all_weights))
+    let mut out = ArrowZSet::new(merged, all_weights);
+    out.frontier = frontier;
+
+    // Preserve any canonical `BatchKeyCapsule` whose `KeySpec` is attached to
+    // every concatenated batch without re-encoding keys.
+    for first_cap in &batches[0].key_capsules {
+        let spec = &first_cap.spec;
+        let matching_caps: Option<Vec<Arc<BatchKeyCapsule>>> = batches
+            .iter()
+            .map(|b| b.key_capsule_for(&spec.columns))
+            .collect();
+        if let Some(caps) = matching_caps {
+            let mut slices: Vec<(&[u8], u128, bool)> = Vec::with_capacity(out.num_rows());
+            for cap in &caps {
+                for row_idx in 0..cap.len() {
+                    slices.push((
+                        cap.row_bytes(row_idx),
+                        cap.row_hash_u128(row_idx),
+                        cap.row_contains_null(row_idx),
+                    ));
+                }
+            }
+            out.push_key_capsule(Arc::new(BatchKeyCapsule::from_encoded_slices(
+                spec.columns.clone(),
+                slices.into_iter(),
+            )));
+        }
+    }
+    Ok(out)
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -1226,6 +1921,69 @@ mod tests {
         let id1 = stable_row_id(1, b"key1", b"rowdata");
         let id2 = stable_row_id(1, b"key2", b"rowdata");
         assert_ne!(id1, id2);
+    }
+
+    #[tokio::test]
+    async fn weighted_join_restore_preserves_exact_retractions() {
+        let db = Arc::new(
+            ShardDb::builder(
+                "weighted-join-replay",
+                Arc::new(object_store::memory::InMemory::new()),
+            )
+            .build()
+            .await
+            .unwrap(),
+        );
+        let original = JoinOp::new(OperatorId(801), vec![0], vec![0]);
+        assert_eq!(
+            extract_join_output_3col(
+                &original
+                    .process_epoch(make_lr_batch(&[(7, 70, 3)]), make_lr_batch(&[(7, 700, 2)]),)
+                    .unwrap()
+            ),
+            vec![(7, 70, 700, 6)]
+        );
+        original.persist_state(&db).await.unwrap();
+        let recovered = JoinOp::load_from_storage(&db, OperatorId(801))
+            .await
+            .unwrap();
+        assert_eq!(
+            extract_join_output_3col(
+                &recovered
+                    .process_epoch(make_lr_batch(&[(7, 70, -1)]), make_lr_batch(&[]),)
+                    .unwrap()
+            ),
+            vec![(7, 70, 700, -2)]
+        );
+        recovered.persist_state(&db).await.unwrap();
+        // Exercise lazy restoration too: a point-loaded arrangement must use
+        // the same sidecar as a full restored operator.
+        let lazy = JoinOp::new(OperatorId(801), vec![0], vec![0]).with_db(db.clone());
+        let (output, _) = lazy
+            .process_epoch_with_storage(make_lr_batch(&[]), make_lr_batch(&[(7, 700, -1)]))
+            .await
+            .unwrap();
+        assert_eq!(extract_join_output_3col(&output), vec![(7, 70, 700, -2)]);
+        lazy.persist_state(&db).await.unwrap();
+        let recovered = JoinOp::load_from_storage(&db, OperatorId(801))
+            .await
+            .unwrap();
+        assert_eq!(
+            extract_join_output_3col(
+                &recovered
+                    .process_epoch(make_lr_batch(&[(7, 70, -2)]), make_lr_batch(&[]),)
+                    .unwrap()
+            ),
+            vec![(7, 70, 700, -2)]
+        );
+        recovered.persist_state(&db).await.unwrap();
+        assert_eq!(
+            db.scan_prefix(&ShardKeyEncoder::join_arr_op_prefix(JoinSide::Left, 801))
+                .await
+                .unwrap(),
+            vec![]
+        );
+        db.as_ref().clone().close().await.unwrap();
     }
 
     #[test]

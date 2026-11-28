@@ -57,10 +57,33 @@ pub struct DeploymentDescriptor {
     pub routing_columns: BTreeMap<String, usize>,
     pub shard: ShardLease,
     pub storage_identity: String,
+    /// Logical workload-relative shard index (`0..shard_count`), independent of
+    /// the globally allocated [`ShardId`].
+    #[serde(default)]
+    pub shard_index: u32,
 }
 
 impl DeploymentDescriptor {
+    /// Stable shared-store namespace, independent of the current lease holder.
+    pub fn object_store_prefix(&self) -> String {
+        format!(
+            "{}/workload-{}/shard-{}",
+            self.storage_root.trim_end_matches('/'),
+            self.workload_id.0,
+            self.shard.shard_id.0
+        )
+    }
+
     pub fn new(request: DeploymentRequest, shard: ShardLease, storage_identity: String) -> Self {
+        Self::with_shard_index(request, shard, storage_identity, 0)
+    }
+
+    pub fn with_shard_index(
+        request: DeploymentRequest,
+        shard: ShardLease,
+        storage_identity: String,
+        shard_index: u32,
+    ) -> Self {
         Self {
             version: request.version,
             workload_id: request.workload_id,
@@ -76,8 +99,49 @@ impl DeploymentDescriptor {
             routing_columns: request.routing_columns,
             shard,
             storage_identity,
+            shard_index,
         }
     }
+}
+
+/// Placement metadata for one deployed shard of a workload, used by direct
+/// data-plane routers to partition and stream Arrow IPC batches straight to
+/// shard owners without routing row payloads through `ControlService`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkloadShardPlacement {
+    pub shard_id: ShardId,
+    pub shard_index: u32,
+    pub worker_id: WorkerId,
+    pub worker_address: String,
+    pub lease_token: LeaseToken,
+    pub operator_id: OperatorId,
+    pub storage_identity: String,
+    pub frontier: Epoch,
+}
+
+/// Cached, versioned placement table for a deployed workload.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkloadTopologySnapshot {
+    pub topology_epoch: u64,
+    pub workload_id: WorkloadId,
+    /// The deployed logical plan, used for executable skew admission.
+    #[serde(default)]
+    pub plan_json: String,
+    pub routing_columns: BTreeMap<String, usize>,
+    pub schemas: Vec<DeploymentSchema>,
+    pub shards: Vec<WorkloadShardPlacement>,
+    pub workers: Vec<crate::topology::WorkerInfo>,
+}
+
+/// Explicit single-owner lease for a source connector task so multiple gateway
+/// replicas never duplicate ingestion for the same connector.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConnectorLease {
+    pub connector_id: crate::ids::ConnectorId,
+    pub owner_id: String,
+    pub lease_token: LeaseToken,
+    pub acquired_at_ms: u64,
+    pub expires_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -96,8 +160,36 @@ pub struct SourceDeltaRequest {
     pub rows: Vec<RuntimeRow>,
 }
 
+/// Durable record of a source epoch that has not yet been fully reconciled.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OwnedEpochIntent {
+    pub attempt_id: uuid::Uuid,
+    pub version: u32,
+    pub request_id: String,
+    pub workload_id: WorkloadId,
+    pub epoch: Epoch,
+    pub source: String,
+    pub anchor_shard: ShardId,
+    pub target_shards: Vec<ShardId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JoinBootstrap {
+    /// The opposite input whose committed low-cardinality rows must be
+    /// installed before this frame's high-cardinality delta is evaluated.
+    pub source: String,
+    pub rows: Vec<RuntimeRow>,
+    /// Exact final group transitions when executable arithmetic admission
+    /// returns a key to its canonical summary owner. These are part of the
+    /// same replay identity and durable sink commit as the source epoch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub final_rows: Vec<RuntimeRow>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeExchangeMessage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<uuid::Uuid>,
     pub version: u32,
     pub request_id: String,
     pub workload_id: WorkloadId,
@@ -107,6 +199,10 @@ pub struct RuntimeExchangeMessage {
     pub lease_token: LeaseToken,
     pub source: String,
     pub rows: Vec<RuntimeRow>,
+    /// A bounded low-side snapshot installed atomically with the source
+    /// delta, arrangement state, output, and execution replay identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_bootstrap: Option<JoinBootstrap>,
 }
 
 impl RuntimeExchangeMessage {
@@ -139,6 +235,8 @@ impl RuntimeExchangeMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeOutputDelta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<uuid::Uuid>,
     pub version: u32,
     pub request_id: String,
     pub workload_id: WorkloadId,
@@ -164,11 +262,28 @@ pub struct WorkerExecutionStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ShardOutput {
     pub shard_id: ShardId,
+    #[serde(default)]
+    pub lease_token: Option<LeaseToken>,
+    /// Durable application frontier captured under the shard execution gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committed_epoch: Option<Epoch>,
+    /// Completed global routing epoch; present only on the workload anchor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_epoch: Option<Epoch>,
+    #[serde(default)]
     pub deltas: Vec<RuntimeOutputDelta>,
+    #[serde(default)]
+    pub rows: Vec<RuntimeRow>,
 }
+
+pub const WORKLOAD_SNAPSHOT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkloadSnapshot {
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
+    pub complete: bool,
     pub deployment: DeploymentRequest,
     pub shards: Vec<ShardOutput>,
     pub workers: Vec<WorkerExecutionStatus>,
@@ -213,6 +328,7 @@ mod tests {
             "lfs:worker-5/shard-2".into(),
         );
         let output = RuntimeOutputDelta {
+            attempt_id: None,
             version: 1,
             request_id: "request-9".into(),
             workload_id: WorkloadId(7),
@@ -227,10 +343,16 @@ mod tests {
             }],
         };
         let snapshot = WorkloadSnapshot {
+            version: WORKLOAD_SNAPSHOT_VERSION,
+            complete: true,
             deployment: request.clone(),
             shards: vec![ShardOutput {
                 shard_id: ShardId(2),
+                lease_token: Some(LeaseToken(13)),
+                committed_epoch: None,
+                routing_epoch: None,
                 deltas: vec![output.clone()],
+                rows: vec![],
             }],
             workers: vec![WorkerExecutionStatus {
                 worker_id: WorkerId(5),
@@ -251,6 +373,8 @@ mod tests {
             rows: output.rows.clone(),
         };
         let exchange = RuntimeExchangeMessage {
+            join_bootstrap: None,
+            attempt_id: None,
             version: output.version,
             request_id: output.request_id.clone(),
             workload_id: output.workload_id,
@@ -295,6 +419,7 @@ mod tests {
             weight: 1,
         }];
         let output = RuntimeOutputDelta {
+            attempt_id: None,
             version: 1,
             request_id: "request-9".into(),
             workload_id: WorkloadId(7),
@@ -315,14 +440,22 @@ mod tests {
             ready: true,
         };
         let snapshot = WorkloadSnapshot {
+            version: WORKLOAD_SNAPSHOT_VERSION,
+            complete: true,
             deployment: request.clone(),
             shards: vec![ShardOutput {
                 shard_id: ShardId(2),
+                lease_token: Some(LeaseToken(13)),
+                committed_epoch: None,
+                routing_epoch: None,
                 deltas: vec![output.clone()],
+                rows: vec![],
             }],
             workers: vec![status.clone()],
         };
         let frame = RuntimeExchangeMessage {
+            join_bootstrap: None,
+            attempt_id: None,
             version: 1,
             request_id: "request-9".into(),
             workload_id: WorkloadId(7),
@@ -343,6 +476,12 @@ mod tests {
             ControlMessage::SourceDeltaCommitted {
                 request_id: "request-9".into(),
                 epoch: 12,
+            },
+            ControlMessage::ReadWorkload {
+                version: WORKLOAD_SNAPSHOT_VERSION,
+                request_id: "read-9".into(),
+                workload_id: WorkloadId(7),
+                shard_ids: vec![ShardId(2)],
             },
             ControlMessage::WorkloadSnapshot { snapshot },
         ];
@@ -374,7 +513,26 @@ mod tests {
                 output_rows: 4,
             },
             WorkerMessage::ReadWorkload {
+                version: WORKLOAD_SNAPSHOT_VERSION,
                 workload_id: WorkloadId(7),
+            },
+            WorkerMessage::WorkloadReadReport {
+                version: WORKLOAD_SNAPSHOT_VERSION,
+                request_id: "read-9".into(),
+                workload_id: WorkloadId(7),
+                worker_id: WorkerId(5),
+                available: true,
+                shards: vec![ShardOutput {
+                    shard_id: ShardId(2),
+                    lease_token: Some(LeaseToken(13)),
+                    committed_epoch: None,
+                    routing_epoch: None,
+                    deltas: vec![],
+                    rows: vec![RuntimeRow {
+                        values_tsv: "42".into(),
+                        weight: 2,
+                    }],
+                }],
             },
         ];
 

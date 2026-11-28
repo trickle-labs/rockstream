@@ -2,6 +2,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -27,6 +28,53 @@ use rockstream_types::ids::WorkerId;
 use rockstream_types::topology::WorkerMessage;
 
 pub type SecurityAuditWaiters = Arc<parking_lot::Mutex<HashMap<String, oneshot::Sender<bool>>>>;
+
+pub(crate) fn remove_security_audit_waiter(
+    waiters: &SecurityAuditWaiters,
+    request_id: &str,
+    capacity: usize,
+) -> Option<oneshot::Sender<bool>> {
+    let mut pending = waiters.lock();
+    let waiter = pending.remove(request_id);
+    if waiter.is_some() {
+        rockstream_types::metrics::set_security_audit_transport_metrics(
+            pending.len() as u64,
+            capacity as u64,
+        );
+    }
+    waiter
+}
+
+pub(crate) fn drain_security_audit_waiters(
+    waiters: &SecurityAuditWaiters,
+) -> Vec<oneshot::Sender<bool>> {
+    let mut pending = waiters.lock();
+    let drained = std::mem::take(&mut *pending);
+    rockstream_types::metrics::set_security_audit_transport_metrics(0, 0);
+    drained.into_values().collect()
+}
+
+struct SecurityAuditWaiterGuard {
+    waiters: SecurityAuditWaiters,
+    request_id: String,
+    capacity: usize,
+}
+
+impl Drop for SecurityAuditWaiterGuard {
+    fn drop(&mut self) {
+        remove_security_audit_waiter(&self.waiters, &self.request_id, self.capacity);
+    }
+}
+
+pub(crate) type OwnedShuffleHandler = Arc<
+    dyn Fn(
+            ShuffleFrame,
+            bytes::Bytes,
+            bool,
+        ) -> Pin<Box<dyn Future<Output = Result<bytes::Bytes, String>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// Holds the input channel and Schema metadata for a local exchange target.
 #[derive(Clone)]
@@ -116,6 +164,11 @@ impl ExchangeRegistry {
         worker_messages: mpsc::Sender<WorkerMessage>,
         waiters: SecurityAuditWaiters,
     ) -> Self {
+        let capacity = worker_messages.max_capacity();
+        rockstream_types::metrics::set_security_audit_transport_metrics(
+            waiters.lock().len() as u64,
+            capacity as u64,
+        );
         self.worker_messages = Some(worker_messages);
         self.security_audit_waiters = Some(waiters);
         self
@@ -135,17 +188,26 @@ impl ExchangeRegistry {
             )))
         })?;
         let request_id = record.event_id.clone();
+        let capacity = worker_messages.max_capacity();
         let (ack_tx, ack_rx) = oneshot::channel();
         {
             let mut waiters = waiters.lock();
-            if waiters.len() >= worker_messages.max_capacity() || waiters.contains_key(&request_id)
-            {
+            if waiters.len() >= capacity || waiters.contains_key(&request_id) {
                 return Err(Box::new(Status::unavailable(format!(
                     "{RS_0003}: required security audit capacity is unavailable"
                 ))));
             }
             waiters.insert(request_id.clone(), ack_tx);
+            rockstream_types::metrics::set_security_audit_transport_metrics(
+                waiters.len() as u64,
+                capacity as u64,
+            );
         }
+        let _waiter_guard = SecurityAuditWaiterGuard {
+            waiters: waiters.clone(),
+            request_id: request_id.clone(),
+            capacity,
+        };
         if worker_messages
             .try_send(WorkerMessage::ReportSecurityAudit {
                 request_id: request_id.clone(),
@@ -153,19 +215,15 @@ impl ExchangeRegistry {
             })
             .is_err()
         {
-            waiters.lock().remove(&request_id);
             return Err(Box::new(Status::unavailable(format!(
                 "{RS_0003}: required security audit transport is unavailable"
             ))));
         }
         match tokio::time::timeout(Duration::from_secs(30), ack_rx).await {
             Ok(Ok(true)) => Ok(()),
-            _ => {
-                waiters.lock().remove(&request_id);
-                Err(Box::new(Status::unavailable(format!(
-                    "{RS_0003}: required security audit append failed"
-                ))))
-            }
+            _ => Err(Box::new(Status::unavailable(format!(
+                "{RS_0003}: required security audit append failed"
+            )))),
         }
     }
 
@@ -237,6 +295,33 @@ impl ExchangeRegistry {
             scope: AuditField::Known("worker_shuffle".to_owned()),
             action: SecurityAuditClass::AuthorizationDenial,
             outcome: SecurityAuditOutcome::Denied,
+            correlation: AuditCorrelation::Observed(format!(
+                "exchange:{}:source:{}:target:{}:epoch:{}:sequence:{}",
+                frame.exchange_id, frame.src_shard, frame.target_shard, frame.epoch, frame.seq
+            )),
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::NotApplicable,
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        })
+        .await
+    }
+
+    pub(crate) async fn audit_direct_epoch_denial(
+        &self,
+        frame: &ShuffleFrame,
+    ) -> Result<(), Box<Status>> {
+        self.append_security_audit(SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: format!("direct-epoch-authorization:{}", uuid::Uuid::new_v4()),
+            timestamp_ms: crate::direct_grants::now_ms().max(1),
+            actor: AuditIdentity::Unknown,
+            target: AuditField::Unverified(format!("workload:{}", frame.exchange_id)),
+            scope: AuditField::Known("direct_source_epoch".to_owned()),
+            action: SecurityAuditClass::AuthorizationDenial,
+            outcome: SecurityAuditOutcome::Denied,
+            // Only fixed-size frame identifiers enter the audit record. Never
+            // include capability tokens, input rows, or unverified source text.
             correlation: AuditCorrelation::Observed(format!(
                 "exchange:{}:source:{}:target:{}:epoch:{}:sequence:{}",
                 frame.exchange_id, frame.src_shard, frame.target_shard, frame.epoch, frame.seq
@@ -372,10 +457,16 @@ pub struct ExchangeService {
     internal_tls: Option<rockstream_types::identity::InternalTlsConfig>,
     tls_reloader: Option<Arc<rockstream_types::tls::TlsCertificateReloader>>,
     protocol_range: SupportedVersionRange,
+    owned_handler: Option<OwnedShuffleHandler>,
     insecure_internal_dev: bool,
 }
 
 impl ExchangeService {
+    pub(crate) fn with_owned_handler(mut self, handler: OwnedShuffleHandler) -> Self {
+        self.owned_handler = Some(handler);
+        self
+    }
+
     pub fn new(registry: ExchangeRegistry) -> Self {
         Self {
             registry,
@@ -384,7 +475,11 @@ impl ExchangeService {
             exchange_config: ExchangeConfig::default(),
             internal_tls: None,
             tls_reloader: None,
-            protocol_range: SupportedVersionRange::v1_through_v3(),
+            protocol_range: SupportedVersionRange::new(
+                rockstream_types::compatibility::ProtocolVersion::V1,
+                rockstream_types::compatibility::ProtocolVersion::V4,
+            ),
+            owned_handler: None,
             insecure_internal_dev: false,
         }
     }
@@ -441,6 +536,17 @@ impl ExchangeService {
         &self,
         addr: std::net::SocketAddr,
     ) -> Result<tokio::task::JoinHandle<()>, String> {
+        let listener = tokio::net::TcpListener::bind(addr).await.map_err(|error| {
+            format!("{RS_0001}: failed to bind worker shuffle listener {addr}: {error}")
+        })?;
+        self.start_listener(listener).await
+    }
+
+    pub(crate) async fn start_listener(
+        &self,
+        listener: tokio::net::TcpListener,
+    ) -> Result<tokio::task::JoinHandle<()>, String> {
+        let addr = listener.local_addr().map_err(|error| error.to_string())?;
         let _ = rustls::crypto::ring::default_provider().install_default();
         let tls_reloader = if let Some(tls_cfg) = &self.internal_tls {
             if !tls_cfg.is_enabled() {
@@ -472,10 +578,7 @@ impl ExchangeService {
                 "{RS_2410}: plaintext worker shuffle requires explicit loopback development opt-in"
             ));
         }
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(|error| {
-            format!("{RS_0001}: failed to bind worker shuffle listener {addr}: {error}")
-        })?;
-        let server = ShuffleServer::new_with_tracker(
+        let mut server = ShuffleServer::new_with_tracker(
             self.registry.clone(),
             Some(self.task_tracker.clone()),
             Some(self.cancel_token.clone()),
@@ -483,6 +586,7 @@ impl ExchangeService {
         .with_exchange_config(self.exchange_config.clone())
         .with_supported_protocol_range(self.protocol_range)
         .with_required_worker_identity(tls_reloader.is_some());
+        server.owned_handler = self.owned_handler.clone();
         let cancel_token = self.cancel_token.clone();
         let task_tracker = self.task_tracker.clone();
 
@@ -600,6 +704,7 @@ pub struct ShuffleServer {
     exchange_config: ExchangeConfig,
     protocol_range: SupportedVersionRange,
     require_worker_identity: bool,
+    owned_handler: Option<OwnedShuffleHandler>,
 }
 
 impl ShuffleServer {
@@ -609,8 +714,12 @@ impl ShuffleServer {
             task_tracker: None,
             cancel_token: None,
             exchange_config: ExchangeConfig::default(),
-            protocol_range: SupportedVersionRange::v1_through_v3(),
+            protocol_range: SupportedVersionRange::new(
+                rockstream_types::compatibility::ProtocolVersion::V1,
+                rockstream_types::compatibility::ProtocolVersion::V4,
+            ),
             require_worker_identity: false,
+            owned_handler: None,
         }
     }
 
@@ -624,8 +733,12 @@ impl ShuffleServer {
             task_tracker,
             cancel_token,
             exchange_config: ExchangeConfig::default(),
-            protocol_range: SupportedVersionRange::v1_through_v3(),
+            protocol_range: SupportedVersionRange::new(
+                rockstream_types::compatibility::ProtocolVersion::V1,
+                rockstream_types::compatibility::ProtocolVersion::V4,
+            ),
             require_worker_identity: false,
+            owned_handler: None,
         }
     }
 
@@ -682,6 +795,11 @@ impl ShuffleServer {
                 ));
             }
         };
+        if identity.role == NodeRole::Gateway
+            && request.metadata().contains_key("rs-owned-context-bin")
+        {
+            return Ok(None);
+        }
         if identity.role != NodeRole::Worker {
             return Err((
                 Status::permission_denied(format!(
@@ -769,6 +887,89 @@ impl ShuffleService for ShuffleServer {
             }
         };
         self.validate_protocol_version(request.metadata())?;
+        let owned_context = request
+            .metadata()
+            .get_bin("rs-owned-context-bin")
+            .map(|value| value.to_bytes())
+            .transpose()
+            .map_err(|_| Status::invalid_argument("invalid owned shuffle context"))?;
+        if let Some(context) = owned_context {
+            let require_actor_grant =
+                self.require_worker_identity && authenticated_worker_id.is_none();
+            let handler = self
+                .owned_handler
+                .clone()
+                .ok_or_else(|| Status::unimplemented("owned shuffle execution is unavailable"))?;
+            let registry = self.registry.clone();
+            let mut stream = request.into_inner();
+            let (tx, rx) = mpsc::channel(2);
+            let task = async move {
+                let frame = match stream.next().await {
+                    Some(Ok(frame)) => frame,
+                    Some(Err(error)) => {
+                        let _ = tx.send(Err(error)).await;
+                        return;
+                    }
+                    None => {
+                        let _ = tx
+                            .send(Err(Status::invalid_argument(
+                                "owned shuffle requires one frame",
+                            )))
+                            .await;
+                        return;
+                    }
+                };
+                registry
+                    .grpc_frames_received
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                match stream.next().await {
+                    None => {}
+                    Some(Ok(_)) => {
+                        let _ = tx
+                            .send(Err(Status::invalid_argument(
+                                "owned shuffle accepts only one frame",
+                            )))
+                            .await;
+                        return;
+                    }
+                    Some(Err(error)) => {
+                        let _ = tx.send(Err(error)).await;
+                        return;
+                    }
+                }
+                let mut ack = ShuffleAck {
+                    exchange_id: frame.exchange_id,
+                    src_shard: frame.src_shard,
+                    target_shard: frame.target_shard,
+                    epoch: frame.epoch,
+                    seq: frame.seq,
+                    credit_grant: frame.row_count.max(1),
+                    owned_result: Default::default(),
+                };
+                let result = handler(frame, context, require_actor_grant).await;
+                if let Ok(result) = &result {
+                    ack.owned_result = result.to_vec();
+                }
+                if tx.send(Ok(ack)).await.is_err() {
+                    return;
+                }
+                if let Err(error) = result {
+                    let _ = tx.send(Err(Status::failed_precondition(error))).await;
+                }
+            };
+            if let Some(tracker) = &self.task_tracker {
+                tracker.spawn(task);
+            } else {
+                tokio::spawn(task);
+            }
+            let mut response =
+                Response::new(Box::pin(RxStream { rx }) as Self::ShuffleStreamStream);
+            response.metadata_mut().insert(
+                "rs-owned-version",
+                tonic::metadata::MetadataValue::from_static("1"),
+            );
+            return Ok(response);
+        }
         let mut stream = request.into_inner();
         let registry = self.registry.clone();
         let require_local_assignment = self.require_worker_identity;
@@ -874,6 +1075,7 @@ impl ShuffleService for ShuffleServer {
                             epoch: frame.epoch,
                             seq: frame.seq,
                             credit_grant: frame.row_count.max(1),
+                            owned_result: Default::default(),
                         };
 
                         if tx.send(Ok(ack)).await.is_err() {
@@ -986,6 +1188,167 @@ mod tests {
     /// `rockstream_types::metrics::tests`.
     static SHM_TEST_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
     static FLOW_CONTROL_TEST_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn direct_epoch_denial_audit_is_bounded_and_waits_for_durable_receipt() {
+        let _metrics_guard = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
+        let (sender, mut receiver) = mpsc::channel::<WorkerMessage>(1);
+        let waiters = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let registry = ExchangeRegistry::new().with_security_audit(sender, waiters.clone());
+        let frame = ShuffleFrame {
+            exchange_id: 7,
+            src_shard: 2,
+            target_shard: 3,
+            epoch: 19,
+            seq: 0,
+            payload: b"private source values must not be audited".to_vec(),
+            row_count: 1,
+        };
+        let append = tokio::spawn({
+            let registry = registry.clone();
+            let frame = frame.clone();
+            async move { registry.audit_direct_epoch_denial(&frame).await }
+        });
+        let Some(WorkerMessage::ReportSecurityAudit { request_id, record }) = receiver.recv().await
+        else {
+            panic!("direct epoch denial did not reach the required audit transport");
+        };
+        assert_eq!(
+            record,
+            SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: request_id.clone(),
+                timestamp_ms: record.timestamp_ms,
+                actor: AuditIdentity::Unknown,
+                target: AuditField::Unverified("workload:7".to_owned()),
+                scope: AuditField::Known("direct_source_epoch".to_owned()),
+                action: SecurityAuditClass::AuthorizationDenial,
+                outcome: SecurityAuditOutcome::Denied,
+                correlation: AuditCorrelation::Observed(
+                    "exchange:7:source:2:target:3:epoch:19:sequence:0".to_owned()
+                ),
+                operation_id: AuditField::NotApplicable,
+                policy_revision: AuditField::NotApplicable,
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::NotApplicable,
+            }
+        );
+        assert!(record.timestamp_ms > 0);
+        let error = registry
+            .audit_direct_epoch_denial(&frame)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (error.code(), error.message()),
+            (
+                tonic::Code::Unavailable,
+                "RS-0003: required security audit capacity is unavailable"
+            )
+        );
+        assert!(!append.is_finished());
+        remove_security_audit_waiter(&waiters, &request_id, 1)
+            .unwrap()
+            .send(true)
+            .unwrap();
+        assert_eq!(
+            append.await.unwrap().map_err(|error| error.to_string()),
+            Ok(())
+        );
+        assert!(waiters.lock().is_empty());
+    }
+
+    // Keep global metric resets and snapshots isolated across async waits.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn security_audit_transport_metrics_track_pending_and_recovery() {
+        let _flow_guard = FLOW_CONTROL_TEST_LOCK.lock().await;
+        let _metrics_guard = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
+        rockstream_types::metrics::reset_all();
+
+        let (sender, mut receiver) = mpsc::channel::<WorkerMessage>(1);
+        let waiters = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let registry = ExchangeRegistry::new().with_security_audit(sender, waiters.clone());
+        let append = tokio::spawn({
+            let registry = registry.clone();
+            async move {
+                registry
+                    .append_security_audit(ExchangeRegistry::node_identity_rejection(
+                        AuditIdentity::Unknown,
+                        AuditField::Unknown,
+                    ))
+                    .await
+            }
+        });
+
+        let Some(WorkerMessage::ReportSecurityAudit { .. }) = receiver.recv().await else {
+            panic!("security audit transport did not receive the request");
+        };
+        let metric_lines = || {
+            rockstream_types::metrics::generate_prometheus_metrics()
+                .lines()
+                .filter(|line| {
+                    line.starts_with("# HELP security_audit_transport_")
+                        || line.starts_with("# TYPE security_audit_transport_")
+                        || line.starts_with("security_audit_transport_")
+                })
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let expected_lines = |pending| {
+            vec![
+                "# HELP security_audit_transport_capacity Maximum in-flight worker security audit acknowledgements.".to_owned(),
+                "# TYPE security_audit_transport_capacity gauge".to_owned(),
+                "security_audit_transport_capacity 1".to_owned(),
+                "# HELP security_audit_transport_pending Worker security audit requests awaiting durable acknowledgement.".to_owned(),
+                "# TYPE security_audit_transport_pending gauge".to_owned(),
+                format!("security_audit_transport_pending {pending}"),
+            ]
+        };
+        assert_eq!(metric_lines(), expected_lines(1));
+
+        let full_error = registry
+            .append_security_audit(ExchangeRegistry::node_identity_rejection(
+                AuditIdentity::Unknown,
+                AuditField::Unknown,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(full_error.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            full_error.message(),
+            "RS-0003: required security audit capacity is unavailable"
+        );
+
+        append.abort();
+        assert!(append.await.unwrap_err().is_cancelled());
+        assert_eq!(metric_lines(), expected_lines(0));
+
+        let append = tokio::spawn({
+            let registry = registry.clone();
+            async move {
+                registry
+                    .append_security_audit(ExchangeRegistry::node_identity_rejection(
+                        AuditIdentity::Unknown,
+                        AuditField::Unknown,
+                    ))
+                    .await
+            }
+        });
+        let Some(WorkerMessage::ReportSecurityAudit { request_id, .. }) = receiver.recv().await
+        else {
+            panic!("recovered security audit transport did not receive the request");
+        };
+        assert_eq!(metric_lines(), expected_lines(1));
+        let waiter = remove_security_audit_waiter(&waiters, &request_id, 1)
+            .expect("request must be waiting for its durable acknowledgement");
+        waiter
+            .send(true)
+            .expect("append task must still be waiting");
+        assert!(append.await.unwrap().is_ok());
+        assert_eq!(metric_lines(), expected_lines(0));
+        rockstream_types::metrics::reset_all();
+    }
 
     fn worker_info(worker_id: u64, address: String, host_id: &str, az: &str) -> WorkerInfo {
         worker_info_with_codecs(worker_id, address, host_id, az, true, true)
@@ -1142,6 +1505,7 @@ mod tests {
     struct DelayedAckShuffleService {
         release_first_ack: Arc<tokio::sync::Notify>,
         frames_seen: Arc<AtomicUsize>,
+        frames: Arc<parking_lot::Mutex<Vec<ShuffleFrame>>>,
     }
 
     #[tonic::async_trait]
@@ -1156,9 +1520,11 @@ mod tests {
             let (tx, rx) = mpsc::channel(8);
             let release_first_ack = self.release_first_ack.clone();
             let frames_seen = self.frames_seen.clone();
+            let frames = self.frames.clone();
             tokio::spawn(async move {
                 while let Some(frame) = stream.next().await.transpose()? {
                     let index = frames_seen.fetch_add(1, Ordering::Relaxed);
+                    frames.lock().push(frame.clone());
                     if index == 0 {
                         release_first_ack.notified().await;
                     }
@@ -1169,6 +1535,7 @@ mod tests {
                         epoch: frame.epoch,
                         seq: frame.seq,
                         credit_grant: frame.row_count.max(1),
+                        owned_result: Default::default(),
                     }))
                     .await
                     .map_err(|_| Status::cancelled("ack receiver dropped"))?;
@@ -1190,6 +1557,70 @@ mod tests {
             let (_tx, rx) = mpsc::channel(1);
             Ok(Response::new(Box::pin(RxStream { rx })))
         }
+    }
+
+    #[tokio::test]
+    async fn owned_shuffle_rejects_a_peer_without_execution_support_before_sending() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let old_peer = DelayedAckShuffleService::default();
+        let observed = old_peer.frames.clone();
+        let server_task = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(
+                    crate::exchange::proto::shuffle_service_server::ShuffleServiceServer::new(
+                        old_peer,
+                    ),
+                )
+                .serve(addr)
+                .await
+                .unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let peers = Arc::new(parking_lot::RwLock::new(HashMap::from([(
+            WorkerId(2),
+            addr.to_string(),
+        )])));
+        let pool = ShuffleClientPool::new(peers);
+        pool.set_local_worker_info(worker_info(
+            1,
+            "127.0.0.1:9001".into(),
+            "host-a",
+            "same-zone",
+        ));
+        pool.upsert_peer_info(worker_info(2, addr.to_string(), "host-b", "same-zone"));
+        let flow = FlowController::new();
+        let mux = WorkerStreamMultiplexer::new(pool, flow.clone());
+        let batch = ArrowZSet::from_ab_rows(&[(1, 10), (2, 20)], 1);
+        let frame = ShuffleFrame {
+            exchange_id: 100,
+            src_shard: 0,
+            target_shard: 1,
+            epoch: 1,
+            seq: 0,
+            payload: serialize_zset(&batch).unwrap().into(),
+            row_count: 2,
+        };
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                mux.send_owned_frame(WorkerId(2), frame, bytes::Bytes::from_static(b"context"))
+            )
+            .await
+            .unwrap(),
+            Err("peer does not support owned shuffle execution".to_owned())
+        );
+        assert_eq!(&*observed.lock(), &Vec::<ShuffleFrame>::new());
+        assert_eq!(
+            (
+                flow.rows_in_flight(100, 0, 1),
+                flow.batches_in_flight(100, 0, 1)
+            ),
+            (0, 0)
+        );
+        mux.shutdown().await;
+        server_task.abort();
     }
 
     #[tokio::test]
@@ -1529,6 +1960,7 @@ mod tests {
             epoch: 1,
             seq: 1,
             credit_grant: 1,
+            owned_result: Default::default(),
         };
         flow_controller.handle_ack(&ack);
 
@@ -1559,6 +1991,7 @@ mod tests {
             epoch: 1,
             seq: 1,
             credit_grant: 5,
+            owned_result: Default::default(),
         });
         assert_eq!(flow_controller.get_credits(7, 1, 2), 8);
         assert_eq!(flow_controller.rows_in_flight(7, 1, 2), 0);
@@ -2823,7 +3256,7 @@ mod tests {
         writer.finish(&store, &path).await.unwrap();
 
         let (_target_store, target_db) = shard_db("dst-mixed-replay").await;
-        let (registry, mut inlet_rx) = make_receiver_registry(target_db);
+        let (registry, mut inlet_rx) = make_receiver_registry(target_db.clone());
         let multiplexer = WorkerStreamMultiplexer::new(
             ShuffleClientPool::new(Arc::new(parking_lot::RwLock::new(HashMap::new()))),
             FlowController::new(),
@@ -2840,6 +3273,9 @@ mod tests {
             inlet_rx.recv().await.unwrap().positive_ab_rows(),
             vec![(32, 320)]
         );
+        crate::exchange::persistence::advance_committed_frontier(&target_db, 1)
+            .await
+            .unwrap();
         multiplexer
             .catch_up_durable(100, 1, WorkerId(501), WorkerId(502), &registry, &store)
             .await

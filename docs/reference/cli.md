@@ -16,7 +16,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ### `rockstream admin backup`
 
-Point-in-time durable backup operations (create, inspect, verify)
+Create backups through authenticated management; inspect or verify local backup files
 
 Exit codes
 
@@ -30,7 +30,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 #### `rockstream admin backup create`
 
-Create a full point-in-time backup
+Create a full point-in-time backup through authenticated management
 
 Options
 
@@ -91,7 +91,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ### `rockstream admin checkpoint`
 
-Checkpoint administration and manual triggering
+Checkpoint administration (currently unavailable: no authenticated management endpoint)
 
 Exit codes
 
@@ -323,7 +323,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ### `rockstream admin restore`
 
-Restore a database backup into a clean or authorized destination
+Unavailable until the CLI exposes an authenticated backup-restore endpoint
 
 Options
 
@@ -345,7 +345,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ## `rockstream audit`
 
-Audit log inspection commands
+Local audit-history commands are unavailable; use authenticated `SHOW SECURITY AUDIT`
 
 Exit codes
 
@@ -359,7 +359,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ### `rockstream audit query`
 
-Query audit log events matching a filter
+Unavailable for local logs; use authenticated `SHOW SECURITY AUDIT`
 
 Options
 
@@ -380,7 +380,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ### `rockstream audit tail`
 
-Tail recent audit log events
+Unavailable for local logs; use authenticated `SHOW SECURITY AUDIT`
 
 Options
 
@@ -414,7 +414,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ## `rockstream checkpoint`
 
-Checkpoint inspection commands
+Checkpoint commands (currently unavailable: no authenticated management endpoint)
 
 Exit codes
 
@@ -1731,10 +1731,10 @@ Options
 
 | Name | Short | Long | Value | Required | Default | Values | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| auth | — | --auth | AUTH | no | — | off, scram, md5, oidc, mtls | Authentication mode. SCRAM requires an enabled durable login; OIDC and mTLS require their configuration. MD5 is rejected. Omitted uses `[auth].mode` |
+| auth | — | --auth | AUTH | no | — | off, scram, md5, oidc, mtls | Authentication mode. SCRAM requires an enabled durable login; OIDC requires an issuer, audience, JWKS URL, and gateway TLS. OIDC accepts RS256 tokens up to 16 KiB and JWKS responses up to 1 MiB and 100 keys. Key cache TTL is at most 60 seconds (honoring shorter issuer lifetimes); fetches time out after 5 seconds and retry transient transport, 429, or server failures once after 250 milliseconds. Expired keys are never used. mTLS requires its gateway credentials; MD5 is rejected. Omitted uses `[auth].mode` |
 | availability_zone | — | --availability-zone | AVAILABILITY_ZONE | no | — | — | Availability zone advertised during worker registration |
 | checkpoint_retention_count | — | --checkpoint-retention-count | CHECKPOINT_RETENTION_COUNT | no | — | — |  |
-| control | — | --control | CONTROL | no | — | — | Control service URL (required for the worker and frontier roles) |
+| control | — | --control | CONTROL | no | — | — | Control service URL (required for the worker, frontier, and compactor roles) |
 | control_bind | — | --control-bind | CONTROL_BIND | no | — | — | Override address worker-facing ControlService binds to |
 | control_shared_storage | — | --control-shared-storage | CONTROL_SHARED_STORAGE | no | — | — | Directory for state shared across control nodes in Raft group |
 | daemon | — | --daemon | DAEMON | no | false | true, false | Run the control role as a daemon |
@@ -1753,7 +1753,7 @@ Options
 | raft_bootstrap | — | --raft-bootstrap | RAFT_BOOTSTRAP | no | false | true, false | Start an election immediately on boot |
 | raft_node_id | — | --raft-node-id | RAFT_NODE_ID | no | — | — | This node's ID within its Raft group |
 | raft_peers | — | --raft-peers | RAFT_PEERS | no | — | — | Comma-separated list of other control nodes in Raft group |
-| role | — | --role | ROLE | no | all | all, gateway, worker, control | Node role |
+| role | — | --role | ROLE | no | all | all, gateway, worker, control, compactor | Node role |
 | same_host_shm_segment_bytes | — | --same-host-shm-segment-bytes | SAME_HOST_SHM_SEGMENT_BYTES | no | — | — |  |
 | same_host_shm_segments_per_peer | — | --same-host-shm-segments-per-peer | SAME_HOST_SHM_SEGMENTS_PER_PEER | no | — | — |  |
 | shutdown_timeout_secs | — | --shutdown-timeout-secs | SHUTDOWN_TIMEOUT_SECS | no | — | — | Configurable shutdown timeout deadline in seconds (default: 30) |
@@ -1788,7 +1788,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ## `rockstream support`
 
-Diagnostic support commands
+Generate actor-bound support artifacts through the authenticated management API
 
 Exit codes
 
@@ -1858,7 +1858,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ### `rockstream support bundle`
 
-Generate on-demand diagnostic support bundle
+Unavailable without authenticated support authorization; use `support artifact create`
 
 Options
 
@@ -1880,7 +1880,7 @@ Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
 ### `rockstream support diagnose`
 
-Look up one runtime diagnostic and write its support bundle
+Unavailable without authenticated diagnostic authorization; use `support artifact create`
 
 Options
 

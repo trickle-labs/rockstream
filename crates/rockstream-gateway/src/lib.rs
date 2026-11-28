@@ -30,6 +30,7 @@ pub mod protocol;
 pub mod role_catalog;
 pub mod server;
 pub mod session;
+pub mod stateless_serving;
 pub mod subscribe_handler;
 pub mod subscribe_parser;
 pub mod tls;

@@ -12,4 +12,5 @@ pub mod oracle;
 pub mod overload;
 pub mod process;
 pub mod report;
+pub mod scale_program;
 pub mod v072_oracles;

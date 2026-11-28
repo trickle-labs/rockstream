@@ -278,6 +278,7 @@ fn bench_flow_control_credit_throughput(c: &mut Criterion) {
                     epoch: 0,
                     seq: 0,
                     credit_grant: 1,
+                    owned_result: Default::default(),
                 });
             },
             BatchSize::SmallInput,

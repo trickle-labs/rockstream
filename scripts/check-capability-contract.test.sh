@@ -116,8 +116,8 @@ python3 -c 'from pathlib import Path; p=Path("'"$TMP_ROOT"'/capabilities.toml");
 run_bad "missing sink state growth proof" "proof target does not resolve"
 cp "$ROOT/capabilities.toml" "$TMP_ROOT/capabilities.toml"
 
-python3 -c 'from pathlib import Path; p=Path("'"$TMP_ROOT"'/capabilities.toml"); s=p.read_text(); s=s.replace("id = \"sink.kafka\"\nkind = \"sink\"\nname = \"Kafka sink\"\ntier = \"Experimental\"", "id = \"sink.kafka\"\nkind = \"sink\"\nname = \"Kafka sink\"\ntier = \"Core\""); p.write_text(s)'
-run_bad "sink promoted without Core qualification" "sink.kafka must be Experimental"
+python3 -c 'from pathlib import Path; p=Path("'"$TMP_ROOT"'/capabilities.toml"); s=p.read_text(); s=s.replace("id = \"sink.kafka\"\nkind = \"sink\"\nname = \"Kafka sink\"\ntier = \"Core\"", "id = \"sink.kafka\"\nkind = \"sink\"\nname = \"Kafka sink\"\ntier = \"Experimental\""); p.write_text(s)'
+run_bad "sink demoted from Core" "sink.kafka must be Core"
 cp "$ROOT/capabilities.toml" "$TMP_ROOT/capabilities.toml"
 
 python3 -c 'from pathlib import Path; p=Path("'"$TMP_ROOT"'/capabilities.toml"); s=p.read_text(); s=s.replace("KafkaViewSink delivers typed view change rows with signed weights in one ordered transaction envelope per nonempty view epoch.", "Materialized-view change rows are delivered."); p.write_text(s)'
@@ -126,10 +126,6 @@ cp "$ROOT/capabilities.toml" "$TMP_ROOT/capabilities.toml"
 
 python3 -c 'from pathlib import Path; p=Path("'"$TMP_ROOT"'/capabilities.toml"); s=p.read_text(); s=s.replace("KafkaViewSink delivers one complete materialized snapshot envelope before live change envelopes.", "Snapshot rows are delivered."); p.write_text(s)'
 run_bad "snapshot claim drift" "sink.kafka backfill requires its exact row-delivery claim and consumer proof"
-cp "$ROOT/capabilities.toml" "$TMP_ROOT/capabilities.toml"
-
-python3 -c 'from pathlib import Path; p=Path("'"$TMP_ROOT"'/capabilities.toml"); s=p.read_text(); s=s.replace("proof = \"\"\nproof_levels_achieved = []", "proof = \"crates/rockstream-connectors/tests/kafka_sink_guarantee_matrix_tests.rs::kafka_sink_emits_epoch_count_marker_only\"\nproof_levels_achieved = [\"L0\"]"); p.write_text(s)'
-run_bad "marker proof qualifies full Core delivery" "sink.kafka remains Experimental; full Core proof levels are not qualified"
 cp "$ROOT/capabilities.toml" "$TMP_ROOT/capabilities.toml"
 
 if ! python3 "$ROOT/scripts/check-capability-contract.py" "$ROOT" >"$OUT" 2>&1; then

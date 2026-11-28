@@ -358,6 +358,11 @@ pub fn deserialize_zset(
     }
 
     let decoded = decode_payload(payload)?;
+    // Negotiated compression may frame an empty epoch marker. Its transport
+    // header is nonempty even though there is no Arrow IPC stream inside.
+    if decoded.is_empty() {
+        return Ok(ArrowZSet::empty(schema));
+    }
     deserialize_raw_ipc(decoded.as_ref(), schema)
 }
 
@@ -452,6 +457,41 @@ fn decode_payload(payload: &[u8]) -> Result<Bytes, String> {
     Ok(decoded)
 }
 
+/// Rejects oversized decoded commands before allocating decompression buffers.
+pub(crate) fn decode_bounded_payload(payload: &[u8], limit: usize) -> Result<Bytes, String> {
+    if payload.len() > limit {
+        return Err(codec_error("payload exceeds byte budget".to_owned()));
+    }
+    if payload.len() >= FRAME_HEADER_LEN && &payload[..4] == FRAME_MAGIC {
+        let header = decode_header(payload)?;
+        if header.uncompressed_len > limit as u64 {
+            return Err(codec_error(
+                "decoded payload exceeds byte budget".to_owned(),
+            ));
+        }
+        if matches!(header.codec, ShuffleCompression::Lz4) {
+            let encoded = &payload[FRAME_HEADER_LEN..];
+            let size: [u8; 4] = encoded
+                .get(..4)
+                .ok_or_else(|| codec_error("truncated lz4 command".to_owned()))?
+                .try_into()
+                .unwrap();
+            if u32::from_le_bytes(size) as u64 != header.uncompressed_len {
+                return Err(codec_error(
+                    "lz4 size does not match frame header".to_owned(),
+                ));
+            }
+        }
+    }
+    let decoded = decode_payload(payload)?;
+    if decoded.len() > limit {
+        return Err(codec_error(
+            "decoded payload exceeds byte budget".to_owned(),
+        ));
+    }
+    Ok(decoded)
+}
+
 fn decode_header(payload: &[u8]) -> Result<PayloadHeader, String> {
     let wire_version = payload[4];
     if wire_version != 1 {
@@ -521,6 +561,20 @@ mod tests {
         let schema = original.schema();
         let recovered = deserialize_zset(&bytes, schema).unwrap();
         assert!(recovered.is_empty());
+    }
+
+    #[test]
+    fn framed_empty_epoch_markers_roundtrip_with_negotiated_compression() {
+        for codec in [ShuffleCompression::Lz4, ShuffleCompression::Zstd] {
+            let schema = ArrowZSet::from_ab_rows(&[], 1).schema();
+            let payload = frame_payload_bytes(&[], codec, true).unwrap();
+            let actual = deserialize_zset(&payload, schema.clone()).unwrap();
+            assert_eq!(
+                actual.data,
+                arrow::record_batch::RecordBatch::new_empty(schema)
+            );
+            assert_eq!(actual.weights, Vec::<i64>::new());
+        }
     }
 
     #[test]

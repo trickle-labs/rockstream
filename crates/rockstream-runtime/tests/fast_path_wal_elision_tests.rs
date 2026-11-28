@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema};
 use object_store::local::LocalFileSystem;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use rockstream_ops::zset::ArrowZSet;
 use rockstream_runtime::client::ShardState;
 use rockstream_runtime::exchange::flow_control::FlowController;
@@ -40,6 +40,78 @@ use tokio::sync::mpsc;
 const MINIO_DIRECT_BUCKET: &str = "rockstream-direct-grpc-fast-path-elision-test";
 const MINIO_LOOPBACK_BUCKET: &str = "rockstream-loopback-fast-path-elision-test";
 const MINIO_DURABLE_BUCKET: &str = "rockstream-durable-catchup-fast-path-elision-test";
+
+#[derive(Debug, Default)]
+struct DelayedHeadStore(object_store::memory::InMemory);
+
+impl std::fmt::Display for DelayedHeadStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DelayedHeadStore")
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for DelayedHeadStore {
+    async fn put_opts(
+        &self,
+        path: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.0.put_opts(path, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        path: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.0.put_multipart_opts(path, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        path: &object_store::path::Path,
+        opts: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        let delay = opts.head && path.as_ref() == "shuffle/100/1/811/812";
+        let result = self.0.get_opts(path, opts).await;
+        if delay {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        result
+    }
+
+    fn delete_stream(
+        &self,
+        paths: futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.0.delete_stream(paths)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.0.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.0.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        opts: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.0.copy_opts(from, to, opts).await
+    }
+}
 
 fn codec_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -134,6 +206,157 @@ async fn assert_no_shuffle_wal(src_db: &ShardDb, target_db: &ShardDb) {
         src_db.scan_prefix(&[0x05]).await.unwrap().len(),
         0,
         "sender must not persist shuffle_outbox on the fast path"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_durable_appends_do_not_silently_overwrite() {
+    let store: Arc<dyn ObjectStore> = Arc::new(DelayedHeadStore::default());
+    let pool = ShuffleClientPool::default();
+    pool.set_local_worker_info(worker_info(811, "127.0.0.1:9811", "host-a", "az-1", false));
+    pool.upsert_peer_info(worker_info(812, "127.0.0.1:9812", "host-b", "az-2", false));
+    let mux = WorkerStreamMultiplexer::new(pool, FlowController::new())
+        .with_object_store(store.clone())
+        .with_src_worker(WorkerId(811));
+    let make_frame = |seq, row| ShuffleFrame {
+        exchange_id: 100,
+        src_shard: 0,
+        target_shard: 1,
+        epoch: 1,
+        seq,
+        payload: serialize_zset(&ArrowZSet::from_ab_rows(&[row], 1))
+            .unwrap()
+            .into(),
+        row_count: 1,
+    };
+    let (first, second) = tokio::join!(
+        mux.send_frame(WorkerId(812), make_frame(1, (5, 50))),
+        mux.send_frame(WorkerId(812), make_frame(2, (6, 60)))
+    );
+    let (winner, failure) = match (first, second) {
+        (Ok(()), Err(error)) => ((1, vec![(5, 50)]), error),
+        (Err(error), Ok(())) => ((2, vec![(6, 60)]), error),
+        other => panic!("unexpected append outcomes: {other:?}"),
+    };
+    assert_eq!(
+        failure,
+        "Durable shuffle append is already in progress or requires recovery"
+    );
+    let path = object_store::path::Path::from("shuffle/100/1/811/812");
+    let footer = rockstream_runtime::exchange::durable::DurableShuffleReader::read_footer(
+        store.as_ref(),
+        &path,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        footer
+            .entries
+            .iter()
+            .map(|entry| entry.seq)
+            .collect::<Vec<_>>(),
+        vec![winner.0]
+    );
+    let payload = rockstream_runtime::exchange::durable::DurableShuffleReader::read_frame(
+        store.as_ref(),
+        &path,
+        &footer.entries[0],
+    )
+    .await
+    .unwrap();
+    let actual =
+        rockstream_runtime::exchange::serialization::deserialize_zset(&payload, codec_schema())
+            .unwrap();
+    assert_eq!(actual.positive_ab_rows(), winner.1);
+
+    assert_eq!(
+        mux.send_frame(WorkerId(812), make_frame(winner.0, winner.1[0]))
+            .await,
+        Ok(())
+    );
+    assert_eq!(
+        mux.send_frame(WorkerId(812), make_frame(winner.0, (99, 990)))
+            .await,
+        Err("Durable shuffle frame identity has different content".to_owned())
+    );
+    let loser = if winner.0 == 1 {
+        (2, (6, 60))
+    } else {
+        (1, (5, 50))
+    };
+    assert_eq!(
+        mux.send_frame(WorkerId(812), make_frame(loser.0, loser.1))
+            .await,
+        Ok(())
+    );
+    let footer = rockstream_runtime::exchange::durable::DurableShuffleReader::read_footer(
+        store.as_ref(),
+        &path,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        footer
+            .entries
+            .iter()
+            .map(|entry| entry.seq)
+            .collect::<Vec<_>>(),
+        vec![winner.0, loser.0]
+    );
+    let mut rows = Vec::new();
+    for entry in &footer.entries {
+        let payload = rockstream_runtime::exchange::durable::DurableShuffleReader::read_frame(
+            store.as_ref(),
+            &path,
+            entry,
+        )
+        .await
+        .unwrap();
+        rows.extend(
+            rockstream_runtime::exchange::serialization::deserialize_zset(&payload, codec_schema())
+                .unwrap()
+                .positive_ab_rows(),
+        );
+    }
+    assert_eq!(rows, vec![winner.1[0], loser.1]);
+
+    let claim = object_store::path::Path::from("shuffle/100/1/811/812.append");
+    store.put(&claim, bytes::Bytes::new().into()).await.unwrap();
+    assert_eq!(
+        mux.send_frame(WorkerId(812), make_frame(3, (7, 70))).await,
+        Err("Durable shuffle append is already in progress or requires recovery".to_owned())
+    );
+    store.delete(&claim).await.unwrap();
+    assert_eq!(
+        mux.send_frame(WorkerId(812), make_frame(3, (7, 70))).await,
+        Ok(())
+    );
+    let footer = rockstream_runtime::exchange::durable::DurableShuffleReader::read_footer(
+        store.as_ref(),
+        &path,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        footer
+            .entries
+            .iter()
+            .map(|entry| entry.seq)
+            .collect::<Vec<_>>(),
+        vec![winner.0, loser.0, 3]
+    );
+    let third = rockstream_runtime::exchange::durable::DurableShuffleReader::read_frame(
+        store.as_ref(),
+        &path,
+        &footer.entries[2],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rockstream_runtime::exchange::serialization::deserialize_zset(&third, codec_schema())
+            .unwrap()
+            .positive_ab_rows(),
+        vec![(7, 70)]
     );
 }
 
@@ -460,6 +683,23 @@ async fn exercise_durable_catch_up_survives_restart(
         )
         .await
         .unwrap();
+    let second = ArrowZSet::from_ab_rows(&[(7, 70)], 1);
+    let expected_second = serialize_zset(&second).unwrap();
+    multiplexer
+        .send_frame(
+            WorkerId(812),
+            ShuffleFrame {
+                exchange_id: 100,
+                src_shard: 0,
+                target_shard: 1,
+                epoch: 1,
+                seq: 2,
+                payload: expected_second.clone().into(),
+                row_count: 1,
+            },
+        )
+        .await
+        .unwrap();
     // Durable fallback opens no direct gRPC stream.
     assert_eq!(multiplexer.connection_count(), 0);
 
@@ -498,21 +738,571 @@ async fn exercise_durable_catch_up_survives_restart(
         .unwrap();
     let received = inlet_rx2.recv().await.unwrap();
     assert_eq!(serialize_zset(&received).unwrap(), expected);
+    let received_second = inlet_rx2.recv().await.unwrap();
+    assert_eq!(serialize_zset(&received_second).unwrap(), expected_second);
 
-    // Catch-up again must not re-deliver (durable path dedups via its own inbox
-    // marker, independent of the elided fast-path WAL).
-    multiplexer
+    // Queued input is pending until its epoch is committed.
+    assert_eq!(
+        multiplexer
+            .catch_up_durable(
+                100,
+                1,
+                WorkerId(811),
+                WorkerId(812),
+                &registry2,
+                durable_store.as_ref(),
+            )
+            .await,
+        Err("Durable shuffle batch is pending above the committed frontier".to_owned())
+    );
+    assert!(inlet_rx2.try_recv().is_err());
+    rockstream_runtime::exchange::persistence::advance_committed_frontier(&reopened_target, 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        multiplexer
+            .catch_up_durable(
+                100,
+                1,
+                WorkerId(811),
+                WorkerId(812),
+                &registry2,
+                durable_store.as_ref()
+            )
+            .await,
+        Ok(())
+    );
+    assert!(inlet_rx2.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn durable_catch_up_does_not_complete_while_delivery_is_pending() {
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let target = reopen_db("concurrent-dst", store.clone()).await;
+    let payload = serialize_zset(&ArrowZSet::from_ab_rows(&[(5, 50), (6, 60)], 1)).unwrap();
+    let mut writer = rockstream_runtime::exchange::durable::DurableShuffleWriter::new();
+    writer.add_frame(0, 1, 1, &payload).unwrap();
+    writer
+        .finish(
+            store.as_ref(),
+            &object_store::path::Path::from("shuffle/100/1/811/812"),
+        )
+        .await
+        .unwrap();
+
+    let (registry, inlet) = make_receiver_registry(target.clone());
+    let sender = registry.get(100, 1).unwrap().sender;
+    for _ in 0..16 {
+        sender
+            .try_send(ArrowZSet::from_ab_rows(&[(99, 990)], 1))
+            .unwrap();
+    }
+    let mux = WorkerStreamMultiplexer::new(ShuffleClientPool::default(), FlowController::new());
+    let (first_mux, first_registry, first_store) = (mux.clone(), registry.clone(), store.clone());
+    let first = tokio::spawn(async move {
+        first_mux
+            .catch_up_durable(
+                100,
+                1,
+                WorkerId(811),
+                WorkerId(812),
+                &first_registry,
+                first_store.as_ref(),
+            )
+            .await
+    });
+    let key = rockstream_runtime::exchange::persistence::inbox_key(100, 0, 1, 1);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while target.get(&key).await.unwrap().is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        rockstream_runtime::exchange::persistence::committed_frontier(&target)
+            .await
+            .unwrap(),
+        0
+    );
+
+    let concurrent = tokio::time::timeout(
+        std::time::Duration::from_millis(150),
+        mux.catch_up_durable(
+            100,
+            1,
+            WorkerId(811),
+            WorkerId(812),
+            &registry,
+            store.as_ref(),
+        ),
+    )
+    .await
+    .ok();
+    drop(inlet);
+    let first_result = first.await.unwrap();
+    assert_eq!(
+        (matches!(concurrent, Some(Ok(()))), first_result.is_err()),
+        (false, true),
+        "a concurrent catch-up must not report success while delivery is unresolved"
+    );
+}
+
+#[tokio::test]
+async fn durable_catch_up_does_not_complete_after_inlet_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let target = reopen_db("concurrent-dst", store.clone()).await;
+    let payload = serialize_zset(&ArrowZSet::from_ab_rows(&[(5, 50), (6, 60)], 1)).unwrap();
+    let mut writer = rockstream_runtime::exchange::durable::DurableShuffleWriter::new();
+    writer.add_frame(0, 1, 1, &payload).unwrap();
+    writer
+        .finish(
+            store.as_ref(),
+            &object_store::path::Path::from("shuffle/100/1/811/812"),
+        )
+        .await
+        .unwrap();
+
+    let (registry, inlet) = make_receiver_registry(target.clone());
+    let sender = registry.get(100, 1).unwrap().sender;
+    for _ in 0..16 {
+        sender
+            .try_send(ArrowZSet::from_ab_rows(&[(99, 990)], 1))
+            .unwrap();
+    }
+    let mux = WorkerStreamMultiplexer::new(ShuffleClientPool::default(), FlowController::new());
+    let (first_mux, first_registry, first_store) = (mux.clone(), registry.clone(), store.clone());
+    let first = tokio::spawn(async move {
+        first_mux
+            .catch_up_durable(
+                100,
+                1,
+                WorkerId(811),
+                WorkerId(812),
+                &first_registry,
+                first_store.as_ref(),
+            )
+            .await
+    });
+    let key = rockstream_runtime::exchange::persistence::inbox_key(100, 0, 1, 1);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while target.get(&key).await.unwrap().is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        rockstream_runtime::exchange::persistence::committed_frontier(&target)
+            .await
+            .unwrap(),
+        0
+    );
+
+    let (replacement_tx, _replacement_inlet) = mpsc::channel(1);
+    registry.register(100, 1, replacement_tx, codec_schema());
+
+    let concurrent = tokio::time::timeout(
+        std::time::Duration::from_millis(150),
+        mux.catch_up_durable(
+            100,
+            1,
+            WorkerId(811),
+            WorkerId(812),
+            &registry,
+            store.as_ref(),
+        ),
+    )
+    .await
+    .ok();
+    drop(inlet);
+    let first_result = first.await.unwrap();
+    assert_eq!(
+        (matches!(concurrent, Some(Ok(()))), first_result.is_err()),
+        (false, true),
+        "a concurrent catch-up must not report success while delivery is unresolved"
+    );
+}
+
+#[tokio::test]
+async fn durable_catch_up_replays_pending_inbox_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let target = reopen_db("pending-dst", store.clone()).await;
+    let payload = serialize_zset(&ArrowZSet::from_ab_rows(&[(5, 50), (6, 60)], 1)).unwrap();
+    let mut writer = rockstream_runtime::exchange::durable::DurableShuffleWriter::new();
+    writer.add_frame(0, 1, 1, &payload).unwrap();
+    writer
+        .finish(
+            store.as_ref(),
+            &object_store::path::Path::from("shuffle/100/1/811/812"),
+        )
+        .await
+        .unwrap();
+    rockstream_runtime::exchange::persistence::persist_inbox(&target, 100, 0, 1, 1, &payload)
+        .await
+        .unwrap();
+    assert_eq!(
+        rockstream_runtime::exchange::persistence::committed_frontier(&target)
+            .await
+            .unwrap(),
+        0
+    );
+    target.close().await.unwrap();
+
+    let reopened = reopen_db("pending-dst", store.clone()).await;
+    assert_eq!(
+        rockstream_runtime::exchange::persistence::committed_frontier(&reopened)
+            .await
+            .unwrap(),
+        0
+    );
+    let (registry, mut inlet) = make_receiver_registry(reopened);
+    let mux = WorkerStreamMultiplexer::new(ShuffleClientPool::default(), FlowController::new());
+    let result = mux
         .catch_up_durable(
             100,
             1,
             WorkerId(811),
             WorkerId(812),
-            &registry2,
-            durable_store.as_ref(),
+            &registry,
+            store.as_ref(),
+        )
+        .await;
+    let rows = match tokio::time::timeout(std::time::Duration::from_millis(150), inlet.recv()).await
+    {
+        Ok(Some(zset)) => Some(zset.positive_ab_rows()),
+        Ok(None) => panic!("reopened inlet closed"),
+        Err(_) => None,
+    };
+    match (result, rows) {
+        (Ok(()), Some(rows)) => assert_eq!(rows, vec![(5, 50), (6, 60)]),
+        (Err(_), None) => {}
+        (result, rows) => panic!("unexpected catch-up outcome: {result:?}, {rows:?}"),
+    }
+}
+
+#[tokio::test]
+async fn durable_send_preserves_existing_object_when_footer_is_invalid() {
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let path = object_store::path::Path::from("shuffle/100/1/811/812");
+    let original = bytes::Bytes::from_static(b"bad");
+    store.put(&path, original.clone().into()).await.unwrap();
+    let pool = ShuffleClientPool::default();
+    pool.set_local_worker_info(worker_info(811, "127.0.0.1:9811", "host-a", "az-1", false));
+    pool.upsert_peer_info(worker_info(812, "127.0.0.1:9812", "host-b", "az-2", false));
+    let mux = WorkerStreamMultiplexer::new(pool, FlowController::new())
+        .with_object_store(store.clone())
+        .with_src_worker(WorkerId(811));
+    let payload = serialize_zset(&ArrowZSet::from_ab_rows(&[(5, 50), (6, 60)], 1)).unwrap();
+    let result = mux
+        .send_frame(
+            WorkerId(812),
+            ShuffleFrame {
+                exchange_id: 100,
+                src_shard: 0,
+                target_shard: 1,
+                epoch: 1,
+                seq: 1,
+                payload: payload.into(),
+                row_count: 2,
+            },
+        )
+        .await;
+    assert_eq!(
+        result,
+        Err("Durable shuffle existing object read failed: [RS-3016] File too small to contain a footer length: size=3".to_owned())
+    );
+    assert_eq!(
+        store.get(&path).await.unwrap().bytes().await.unwrap(),
+        original
+    );
+    assert!(matches!(
+        store
+            .head(&object_store::path::Path::from(
+                "shuffle/100/1/811/812.append"
+            ))
+            .await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+}
+
+#[tokio::test]
+async fn durable_catch_up_missing_object_is_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let target = reopen_db("missing-footer", store.clone()).await;
+    let (registry, mut inlet) = make_receiver_registry(target);
+    let mux = WorkerStreamMultiplexer::new(ShuffleClientPool::default(), FlowController::new());
+    let result = mux
+        .catch_up_durable(
+            100,
+            1,
+            WorkerId(811),
+            WorkerId(812),
+            &registry,
+            store.as_ref(),
+        )
+        .await;
+    assert_eq!(result, Ok(()));
+    assert!(matches!(
+        inlet.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test]
+async fn durable_catch_up_rejects_malformed_footer() {
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let target = reopen_db("malformed-footer", store.clone()).await;
+    let path = object_store::path::Path::from("shuffle/100/1/811/812");
+    store
+        .put(&path, bytes::Bytes::from_static(b"bad").into())
+        .await
+        .unwrap();
+    let (registry, mut inlet) = make_receiver_registry(target);
+    let mux = WorkerStreamMultiplexer::new(ShuffleClientPool::default(), FlowController::new());
+    let result = mux
+        .catch_up_durable(
+            100,
+            1,
+            WorkerId(811),
+            WorkerId(812),
+            &registry,
+            store.as_ref(),
+        )
+        .await;
+    assert_eq!(
+        result,
+        Err("[RS-3016] File too small to contain a footer length: size=3".to_owned())
+    );
+    assert!(matches!(
+        inlet.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test]
+async fn durable_catch_up_reports_unavailable_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let target = reopen_db("unavailable-target", store.clone()).await;
+    let payload = serialize_zset(&ArrowZSet::from_ab_rows(&[(5, 50), (6, 60)], 1)).unwrap();
+    let mut writer = rockstream_runtime::exchange::durable::DurableShuffleWriter::new();
+    writer.add_frame(0, 1, 1, &payload).unwrap();
+    writer
+        .finish(
+            store.as_ref(),
+            &object_store::path::Path::from("shuffle/100/1/811/812"),
         )
         .await
         .unwrap();
-    assert!(inlet_rx2.try_recv().is_err());
+    let mux = WorkerStreamMultiplexer::new(ShuffleClientPool::default(), FlowController::new());
+    let (registry, mut inlet) = make_receiver_registry(target);
+    registry.unregister(100, 1);
+    assert_eq!(
+        mux.catch_up_durable(
+            100,
+            1,
+            WorkerId(811),
+            WorkerId(812),
+            &registry,
+            store.as_ref()
+        )
+        .await,
+        Err("Durable shuffle target inlet is not registered: exchange 100, shard 1".to_owned())
+    );
+    assert!(matches!(
+        inlet.try_recv(),
+        Err(mpsc::error::TryRecvError::Disconnected)
+    ));
+    registry
+        .get_shard_db(1)
+        .unwrap()
+        .put(
+            &rockstream_storage::keys::ShardKeyEncoder::frontier_key(),
+            &1_u64.to_be_bytes(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        mux.catch_up_durable(
+            100,
+            1,
+            WorkerId(811),
+            WorkerId(812),
+            &registry,
+            store.as_ref()
+        )
+        .await,
+        Ok(())
+    );
+
+    let registry = ExchangeRegistry::new();
+    let (sender, mut inlet) = mpsc::channel(1);
+    registry.register(100, 1, sender, codec_schema());
+    assert_eq!(
+        mux.catch_up_durable(
+            100,
+            1,
+            WorkerId(811),
+            WorkerId(812),
+            &registry,
+            store.as_ref()
+        )
+        .await,
+        Err("Durable shuffle target storage is unavailable: shard 1".to_owned())
+    );
+    assert!(matches!(
+        inlet.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test]
+async fn durable_catch_up_rejects_invalid_frontier_without_delivery() {
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let target = reopen_db("invalid-frontier", store.clone()).await;
+    target
+        .put(
+            &rockstream_storage::keys::ShardKeyEncoder::frontier_key(),
+            b"invalid",
+        )
+        .await
+        .unwrap();
+    let payload = serialize_zset(&ArrowZSet::from_ab_rows(&[(5, 50), (6, 60)], 1)).unwrap();
+    let mut writer = rockstream_runtime::exchange::durable::DurableShuffleWriter::new();
+    writer.add_frame(0, 1, 1, &payload).unwrap();
+    writer
+        .finish(
+            store.as_ref(),
+            &object_store::path::Path::from("shuffle/100/1/811/812"),
+        )
+        .await
+        .unwrap();
+    let (registry, mut inlet) = make_receiver_registry(target);
+    let mux = WorkerStreamMultiplexer::new(ShuffleClientPool::default(), FlowController::new());
+    let result = mux
+        .catch_up_durable(
+            100,
+            1,
+            WorkerId(811),
+            WorkerId(812),
+            &registry,
+            store.as_ref(),
+        )
+        .await;
+    assert_eq!(
+        result,
+        Err("Committed frontier is not a valid epoch".to_owned())
+    );
+    assert!(matches!(
+        inlet.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test]
+async fn durable_catch_up_delivers_epoch_zero_without_frontier() {
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let target = reopen_db("initial-epoch", store.clone()).await;
+    let payload = serialize_zset(&ArrowZSet::from_ab_rows(&[(5, 50), (6, 60)], 1)).unwrap();
+    let mut writer = rockstream_runtime::exchange::durable::DurableShuffleWriter::new();
+    writer.add_frame(0, 1, 1, &payload).unwrap();
+    writer
+        .finish(
+            store.as_ref(),
+            &object_store::path::Path::from("shuffle/100/0/811/812"),
+        )
+        .await
+        .unwrap();
+    let (registry, mut inlet) = make_receiver_registry(target);
+    let mux = WorkerStreamMultiplexer::new(ShuffleClientPool::default(), FlowController::new());
+    let result = mux
+        .catch_up_durable(
+            100,
+            0,
+            WorkerId(811),
+            WorkerId(812),
+            &registry,
+            store.as_ref(),
+        )
+        .await;
+    let rows = tokio::time::timeout(std::time::Duration::from_millis(150), inlet.recv())
+        .await
+        .ok()
+        .flatten()
+        .map(|zset| zset.positive_ab_rows());
+    assert_eq!((result, rows), (Ok(()), Some(vec![(5, 50), (6, 60)])));
+}
+
+#[tokio::test]
+async fn durable_catch_up_requires_commit_after_inlet_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let target = reopen_db("replaced-after-send", store.clone()).await;
+    let payload = serialize_zset(&ArrowZSet::from_ab_rows(&[(5, 50), (6, 60)], 1)).unwrap();
+    let mut writer = rockstream_runtime::exchange::durable::DurableShuffleWriter::new();
+    writer.add_frame(0, 1, 1, &payload).unwrap();
+    writer
+        .finish(
+            store.as_ref(),
+            &object_store::path::Path::from("shuffle/100/1/811/812"),
+        )
+        .await
+        .unwrap();
+    let (registry, mut old_inlet) = make_receiver_registry(target.clone());
+    let schema = registry.get(100, 1).unwrap().schema;
+    let mux = WorkerStreamMultiplexer::new(ShuffleClientPool::default(), FlowController::new());
+    let catch_up = || {
+        mux.catch_up_durable(
+            100,
+            1,
+            WorkerId(811),
+            WorkerId(812),
+            &registry,
+            store.as_ref(),
+        )
+    };
+    assert_eq!(catch_up().await, Ok(()));
+    let (new_sender, mut new_inlet) = mpsc::channel(16);
+    registry.register(100, 1, new_sender, schema);
+    assert_eq!(
+        catch_up().await,
+        Err("Durable shuffle batch is pending above the committed frontier".to_owned())
+    );
+    assert_eq!(
+        old_inlet.recv().await.unwrap().positive_ab_rows(),
+        vec![(5, 50), (6, 60)]
+    );
+    assert!(matches!(
+        new_inlet.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    rockstream_runtime::exchange::persistence::advance_committed_frontier(&target, 1)
+        .await
+        .unwrap();
+    assert_eq!(catch_up().await, Ok(()));
+    assert!(matches!(
+        new_inlet.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
 }
 
 #[tokio::test]
@@ -591,7 +1381,13 @@ async fn durable_catch_up_retries_after_closed_inlet() {
     let no_duplicate = matches!(inlet_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));
     assert_eq!(
         (rejected.is_err(), resumed, rows, repeated, no_duplicate),
-        (true, Ok(()), Some(vec![(5, 50), (6, 60)]), Ok(()), true)
+        (
+            true,
+            Ok(()),
+            Some(vec![(5, 50), (6, 60)]),
+            Err("Durable shuffle batch is pending above the committed frontier".to_owned()),
+            true,
+        )
     );
 }
 

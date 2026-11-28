@@ -23,21 +23,23 @@ The protocol version is `1`. Every request carries `protocol_version`. The serve
 | `GetShard` | Returns one current shard lease or `NOT_FOUND`. |
 | `ListOperations` | Returns a page of retained operation records. |
 | `GetOperation` | Returns one operation or `NOT_FOUND`. |
-| `ListSecurityPrincipals` | Returns safe principal, fixed-preset, scoped-grant, and effective-permission data to a principal authorized for grant management. Login credentials are omitted. |
+| `ListSecurityPrincipals` | Returns safe principal, service-identity, fixed-preset, scoped-grant, and effective-permission data to a principal authorized for grant management. Login credentials are omitted. |
+| `CreateServicePrincipal` | Creates an enabled service-only principal with scoped grants after checking the reviewed grantor revision. The principal and correlated grant/completion audit records commit together; retry the same canonical UUID after a lost response. |
+| `DeleteSecurityPrincipal` | Deletes a principal after checking the reviewed target and grantor revisions. The deletion and correlated grant/completion audit records commit together; the response's `operation_id` identifies that catalog transaction. Retry the same canonical UUID after a lost response. The last active mTLS administrator cannot be deleted. |
 | `SetSecurityPrincipalGrants` | Replaces an existing principal's grants after checking the reviewed target and grantor revisions. Persists the operation before applying the change and commits the grant record with its audit event. |
 | `GetConfigSummary` | Returns effective configuration values and redaction flags. |
 | `GetCapabilities` | Returns the methods attached to this server. |
 | `GetHealth` | Returns `unknown` until the process registers authoritative health telemetry. |
-| `DrainWorker` | Persists an idempotent operation request, then drains a worker asynchronously. |
-| `MigrateShard` | Persists an idempotent request, flushes and closes the donor shard, transfers its lease, and waits for the recipient to open it. Before donor handoff, the v0.66 executor rejects a shard with a registered active workload deployment. |
-| `CreateBackup` | Persists an idempotent operation, requests a durable checkpoint from every shard owner, exports checkpoint-pinned shard data and control state while excluding the audit and management-operation logs and live worker topology, and reports success only after validating its terminal marker. Workers rebuild their topology records when they register. The method appears in capabilities only when a backup source store is attached. |
+| `DrainWorker` | Persists an idempotent operation request, then drains a worker online—flushing and closing its shards, transferring leases to healthy recipients sharing the shard store, re-activating any active workloads on recipients, and updating routing atomically. |
+| `MigrateShard` | Persists an idempotent request, pins GC protection, flushes and closes the donor shard, transfers its lease, opens the shard and re-activates any active workloads on the recipient, and updates routing atomically while foreground ingestion pauses briefly for the handoff and resumes seamlessly. |
+| `CreateBackup` | Persists an idempotent operation, requests a durable SlateDB checkpoint from every shard owner without blocking active workloads or ongoing writes, pins GC protection for the selected checkpoint, streams checkpoint-pinned shard data and control state (excluding newer concurrent control manifests, GC pins, audit/management-operation logs, and live worker topology) in bounded 8 MiB chunks with no total-object or 64 MiB per-object ceiling, validates end-to-end SHA-256 checksums, and publishes completion only after the generation is independently restorable. Workers rebuild their topology records when they register. The method appears in capabilities only when a backup source store is attached. |
 | `CancelOperation` | Cancels a pending operation or a migration before lease transfer. During donor handoff, the executor waits for the worker acknowledgement and reopens the donor before returning to its caller. It returns `FAILED_PRECONDITION` after lease transfer starts. |
 | `GenerateSupportArtifact` | Creates a sanitized cluster- or node-scoped support artifact and binds its opaque UUID to the authenticated principal, scope, and client idempotency key. |
 | `DownloadSupportArtifact` | Streams an artifact to its creating principal when current download and source-scope grants still allow access. The UUID is opaque and never names a server filesystem path. |
 
 The control service attaches drain and migration executors. It attaches the backup executor only when it can read the authoritative shard store. Embedded `--role all` supports one local worker. Multi-worker backups require every shard owner to use the same configured shared object store.
 
-The CLI sends `admin backup create` to `CreateBackup` only when you pass `--management`. Without that flag, it writes the legacy local manifest used by `admin backup inspect` and `admin backup verify`.
+The CLI sends `admin backup create` to `CreateBackup` only when you pass `--management`. Without that flag it fails closed with `RS-2400`; local backup creation no longer relies on `--identity-role`. `admin backup inspect` and `admin backup verify` remain local file checks. No authenticated backup-restore RPC is currently exposed, so `admin restore` also fails closed.
 
 ## CLI examples
 
@@ -69,7 +71,7 @@ rockstream --management 127.0.0.1:9201 support artifact create --idempotency-key
 rockstream --management 127.0.0.1:9201 support artifact download <opaque-id> --out support.json
 ```
 
-`CreateBackup` accepts a local path, a `file://` path, or an `s3://bucket/prefix` destination. It requires an idle cluster with no active workload deployments or source writes. The operation record stores the destination and checkpoint phase. The server stores its checkpoint manifest in the source store and writes the export under `checkpoint-exports/management-<operation_id>`. A missing worker or temporary storage error leaves the operation waiting. An invalid destination or checkpoint integrity error leaves it failed.
+`CreateBackup` accepts a local path, a `file://` path, or an `s3://bucket/prefix` destination. It runs online while active workloads and source writes continue, pinning a consistent committed checkpoint generation against concurrent GC/compaction and concurrent newer control manifests. The operation record stores the destination and checkpoint phase. The server stores its checkpoint manifest in the source store and writes the export under `checkpoint-exports/management-<operation_id>`. A missing worker or temporary storage error leaves the operation waiting. An invalid destination or checkpoint integrity error leaves it failed.
 
 The management backup format is a committed checkpoint generation with inventory records and a terminal `commit` marker. It is separate from the local `manifest.json` format used by the legacy `admin backup inspect` and `admin backup verify` commands.
 
@@ -97,7 +99,7 @@ The server admits at most 64 concurrent management requests and 64 ACK waiters f
 
 ## Idempotency and cancellation
 
-`DrainWorker`, `MigrateShard`, and `CreateBackup` accept an `idempotency_key`. `SetSecurityPrincipalGrants` and SQL `ALTER SECRET` use a canonical client-generated UUID as the operation ID. For secret rotation, set `rockstream.idempotency_key` in the SQL session before the mutation. The server binds the UUID to the authenticated actor, deployment, secret scope, and a digest of the submitted values; it does not persist those values in the operation record. An exact retry returns the original result. A changed request under the same key is rejected without applying another mutation. A submitting principal or a principal with current `operation_history_read` authority can use `GetOperation` to recover the safe result when the gateway and management service share the operation store. Retry SQL with the original UUID and request; never resubmit the mutation with a new key.
+`DrainWorker`, `MigrateShard`, and `CreateBackup` accept an `idempotency_key`. `SetSecurityPrincipalGrants`, `DeleteSecurityPrincipal`, and SQL `ALTER SECRET` use a canonical client-generated UUID as the idempotency key. For secret rotation, set `rockstream.idempotency_key` in the SQL session before the mutation. The server binds the UUID to the authenticated actor, deployment, secret scope, and a digest of the submitted values; it does not persist those values in the operation record. An exact retry returns the original result. A changed request under the same key is rejected without applying another mutation. A submitting principal or a principal with current `operation_history_read` authority can use `GetOperation` to recover the safe result when the gateway and management service share the operation store. Retry SQL with the original UUID and request; never resubmit the mutation with a new key.
 
 The valid status transitions are:
 
@@ -120,6 +122,6 @@ Cancellation is allowed before lease transfer. A migration cancelled during dono
 
 Management RPC errors retain their gRPC status. The CLI currently maps management status errors to `RS-0003`, so automation cannot distinguish every gRPC failure through the CLI output.
 
-`SetSecurityPrincipalGrants` updates grants on an existing principal. Principal creation, deletion, login-method changes, password changes, and their bootstrap workflows have separate interfaces and are not implemented by this RPC. The CLI's local identity flags do not authenticate a caller to the management service.
+`CreateServicePrincipal` creates a service identity with scoped grants and no presets. Interactive login-method changes, password changes, and bootstrap recovery use separate interfaces. The CLI's local identity flags do not authenticate a caller to the management service.
 
 The server has no authoritative process-health telemetry, so `GetHealth` returns `unknown`. This is the qualified behavior for v0.66; the limitation remains explicit until health telemetry is implemented.

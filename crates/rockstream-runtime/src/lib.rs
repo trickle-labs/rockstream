@@ -14,7 +14,11 @@ pub mod arrangement_attach;
 pub mod client;
 pub mod compaction;
 pub mod data_plane;
+mod direct_grants;
 pub mod epoch_compaction;
+mod owned_epoch;
+pub mod skew_aggregate;
+pub mod skew_routing;
 pub use epoch_compaction::{
     EpochCompactionConfig, EpochCompactionError, EpochCompactionFilter, EpochCompactionMetrics,
     EpochCompactionMetricsSnapshot, EpochCompactor, InFlightZSetAccumulator, KeyExtractionStrategy,
@@ -22,6 +26,7 @@ pub use epoch_compaction::{
 };
 pub mod secrets;
 pub mod shard_actor;
+pub mod skew_join;
 pub mod tls;
 pub use client::{
     execute_frame, setup_test_deployment, start_worker_client,
@@ -34,7 +39,8 @@ pub use client::{
 pub use compaction::{CompactionBudget, CompactionPermit, CompactionWorker};
 pub use data_plane::DataPlaneClient;
 pub use secrets::{
-    ResolvedSecret, SecretManagerError, WorkerSecretManager, MAX_WORKER_SECRET_TOKENS,
+    ResolvedSecret, SecretManagerError, WorkerSecretManager, MAX_WORKER_SECRET_CACHE_BYTES,
+    MAX_WORKER_SECRET_TOKENS,
 };
 pub use shard_actor::{
     CreditError, ExchangeCredit, ExchangeCredits, ExecutionMorsel, FrameExecutor, MailboxFillLevel,
@@ -43,6 +49,12 @@ pub use shard_actor::{
 };
 
 pub mod exchange;
+pub use exchange::capsule_partition::partition_batch_by_capsule;
+pub mod fair_scheduler;
+pub use fair_scheduler::{
+    ChunkedTaskOutcome, FairChunkScheduler, FairSchedulerHandle, WorkloadFreshnessStats,
+    WorkloadPriority,
+};
 pub mod migration;
 pub use migration::{DualWriteRouter, RoutedWrite, RoutingError};
 
@@ -58,6 +70,9 @@ pub use recovery::{
 
 pub mod quota;
 pub use quota::WorkerQuotaManager;
+
+pub mod resource_controller;
+pub use resource_controller::{WorkerResourceConfig, WorkerResourceController};
 
 pub mod source_pressure;
 pub use source_pressure::{SourcePressureController, SourcePressureState};
@@ -89,7 +104,14 @@ mod tests {
 
         let storage_dir = tempfile::tempdir().unwrap();
 
-        let (client, worker_handle) = start_worker_client(42, &control_url, storage_dir.path())
+        let (client, worker_handle) =
+            client::start_worker_client_with_insecure_internal_dev_and_metadata(
+                42,
+                &control_url,
+                storage_dir.path(),
+                Default::default(),
+                Default::default(),
+            )
             .await
             .unwrap();
 

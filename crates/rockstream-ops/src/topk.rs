@@ -24,10 +24,11 @@ use std::sync::{
 };
 
 use crate::op::Operator;
-use arrow::array::{ArrayRef, Int64Array};
+use arrow::array::{Array, ArrayRef, Int64Array};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 
+use rockstream_plan::TopKOrderKey;
 use rockstream_storage::{keys::ShardKeyEncoder, ShardDb, WriteBatch};
 use rockstream_types::ids::OperatorId;
 
@@ -56,7 +57,7 @@ impl Drop for RecoveryGuard<'_> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BufferEntry {
     rank_value: i64,
-    row_vals: Vec<i64>,
+    row_vals: Vec<Option<i64>>,
     net_weight: i64,
 }
 
@@ -70,7 +71,7 @@ struct PartitionState {
     positive_count: usize,
     spilled: HashSet<u128>,
     /// Currently emitted top-K: row_id → (row_vals, emitted multiplicity).
-    emitted: HashMap<u128, (Vec<i64>, i64)>,
+    emitted: HashMap<u128, (Vec<Option<i64>>, i64)>,
 }
 
 impl PartitionState {
@@ -130,6 +131,7 @@ pub struct TopKOp {
     k: usize,
     rank_col: usize,
     partition_by: Vec<usize>,
+    order_by: Vec<TopKOrderKey>,
     // shortcut: abandoned spill namespaces remain on disk, reclaim them when durable spill ownership exists.
     spill_id: u128,
     spill_slot: AtomicU8,
@@ -140,15 +142,38 @@ pub struct TopKOp {
 }
 
 impl TopKOp {
-    /// Create an in-memory TopKOp (no LFS persistence).
+    /// Create an in-memory TopKOp (no LFS persistence) with default descending rank_col ordering.
     pub fn new(schema: SchemaRef, k: usize, rank_col: usize, partition_by: Vec<usize>) -> Self {
+        Self::new_with_order(schema, k, rank_col, partition_by, vec![])
+    }
+
+    /// Create an in-memory TopKOp with explicit multi-column `order_by` keys
+    /// (ASC/DESC and NULLS FIRST/LAST). When `order_by` is empty, defaults to
+    /// descending `rank_col` with NULLS LAST.
+    pub fn new_with_order(
+        schema: SchemaRef,
+        k: usize,
+        rank_col: usize,
+        partition_by: Vec<usize>,
+        order_by: Vec<TopKOrderKey>,
+    ) -> Self {
         let n_input_cols = schema.fields().len();
+        let effective_order = if order_by.is_empty() {
+            vec![TopKOrderKey {
+                col: rank_col,
+                asc: false,
+                nulls_first: false,
+            }]
+        } else {
+            order_by
+        };
         Self {
             schema,
             n_input_cols,
             k,
             rank_col,
             partition_by,
+            order_by: effective_order,
             spill_id: rand::random(),
             spill_slot: AtomicU8::new(0),
             recovering: AtomicBool::new(false),
@@ -208,7 +233,7 @@ impl TopKOp {
                 let part_key = self.partition_key_bytes(&row_vals);
                 if key.as_ref() != ShardKeyEncoder::topk_key(op_id.0, &part_key, rank_value, row_id)
                     || row_id_hash(&row_vals) != row_id
-                    || rank_value != row_vals.get(self.rank_col).copied().unwrap_or(0)
+                    || rank_value != row_vals.get(self.rank_col).copied().flatten().unwrap_or(0)
                 {
                     return Err(topk_corruption());
                 }
@@ -276,7 +301,7 @@ impl TopKOp {
                 .into_iter()
                 .map(|((_, _, row_id), entry)| (row_id, entry))
                 .collect();
-            part.emitted = select_topk(part, self.k, &spilled);
+            part.emitted = select_topk(part, self.k, &spilled, &self.order_by);
         }
         let total = state.total_entries();
         let mut current = self.state.lock().unwrap();
@@ -337,7 +362,7 @@ impl TopKOp {
             }
             let row_vals = extract_row_vals(&delta.data, row_idx, self.n_input_cols);
             let rank_value = if self.rank_col < self.n_input_cols {
-                row_vals[self.rank_col]
+                row_vals[self.rank_col].unwrap_or(0)
             } else {
                 0
             };
@@ -476,7 +501,7 @@ impl TopKOp {
         }
 
         // ── Recompute top-K for dirty partitions ──────────────────────────────
-        let mut output_rows: Vec<(Vec<i64>, i64)> = Vec::new();
+        let mut output_rows: Vec<(Vec<Option<i64>>, i64)> = Vec::new();
 
         for part_key in &dirty_partitions {
             let part = match state.partitions.get_mut(part_key) {
@@ -484,11 +509,7 @@ impl TopKOp {
                 None => continue,
             };
 
-            // Compute new top-K: sort positive-weight buffer entries by
-            // rank_value descending, then by full row bytes ascending (stable
-            // tiebreaker). Consume each entry's full positive multiplicity so
-            // duplicate input rows occupy duplicate Top-K positions.
-            let new_topk = select_topk(part, self.k, &spills[part_key]);
+            let new_topk = select_topk(part, self.k, &spills[part_key], &self.order_by);
 
             // Retract rows no longer in top-K.
             for (rid, (old_vals, old_count)) in &part.emitted {
@@ -522,11 +543,11 @@ impl TopKOp {
         Ok(output)
     }
 
-    fn partition_key_bytes(&self, row_vals: &[i64]) -> Vec<u8> {
+    fn partition_key_bytes(&self, row_vals: &[Option<i64>]) -> Vec<u8> {
         let mut key = Vec::with_capacity(self.partition_by.len() * 8);
         for &col in &self.partition_by {
             let v = if col < self.n_input_cols {
-                row_vals[col]
+                row_vals[col].unwrap_or(0)
             } else {
                 0
             };
@@ -574,15 +595,24 @@ impl Operator for TopKOp {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-fn encode_row(vals: &[i64]) -> Vec<u8> {
-    let mut key = Vec::with_capacity(vals.len() * 8);
+fn encode_row(vals: &[Option<i64>]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(vals.len() * 9);
     for v in vals {
-        key.extend_from_slice(&v.to_be_bytes());
+        match v {
+            Some(val) => {
+                key.push(1);
+                key.extend_from_slice(&val.to_be_bytes());
+            }
+            None => {
+                key.push(0);
+                key.extend_from_slice(&0i64.to_be_bytes());
+            }
+        }
     }
     key
 }
 
-fn extract_row_vals(batch: &RecordBatch, row_idx: usize, n_cols: usize) -> Vec<i64> {
+fn extract_row_vals(batch: &RecordBatch, row_idx: usize, n_cols: usize) -> Vec<Option<i64>> {
     batch
         .columns()
         .iter()
@@ -590,8 +620,14 @@ fn extract_row_vals(batch: &RecordBatch, row_idx: usize, n_cols: usize) -> Vec<i
         .map(|col| {
             col.as_any()
                 .downcast_ref::<Int64Array>()
-                .map(|a| a.value(row_idx))
-                .unwrap_or(0)
+                .map(|a| {
+                    if a.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(a.value(row_idx))
+                    }
+                })
+                .unwrap_or(Some(0))
         })
         .collect()
 }
@@ -640,33 +676,63 @@ fn topk_corruption() -> OpError {
     OpError::storage_error("corrupt topk record")
 }
 
+fn compare_topk_rows(
+    a: &[Option<i64>],
+    b: &[Option<i64>],
+    order_by: &[TopKOrderKey],
+) -> std::cmp::Ordering {
+    for key in order_by {
+        let av = a.get(key.col).copied().flatten();
+        let bv = b.get(key.col).copied().flatten();
+        let ord = match (av, bv) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, Some(_)) => {
+                if key.nulls_first {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                }
+            }
+            (Some(_), None) => {
+                if key.nulls_first {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Less
+                }
+            }
+            (Some(x), Some(y)) => {
+                if key.asc {
+                    x.cmp(&y)
+                } else {
+                    y.cmp(&x)
+                }
+            }
+        };
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    encode_row(a).cmp(&encode_row(b))
+}
+
 fn select_topk(
     part: &PartitionState,
     k: usize,
     spilled: &HashMap<u128, BufferEntry>,
-) -> HashMap<u128, (Vec<i64>, i64)> {
-    let mut sorted: Vec<(i64, u128, Vec<i64>, i64)> = part
+    order_by: &[TopKOrderKey],
+) -> HashMap<u128, (Vec<Option<i64>>, i64)> {
+    let mut sorted: Vec<(u128, Vec<Option<i64>>, i64)> = part
         .buffer
         .iter()
         .chain(spilled.iter())
         .filter(|(_, entry)| entry.net_weight > 0)
-        .map(|(&row_id, entry)| {
-            (
-                entry.rank_value,
-                row_id,
-                entry.row_vals.clone(),
-                entry.net_weight,
-            )
-        })
+        .map(|(&row_id, entry)| (row_id, entry.row_vals.clone(), entry.net_weight))
         .collect();
-    sorted.sort_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then_with(|| encode_row(&a.2).cmp(&encode_row(&b.2)))
-    });
+    sorted.sort_by(|a, b| compare_topk_rows(&a.1, &b.1, order_by));
 
     let mut remaining = k.min(i64::MAX as usize) as i64;
     let mut selected = HashMap::new();
-    for (_, row_id, row_vals, net_weight) in sorted {
+    for (row_id, row_vals, net_weight) in sorted {
         if remaining == 0 {
             break;
         }
@@ -677,14 +743,22 @@ fn select_topk(
     selected
 }
 
-fn row_id_hash(vals: &[i64]) -> u128 {
+fn row_id_hash(vals: &[Option<i64>]) -> u128 {
     const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
     const OFFSET_A: u64 = 0xcbf2_9ce4_8422_2325;
     const OFFSET_B: u64 = 0x6c62_272e_07bb_0142;
     let mut h0 = OFFSET_A;
     let mut h1 = OFFSET_B;
     for v in vals {
-        for &b in &v.to_be_bytes() {
+        let tag = match v {
+            Some(_) => 1u8,
+            None => 0u8,
+        };
+        h0 ^= tag as u64;
+        h0 = h0.wrapping_mul(FNV_PRIME);
+        h1 ^= (tag ^ 0x5A) as u64;
+        h1 = h1.wrapping_mul(FNV_PRIME);
+        for &b in &v.unwrap_or(0).to_be_bytes() {
             h0 ^= b as u64;
             h0 = h0.wrapping_mul(FNV_PRIME);
             h1 ^= (b ^ 0x5A) as u64;
@@ -694,12 +768,15 @@ fn row_id_hash(vals: &[i64]) -> u128 {
     ((h0 as u128) << 64) | (h1 as u128)
 }
 
-fn build_output(schema: &SchemaRef, rows: Vec<(Vec<i64>, i64)>) -> Result<ArrowZSet, OpError> {
+fn build_output(
+    schema: &SchemaRef,
+    rows: Vec<(Vec<Option<i64>>, i64)>,
+) -> Result<ArrowZSet, OpError> {
     if rows.is_empty() {
         return Ok(ArrowZSet::empty(schema.clone()));
     }
 
-    let mut agg: HashMap<u128, (i64, Vec<i64>)> = HashMap::new();
+    let mut agg: HashMap<u128, (i64, Vec<Option<i64>>)> = HashMap::new();
     for (vals, w) in rows {
         let h = row_id_hash(&vals);
         let entry = agg.entry(h).or_insert((0i64, vals));
@@ -707,7 +784,7 @@ fn build_output(schema: &SchemaRef, rows: Vec<(Vec<i64>, i64)>) -> Result<ArrowZ
     }
 
     let num_cols = schema.fields().len();
-    let mut col_builders: Vec<Vec<i64>> = vec![Vec::new(); num_cols];
+    let mut col_builders: Vec<Vec<Option<i64>>> = vec![Vec::new(); num_cols];
     let mut weights: Vec<i64> = Vec::new();
 
     for (_, (net_w, vals)) in agg {
@@ -735,29 +812,67 @@ fn build_output(schema: &SchemaRef, rows: Vec<(Vec<i64>, i64)>) -> Result<ArrowZ
 
 // ─── LFS persistence ─────────────────────────────────────────────────────────
 
-/// Encode TopK buffer entry value: `[rank_value:8 BE][net_weight:8 BE][col0:8 BE]...[colN:8 BE]`
-fn encode_topk_value(rank_value: i64, net_weight: i64, row_vals: &[i64]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(16 + row_vals.len() * 8);
-    v.extend_from_slice(&rank_value.to_be_bytes());
-    v.extend_from_slice(&net_weight.to_be_bytes());
-    for val in row_vals {
-        v.extend_from_slice(&val.to_be_bytes());
+const TOPK_VALUE_V2_TAG: u8 = 0x02;
+
+/// Encode TopK buffer entry value.
+/// Legacy v1 (all non-null): `[rank_value:8 BE][net_weight:8 BE][col0:8 BE]...[colN:8 BE]`
+/// Null-aware v2 (when any column is NULL): `[0x02][rank_value:8 BE][net_weight:8 BE][is_some:1, val:8 BE]...`
+fn encode_topk_value(rank_value: i64, net_weight: i64, row_vals: &[Option<i64>]) -> Vec<u8> {
+    if row_vals.iter().all(Option::is_some) {
+        let mut v = Vec::with_capacity(16 + row_vals.len() * 8);
+        v.extend_from_slice(&rank_value.to_be_bytes());
+        v.extend_from_slice(&net_weight.to_be_bytes());
+        for val in row_vals {
+            v.extend_from_slice(&val.unwrap().to_be_bytes());
+        }
+        v
+    } else {
+        let mut v = Vec::with_capacity(1 + 16 + row_vals.len() * 9);
+        v.push(TOPK_VALUE_V2_TAG);
+        v.extend_from_slice(&rank_value.to_be_bytes());
+        v.extend_from_slice(&net_weight.to_be_bytes());
+        for val in row_vals {
+            match val {
+                Some(x) => {
+                    v.push(1);
+                    v.extend_from_slice(&x.to_be_bytes());
+                }
+                None => {
+                    v.push(0);
+                    v.extend_from_slice(&0i64.to_be_bytes());
+                }
+            }
+        }
+        v
     }
-    v
 }
 
-fn decode_topk_value(bytes: &[u8], n_input_cols: usize) -> Option<(i64, i64, Vec<i64>)> {
-    if bytes.len() != 16 + n_input_cols * 8 {
-        return None;
+fn decode_topk_value(bytes: &[u8], n_input_cols: usize) -> Option<(i64, i64, Vec<Option<i64>>)> {
+    if bytes.len() == 16 + n_input_cols * 8 {
+        let rank_value = i64::from_be_bytes(bytes[0..8].try_into().ok()?);
+        let net_weight = i64::from_be_bytes(bytes[8..16].try_into().ok()?);
+        let mut vals = Vec::with_capacity(n_input_cols);
+        for i in 0..n_input_cols {
+            let off = 16 + i * 8;
+            vals.push(Some(i64::from_be_bytes(
+                bytes[off..off + 8].try_into().ok()?,
+            )));
+        }
+        return Some((rank_value, net_weight, vals));
     }
-    let rank_value = i64::from_be_bytes(bytes[0..8].try_into().ok()?);
-    let net_weight = i64::from_be_bytes(bytes[8..16].try_into().ok()?);
-    let mut vals = Vec::with_capacity(n_input_cols);
-    for i in 0..n_input_cols {
-        let off = 16 + i * 8;
-        vals.push(i64::from_be_bytes(bytes[off..off + 8].try_into().ok()?));
+    if bytes.len() == 1 + 16 + n_input_cols * 9 && bytes[0] == TOPK_VALUE_V2_TAG {
+        let rank_value = i64::from_be_bytes(bytes[1..9].try_into().ok()?);
+        let net_weight = i64::from_be_bytes(bytes[9..17].try_into().ok()?);
+        let mut vals = Vec::with_capacity(n_input_cols);
+        for i in 0..n_input_cols {
+            let off = 17 + i * 9;
+            let is_some = bytes[off];
+            let raw = i64::from_be_bytes(bytes[off + 1..off + 9].try_into().ok()?);
+            vals.push(if is_some != 0 { Some(raw) } else { None });
+        }
+        return Some((rank_value, net_weight, vals));
     }
-    Some((rank_value, net_weight, vals))
+    None
 }
 
 /// Persist TopKOp state to a ShardDb.
@@ -877,7 +992,7 @@ pub async fn load_topk_state(
     }
     for part in st.partitions.values_mut() {
         part.positive_count = part.buffer.values().filter(|e| e.net_weight > 0).count();
-        part.emitted = select_topk(part, k, &HashMap::new());
+        part.emitted = select_topk(part, k, &HashMap::new(), &op.order_by);
     }
     let total = st.total_entries();
     *op.state.lock().unwrap() = st;
@@ -963,7 +1078,7 @@ mod tests {
         let persisted = db.scan_prefix(b"topk_spill:").await.unwrap();
         assert_eq!(
             accepted.partitions[&0_i64.to_be_bytes().to_vec()].spilled,
-            HashSet::from([row_id_hash(&[100001, 0])])
+            HashSet::from([row_id_hash(&[Some(100001), Some(0)])])
         );
 
         db.set_fail_scans(true);
@@ -1013,9 +1128,9 @@ mod tests {
         assert_eq!(
             expected,
             HashMap::from([
-                (vec![7, 1], -1),
-                (vec![100000, 0], -1),
-                (vec![100001, 0], 1),
+                (vec![Some(7), Some(1)], -1),
+                (vec![Some(100000), Some(0)], -1),
+                (vec![Some(100001), Some(0)], 1),
             ])
         );
         drop(op);
@@ -1055,7 +1170,10 @@ mod tests {
             .collect::<HashMap<_, _>>();
         assert_eq!(
             actual,
-            HashMap::from([(vec![100_001, 0], 1), (vec![100_000, 0], -1)])
+            HashMap::from([
+                (vec![Some(100_001), Some(0)], 1),
+                (vec![Some(100_000), Some(0)], -1),
+            ])
         );
     }
 
@@ -1079,7 +1197,7 @@ mod tests {
             records.iter().map(|(_, v)| v.to_vec()).collect::<Vec<_>>(),
             (1_i64..=3)
                 .rev()
-                .map(|v| encode_topk_value(v, 1, &[v, v]))
+                .map(|v| encode_topk_value(v, 1, &[Some(v), Some(v)]))
                 .collect::<Vec<_>>()
         );
         let (key, value) = &records[1];

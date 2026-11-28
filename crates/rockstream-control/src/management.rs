@@ -8,8 +8,11 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use chrono::{SecondsFormat, Utc};
 use futures::Stream;
+use prost::Message;
 use rockstream_management_proto::{ensure_protocol_version, v1};
 use rockstream_storage::catalog::{CatalogMutation, CatalogStore, CatalogTxn};
 use rockstream_types::authorization::{
@@ -48,6 +51,32 @@ use crate::topology::TopologyCatalog;
 const DEFAULT_PAGE_SIZE: usize = 50;
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_MANAGEMENT_REQUESTS: usize = 64;
+
+struct BoundedJsonBuffer {
+    bytes: Vec<u8>,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl io::Write for BoundedJsonBuffer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let remaining = self.limit.saturating_sub(self.bytes.len());
+        if bytes.len() > remaining {
+            self.bytes.extend_from_slice(&bytes[..remaining]);
+            self.exceeded = true;
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "security audit record exceeds response limit",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 pub fn security_deployment_fingerprint(config: &NodeConfig, catalog_namespace: &str) -> String {
     let context = format!(
@@ -96,6 +125,25 @@ struct SupportArtifactDigest {
 }
 
 #[derive(Serialize)]
+struct SecurityPrincipalCreateDigest {
+    deployment_id: String,
+    principal: SecurityPrincipal,
+    grantor_id: u64,
+    grantor_revision: u64,
+    certificate_sha256: String,
+}
+
+#[derive(Serialize)]
+struct SecurityPrincipalDeleteDigest {
+    deployment_id: String,
+    principal_id: u64,
+    expected_revision: u64,
+    grantor_id: u64,
+    grantor_revision: u64,
+    certificate_sha256: String,
+}
+
+#[derive(Serialize)]
 struct SupportArtifactDocument {
     format_version: u16,
     generated_at_ms: u64,
@@ -127,6 +175,31 @@ struct SupportArtifactAudit<'a> {
 }
 
 impl<'a> SupportArtifactAudit<'a> {
+    fn into_record(
+        self,
+        principal_id: PrincipalId,
+        policy_revision: u64,
+    ) -> Result<SecurityAuditRecord, Status> {
+        Ok(SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: format!("support-artifact-{}", uuid::Uuid::new_v4()),
+            timestamp_ms: Utc::now().timestamp_millis().max(1) as u64,
+            actor: AuditIdentity::Verified(format!("principal:{}", principal_id.0)),
+            target: AuditField::Known(format!("support-artifact:{}", self.artifact_id)),
+            scope: AuditField::Known(
+                serde_json::to_string(self.scope)
+                    .map_err(|_| Status::internal("support artifact scope serialization failed"))?,
+            ),
+            action: self.action,
+            outcome: self.outcome,
+            correlation: self.correlation,
+            operation_id: self.operation_id,
+            policy_revision: AuditField::Known(policy_revision),
+            before_state: self.before_state,
+            after_state: self.after_state,
+        })
+    }
+
     fn operation(
         artifact_id: &'a str,
         scope: &'a PolicyScope,
@@ -844,32 +917,16 @@ impl ManagementService {
         policy_revision: u64,
         audit: SupportArtifactAudit<'_>,
     ) -> Result<(), Status> {
+        let record = audit.into_record(principal_id, policy_revision)?;
         let catalog = self
             .security_catalog
             .as_ref()
             .ok_or_else(|| Status::unavailable("management security catalog is unavailable"))?;
-        let scope = serde_json::to_string(audit.scope)
-            .map_err(|_| Status::internal("support artifact scope serialization failed"))?;
-        append_security_audit(
-            catalog.as_ref(),
-            SecurityAuditRecord {
-                format_version: SECURITY_AUDIT_FORMAT_VERSION,
-                event_id: format!("support-artifact-{}", uuid::Uuid::new_v4()),
-                timestamp_ms: Utc::now().timestamp_millis().max(1) as u64,
-                actor: AuditIdentity::Verified(format!("principal:{}", principal_id.0)),
-                target: AuditField::Known(format!("support-artifact:{}", audit.artifact_id)),
-                scope: AuditField::Known(scope),
-                action: audit.action,
-                outcome: audit.outcome,
-                correlation: audit.correlation,
-                operation_id: audit.operation_id,
-                policy_revision: AuditField::Known(policy_revision),
-                before_state: audit.before_state,
-                after_state: audit.after_state,
-            },
-        )
-        .await
-        .map_err(|_| required_audit_unavailable(request, "support artifact audit is unavailable"))
+        append_security_audit(catalog.as_ref(), record)
+            .await
+            .map_err(|_| {
+                required_audit_unavailable(request, "support artifact audit is unavailable")
+            })
     }
 
     async fn support_artifact_content(
@@ -928,24 +985,25 @@ impl ManagementService {
         operation: &OperationRecord,
         phase: &str,
     ) -> Result<(), Status> {
-        self.record_support_artifact_audit(
-            request,
-            principal_id,
-            policy_revision,
-            SupportArtifactAudit::operation(
-                artifact.0,
-                artifact.1,
-                SecurityAuditClass::AdminOperationCompletion,
-                SecurityAuditOutcome::Failure,
-                AuditField::Known("generating".to_owned()),
-                AuditField::Known(phase.to_owned()),
-            ),
+        let before_state = if operation.status() == OperationStatus::Running {
+            "generating".to_owned()
+        } else {
+            format!("{:?}", operation.status()).to_lowercase()
+        };
+        let audit = SupportArtifactAudit::operation(
+            artifact.0,
+            artifact.1,
+            SecurityAuditClass::AdminOperationCompletion,
+            SecurityAuditOutcome::Failure,
+            AuditField::Known(before_state),
+            AuditField::Known(phase.to_owned()),
         )
-        .await?;
-        self.operations
-            .transition_if(
+        .into_record(principal_id, policy_revision)?;
+        let failed = self
+            .operations
+            .transition_if_with_audit(
                 operation.operation_id(),
-                OperationStatus::Running,
+                operation.status(),
                 operation.phase(),
                 crate::management_store::OperationUpdate {
                     status: OperationStatus::Failed,
@@ -953,11 +1011,22 @@ impl ManagementService {
                     progress: Some(100),
                     phase: Some(phase.to_owned()),
                     error_code: None,
-                    next_steps: Vec::new(),
+                    next_steps: if phase == "expired_before_generation" {
+                        vec![
+                            "Use a new idempotency key to request another support artifact."
+                                .to_owned(),
+                        ]
+                    } else {
+                        Vec::new()
+                    },
                 },
+                audit,
             )
             .await
             .map_err(store_error)?;
+        self.flush_operation_audit(failed).await.map_err(|_| {
+            required_audit_unavailable(request, "support artifact audit is unavailable")
+        })?;
         Ok(())
     }
 
@@ -1077,7 +1146,7 @@ impl ManagementService {
             },
             None => PolicyScope::Cluster,
         };
-        let Some(catalog) = self.security_catalog.as_ref() else {
+        let Some(_catalog) = self.security_catalog.as_ref() else {
             tracing::error!(
                 code = %rockstream_types::error_code::RS_0003,
                 operation_id = current.operation_id(),
@@ -1102,13 +1171,9 @@ impl ManagementService {
             before_state: AuditField::Known(format!("{:?}", current.status())),
             after_state: AuditField::Known("expired_before_generation".to_owned()),
         };
-        if let Err(error) = append_security_audit(catalog.as_ref(), audit).await {
-            tracing::warn!(%error, operation_id = current.operation_id(), "support artifact expiry audit failed");
-            return;
-        }
-        if let Err(error) = self
+        let failed = match self
             .operations
-            .transition_if(
+            .transition_if_with_audit(
                 current.operation_id(),
                 current.status(),
                 current.phase(),
@@ -1122,10 +1187,18 @@ impl ManagementService {
                         "Use a new idempotency key to request another support artifact.".to_owned(),
                     ],
                 },
+                audit,
             )
             .await
         {
-            tracing::warn!(%error, operation_id = current.operation_id(), "support artifact expiry transition failed");
+            Ok(failed) => failed,
+            Err(error) => {
+                tracing::warn!(%error, operation_id = current.operation_id(), "support artifact expiry transition failed");
+                return;
+            }
+        };
+        if let Err(error) = self.flush_operation_audit(failed).await {
+            tracing::warn!(%error, operation_id = current.operation_id(), "support artifact expiry audit failed");
         }
     }
 
@@ -1313,6 +1386,703 @@ impl ManagementService {
                     .map_err(|error| error.to_string())
             }
         }
+    }
+
+    async fn ensure_service_principal_create_started(
+        &self,
+        request: &Request<v1::CreateServicePrincipalRequest>,
+        operation_id: &str,
+        change: &SecurityPrincipalCreateDigest,
+        fingerprint: &str,
+    ) -> Result<(), Status> {
+        let catalog = self
+            .security_catalog
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("management security catalog is unavailable"))?;
+        let event_id = format!("management-service-principal-create-start:{operation_id}");
+        catalog.refresh().await.map_err(|_| {
+            required_audit_unavailable(request, "service principal audit is unavailable")
+        })?;
+        if let Some(record) = catalog
+            .get_security_audit_record(&event_id)
+            .await
+            .map_err(|_| {
+                required_audit_unavailable(request, "service principal audit is unavailable")
+            })?
+        {
+            if record.action == SecurityAuditClass::AdminOperationStart
+                && record.outcome == SecurityAuditOutcome::Success
+                && record.actor
+                    == AuditIdentity::Verified(format!("principal:{}", change.grantor_id))
+                && record.target
+                    == AuditField::Known(format!("principal:{}", change.principal.id.0))
+                && record.scope == AuditField::Known("cluster".to_owned())
+                && record.correlation == AuditCorrelation::Observed(operation_id.to_owned())
+                && record.operation_id == AuditField::Known(operation_id.to_owned())
+                && record.policy_revision == AuditField::Known(change.grantor_revision)
+                && record.before_state == AuditField::NotApplicable
+                && record.after_state == AuditField::Known(format!("request_sha256:{fingerprint}"))
+            {
+                return Ok(());
+            }
+            return Err(Status::already_exists(
+                "idempotency key is bound to another service-principal request",
+            ));
+        }
+        append_security_audit(
+            catalog.as_ref(),
+            SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id,
+                timestamp_ms: Utc::now().timestamp_millis().max(1) as u64,
+                actor: AuditIdentity::Verified(format!("principal:{}", change.grantor_id)),
+                target: AuditField::Known(format!("principal:{}", change.principal.id.0)),
+                scope: AuditField::Known("cluster".to_owned()),
+                action: SecurityAuditClass::AdminOperationStart,
+                outcome: SecurityAuditOutcome::Success,
+                correlation: AuditCorrelation::Observed(operation_id.to_owned()),
+                operation_id: AuditField::Known(operation_id.to_owned()),
+                policy_revision: AuditField::Known(change.grantor_revision),
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::Known(format!("request_sha256:{fingerprint}")),
+            },
+        )
+        .await
+        .map_err(|_| required_audit_unavailable(request, "service principal audit is unavailable"))
+    }
+
+    async fn apply_service_principal_create(
+        &self,
+        operation_id: &str,
+        change: &SecurityPrincipalCreateDigest,
+    ) -> Result<(), Status> {
+        if change.deployment_id != self.deployment_fingerprint() {
+            return Err(Status::failed_precondition(
+                "service principal request belongs to another deployment",
+            ));
+        }
+        let catalog = self
+            .security_catalog
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("management security catalog is unavailable"))?;
+        let grantor_id = PrincipalId(change.grantor_id);
+        let target_id = change.principal.id;
+        let grant_event_id = format!("management-service-principal-create:{operation_id}");
+        let completion_event_id =
+            format!("management-service-principal-create-completion:{operation_id}");
+        let actor = AuditIdentity::Verified(format!("principal:{}", grantor_id.0));
+        let target = AuditField::Known(format!("principal:{}", target_id.0));
+        let after_state = security_principal_policy_state(&change.principal)
+            .map_err(|_| Status::internal("failed to encode service principal policy"))?;
+        let certificate: [u8; 32] = hex::decode(&change.certificate_sha256)
+            .map_err(|_| Status::internal("service principal grantor identity is malformed"))?
+            .try_into()
+            .map_err(|_| Status::internal("service principal grantor identity is malformed"))?;
+
+        for attempt in 0..rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS {
+            catalog
+                .refresh()
+                .await
+                .map_err(|_| Status::unavailable("management security catalog is unavailable"))?;
+            if let Some(record) = catalog
+                .get_security_audit_record(&grant_event_id)
+                .await
+                .map_err(|_| Status::unavailable("management security catalog is unavailable"))?
+            {
+                let completion = catalog
+                    .get_security_audit_record(&completion_event_id)
+                    .await
+                    .map_err(|_| {
+                        Status::unavailable("management security catalog is unavailable")
+                    })?;
+                let valid_grant = record.action == SecurityAuditClass::GrantChange
+                    && record.outcome == SecurityAuditOutcome::Success
+                    && record.actor == actor
+                    && record.target == target
+                    && record.scope == AuditField::Known("cluster".to_owned())
+                    && record.correlation == AuditCorrelation::Observed(operation_id.to_owned())
+                    && record.operation_id == AuditField::Known(operation_id.to_owned())
+                    && record.policy_revision == AuditField::Known(1)
+                    && record.before_state == AuditField::NotApplicable
+                    && record.after_state == AuditField::Known(after_state.clone());
+                let valid_completion = completion.as_ref().is_some_and(|record| {
+                    record.action == SecurityAuditClass::AdminOperationCompletion
+                        && record.outcome == SecurityAuditOutcome::Success
+                        && record.actor == actor
+                        && record.target == target
+                        && record.scope == AuditField::Known("cluster".to_owned())
+                        && record.correlation == AuditCorrelation::Observed(operation_id.to_owned())
+                        && record.operation_id == AuditField::Known(operation_id.to_owned())
+                        && record.policy_revision == AuditField::Known(1)
+                        && record.before_state == AuditField::NotApplicable
+                        && record.after_state == AuditField::Known(after_state.clone())
+                });
+                return if valid_grant && valid_completion {
+                    Ok(())
+                } else {
+                    Err(Status::data_loss(
+                        "service principal creation audit does not match its request",
+                    ))
+                };
+            }
+            if let Some(record) = catalog
+                .get_security_audit_record(&completion_event_id)
+                .await
+                .map_err(|_| Status::unavailable("management security catalog is unavailable"))?
+            {
+                if record.action == SecurityAuditClass::AdminOperationCompletion
+                    && record.outcome == SecurityAuditOutcome::Failure
+                    && record.actor == actor
+                    && record.target == target
+                    && record.operation_id == AuditField::Known(operation_id.to_owned())
+                {
+                    return Err(Status::failed_precondition(
+                        "service principal creation previously failed; use a new idempotency key",
+                    ));
+                }
+                return Err(Status::data_loss(
+                    "service principal creation completion audit is inconsistent",
+                ));
+            }
+
+            let grantor = catalog
+                .get_security_principal(grantor_id)
+                .await
+                .map_err(|_| Status::unavailable("management security catalog is unavailable"))?
+                .ok_or_else(|| Status::failed_precondition("granting principal is unavailable"))?;
+            if grantor.revision != change.grantor_revision
+                || !has_management_admin(std::slice::from_ref(&grantor))
+                || !grantor.login_methods.iter().any(|method| {
+                    matches!(method, rockstream_types::authorization::LoginMethod::Mtls { certificate_sha256 } if certificate_sha256 == &certificate)
+                })
+                || !crate::authorization::allows(
+                    &grantor,
+                    SecurityAction::GrantManage,
+                    &PolicyScope::Cluster,
+                )
+            {
+                return Err(Status::failed_precondition(
+                    "grantor authority or reviewed revision is no longer current",
+                ));
+            }
+            let mut principals = catalog
+                .list_security_principals()
+                .await
+                .map_err(|_| Status::unavailable("management security catalog is unavailable"))?;
+            if principals.iter().any(|principal| principal.id == target_id) {
+                return Err(Status::already_exists("principal id is already in use"));
+            }
+            principals.push(change.principal.clone());
+            if SecurityPrincipal::validate_unique_login_identities(principals.iter()).is_err() {
+                return Err(Status::already_exists("service identity is already in use"));
+            }
+            if !has_management_admin(&principals) {
+                return Err(Status::failed_precondition(
+                    "service principal mutation would remove the last management administrator",
+                ));
+            }
+            let timestamp_ms = Utc::now().timestamp_millis().max(1) as u64;
+            let grant_audit = SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: grant_event_id.clone(),
+                timestamp_ms,
+                actor: actor.clone(),
+                target: target.clone(),
+                scope: AuditField::Known("cluster".to_owned()),
+                action: SecurityAuditClass::GrantChange,
+                outcome: SecurityAuditOutcome::Success,
+                correlation: AuditCorrelation::Observed(operation_id.to_owned()),
+                operation_id: AuditField::Known(operation_id.to_owned()),
+                policy_revision: AuditField::Known(1),
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::Known(after_state.clone()),
+            };
+            let completion_audit = SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: completion_event_id.clone(),
+                timestamp_ms,
+                actor: actor.clone(),
+                target: target.clone(),
+                scope: AuditField::Known("cluster".to_owned()),
+                action: SecurityAuditClass::AdminOperationCompletion,
+                outcome: SecurityAuditOutcome::Success,
+                correlation: AuditCorrelation::Observed(operation_id.to_owned()),
+                operation_id: AuditField::Known(operation_id.to_owned()),
+                policy_revision: AuditField::Known(1),
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::Known(after_state.clone()),
+            };
+            let revision = catalog.get_revision().await.checked_add(1).ok_or_else(|| {
+                Status::resource_exhausted("security catalog revision is exhausted")
+            })?;
+            let txn = CatalogTxn::new(
+                revision,
+                rand::random::<u64>().max(1),
+                vec![
+                    CatalogMutation::PutSecurityPrincipalForOperation {
+                        principal: change.principal.clone(),
+                        expected_revision: None,
+                        grantor_revision: Some((grantor_id, change.grantor_revision)),
+                        operation_id: operation_id.to_owned(),
+                        audit: grant_audit,
+                    },
+                    CatalogMutation::AppendSecurityAudit(completion_audit),
+                ],
+            )
+            .map_err(|_| Status::internal("invalid service principal transaction"))?;
+            match catalog.commit_txn(txn).await {
+                Ok(_) => return Ok(()),
+                Err(rockstream_storage::catalog::CatalogError::OptimisticConflict(_))
+                    if attempt + 1
+                        < rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS => {}
+                Err(rockstream_storage::catalog::CatalogError::InvalidSecurityPolicy(_)) => {
+                    return Err(Status::failed_precondition(
+                        "service principal conflicts with current security policy",
+                    ));
+                }
+                Err(_) => {
+                    return Err(Status::unavailable(
+                        "management security catalog is unavailable",
+                    ));
+                }
+            }
+        }
+        Err(Status::unavailable(
+            "security catalog changed too frequently; retry the same idempotency key",
+        ))
+    }
+
+    async fn append_service_principal_create_failure(
+        &self,
+        request: &Request<v1::CreateServicePrincipalRequest>,
+        operation_id: &str,
+        change: &SecurityPrincipalCreateDigest,
+    ) -> Result<(), Status> {
+        let catalog = self
+            .security_catalog
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("management security catalog is unavailable"))?;
+        let event_id = format!("management-service-principal-create-completion:{operation_id}");
+        catalog.refresh().await.map_err(|_| {
+            required_audit_unavailable(request, "service principal audit is unavailable")
+        })?;
+        if let Some(record) = catalog
+            .get_security_audit_record(&event_id)
+            .await
+            .map_err(|_| {
+                required_audit_unavailable(request, "service principal audit is unavailable")
+            })?
+        {
+            if record.action == SecurityAuditClass::AdminOperationCompletion
+                && record.outcome == SecurityAuditOutcome::Failure
+                && record.actor
+                    == AuditIdentity::Verified(format!("principal:{}", change.grantor_id))
+                && record.target
+                    == AuditField::Known(format!("principal:{}", change.principal.id.0))
+                && record.operation_id == AuditField::Known(operation_id.to_owned())
+            {
+                return Ok(());
+            }
+            return Err(Status::data_loss(
+                "service principal completion audit is inconsistent",
+            ));
+        }
+        append_security_audit(
+            catalog.as_ref(),
+            SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id,
+                timestamp_ms: Utc::now().timestamp_millis().max(1) as u64,
+                actor: AuditIdentity::Verified(format!("principal:{}", change.grantor_id)),
+                target: AuditField::Known(format!("principal:{}", change.principal.id.0)),
+                scope: AuditField::Known("cluster".to_owned()),
+                action: SecurityAuditClass::AdminOperationCompletion,
+                outcome: SecurityAuditOutcome::Failure,
+                correlation: AuditCorrelation::Observed(operation_id.to_owned()),
+                operation_id: AuditField::Known(operation_id.to_owned()),
+                policy_revision: AuditField::Known(change.grantor_revision),
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::Known("rejected".to_owned()),
+            },
+        )
+        .await
+        .map_err(|_| required_audit_unavailable(request, "service principal audit is unavailable"))
+    }
+
+    async fn ensure_security_principal_delete_started(
+        &self,
+        request: &Request<v1::DeleteSecurityPrincipalRequest>,
+        operation_id: &str,
+        change: &SecurityPrincipalDeleteDigest,
+        fingerprint: &str,
+    ) -> Result<(), Status> {
+        let catalog = self
+            .security_catalog
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("management security catalog is unavailable"))?;
+        let event_id = format!("management-principal-delete-start:{operation_id}");
+        let valid_start = |record: &SecurityAuditRecord| {
+            record.action == SecurityAuditClass::AdminOperationStart
+                && record.outcome == SecurityAuditOutcome::Success
+                && record.actor
+                    == AuditIdentity::Verified(format!("principal:{}", change.grantor_id))
+                && record.target == AuditField::Known(format!("principal:{}", change.principal_id))
+                && record.scope == AuditField::Known("cluster".to_owned())
+                && record.correlation == AuditCorrelation::Observed(operation_id.to_owned())
+                && record.operation_id == AuditField::Known(operation_id.to_owned())
+                && record.policy_revision == AuditField::Known(change.grantor_revision)
+                && record.before_state == AuditField::NotApplicable
+                && record.after_state == AuditField::Known(format!("request_sha256:{fingerprint}"))
+        };
+        catalog.refresh().await.map_err(|_| {
+            required_audit_unavailable(request, "principal deletion audit is unavailable")
+        })?;
+        if let Some(record) = catalog
+            .get_security_audit_record(&event_id)
+            .await
+            .map_err(|_| {
+                required_audit_unavailable(request, "principal deletion audit is unavailable")
+            })?
+        {
+            if valid_start(&record) {
+                return Ok(());
+            }
+            return Err(Status::already_exists(
+                "idempotency key is bound to another principal-deletion request",
+            ));
+        }
+        let start_record = SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: event_id.clone(),
+            timestamp_ms: Utc::now().timestamp_millis().max(1) as u64,
+            actor: AuditIdentity::Verified(format!("principal:{}", change.grantor_id)),
+            target: AuditField::Known(format!("principal:{}", change.principal_id)),
+            scope: AuditField::Known("cluster".to_owned()),
+            action: SecurityAuditClass::AdminOperationStart,
+            outcome: SecurityAuditOutcome::Success,
+            correlation: AuditCorrelation::Observed(operation_id.to_owned()),
+            operation_id: AuditField::Known(operation_id.to_owned()),
+            policy_revision: AuditField::Known(change.grantor_revision),
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::Known(format!("request_sha256:{fingerprint}")),
+        };
+        if append_security_audit(catalog.as_ref(), start_record)
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+        catalog.refresh().await.map_err(|_| {
+            required_audit_unavailable(request, "principal deletion audit is unavailable")
+        })?;
+        if let Some(record) = catalog
+            .get_security_audit_record(&event_id)
+            .await
+            .map_err(|_| {
+                required_audit_unavailable(request, "principal deletion audit is unavailable")
+            })?
+        {
+            if valid_start(&record) {
+                return Ok(());
+            }
+            return Err(Status::already_exists(
+                "idempotency key is bound to another principal-deletion request",
+            ));
+        }
+        Err(required_audit_unavailable(
+            request,
+            "principal deletion audit is unavailable",
+        ))
+    }
+
+    async fn apply_security_principal_delete(
+        &self,
+        operation_id: &str,
+        change: &SecurityPrincipalDeleteDigest,
+    ) -> Result<u64, Status> {
+        if change.deployment_id != self.deployment_fingerprint() {
+            return Err(Status::failed_precondition(
+                "principal deletion request belongs to another deployment",
+            ));
+        }
+        let catalog = self
+            .security_catalog
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("management security catalog is unavailable"))?;
+        let expected_deleted_revision =
+            change.expected_revision.checked_add(1).ok_or_else(|| {
+                Status::resource_exhausted("security principal revision is exhausted")
+            })?;
+        let grantor_id = PrincipalId(change.grantor_id);
+        let principal_id = PrincipalId(change.principal_id);
+        let grant_event_id = format!("management-principal-delete:{operation_id}");
+        let completion_event_id = format!("management-principal-delete-completion:{operation_id}");
+        let actor = AuditIdentity::Verified(format!("principal:{}", grantor_id.0));
+        let target = AuditField::Known(format!("principal:{}", principal_id.0));
+        let certificate: [u8; 32] = hex::decode(&change.certificate_sha256)
+            .map_err(|_| Status::internal("principal deletion grantor identity is malformed"))?
+            .try_into()
+            .map_err(|_| Status::internal("principal deletion grantor identity is malformed"))?;
+
+        for attempt in 0..rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS {
+            catalog
+                .refresh()
+                .await
+                .map_err(|_| Status::unavailable("management security catalog is unavailable"))?;
+            if let Some(record) = catalog
+                .get_security_audit_record(&grant_event_id)
+                .await
+                .map_err(|_| Status::unavailable("management security catalog is unavailable"))?
+            {
+                let completion = catalog
+                    .get_security_audit_record(&completion_event_id)
+                    .await
+                    .map_err(|_| {
+                        Status::unavailable("management security catalog is unavailable")
+                    })?;
+                let expected_before_prefix =
+                    format!("revision={};policy=", change.expected_revision);
+                let operation_id_value = match &record.operation_id {
+                    AuditField::Known(value) => value.parse::<u64>().ok().filter(|id| *id > 0),
+                    _ => None,
+                };
+                let valid_grant = record.action == SecurityAuditClass::GrantChange
+                    && record.outcome == SecurityAuditOutcome::Success
+                    && record.actor == actor
+                    && record.target == target
+                    && record.scope == AuditField::Known("cluster".to_owned())
+                    && record.correlation == AuditCorrelation::Observed(operation_id.to_owned())
+                    && operation_id_value.is_some()
+                    && record.policy_revision == AuditField::Known(expected_deleted_revision)
+                    && matches!(&record.before_state, AuditField::Known(state) if state.starts_with(&expected_before_prefix))
+                    && record.after_state == AuditField::NotApplicable;
+                let valid_completion = completion.as_ref().is_some_and(|completion| {
+                    completion.action == SecurityAuditClass::AdminOperationCompletion
+                        && completion.outcome == SecurityAuditOutcome::Success
+                        && completion.actor == actor
+                        && completion.target == target
+                        && completion.scope == AuditField::Known("cluster".to_owned())
+                        && completion.correlation
+                            == AuditCorrelation::Observed(operation_id.to_owned())
+                        && completion.operation_id == record.operation_id
+                        && completion.policy_revision
+                            == AuditField::Known(expected_deleted_revision)
+                        && completion.before_state == record.before_state
+                        && completion.after_state == AuditField::Known("deleted".to_owned())
+                });
+                return if valid_grant && valid_completion {
+                    operation_id_value.ok_or_else(|| {
+                        Status::data_loss("principal deletion audit operation ID is invalid")
+                    })
+                } else {
+                    Err(Status::data_loss(
+                        "principal deletion audit does not match its request",
+                    ))
+                };
+            }
+            if let Some(completion) = catalog
+                .get_security_audit_record(&completion_event_id)
+                .await
+                .map_err(|_| Status::unavailable("management security catalog is unavailable"))?
+            {
+                if completion.action == SecurityAuditClass::AdminOperationCompletion
+                    && completion.outcome == SecurityAuditOutcome::Failure
+                    && completion.event_id == completion_event_id
+                    && completion.actor == actor
+                    && completion.target == target
+                    && completion.scope == AuditField::Known("cluster".to_owned())
+                    && completion.correlation == AuditCorrelation::Observed(operation_id.to_owned())
+                    && completion.operation_id == AuditField::Known(operation_id.to_owned())
+                    && completion.policy_revision == AuditField::Known(change.expected_revision)
+                    && completion.before_state == AuditField::NotApplicable
+                    && completion.after_state == AuditField::Known("rejected".to_owned())
+                {
+                    return Err(Status::failed_precondition(
+                        "principal deletion previously failed; use a new idempotency key",
+                    ));
+                }
+                return Err(Status::data_loss(
+                    "principal deletion completion audit is inconsistent",
+                ));
+            }
+
+            let grantor = catalog
+                .get_security_principal(grantor_id)
+                .await
+                .map_err(|_| Status::unavailable("management security catalog is unavailable"))?
+                .ok_or_else(|| Status::failed_precondition("granting principal is unavailable"))?;
+            if grantor.revision != change.grantor_revision
+                || !has_management_admin(std::slice::from_ref(&grantor))
+                || !grantor.login_methods.iter().any(|method| {
+                    matches!(method, rockstream_types::authorization::LoginMethod::Mtls { certificate_sha256 } if certificate_sha256 == &certificate)
+                })
+                || !crate::authorization::allows(
+                    &grantor,
+                    SecurityAction::GrantManage,
+                    &PolicyScope::Cluster,
+                )
+            {
+                return Err(Status::failed_precondition(
+                    "grantor authority or reviewed revision is no longer current",
+                ));
+            }
+            let principal = catalog
+                .get_security_principal(principal_id)
+                .await
+                .map_err(|_| Status::unavailable("management security catalog is unavailable"))?
+                .ok_or_else(|| Status::not_found("security principal was not found"))?;
+            if principal.revision != change.expected_revision {
+                return Err(Status::failed_precondition(
+                    "security principal revision is no longer current",
+                ));
+            }
+            let before_state = security_principal_policy_state(&principal)
+                .map_err(|_| Status::internal("failed to encode security principal policy"))?;
+            let principals = catalog
+                .list_security_principals()
+                .await
+                .map_err(|_| Status::unavailable("management security policy is unavailable"))?
+                .into_iter()
+                .filter(|candidate| candidate.id != principal_id)
+                .collect::<Vec<_>>();
+            if !has_management_admin(&principals) {
+                return Err(Status::failed_precondition(
+                    "principal deletion would remove the last management administrator",
+                ));
+            }
+
+            let catalog_operation_id = rand::random::<u64>().max(1);
+            let catalog_operation_id_string = catalog_operation_id.to_string();
+            let timestamp_ms = Utc::now().timestamp_millis().max(1) as u64;
+            let grant_audit = SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: grant_event_id.clone(),
+                timestamp_ms,
+                actor: actor.clone(),
+                target: target.clone(),
+                scope: AuditField::Known("cluster".to_owned()),
+                action: SecurityAuditClass::GrantChange,
+                outcome: SecurityAuditOutcome::Success,
+                correlation: AuditCorrelation::Observed(operation_id.to_owned()),
+                operation_id: AuditField::Known(catalog_operation_id_string.clone()),
+                policy_revision: AuditField::Known(expected_deleted_revision),
+                before_state: AuditField::Known(before_state.clone()),
+                after_state: AuditField::NotApplicable,
+            };
+            let completion_audit = SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: completion_event_id.clone(),
+                timestamp_ms,
+                actor: actor.clone(),
+                target: target.clone(),
+                scope: AuditField::Known("cluster".to_owned()),
+                action: SecurityAuditClass::AdminOperationCompletion,
+                outcome: SecurityAuditOutcome::Success,
+                correlation: AuditCorrelation::Observed(operation_id.to_owned()),
+                operation_id: AuditField::Known(catalog_operation_id_string),
+                policy_revision: AuditField::Known(expected_deleted_revision),
+                before_state: AuditField::Known(before_state),
+                after_state: AuditField::Known("deleted".to_owned()),
+            };
+            let revision = catalog.get_revision().await.checked_add(1).ok_or_else(|| {
+                Status::resource_exhausted("security catalog revision is exhausted")
+            })?;
+            let txn = CatalogTxn::new(
+                revision,
+                catalog_operation_id,
+                vec![
+                    CatalogMutation::DeleteSecurityPrincipal {
+                        principal_id,
+                        expected_revision: change.expected_revision,
+                        grantor_revision: Some((grantor_id, change.grantor_revision)),
+                        audit: grant_audit,
+                    },
+                    CatalogMutation::AppendSecurityAudit(completion_audit),
+                ],
+            )
+            .map_err(|_| Status::internal("invalid principal deletion transaction"))?;
+            match catalog.commit_txn(txn).await {
+                Ok(_) => return Ok(catalog_operation_id),
+                Err(rockstream_storage::catalog::CatalogError::OptimisticConflict(_))
+                    if attempt + 1
+                        < rockstream_storage::catalog::SECURITY_AUDIT_APPEND_ATTEMPTS => {}
+                Err(rockstream_storage::catalog::CatalogError::InvalidSecurityPolicy(_)) => {
+                    return Err(Status::failed_precondition(
+                        "principal deletion conflicts with current security policy",
+                    ));
+                }
+                Err(_) => {
+                    return Err(Status::unavailable(
+                        "management security catalog is unavailable",
+                    ));
+                }
+            }
+        }
+        Err(Status::unavailable(
+            "security catalog changed too frequently; retry the same idempotency key",
+        ))
+    }
+
+    async fn append_security_principal_delete_failure(
+        &self,
+        request: &Request<v1::DeleteSecurityPrincipalRequest>,
+        operation_id: &str,
+        change: &SecurityPrincipalDeleteDigest,
+    ) -> Result<(), Status> {
+        let catalog = self
+            .security_catalog
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("management security catalog is unavailable"))?;
+        let event_id = format!("management-principal-delete-completion:{operation_id}");
+        catalog.refresh().await.map_err(|_| {
+            required_audit_unavailable(request, "principal deletion audit is unavailable")
+        })?;
+        if let Some(record) = catalog
+            .get_security_audit_record(&event_id)
+            .await
+            .map_err(|_| {
+                required_audit_unavailable(request, "principal deletion audit is unavailable")
+            })?
+        {
+            if record.action == SecurityAuditClass::AdminOperationCompletion
+                && record.outcome == SecurityAuditOutcome::Failure
+                && record.event_id == event_id
+                && record.actor
+                    == AuditIdentity::Verified(format!("principal:{}", change.grantor_id))
+                && record.target == AuditField::Known(format!("principal:{}", change.principal_id))
+                && record.scope == AuditField::Known("cluster".to_owned())
+                && record.correlation == AuditCorrelation::Observed(operation_id.to_owned())
+                && record.operation_id == AuditField::Known(operation_id.to_owned())
+                && record.policy_revision == AuditField::Known(change.expected_revision)
+                && record.before_state == AuditField::NotApplicable
+                && record.after_state == AuditField::Known("rejected".to_owned())
+            {
+                return Ok(());
+            }
+            return Err(Status::data_loss(
+                "principal deletion completion audit is inconsistent",
+            ));
+        }
+        append_security_audit(
+            catalog.as_ref(),
+            SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id,
+                timestamp_ms: Utc::now().timestamp_millis().max(1) as u64,
+                actor: AuditIdentity::Verified(format!("principal:{}", change.grantor_id)),
+                target: AuditField::Known(format!("principal:{}", change.principal_id)),
+                scope: AuditField::Known("cluster".to_owned()),
+                action: SecurityAuditClass::AdminOperationCompletion,
+                outcome: SecurityAuditOutcome::Failure,
+                correlation: AuditCorrelation::Observed(operation_id.to_owned()),
+                operation_id: AuditField::Known(operation_id.to_owned()),
+                policy_revision: AuditField::Known(change.expected_revision),
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::Known("rejected".to_owned()),
+            },
+        )
+        .await
+        .map_err(|_| required_audit_unavailable(request, "principal deletion audit is unavailable"))
     }
 
     async fn apply_security_principal_grants(
@@ -1664,6 +2434,87 @@ fn encode_policy<T: Serialize>(value: &T) -> Result<String, Status> {
         .map_err(|_| Status::internal("failed to encode security policy metadata"))
 }
 
+fn security_principal_response(
+    principal: SecurityPrincipal,
+) -> Result<v1::SecurityPrincipal, Status> {
+    let mut effective = Vec::new();
+    for grant in &principal.preset_grants {
+        for action in grant.preset.actions() {
+            let permission = (*action, grant.scope.clone());
+            if !effective.contains(&permission) {
+                effective.push(permission);
+            }
+        }
+    }
+    for grant in &principal.scoped_grants {
+        let permission = (grant.action, grant.scope.clone());
+        if !effective.contains(&permission) {
+            effective.push(permission);
+        }
+    }
+    Ok(v1::SecurityPrincipal {
+        principal_id: principal.id.0,
+        display_name: principal.display_name,
+        enabled: principal.enabled,
+        revision: principal.revision,
+        preset_grants: principal
+            .preset_grants
+            .into_iter()
+            .map(|grant| {
+                Ok(v1::SecurityPresetGrant {
+                    preset: encode_policy(&grant.preset)?.trim_matches('"').to_owned(),
+                    scope_json: encode_policy(&grant.scope)?,
+                })
+            })
+            .collect::<Result<_, Status>>()?,
+        scoped_grants: principal
+            .scoped_grants
+            .into_iter()
+            .map(|grant| {
+                Ok(v1::SecurityActionGrant {
+                    action: encode_policy(&grant.action)?.trim_matches('"').to_owned(),
+                    scope_json: encode_policy(&grant.scope)?,
+                })
+            })
+            .collect::<Result<_, Status>>()?,
+        effective_permissions: effective
+            .into_iter()
+            .map(|(action, scope)| {
+                Ok(v1::SecurityActionGrant {
+                    action: encode_policy(&action)?.trim_matches('"').to_owned(),
+                    scope_json: encode_policy(&scope)?,
+                })
+            })
+            .collect::<Result<_, Status>>()?,
+        service_ids: principal
+            .login_methods
+            .iter()
+            .filter_map(|method| match method {
+                rockstream_types::authorization::LoginMethod::Service { service_id } => {
+                    Some(service_id.clone())
+                }
+                _ => None,
+            })
+            .collect(),
+    })
+}
+
+fn security_principal_create_fingerprint(
+    change: &SecurityPrincipalCreateDigest,
+) -> Result<String, Status> {
+    let bytes = serde_json::to_vec(change)
+        .map_err(|_| Status::internal("failed to fingerprint service principal request"))?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn security_principal_delete_fingerprint(
+    change: &SecurityPrincipalDeleteDigest,
+) -> Result<String, Status> {
+    let bytes = serde_json::to_vec(change)
+        .map_err(|_| Status::internal("failed to fingerprint principal deletion request"))?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
 fn security_principal_policy_state(principal: &SecurityPrincipal) -> Result<String, String> {
     let policy = serde_json::to_string(&(
         principal.enabled,
@@ -1725,6 +2576,59 @@ fn page_size(requested: u32) -> Result<usize, Status> {
         )));
     }
     Ok(size)
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SecurityAuditPageToken {
+    version: u8,
+    from_timestamp_ms: Option<u64>,
+    to_timestamp_ms: Option<u64>,
+    after_timestamp_ms: u64,
+    after_event_id: String,
+}
+
+fn security_audit_page_cursor(
+    token: &str,
+    from_timestamp_ms: Option<u64>,
+    to_timestamp_ms: Option<u64>,
+) -> Result<Option<(u64, String)>, Status> {
+    if token.is_empty() {
+        return Ok(None);
+    }
+    let decoded = URL_SAFE_NO_PAD
+        .decode(token)
+        .map_err(|_| Status::invalid_argument("invalid page token"))?;
+    let cursor: SecurityAuditPageToken = serde_json::from_slice(&decoded)
+        .map_err(|_| Status::invalid_argument("invalid page token"))?;
+    if cursor.version != 1
+        || cursor.from_timestamp_ms != from_timestamp_ms
+        || cursor.to_timestamp_ms != to_timestamp_ms
+        || cursor.after_timestamp_ms == 0
+        || cursor.after_event_id.trim().is_empty()
+        || from_timestamp_ms.is_some_and(|from| cursor.after_timestamp_ms < from)
+        || to_timestamp_ms.is_some_and(|to| cursor.after_timestamp_ms > to)
+    {
+        return Err(Status::invalid_argument("invalid page token"));
+    }
+    Ok(Some((cursor.after_timestamp_ms, cursor.after_event_id)))
+}
+
+fn security_audit_page_token(
+    record: &SecurityAuditRecord,
+    from_timestamp_ms: Option<u64>,
+    to_timestamp_ms: Option<u64>,
+) -> Result<String, Status> {
+    let cursor = SecurityAuditPageToken {
+        version: 1,
+        from_timestamp_ms,
+        to_timestamp_ms,
+        after_timestamp_ms: record.timestamp_ms,
+        after_event_id: record.event_id.clone(),
+    };
+    serde_json::to_vec(&cursor)
+        .map(|cursor| URL_SAFE_NO_PAD.encode(cursor))
+        .map_err(|_| Status::internal("security audit page token could not be encoded"))
 }
 
 fn page<T>(items: Vec<T>, size: usize, token: &str) -> Result<(Vec<T>, String), Status> {
@@ -1919,66 +2823,163 @@ impl v1::management_service_server::ManagementService for ManagementService {
         let (principals, next_page_token) = page(principals, size, &request.page_token)?;
         let principals = principals
             .into_iter()
-            .map(|principal| {
-                let mut effective = Vec::new();
-                for grant in &principal.preset_grants {
-                    for action in grant.preset.actions() {
-                        let permission = (*action, grant.scope.clone());
-                        if !effective.contains(&permission) {
-                            effective.push(permission);
-                        }
-                    }
-                }
-                for grant in &principal.scoped_grants {
-                    let permission = (grant.action, grant.scope.clone());
-                    if !effective.contains(&permission) {
-                        effective.push(permission);
-                    }
-                }
-                let effective_permissions = effective
-                    .into_iter()
-                    .map(|(action, scope)| {
-                        Ok(v1::SecurityActionGrant {
-                            action: encode_policy(&action)?.trim_matches('"').to_owned(),
-                            scope_json: encode_policy(&scope)?,
-                        })
-                    })
-                    .collect::<Result<_, Status>>()?;
-                let preset_grants = principal
-                    .preset_grants
-                    .into_iter()
-                    .map(|grant| {
-                        Ok(v1::SecurityPresetGrant {
-                            preset: encode_policy(&grant.preset)?.trim_matches('"').to_owned(),
-                            scope_json: encode_policy(&grant.scope)?,
-                        })
-                    })
-                    .collect::<Result<_, Status>>()?;
-                let scoped_grants = principal
-                    .scoped_grants
-                    .into_iter()
-                    .map(|grant| {
-                        Ok(v1::SecurityActionGrant {
-                            action: encode_policy(&grant.action)?.trim_matches('"').to_owned(),
-                            scope_json: encode_policy(&grant.scope)?,
-                        })
-                    })
-                    .collect::<Result<_, Status>>()?;
-                Ok(v1::SecurityPrincipal {
-                    principal_id: principal.id.0,
-                    display_name: principal.display_name,
-                    enabled: principal.enabled,
-                    revision: principal.revision,
-                    preset_grants,
-                    scoped_grants,
-                    effective_permissions,
-                })
-            })
+            .map(security_principal_response)
             .collect::<Result<_, Status>>()?;
         Ok(Response::new(v1::ListSecurityPrincipalsResponse {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
             principals,
             next_page_token,
+        }))
+    }
+
+    async fn create_service_principal(
+        &self,
+        request: Request<v1::CreateServicePrincipalRequest>,
+    ) -> Result<Response<v1::CreateServicePrincipalResponse>, Status> {
+        let _permit = self.acquire_request()?;
+        Self::ensure_version(request.get_ref().protocol_version)?;
+        let body = request.get_ref();
+        let operation_id = uuid::Uuid::parse_str(&body.idempotency_key)
+            .map(|value| value.to_string())
+            .ok()
+            .filter(|value| value == &body.idempotency_key)
+            .ok_or_else(|| Status::invalid_argument("idempotency_key must be a canonical UUID"))?;
+        if body.principal_id == 0 || body.expected_grantor_revision == 0 {
+            return Err(Status::invalid_argument(
+                "principal and reviewed grantor revision must be nonzero",
+            ));
+        }
+        self.authorize(&request, SecurityAction::GrantManage, PolicyScope::Cluster)
+            .await?;
+        let peer = request
+            .extensions()
+            .get::<ManagementConnectionInfo>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("management mTLS identity is required"))?;
+        let scoped_grants = body
+            .scoped_grants
+            .iter()
+            .map(|grant| {
+                Ok(ScopedActionGrant {
+                    action: serde_json::from_value(serde_json::Value::String(grant.action.clone()))
+                        .map_err(|_| Status::invalid_argument("scoped grant action is invalid"))?,
+                    scope: serde_json::from_str(&grant.scope_json)
+                        .map_err(|_| Status::invalid_argument("scoped grant scope is invalid"))?,
+                })
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+        let principal = SecurityPrincipal {
+            format_version: rockstream_types::authorization::SECURITY_PRINCIPAL_FORMAT_VERSION,
+            id: PrincipalId(body.principal_id),
+            display_name: body.display_name.clone(),
+            enabled: true,
+            revision: 1,
+            login_methods: vec![rockstream_types::authorization::LoginMethod::Service {
+                service_id: body.service_id.clone(),
+            }],
+            preset_grants: Vec::new(),
+            scoped_grants,
+        };
+        principal
+            .validate()
+            .map_err(|_| Status::invalid_argument("service principal is invalid"))?;
+        let change = SecurityPrincipalCreateDigest {
+            deployment_id: self.deployment_fingerprint(),
+            principal,
+            grantor_id: peer.principal_id.0,
+            grantor_revision: body.expected_grantor_revision,
+            certificate_sha256: hex::encode(peer.certificate_sha256),
+        };
+        let fingerprint = security_principal_create_fingerprint(&change)?;
+        self.ensure_service_principal_create_started(
+            &request,
+            &operation_id,
+            &change,
+            &fingerprint,
+        )
+        .await?;
+        if let Err(status) = self
+            .apply_service_principal_create(&operation_id, &change)
+            .await
+        {
+            if !matches!(
+                status.code(),
+                tonic::Code::Unavailable | tonic::Code::DataLoss
+            ) {
+                self.append_service_principal_create_failure(&request, &operation_id, &change)
+                    .await?;
+            }
+            return Err(status);
+        }
+        Ok(Response::new(v1::CreateServicePrincipalResponse {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            principal: Some(security_principal_response(change.principal)?),
+        }))
+    }
+
+    async fn delete_security_principal(
+        &self,
+        request: Request<v1::DeleteSecurityPrincipalRequest>,
+    ) -> Result<Response<v1::DeleteSecurityPrincipalResponse>, Status> {
+        let _permit = self.acquire_request()?;
+        Self::ensure_version(request.get_ref().protocol_version)?;
+        let body = request.get_ref();
+        let operation_id = uuid::Uuid::parse_str(&body.idempotency_key)
+            .map(|value| value.to_string())
+            .ok()
+            .filter(|value| value == &body.idempotency_key)
+            .ok_or_else(|| Status::invalid_argument("idempotency_key must be a canonical UUID"))?;
+        if body.principal_id == 0
+            || body.expected_revision == 0
+            || body.expected_grantor_revision == 0
+        {
+            return Err(Status::invalid_argument(
+                "principal and reviewed policy revisions must be nonzero",
+            ));
+        }
+        self.authorize(&request, SecurityAction::GrantManage, PolicyScope::Cluster)
+            .await?;
+        let peer = request
+            .extensions()
+            .get::<ManagementConnectionInfo>()
+            .ok_or_else(|| Status::unauthenticated("management mTLS identity is required"))?;
+        let change = SecurityPrincipalDeleteDigest {
+            deployment_id: self.deployment_fingerprint(),
+            principal_id: body.principal_id,
+            expected_revision: body.expected_revision,
+            grantor_id: peer.principal_id.0,
+            grantor_revision: body.expected_grantor_revision,
+            certificate_sha256: hex::encode(peer.certificate_sha256),
+        };
+        let fingerprint = security_principal_delete_fingerprint(&change)?;
+        self.ensure_security_principal_delete_started(
+            &request,
+            &operation_id,
+            &change,
+            &fingerprint,
+        )
+        .await?;
+        let catalog_operation_id = match self
+            .apply_security_principal_delete(&operation_id, &change)
+            .await
+        {
+            Ok(operation_id) => operation_id,
+            Err(status) => {
+                if !matches!(
+                    status.code(),
+                    tonic::Code::Unavailable | tonic::Code::DataLoss
+                ) {
+                    self.append_security_principal_delete_failure(&request, &operation_id, &change)
+                        .await?;
+                }
+                return Err(status);
+            }
+        };
+        Ok(Response::new(v1::DeleteSecurityPrincipalResponse {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            principal_id: body.principal_id,
+            deleted_revision: body.expected_revision + 1,
+            operation_id: catalog_operation_id.to_string(),
         }))
     }
 
@@ -2185,6 +3186,102 @@ impl v1::management_service_server::ManagementService for ManagementService {
         }))
     }
 
+    async fn list_security_audit_records(
+        &self,
+        request: Request<v1::ListSecurityAuditRecordsRequest>,
+    ) -> Result<Response<v1::ListSecurityAuditRecordsResponse>, Status> {
+        let _permit = self.acquire_request()?;
+        Self::ensure_version(request.get_ref().protocol_version)?;
+        let from_timestamp_ms = request.get_ref().from_timestamp_ms;
+        let to_timestamp_ms = request.get_ref().to_timestamp_ms;
+        if from_timestamp_ms
+            .zip(to_timestamp_ms)
+            .is_some_and(|(from, to)| from > to)
+        {
+            return Err(Status::invalid_argument(
+                "from_timestamp_ms must not exceed to_timestamp_ms",
+            ));
+        }
+        let (principal_id, policy_revision) = self
+            .authorize(
+                &request,
+                SecurityAction::SecurityAuditRead,
+                PolicyScope::AuditRange {
+                    from_ms: from_timestamp_ms,
+                    to_ms: to_timestamp_ms,
+                },
+            )
+            .await?;
+        let request = request.into_inner();
+        let size = page_size(request.page_size)?;
+        let after =
+            security_audit_page_cursor(&request.page_token, from_timestamp_ms, to_timestamp_ms)?;
+        let catalog = self
+            .security_catalog
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("management security catalog is unavailable"))?;
+        let records = catalog
+            .list_security_audit_page(
+                (principal_id, policy_revision),
+                from_timestamp_ms,
+                to_timestamp_ms,
+                after,
+                size + 1,
+            )
+            .await
+            .map_err(|_| Status::unavailable("management security audit history is unavailable"))?;
+        let record_count = records.len();
+        let mut response = v1::ListSecurityAuditRecordsResponse {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            observed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            source_version: format!("security-audit-records:v{SECURITY_AUDIT_FORMAT_VERSION}"),
+            records_json: Vec::new(),
+            next_page_token: String::new(),
+        };
+        for (index, record) in records.into_iter().take(size).enumerate() {
+            let mut json = BoundedJsonBuffer {
+                bytes: Vec::new(),
+                limit: MAX_MESSAGE_BYTES,
+                exceeded: false,
+            };
+            if serde_json::to_writer(&mut json, &record).is_err() {
+                if json.exceeded {
+                    if response.records_json.is_empty() {
+                        return Err(Status::resource_exhausted(
+                            "security audit record exceeds the management response size limit",
+                        ));
+                    }
+                    break;
+                }
+                return Err(Status::internal(
+                    "security audit record could not be encoded",
+                ));
+            }
+            let record_json = String::from_utf8(json.bytes)
+                .map_err(|_| Status::internal("security audit record could not be encoded"))?;
+            response.records_json.push(record_json);
+            let previous_page_token = std::mem::replace(
+                &mut response.next_page_token,
+                if index + 1 < record_count {
+                    security_audit_page_token(&record, from_timestamp_ms, to_timestamp_ms)?
+                } else {
+                    String::new()
+                },
+            );
+            if response.encoded_len() > MAX_MESSAGE_BYTES {
+                response.records_json.pop();
+                response.next_page_token = previous_page_token;
+                if response.records_json.is_empty() {
+                    return Err(Status::resource_exhausted(
+                        "security audit record exceeds the management response size limit",
+                    ));
+                }
+                break;
+            }
+        }
+        Ok(Response::new(response))
+    }
+
     async fn list_operations(
         &self,
         request: Request<v1::ListOperationsRequest>,
@@ -2353,6 +3450,8 @@ impl v1::management_service_server::ManagementService for ManagementService {
             "GetShard".to_owned(),
             "ListOperations".to_owned(),
             "ListSecurityPrincipals".to_owned(),
+            "CreateServicePrincipal".to_owned(),
+            "DeleteSecurityPrincipal".to_owned(),
             "SetSecurityPrincipalGrants".to_owned(),
             "GetOperation".to_owned(),
             "GetConfigSummary".to_owned(),
@@ -2793,6 +3892,9 @@ impl v1::management_service_server::ManagementService for ManagementService {
             .await
             .map_err(store_error)?;
         crate::support_artifact::maybe_crash_after_debug_test_boundary("operation-accepted");
+        accepted = self.flush_operation_audit(accepted).await.map_err(|_| {
+            required_audit_unavailable(&request, "support artifact audit is unavailable")
+        })?;
         let expires_at_ms = accepted
             .started_at_ms()
             .checked_add(ARTIFACT_TTL.as_millis() as i64)
@@ -2886,36 +3988,15 @@ impl v1::management_service_server::ManagementService for ManagementService {
             ));
         }
         if Utc::now().timestamp_millis().max(1) as u64 >= expires_at_ms {
-            self.record_support_artifact_audit(
+            self.fail_support_artifact_generation(
                 &request,
                 principal_id,
                 policy_revision,
-                SupportArtifactAudit::operation(
-                    &key,
-                    &scope,
-                    SecurityAuditClass::AdminOperationCompletion,
-                    SecurityAuditOutcome::Failure,
-                    AuditField::Known("generating".to_owned()),
-                    AuditField::Known("expired_before_generation".to_owned()),
-                ),
+                (&key, &scope),
+                &accepted,
+                "expired_before_generation",
             )
             .await?;
-            self.operations
-                .transition_if(
-                    accepted.operation_id(),
-                    accepted.status(),
-                    accepted.phase(),
-                    crate::management_store::OperationUpdate {
-                        status: OperationStatus::Failed,
-                        updated_at_ms: Utc::now().timestamp_millis().max(1),
-                        progress: Some(100),
-                        phase: Some("expired_before_generation".to_owned()),
-                        error_code: None,
-                        next_steps: Vec::new(),
-                    },
-                )
-                .await
-                .map_err(store_error)?;
             return Err(Status::deadline_exceeded(
                 "support artifact operation expired before generation",
             ));
@@ -3030,40 +4111,19 @@ impl v1::management_service_server::ManagementService for ManagementService {
                 });
             }
         }
-        if let Err(status) = self
-            .record_support_artifact_audit(
-                &request,
-                principal_id,
-                policy_revision,
-                SupportArtifactAudit::operation(
-                    &key,
-                    &scope,
-                    SecurityAuditClass::AdminOperationCompletion,
-                    SecurityAuditOutcome::Success,
-                    AuditField::Known("generating".to_owned()),
-                    AuditField::Known(format!("available_until_ms:{expires_at_ms}")),
-                ),
-            )
-            .await
-        {
-            if let Err(error) = self.support_artifacts.remove(&key, principal_id).await {
-                tracing::error!(
-                    code = %rockstream_types::error_code::RS_0003,
-                    ?error,
-                    artifact_id = %key,
-                    "failed to remove unaudited support artifact"
-                );
-                return Err(Status::unavailable(
-                    "support artifact cleanup is unavailable",
-                ));
-            }
-            return Err(status);
-        }
-        crate::support_artifact::maybe_crash_after_debug_test_boundary("completion-audit");
         let completion_phase = format!("available_until_ms:{expires_at_ms}");
-        match self
+        let audit = SupportArtifactAudit::operation(
+            &key,
+            &scope,
+            SecurityAuditClass::AdminOperationCompletion,
+            SecurityAuditOutcome::Success,
+            AuditField::Known("generating".to_owned()),
+            AuditField::Known(completion_phase.clone()),
+        )
+        .into_record(principal_id, policy_revision)?;
+        let completed = match self
             .operations
-            .transition_if(
+            .transition_if_with_audit(
                 running.operation_id(),
                 OperationStatus::Running,
                 running.phase(),
@@ -3075,10 +4135,11 @@ impl v1::management_service_server::ManagementService for ManagementService {
                     error_code: None,
                     next_steps: Vec::new(),
                 },
+                audit,
             )
             .await
         {
-            Ok(_) => {}
+            Ok(completed) => completed,
             Err(error @ crate::management_store::OperationStoreError::TransitionConflict(_)) => {
                 let completed = self
                     .operations
@@ -3091,11 +4152,27 @@ impl v1::management_service_server::ManagementService for ManagementService {
                 if completed.status() != OperationStatus::Succeeded
                     || completed.phase() != Some(completion_phase.as_str())
                 {
+                    if matches!(
+                        completed.status(),
+                        OperationStatus::Failed | OperationStatus::Cancelled
+                    ) {
+                        self.support_artifacts
+                            .remove(running.operation_id(), principal_id)
+                            .await
+                            .map_err(|_| {
+                                Status::unavailable("support artifact cleanup is unavailable")
+                            })?;
+                    }
                     return Err(store_error(error));
                 }
+                completed
             }
             Err(error) => return Err(store_error(error)),
-        }
+        };
+        crate::support_artifact::maybe_crash_after_debug_test_boundary("completion-audit");
+        self.flush_operation_audit(completed).await.map_err(|_| {
+            required_audit_unavailable(&request, "support artifact audit is unavailable")
+        })?;
         crate::support_artifact::maybe_crash_after_debug_test_boundary("operation-succeeded");
         Ok(Response::new(v1::GenerateSupportArtifactResponse {
             protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
@@ -3353,8 +4430,12 @@ mod tests {
     }
 
     async fn test_security_catalog() -> Arc<dyn CatalogStore> {
+        test_security_catalog_with_store(Arc::new(InMemory::new())).await
+    }
+
+    async fn test_security_catalog_with_store(store: Arc<InMemory>) -> Arc<dyn CatalogStore> {
         let catalog = Arc::new(rockstream_storage::catalog::DurableCatalogStore::new(
-            Arc::new(InMemory::new()),
+            store,
             "management-test",
         ));
         let principal = rockstream_types::authorization::SecurityPrincipal {
@@ -3588,6 +4669,118 @@ mod tests {
             operations.get(&key).await.unwrap().unwrap().status(),
             OperationStatus::Cancelled
         );
+    }
+
+    #[tokio::test]
+    async fn failed_support_artifact_retry_removes_late_object_write() {
+        let security_catalog = test_security_catalog().await;
+        let operations = ManagementOperationStore::new(Arc::new(InMemory::new()));
+        let mut service = ManagementService::new(
+            TopologyCatalog::new(),
+            ShardManager::new(),
+            operations.clone(),
+            NodeConfig::default(),
+        )
+        .with_security_catalog(security_catalog.clone());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        service.support_artifacts.artifact_put_gate =
+            Some((Arc::clone(&started), Arc::clone(&resume)));
+
+        let key = uuid::Uuid::new_v4().to_string();
+        let generation_service = service.clone();
+        let generation_key = key.clone();
+        let generation = tokio::spawn(async move {
+            <ManagementService as v1::management_service_server::ManagementService>::generate_support_artifact(
+                &generation_service,
+                authenticated_request(v1::GenerateSupportArtifactRequest {
+                    protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                    node_id: String::new(),
+                    idempotency_key: generation_key,
+                }),
+            )
+            .await
+        });
+        started.notified().await;
+
+        let running = operations.get(&key).await.unwrap().unwrap();
+        assert_eq!(running.status(), OperationStatus::Running);
+        let scope = PolicyScope::Cluster;
+        let failure_request = authenticated_request(v1::GenerateSupportArtifactRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            node_id: String::new(),
+            idempotency_key: key.clone(),
+        });
+        let (principal_id, policy_revision) = service
+            .authorize(
+                &failure_request,
+                SecurityAction::SupportGenerate,
+                scope.clone(),
+            )
+            .await
+            .unwrap();
+        service
+            .fail_support_artifact_generation(
+                &failure_request,
+                principal_id,
+                policy_revision,
+                (&key, &scope),
+                &running,
+                "injected_failure",
+            )
+            .await
+            .unwrap();
+
+        resume.notify_one();
+        let error = generation.await.unwrap().unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            error.message(),
+            format!("operation {key} changed while the request was processed")
+        );
+        let failed = operations.get(&key).await.unwrap().unwrap();
+        assert_eq!(failed.status(), OperationStatus::Failed);
+        assert_eq!(failed.phase(), Some("injected_failure"));
+
+        let now_ms = Utc::now().timestamp_millis().max(1) as u64;
+        let expiry = ArtifactExpiry {
+            unix_ms: now_ms + ARTIFACT_TTL.as_millis() as u64,
+        };
+        let replacement: Arc<[u8]> = Arc::from(b"replacement".to_vec());
+        service.support_artifacts.artifact_put_gate = None;
+        service
+            .support_artifacts
+            .insert(
+                key.clone(),
+                principal_id,
+                scope.clone(),
+                replacement.clone(),
+                expiry,
+                now_ms,
+            )
+            .await
+            .unwrap();
+        let (downloaded, _, _) = service
+            .support_artifacts
+            .download(&key, principal_id, now_ms)
+            .await
+            .unwrap();
+        assert_eq!(downloaded.as_ref(), replacement.as_ref());
+
+        let audit = security_catalog
+            .list_security_audit_records()
+            .await
+            .unwrap();
+        assert_eq!(
+            audit.iter().map(|record| record.action).collect::<Vec<_>>(),
+            vec![
+                SecurityAuditClass::GrantChange,
+                SecurityAuditClass::GrantChange,
+                SecurityAuditClass::AdminOperationStart,
+                SecurityAuditClass::AdminOperationCompletion,
+            ]
+        );
+        assert_eq!(audit.last().unwrap().outcome, SecurityAuditOutcome::Failure);
     }
 
     #[tokio::test]
@@ -3938,6 +5131,311 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn security_audit_history_is_range_authorized_and_paginated() {
+        let security_catalog = test_security_catalog().await;
+        let from_timestamp_ms = Utc::now().timestamp_millis().max(1) as u64 + 60_000;
+        let events = (0..4)
+            .map(|index| SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: format!("audit-history-{index}"),
+                timestamp_ms: from_timestamp_ms + index,
+                actor: AuditIdentity::Verified("principal:1".to_owned()),
+                target: AuditField::Known(if index == 3 {
+                    "x".repeat(MAX_MESSAGE_BYTES)
+                } else {
+                    "audit-history-test".to_owned()
+                }),
+                scope: AuditField::Known("cluster".to_owned()),
+                action: SecurityAuditClass::AuthenticationSuccess,
+                outcome: SecurityAuditOutcome::Success,
+                correlation: AuditCorrelation::NotApplicable,
+                operation_id: AuditField::NotApplicable,
+                policy_revision: AuditField::Known(1),
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::NotApplicable,
+            })
+            .collect::<Vec<_>>();
+        let revision = security_catalog.get_revision().await;
+        security_catalog
+            .commit_txn(
+                CatalogTxn::new(
+                    revision + 1,
+                    revision + 1,
+                    events
+                        .iter()
+                        .cloned()
+                        .map(CatalogMutation::AppendSecurityAudit)
+                        .collect(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let operations = ManagementOperationStore::new(Arc::new(InMemory::new()));
+        let service = ManagementService::new(
+            TopologyCatalog::new(),
+            ShardManager::new(),
+            operations,
+            NodeConfig::default(),
+        )
+        .with_security_catalog(security_catalog.clone());
+        let granted_range = PolicyScope::AuditRange {
+            from_ms: Some(from_timestamp_ms + 1),
+            to_ms: Some(from_timestamp_ms + 3),
+        };
+        let grant_operation_id = uuid::Uuid::new_v4().to_string();
+        let grant_response = <ManagementService as v1::management_service_server::ManagementService>::set_security_principal_grants(
+            &service,
+            authenticated_request(v1::SetSecurityPrincipalGrantsRequest {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                principal_id: 2,
+                expected_revision: 1,
+                expected_grantor_revision: 1,
+                idempotency_key: grant_operation_id,
+                preset_grants: vec![v1::SecurityPresetGrant {
+                    preset: "operator".to_owned(),
+                    scope_json: serde_json::to_string(&PolicyScope::Cluster).unwrap(),
+                }],
+                scoped_grants: vec![v1::SecurityActionGrant {
+                    action: "security_audit_read".to_owned(),
+                    scope_json: serde_json::to_string(&granted_range).unwrap(),
+                }],
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(grant_response.operation.unwrap().state, "succeeded");
+
+        let audit_request = |principal_id,
+                             certificate_sha256,
+                             from_timestamp_ms,
+                             to_timestamp_ms,
+                             page_size,
+                             page_token| {
+            let mut request = Request::new(v1::ListSecurityAuditRecordsRequest {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                from_timestamp_ms,
+                to_timestamp_ms,
+                page_size,
+                page_token,
+            });
+            request.extensions_mut().insert(ManagementConnectionInfo {
+                certificate_sha256,
+                principal_id,
+                closed: Arc::new(AtomicBool::new(false)),
+            });
+            request
+        };
+        let mut first_page = <ManagementService as v1::management_service_server::ManagementService>::list_security_audit_records(
+            &service,
+            audit_request(
+                PrincipalId(2),
+                [8; 32],
+                Some(from_timestamp_ms + 1),
+                Some(from_timestamp_ms + 2),
+                1,
+                String::new(),
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            first_page.protocol_version,
+            rockstream_management_proto::PROTOCOL_VERSION
+        );
+        assert_eq!(
+            first_page.source_version,
+            format!("security-audit-records:v{SECURITY_AUDIT_FORMAT_VERSION}")
+        );
+        assert!(chrono::DateTime::parse_from_rfc3339(&first_page.observed_at).is_ok());
+        assert_eq!(
+            first_page.records_json,
+            vec![serde_json::to_string(&events[1]).unwrap()]
+        );
+        assert!(!first_page.next_page_token.is_empty());
+
+        let next_page_token = std::mem::take(&mut first_page.next_page_token);
+        let second_page = <ManagementService as v1::management_service_server::ManagementService>::list_security_audit_records(
+            &service,
+            audit_request(
+                PrincipalId(2),
+                [8; 32],
+                Some(from_timestamp_ms + 1),
+                Some(from_timestamp_ms + 2),
+                1,
+                next_page_token.clone(),
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            second_page.records_json,
+            vec![serde_json::to_string(&events[2]).unwrap()]
+        );
+        assert!(second_page.next_page_token.is_empty());
+
+        let bounded_page = <ManagementService as v1::management_service_server::ManagementService>::list_security_audit_records(
+            &service,
+            audit_request(
+                PrincipalId(2),
+                [8; 32],
+                Some(from_timestamp_ms + 1),
+                Some(from_timestamp_ms + 3),
+                3,
+                String::new(),
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            bounded_page.records_json,
+            vec![
+                serde_json::to_string(&events[1]).unwrap(),
+                serde_json::to_string(&events[2]).unwrap(),
+            ]
+        );
+        let bounded_page_token = security_audit_page_token(
+            &events[2],
+            Some(from_timestamp_ms + 1),
+            Some(from_timestamp_ms + 3),
+        )
+        .unwrap();
+        assert_eq!(bounded_page.next_page_token, bounded_page_token);
+        let oversized_record = <ManagementService as v1::management_service_server::ManagementService>::list_security_audit_records(
+            &service,
+            audit_request(
+                PrincipalId(2),
+                [8; 32],
+                Some(from_timestamp_ms + 1),
+                Some(from_timestamp_ms + 3),
+                3,
+                bounded_page_token,
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(oversized_record.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(
+            oversized_record.message(),
+            "security audit record exceeds the management response size limit"
+        );
+
+        let changed_range = <ManagementService as v1::management_service_server::ManagementService>::list_security_audit_records(
+            &service,
+            audit_request(
+                PrincipalId(1),
+                [7; 32],
+                Some(from_timestamp_ms),
+                Some(from_timestamp_ms + 2),
+                1,
+                next_page_token,
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(changed_range.code(), tonic::Code::InvalidArgument);
+        assert_eq!(changed_range.message(), "invalid page token");
+
+        let denied_peer = ManagementConnectionInfo {
+            certificate_sha256: [8; 32],
+            principal_id: PrincipalId(2),
+            closed: Arc::new(AtomicBool::new(false)),
+        };
+        let mut denied_request = audit_request(
+            PrincipalId(2),
+            [8; 32],
+            Some(from_timestamp_ms),
+            Some(from_timestamp_ms + 2),
+            1,
+            String::new(),
+        );
+        denied_request.extensions_mut().insert(denied_peer.clone());
+        let denied = <ManagementService as v1::management_service_server::ManagementService>::list_security_audit_records(
+            &service,
+            denied_request,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        assert_eq!(denied.message(), "management action is not authorized");
+        assert!(!denied_peer.is_closed());
+
+        let mut forbidden_grants_request = Request::new(v1::ListSecurityPrincipalsRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            page_size: 0,
+            page_token: String::new(),
+        });
+        forbidden_grants_request
+            .extensions_mut()
+            .insert(ManagementConnectionInfo {
+                certificate_sha256: [8; 32],
+                principal_id: PrincipalId(2),
+                closed: Arc::new(AtomicBool::new(false)),
+            });
+        let forbidden_grants = <ManagementService as v1::management_service_server::ManagementService>::list_security_principals(
+            &service,
+            forbidden_grants_request,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(forbidden_grants.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            forbidden_grants.message(),
+            "management action is not authorized"
+        );
+
+        let audit = security_catalog
+            .list_security_audit_records()
+            .await
+            .unwrap();
+        let denial = audit
+            .iter()
+            .find(|record| {
+                record.action == SecurityAuditClass::AuthorizationDenial
+                    && record.target == AuditField::Known("SecurityAuditRead".to_owned())
+            })
+            .unwrap();
+        let event_id = denial
+            .event_id
+            .strip_prefix("management-denial-")
+            .expect("range denial audit event");
+        assert!(uuid::Uuid::parse_str(event_id).is_ok());
+        assert!(denial.timestamp_ms > 0);
+        let mut normalized_denial = denial.clone();
+        normalized_denial.event_id = "<event_id>".to_owned();
+        normalized_denial.timestamp_ms = 0;
+        assert_eq!(
+            normalized_denial,
+            SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: "<event_id>".to_owned(),
+                timestamp_ms: 0,
+                actor: AuditIdentity::Verified("principal:2".to_owned()),
+                target: AuditField::Known("SecurityAuditRead".to_owned()),
+                scope: AuditField::Known(
+                    serde_json::to_string(&PolicyScope::AuditRange {
+                        from_ms: Some(from_timestamp_ms),
+                        to_ms: Some(from_timestamp_ms + 2),
+                    })
+                    .unwrap()
+                ),
+                action: SecurityAuditClass::AuthorizationDenial,
+                outcome: SecurityAuditOutcome::Denied,
+                correlation: AuditCorrelation::Unknown,
+                operation_id: AuditField::NotApplicable,
+                policy_revision: AuditField::Known(2),
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::NotApplicable,
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn abandoned_support_artifact_operation_expires_with_durable_audit() {
         let security_catalog = test_security_catalog().await;
         let operations = ManagementOperationStore::new(Arc::new(InMemory::new()));
@@ -4113,5 +5611,594 @@ mod tests {
                 after_state: AuditField::NotApplicable,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn service_principal_creation_is_revision_checked_idempotent_and_audited() {
+        let security_catalog = test_security_catalog().await;
+        let service = ManagementService::new(
+            TopologyCatalog::new(),
+            ShardManager::new(),
+            ManagementOperationStore::new(Arc::new(InMemory::new())),
+            NodeConfig::default(),
+        )
+        .with_security_catalog(security_catalog.clone());
+        let scope = PolicyScope::Secret {
+            namespace: "finance".to_owned(),
+            name: "ledger".to_owned(),
+            consumer: Some(PrincipalId(3)),
+        };
+        let grant = ScopedActionGrant {
+            action: SecurityAction::SecretUse,
+            scope: scope.clone(),
+        };
+        let principal = SecurityPrincipal {
+            format_version: rockstream_types::authorization::SECURITY_PRINCIPAL_FORMAT_VERSION,
+            id: PrincipalId(3),
+            display_name: "Ledger service".to_owned(),
+            enabled: true,
+            revision: 1,
+            login_methods: vec![rockstream_types::authorization::LoginMethod::Service {
+                service_id: "ledger-worker".to_owned(),
+            }],
+            preset_grants: Vec::new(),
+            scoped_grants: vec![grant.clone()],
+        };
+        let operation_id = "5c3c4d67-2b81-4b02-88e8-6d28af07f123".to_owned();
+        let request = v1::CreateServicePrincipalRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            principal_id: principal.id.0,
+            display_name: principal.display_name.clone(),
+            service_id: "ledger-worker".to_owned(),
+            expected_grantor_revision: 1,
+            idempotency_key: operation_id.clone(),
+            scoped_grants: vec![v1::SecurityActionGrant {
+                action: "secret_use".to_owned(),
+                scope_json: serde_json::to_string(&scope).unwrap(),
+            }],
+        };
+
+        let mut stale_request = request.clone();
+        stale_request.expected_grantor_revision = 2;
+        stale_request.idempotency_key = "b147cc48-cc70-4bb4-88b1-80f82d74e1cf".to_owned();
+        let stale = <ManagementService as v1::management_service_server::ManagementService>::create_service_principal(
+            &service,
+            authenticated_request(stale_request),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            stale.message(),
+            "grantor authority or reviewed revision is no longer current"
+        );
+        assert!(security_catalog
+            .get_security_principal(principal.id)
+            .await
+            .unwrap()
+            .is_none());
+
+        let digest = SecurityPrincipalCreateDigest {
+            deployment_id: service.deployment_fingerprint(),
+            principal: principal.clone(),
+            grantor_id: 1,
+            grantor_revision: 1,
+            certificate_sha256: hex::encode([7; 32]),
+        };
+        let fingerprint = security_principal_create_fingerprint(&digest).unwrap();
+        let created = <ManagementService as v1::management_service_server::ManagementService>::create_service_principal(
+            &service,
+            authenticated_request(request.clone()),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let expected_principal = v1::SecurityPrincipal {
+            principal_id: 3,
+            display_name: "Ledger service".to_owned(),
+            enabled: true,
+            revision: 1,
+            preset_grants: Vec::new(),
+            scoped_grants: vec![v1::SecurityActionGrant {
+                action: "secret_use".to_owned(),
+                scope_json: serde_json::to_string(&scope).unwrap(),
+            }],
+            effective_permissions: vec![v1::SecurityActionGrant {
+                action: "secret_use".to_owned(),
+                scope_json: serde_json::to_string(&scope).unwrap(),
+            }],
+            service_ids: vec!["ledger-worker".to_owned()],
+        };
+        assert_eq!(
+            created.protocol_version,
+            rockstream_management_proto::PROTOCOL_VERSION
+        );
+        assert_eq!(created.principal, Some(expected_principal));
+
+        security_catalog.refresh().await.unwrap();
+        assert_eq!(
+            security_catalog
+                .get_security_principal(principal.id)
+                .await
+                .unwrap(),
+            Some(principal.clone())
+        );
+        let audit_before_retry = security_catalog
+            .list_security_audit_records()
+            .await
+            .unwrap();
+        let mut operation_audit: Vec<_> = audit_before_retry
+            .iter()
+            .filter(|record| record.operation_id == AuditField::Known(operation_id.clone()))
+            .cloned()
+            .collect();
+        operation_audit.sort_by(|left, right| left.event_id.cmp(&right.event_id));
+        for record in &mut operation_audit {
+            assert!(record.timestamp_ms > 0);
+            record.timestamp_ms = 0;
+        }
+        let after_state = security_principal_policy_state(&principal).unwrap();
+        let mut expected_audit = vec![
+            SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: format!("management-service-principal-create-start:{operation_id}"),
+                timestamp_ms: 0,
+                actor: AuditIdentity::Verified("principal:1".to_owned()),
+                target: AuditField::Known("principal:3".to_owned()),
+                scope: AuditField::Known("cluster".to_owned()),
+                action: SecurityAuditClass::AdminOperationStart,
+                outcome: SecurityAuditOutcome::Success,
+                correlation: AuditCorrelation::Observed(operation_id.clone()),
+                operation_id: AuditField::Known(operation_id.clone()),
+                policy_revision: AuditField::Known(1),
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::Known(format!("request_sha256:{fingerprint}")),
+            },
+            SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: format!("management-service-principal-create:{operation_id}"),
+                timestamp_ms: 0,
+                actor: AuditIdentity::Verified("principal:1".to_owned()),
+                target: AuditField::Known("principal:3".to_owned()),
+                scope: AuditField::Known("cluster".to_owned()),
+                action: SecurityAuditClass::GrantChange,
+                outcome: SecurityAuditOutcome::Success,
+                correlation: AuditCorrelation::Observed(operation_id.clone()),
+                operation_id: AuditField::Known(operation_id.clone()),
+                policy_revision: AuditField::Known(1),
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::Known(after_state.clone()),
+            },
+            SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: format!("management-service-principal-create-completion:{operation_id}"),
+                timestamp_ms: 0,
+                actor: AuditIdentity::Verified("principal:1".to_owned()),
+                target: AuditField::Known("principal:3".to_owned()),
+                scope: AuditField::Known("cluster".to_owned()),
+                action: SecurityAuditClass::AdminOperationCompletion,
+                outcome: SecurityAuditOutcome::Success,
+                correlation: AuditCorrelation::Observed(operation_id.clone()),
+                operation_id: AuditField::Known(operation_id.clone()),
+                policy_revision: AuditField::Known(1),
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::Known(after_state),
+            },
+        ];
+        expected_audit.sort_by(|left, right| left.event_id.cmp(&right.event_id));
+        assert_eq!(operation_audit, expected_audit);
+
+        let retry = <ManagementService as v1::management_service_server::ManagementService>::create_service_principal(
+            &service,
+            authenticated_request(request.clone()),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(retry, created);
+        assert_eq!(
+            security_catalog
+                .list_security_audit_records()
+                .await
+                .unwrap(),
+            audit_before_retry
+        );
+
+        let mut reused_key = request;
+        reused_key.service_id = "other-service".to_owned();
+        let conflict = <ManagementService as v1::management_service_server::ManagementService>::create_service_principal(
+            &service,
+            authenticated_request(reused_key),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
+        assert_eq!(
+            security_catalog
+                .list_security_audit_records()
+                .await
+                .unwrap(),
+            audit_before_retry
+        );
+
+        let mut operator_request = Request::new(v1::CreateServicePrincipalRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            principal_id: 4,
+            display_name: "Denied service".to_owned(),
+            service_id: "denied-service".to_owned(),
+            expected_grantor_revision: 1,
+            idempotency_key: "7194df45-65bf-4e17-a29e-f71184370872".to_owned(),
+            scoped_grants: Vec::new(),
+        });
+        operator_request
+            .extensions_mut()
+            .insert(ManagementConnectionInfo {
+                certificate_sha256: [8; 32],
+                principal_id: PrincipalId(2),
+                closed: Arc::new(AtomicBool::new(false)),
+            });
+        let denied = <ManagementService as v1::management_service_server::ManagementService>::create_service_principal(
+            &service,
+            operator_request,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        assert!(security_catalog
+            .get_security_principal(PrincipalId(4))
+            .await
+            .unwrap()
+            .is_none());
+        let capabilities = <ManagementService as v1::management_service_server::ManagementService>::get_capabilities(
+            &service,
+            authenticated_request(v1::GetCapabilitiesRequest {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(capabilities
+            .capabilities
+            .contains(&"CreateServicePrincipal".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn principal_deletion_is_revision_checked_idempotent_and_audited() {
+        let object_store = Arc::new(InMemory::new());
+        let security_catalog = test_security_catalog_with_store(object_store.clone()).await;
+        let service = ManagementService::new(
+            TopologyCatalog::new(),
+            ShardManager::new(),
+            ManagementOperationStore::new(Arc::new(InMemory::new())),
+            NodeConfig::default(),
+        )
+        .with_security_catalog(security_catalog.clone());
+        let principal = SecurityPrincipal {
+            format_version: rockstream_types::authorization::SECURITY_PRINCIPAL_FORMAT_VERSION,
+            id: PrincipalId(3),
+            display_name: "Deletion target".to_owned(),
+            enabled: true,
+            revision: 1,
+            login_methods: vec![rockstream_types::authorization::LoginMethod::Service {
+                service_id: "deletion-target".to_owned(),
+            }],
+            preset_grants: Vec::new(),
+            scoped_grants: Vec::new(),
+        };
+        let created = <ManagementService as v1::management_service_server::ManagementService>::create_service_principal(
+            &service,
+            authenticated_request(v1::CreateServicePrincipalRequest {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                principal_id: principal.id.0,
+                display_name: principal.display_name.clone(),
+                service_id: "deletion-target".to_owned(),
+                expected_grantor_revision: 1,
+                idempotency_key: "c0f3c740-dcfe-4b4a-b7ef-a40a1a67fda1".to_owned(),
+                scoped_grants: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            created.principal,
+            Some(security_principal_response(principal.clone()).unwrap())
+        );
+
+        let request = v1::DeleteSecurityPrincipalRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            principal_id: principal.id.0,
+            expected_revision: 1,
+            expected_grantor_revision: 1,
+            idempotency_key: "5fbd04ca-bb0b-43df-9e55-d0b6f4475aef".to_owned(),
+        };
+        let mut stale_grantor = request.clone();
+        stale_grantor.expected_grantor_revision = 2;
+        stale_grantor.idempotency_key = "cd900848-6d68-45b4-9681-004761b88cda".to_owned();
+        let stale = <ManagementService as v1::management_service_server::ManagementService>::delete_security_principal(
+            &service,
+            authenticated_request(stale_grantor),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            stale.message(),
+            "grantor authority or reviewed revision is no longer current"
+        );
+
+        let mut stale_target = request.clone();
+        stale_target.expected_revision = 2;
+        stale_target.idempotency_key = "bac13606-4b9e-490a-8e29-0f46d10b59d9".to_owned();
+        let stale = <ManagementService as v1::management_service_server::ManagementService>::delete_security_principal(
+            &service,
+            authenticated_request(stale_target),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            stale.message(),
+            "security principal revision is no longer current"
+        );
+
+        let last_admin = <ManagementService as v1::management_service_server::ManagementService>::delete_security_principal(
+            &service,
+            authenticated_request(v1::DeleteSecurityPrincipalRequest {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                principal_id: 1,
+                expected_revision: 1,
+                expected_grantor_revision: 1,
+                idempotency_key: "7e675c59-4661-4ac1-a776-50a2abf30c55".to_owned(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(last_admin.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            last_admin.message(),
+            "principal deletion would remove the last management administrator"
+        );
+        assert!(security_catalog
+            .get_security_principal(PrincipalId(1))
+            .await
+            .unwrap()
+            .is_some());
+        assert!(security_catalog
+            .get_security_principal(principal.id)
+            .await
+            .unwrap()
+            .is_some());
+
+        let (deleted, concurrent_retry) = tokio::join!(
+            <ManagementService as v1::management_service_server::ManagementService>::delete_security_principal(
+                &service,
+                authenticated_request(request.clone()),
+            ),
+            <ManagementService as v1::management_service_server::ManagementService>::delete_security_principal(
+                &service,
+                authenticated_request(request.clone()),
+            ),
+        );
+        let deleted = deleted.unwrap().into_inner();
+        assert_eq!(concurrent_retry.unwrap().into_inner(), deleted);
+        assert!(security_catalog
+            .get_security_principal(principal.id)
+            .await
+            .unwrap()
+            .is_none());
+
+        let grant_event_id = format!("management-principal-delete:{}", request.idempotency_key);
+        let operation_id = match security_catalog
+            .get_security_audit_record(&grant_event_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .operation_id
+        {
+            AuditField::Known(operation_id) => operation_id,
+            _ => panic!("successful deletion must record its catalog operation ID"),
+        };
+        assert!(operation_id.parse::<u64>().is_ok_and(|id| id > 0));
+        assert_eq!(
+            deleted,
+            v1::DeleteSecurityPrincipalResponse {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+                principal_id: principal.id.0,
+                deleted_revision: 2,
+                operation_id: operation_id.clone(),
+            }
+        );
+        let before_state = security_principal_policy_state(&principal).unwrap();
+        let change = SecurityPrincipalDeleteDigest {
+            deployment_id: service.deployment_fingerprint(),
+            principal_id: principal.id.0,
+            expected_revision: 1,
+            grantor_id: 1,
+            grantor_revision: 1,
+            certificate_sha256: hex::encode([7; 32]),
+        };
+        let fingerprint = security_principal_delete_fingerprint(&change).unwrap();
+        let mut operation_audit: Vec<_> = security_catalog
+            .list_security_audit_records()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|record| {
+                record.correlation == AuditCorrelation::Observed(request.idempotency_key.clone())
+            })
+            .collect();
+        operation_audit.sort_by(|left, right| left.event_id.cmp(&right.event_id));
+        for record in &mut operation_audit {
+            assert!(record.timestamp_ms > 0);
+            record.timestamp_ms = 0;
+        }
+        let expected_audit = vec![
+            SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: format!("management-principal-delete:{}", request.idempotency_key),
+                timestamp_ms: 0,
+                actor: AuditIdentity::Verified("principal:1".to_owned()),
+                target: AuditField::Known("principal:3".to_owned()),
+                scope: AuditField::Known("cluster".to_owned()),
+                action: SecurityAuditClass::GrantChange,
+                outcome: SecurityAuditOutcome::Success,
+                correlation: AuditCorrelation::Observed(request.idempotency_key.clone()),
+                operation_id: AuditField::Known(operation_id.clone()),
+                policy_revision: AuditField::Known(2),
+                before_state: AuditField::Known(before_state.clone()),
+                after_state: AuditField::NotApplicable,
+            },
+            SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: format!(
+                    "management-principal-delete-completion:{}",
+                    request.idempotency_key
+                ),
+                timestamp_ms: 0,
+                actor: AuditIdentity::Verified("principal:1".to_owned()),
+                target: AuditField::Known("principal:3".to_owned()),
+                scope: AuditField::Known("cluster".to_owned()),
+                action: SecurityAuditClass::AdminOperationCompletion,
+                outcome: SecurityAuditOutcome::Success,
+                correlation: AuditCorrelation::Observed(request.idempotency_key.clone()),
+                operation_id: AuditField::Known(operation_id.clone()),
+                policy_revision: AuditField::Known(2),
+                before_state: AuditField::Known(before_state),
+                after_state: AuditField::Known("deleted".to_owned()),
+            },
+            SecurityAuditRecord {
+                format_version: SECURITY_AUDIT_FORMAT_VERSION,
+                event_id: format!(
+                    "management-principal-delete-start:{}",
+                    request.idempotency_key
+                ),
+                timestamp_ms: 0,
+                actor: AuditIdentity::Verified("principal:1".to_owned()),
+                target: AuditField::Known("principal:3".to_owned()),
+                scope: AuditField::Known("cluster".to_owned()),
+                action: SecurityAuditClass::AdminOperationStart,
+                outcome: SecurityAuditOutcome::Success,
+                correlation: AuditCorrelation::Observed(request.idempotency_key.clone()),
+                operation_id: AuditField::Known(request.idempotency_key.clone()),
+                policy_revision: AuditField::Known(1),
+                before_state: AuditField::NotApplicable,
+                after_state: AuditField::Known(format!("request_sha256:{fingerprint}")),
+            },
+        ];
+        let mut expected_audit = expected_audit;
+        expected_audit.sort_by(|left, right| left.event_id.cmp(&right.event_id));
+        assert_eq!(operation_audit, expected_audit);
+
+        let audit_before_retry = security_catalog
+            .list_security_audit_records()
+            .await
+            .unwrap();
+        let retry = <ManagementService as v1::management_service_server::ManagementService>::delete_security_principal(
+            &service,
+            authenticated_request(request.clone()),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(retry, deleted);
+        assert_eq!(
+            security_catalog
+                .list_security_audit_records()
+                .await
+                .unwrap(),
+            audit_before_retry
+        );
+
+        let restarted_catalog = Arc::new(rockstream_storage::catalog::DurableCatalogStore::new(
+            object_store,
+            "management-test",
+        ));
+        restarted_catalog.refresh().await.unwrap();
+        let restarted_service = ManagementService::new(
+            TopologyCatalog::new(),
+            ShardManager::new(),
+            ManagementOperationStore::new(Arc::new(InMemory::new())),
+            NodeConfig::default(),
+        )
+        .with_security_catalog(restarted_catalog.clone());
+        let restarted_retry = <ManagementService as v1::management_service_server::ManagementService>::delete_security_principal(
+            &restarted_service,
+            authenticated_request(request.clone()),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(restarted_retry, deleted);
+        assert_eq!(
+            restarted_catalog
+                .list_security_audit_records()
+                .await
+                .unwrap(),
+            audit_before_retry
+        );
+
+        let mut reused_key = request.clone();
+        reused_key.expected_revision = 2;
+        let conflict = <ManagementService as v1::management_service_server::ManagementService>::delete_security_principal(
+            &service,
+            authenticated_request(reused_key),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
+        assert_eq!(
+            conflict.message(),
+            "idempotency key is bound to another principal-deletion request"
+        );
+        assert_eq!(
+            security_catalog
+                .list_security_audit_records()
+                .await
+                .unwrap(),
+            audit_before_retry
+        );
+
+        let mut operator_request = Request::new(v1::DeleteSecurityPrincipalRequest {
+            protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            principal_id: 2,
+            expected_revision: 1,
+            expected_grantor_revision: 1,
+            idempotency_key: "91cdfba0-b030-40b3-b465-1dba98f77c03".to_owned(),
+        });
+        operator_request
+            .extensions_mut()
+            .insert(ManagementConnectionInfo {
+                certificate_sha256: [8; 32],
+                principal_id: PrincipalId(2),
+                closed: Arc::new(AtomicBool::new(false)),
+            });
+        let denied = <ManagementService as v1::management_service_server::ManagementService>::delete_security_principal(
+            &service,
+            operator_request,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        assert_eq!(denied.message(), "management action is not authorized");
+        assert!(security_catalog
+            .get_security_principal(PrincipalId(2))
+            .await
+            .unwrap()
+            .is_some());
+
+        let capabilities = <ManagementService as v1::management_service_server::ManagementService>::get_capabilities(
+            &service,
+            authenticated_request(v1::GetCapabilitiesRequest {
+                protocol_version: rockstream_management_proto::PROTOCOL_VERSION,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(capabilities
+            .capabilities
+            .contains(&"DeleteSecurityPrincipal".to_owned()));
     }
 }

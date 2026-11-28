@@ -22,6 +22,7 @@ pub mod connector;
 pub mod cost;
 pub mod data_plane;
 pub mod diagnostic;
+pub mod direct_epoch;
 pub mod dlq;
 pub mod error_code;
 pub mod evidence_manifest;
@@ -88,7 +89,11 @@ pub use ids::{
     LeaseToken, NamespaceId, OperatorId, PrincipalId, ShardId, SinkId, SourceId, TableId, TenantId,
     ViewId, WorkerId, WorkloadId,
 };
-pub use key_capsule::{KeyCapsule, KeyCapsuleError, KeyValue};
+pub use key_capsule::{
+    batch_key_capsule_encodings_global, batch_key_capsule_encodings_local,
+    measure_batch_key_capsule_encodings, reset_batch_key_capsule_encodings_local, BatchKeyCapsule,
+    KeyCapsule, KeyCapsuleError, KeySpec, KeyValue,
+};
 pub use lifecycle::{
     DependencyHealthReport, DependencyStatus, HealthDimensionObservation, HealthDimensionStatus,
     HealthDimensions, HealthReason, HealthReport, LifecycleState, LifecycleTracker, LiveResponse,
@@ -101,8 +106,9 @@ pub use logging::{
 };
 pub use platform::{ClassificationTier, PlatformClassification, PlatformClassifier};
 pub use qualification::{
-    QualificationAggregateMetrics, QualificationError, QualificationEvidenceManifest,
-    QualificationGateDecision, QualificationGateRejection, QualificationProfile,
+    MeasuredExecutionMetadata, QualificationAggregateMetrics, QualificationCostAccounting,
+    QualificationError, QualificationEvidenceManifest, QualificationGateDecision,
+    QualificationGateRejection, QualificationProfile, QualificationProvenance,
     QualificationReleaseGate, QualificationRun, QualificationRunStatus, QualificationWorkload,
     TopologySpec, WorkloadRunResult,
 };

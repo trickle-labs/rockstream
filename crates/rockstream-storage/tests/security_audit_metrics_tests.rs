@@ -38,6 +38,14 @@ fn expected_metric_lines(records: u64, bytes: u64) -> Vec<String> {
             .to_owned(),
         "# TYPE security_audit_degraded gauge".to_owned(),
         "security_audit_degraded 0".to_owned(),
+        "# HELP security_audit_transport_capacity Maximum in-flight worker security audit acknowledgements."
+            .to_owned(),
+        "# TYPE security_audit_transport_capacity gauge".to_owned(),
+        "security_audit_transport_capacity 0".to_owned(),
+        "# HELP security_audit_transport_pending Worker security audit requests awaiting durable acknowledgement."
+            .to_owned(),
+        "# TYPE security_audit_transport_pending gauge".to_owned(),
+        "security_audit_transport_pending 0".to_owned(),
     ]
 }
 

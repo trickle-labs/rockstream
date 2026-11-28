@@ -33,7 +33,6 @@
 //! to restore state.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -45,13 +44,19 @@ use tracing::debug;
 use rockstream_plan::virtual_bucket::{
     normalize_power_of_two_bucket_count, route_power_of_two_bucket,
 };
-use rockstream_storage::{ShardDb, ShardKeyEncoder, ShardPrefix, WriteBatch};
+use rockstream_storage::{
+    MergeOperatorRegistry, MergeTag, ShardDb, ShardKeyEncoder, ShardPrefix, WriteBatch,
+};
 use rockstream_types::ids::OperatorId;
 use rockstream_types::laws::arithmetic::{
     checked_add_i64, checked_i128_to_i64, checked_mul_i64, decode_i64, decode_u64, encode_i64,
     encode_u64,
 };
-use rockstream_types::laws::sum_count::avg_from_sum_count;
+use rockstream_types::laws::sum_count::{
+    avg_from_sum_count, SumCountV1, SUM_COUNT_ID, SUM_COUNT_VERSION,
+};
+use rockstream_types::merge_law::LawBundle;
+use rockstream_types::state_mutation::StateMutation;
 
 use crate::error::OpError;
 use crate::op::Operator;
@@ -202,23 +207,147 @@ impl Operator for DecimalAggregateFormatOp {
 ///
 /// The arrangement is bounded by the number of distinct group keys in the input
 /// stream.  The fill level is tracked via `entry_count()`.
+/// Persistence policy governing whether `AggregateOp` emits law-native
+/// `StateMutation::Merge` (`SumCount/v1`) operands or falls back to `Put`/`Delete`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AggregatePersistenceMode {
+    /// Default for ADR 0004 admitted `SumCount/v1` views that emit downstream
+    /// `-1 old / +1 new` retraction deltas (views feeding dependent views,
+    /// `SUBSCRIBE`, or `ViewSink`). New/recreated/non-reassociable keys emit
+    /// tagged `Put`, admitted updates emit `StateMutation::Merge` (`MergeTag::SumCount`),
+    /// and zero-count deletions emit `StateMutation::Delete`.
+    #[default]
+    MergeDelta,
+    /// Eligible for terminal materialized `SUM`/`COUNT`/`AVG` views served from
+    /// storage without downstream `-1 old / +1 new` retraction streams. Consolidates
+    /// duplicate keys in-epoch and emits `StateMutation::Merge` directly into SlateDB
+    /// without forcing cold-key reads solely to persist a delta.
+    BlindMerge,
+    /// Fallback dirty-key `Put`/`Delete` using raw 16-byte V1 encoding for
+    /// non-admitted aggregates.
+    PutDelete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingKeyMutation {
+    Put { sum: i64, count: i64 },
+    Merge { delta_sum: i64, delta_count: i64 },
+    Delete,
+}
+
+fn encode_pending_mutation(
+    op_id: OperatorId,
+    group_key: i64,
+    pending: PendingKeyMutation,
+    mode: AggregatePersistenceMode,
+) -> StateMutation {
+    let key = ShardKeyEncoder::encode(ShardPrefix::OpState, op_id.0, &group_key.to_be_bytes());
+    match pending {
+        PendingKeyMutation::Delete => StateMutation::Delete { key },
+        PendingKeyMutation::Merge {
+            delta_sum,
+            delta_count,
+        } => StateMutation::Merge {
+            key,
+            law: SUM_COUNT_ID,
+            law_version: SUM_COUNT_VERSION,
+            operand: bytes::Bytes::from(MergeOperatorRegistry::encode_sum_count(
+                delta_sum,
+                delta_count,
+            )),
+        },
+        PendingKeyMutation::Put { sum, count } => match mode {
+            AggregatePersistenceMode::PutDelete => {
+                let mut value = [0u8; 16];
+                value[..8].copy_from_slice(&encode_i64(sum));
+                value[8..].copy_from_slice(&encode_i64(count));
+                StateMutation::Put {
+                    key,
+                    value: bytes::Bytes::copy_from_slice(&value),
+                }
+            }
+            AggregatePersistenceMode::MergeDelta | AggregatePersistenceMode::BlindMerge => {
+                StateMutation::Put {
+                    key,
+                    value: bytes::Bytes::from(MergeOperatorRegistry::encode_sum_count(sum, count)),
+                }
+            }
+        },
+    }
+}
+
 fn encode_state_mutation(
     op_id: OperatorId,
     group_key: i64,
     state: Option<(i64, i64)>,
-) -> rockstream_types::state_mutation::StateMutation {
-    let key = ShardKeyEncoder::encode(ShardPrefix::OpState, op_id.0, &group_key.to_be_bytes());
-    match state {
-        Some((sum, count)) => {
-            let mut value = [0u8; 16];
-            value[..8].copy_from_slice(&encode_i64(sum));
-            value[8..].copy_from_slice(&encode_i64(count));
-            rockstream_types::state_mutation::StateMutation::Put {
-                key,
-                value: bytes::Bytes::copy_from_slice(&value),
-            }
+) -> StateMutation {
+    let pending = match state {
+        Some((sum, count)) => PendingKeyMutation::Put { sum, count },
+        None => PendingKeyMutation::Delete,
+    };
+    encode_pending_mutation(
+        op_id,
+        group_key,
+        pending,
+        AggregatePersistenceMode::PutDelete,
+    )
+}
+
+fn decode_persisted_sum_count(
+    value: &[u8],
+    op_id: OperatorId,
+) -> Result<Option<(i64, i64, bool)>, OpError> {
+    if value.len() == 17 && value[0] == MergeTag::SumCount as u8 {
+        let sum = decode_i64(&value[1..9])
+            .map_err(|_| OpError::storage_error("RS-3616: corrupted tagged aggregate sum"))?;
+        let count = decode_i64(&value[9..17])
+            .map_err(|_| OpError::storage_error("RS-3616: corrupted tagged aggregate count"))?;
+        if count == 0 && sum == 0 {
+            // Identity element from blind merge deletion: treat as deleted/absent.
+            return Ok(None);
         }
-        None => rockstream_types::state_mutation::StateMutation::Delete { key },
+        if count <= 0 {
+            return Err(OpError::storage_error(format!(
+                "RS-3616: corrupted recovery record for operator {}: non-positive count",
+                op_id.0
+            )));
+        }
+        return Ok(Some((sum, count, false)));
+    }
+    if value.len() == 16 {
+        let sum = decode_i64(&value[..8])
+            .map_err(|_| OpError::storage_error("RS-3616: corrupted aggregate sum"))?;
+        let count = decode_i64(&value[8..16])
+            .map_err(|_| OpError::storage_error("RS-3616: corrupted aggregate count"))?;
+        if count <= 0 {
+            return Err(OpError::storage_error(format!(
+                "RS-3616: corrupted recovery record for operator {}: non-positive count",
+                op_id.0
+            )));
+        }
+        return Ok(Some((sum, count, true)));
+    }
+    Err(OpError::storage_error(
+        "RS-3616: corrupted recovery record: aggregate value must be 16 or 17 bytes",
+    ))
+}
+
+/// Check ADR 0004 reassociation admission before emitting a `SumCount/v1` `StateMutation::Merge`
+/// so partial compaction reassociation can never spuriously overflow `i64`.
+fn admits_sum_count_merge(
+    old_sum: i64,
+    old_count: i64,
+    delta_sum: i128,
+    delta_count: i64,
+) -> Option<i64> {
+    let delta_sum_i64 = i64::try_from(delta_sum).ok()?;
+    let law = SumCountV1;
+    if law.admits_reassociation(&[old_sum, delta_sum_i64])
+        && law.admits_reassociation(&[old_count, delta_count])
+    {
+        Some(delta_sum_i64)
+    } else {
+        None
     }
 }
 
@@ -351,38 +480,25 @@ impl AggState {
             .collect()
     }
 
-    fn decode_persisted_entry(
+    fn decode_persisted_entry_opt(
         key: &[u8],
         value: &[u8],
         op_id: OperatorId,
         op_prefix: &[u8],
-    ) -> Result<(i64, i64, i64), OpError> {
+    ) -> Result<Option<(i64, i64, i64, bool)>, OpError> {
         if key.len() != op_prefix.len() + 8 || !key.starts_with(op_prefix) {
             return Err(OpError::storage_error(
                 "RS-3616: corrupted recovery record: invalid aggregate key",
             ));
         }
-        if value.len() != 16 {
-            return Err(OpError::storage_error(
-                "RS-3616: corrupted recovery record: aggregate value must be exactly 16 bytes",
-            ));
-        }
         let k = decode_i64(&key[op_prefix.len()..])
             .map_err(|_| OpError::storage_error("RS-3616: corrupted aggregate group key"))?;
-        let sum = decode_i64(&value[..8])
-            .map_err(|_| OpError::storage_error("RS-3616: corrupted aggregate sum"))?;
-        let count = decode_i64(&value[8..])
-            .map_err(|_| OpError::storage_error("RS-3616: corrupted aggregate count"))?;
-        if count <= 0 {
-            return Err(OpError::storage_error(format!(
-                "RS-3616: corrupted recovery record for operator {}: non-positive count",
-                op_id.0
-            )));
-        }
-        Ok((k, sum, count))
+        Ok(decode_persisted_sum_count(value, op_id)?
+            .map(|(sum, count, is_legacy)| (k, sum, count, is_legacy)))
     }
 
-    /// Decode from the raw entries stored by a previous `encode_as_write_batch`.
+    /// Decode from the raw entries stored by a previous `encode_as_write_batch`
+    /// or `WriteBatch::merge` persistence.
     ///
     /// `raw_entries` is the result of scanning the `op_state` namespace for
     /// the given `op_id`.
@@ -393,8 +509,11 @@ impl AggState {
         let op_prefix = ShardKeyEncoder::operator_prefix(ShardPrefix::OpState, op_id.0);
         let mut state = AggState::new();
         for (key, value) in raw_entries {
-            let (k, sum, count) = Self::decode_persisted_entry(key, value, op_id, &op_prefix)?;
-            state.entries.insert(k, (sum, count));
+            if let Some((k, sum, count, _)) =
+                Self::decode_persisted_entry_opt(key, value, op_id, &op_prefix)?
+            {
+                state.entries.insert(k, (sum, count));
+            }
         }
         Ok(state)
     }
@@ -536,27 +655,30 @@ impl Default for StagedEpochAggregator {
 /// Named upper bound for clean LRU capacity in AggregateOp.
 pub const MAX_CLEAN_LRU_CAPACITY: usize = 262_144;
 
-/// Stateful incremental aggregate operator.
+/// Single-owner, lock-free (`&mut self`) state core for [`AggregateOp`].
 ///
-/// Input:  two Int64 columns `(k, v)`.
-/// Output: `(k, sum_v, count, avg_v)` — first three columns Int64, `avg_v` Float64.
-///
-/// Uses interior mutability (`Mutex`) so it satisfies `Operator: &self`.
-pub struct AggregateOp {
-    db: Mutex<Option<Arc<ShardDb>>>,
-    state: Mutex<AggState>,
-    dirty_keys: Mutex<HashSet<i64>>,
-    clean_lru: Mutex<VecDeque<i64>>,
+/// Owns all mutable arrangement maps, pending consolidated mutations, undo log,
+/// clean LRU, and persistence settings directly with zero internal `Mutex`es so
+/// shard actors execute the hot loop with zero locking.
+pub struct AggregateStateCore {
     pub op_id: OperatorId,
-    max_groups: AtomicUsize,
-    max_bytes: AtomicUsize,
-    max_state_bytes: AtomicUsize,
-    last_consolidation_groups: AtomicUsize,
-    last_consolidation_bytes: AtomicUsize,
+    db: Option<Arc<ShardDb>>,
+    state: AggState,
+    dirty_keys: HashSet<i64>,
+    pending_mutations: HashMap<i64, PendingKeyMutation>,
+    uncommitted_undo: HashMap<i64, Option<(i64, i64)>>,
+    legacy_keys: HashSet<i64>,
+    clean_lru: VecDeque<i64>,
+    persistence_mode: AggregatePersistenceMode,
+    max_groups: usize,
+    max_bytes: usize,
+    max_state_bytes: usize,
+    last_consolidation_groups: usize,
+    last_consolidation_bytes: usize,
+    cold_key_reads: u64,
 }
 
-impl AggregateOp {
-    /// Create a new aggregate operator with default consolidation limits and empty state.
+impl AggregateStateCore {
     pub fn new(op_id: OperatorId) -> Self {
         Self::with_limits(
             op_id,
@@ -565,252 +687,178 @@ impl AggregateOp {
         )
     }
 
-    /// Create from pre-loaded state (used after loading from storage).
     pub fn with_state(op_id: OperatorId, state: AggState) -> Self {
         let clean_keys: VecDeque<i64> = state.entries.keys().copied().collect();
-        AggregateOp {
-            db: Mutex::new(None),
-            state: Mutex::new(state),
-            dirty_keys: Mutex::new(HashSet::new()),
-            clean_lru: Mutex::new(clean_keys),
+        Self {
             op_id,
-            max_groups: AtomicUsize::new(MAX_EPOCH_CONSOLIDATION_GROUPS),
-            max_bytes: AtomicUsize::new(MAX_EPOCH_CONSOLIDATION_BYTES),
-            max_state_bytes: AtomicUsize::new(0),
-            last_consolidation_groups: AtomicUsize::new(0),
-            last_consolidation_bytes: AtomicUsize::new(0),
+            db: None,
+            state,
+            dirty_keys: HashSet::new(),
+            pending_mutations: HashMap::new(),
+            uncommitted_undo: HashMap::new(),
+            legacy_keys: HashSet::new(),
+            clean_lru: clean_keys,
+            persistence_mode: AggregatePersistenceMode::default(),
+            max_groups: MAX_EPOCH_CONSOLIDATION_GROUPS,
+            max_bytes: MAX_EPOCH_CONSOLIDATION_BYTES,
+            max_state_bytes: 0,
+            last_consolidation_groups: 0,
+            last_consolidation_bytes: 0,
+            cold_key_reads: 0,
         }
     }
 
-    /// Create with custom consolidation limits.
     pub fn with_limits(op_id: OperatorId, max_groups: usize, max_bytes: usize) -> Self {
-        AggregateOp {
-            db: Mutex::new(None),
-            state: Mutex::new(AggState::new()),
-            dirty_keys: Mutex::new(HashSet::new()),
-            clean_lru: Mutex::new(VecDeque::new()),
+        Self {
             op_id,
-            max_groups: AtomicUsize::new(max_groups),
-            max_bytes: AtomicUsize::new(max_bytes),
-            max_state_bytes: AtomicUsize::new(0),
-            last_consolidation_groups: AtomicUsize::new(0),
-            last_consolidation_bytes: AtomicUsize::new(0),
+            db: None,
+            state: AggState::new(),
+            dirty_keys: HashSet::new(),
+            pending_mutations: HashMap::new(),
+            uncommitted_undo: HashMap::new(),
+            legacy_keys: HashSet::new(),
+            clean_lru: VecDeque::new(),
+            persistence_mode: AggregatePersistenceMode::default(),
+            max_groups,
+            max_bytes,
+            max_state_bytes: 0,
+            last_consolidation_groups: 0,
+            last_consolidation_bytes: 0,
+            cold_key_reads: 0,
         }
     }
 
-    /// Attach a ShardDb for transparent spill-to-disk and demand-loading.
-    pub fn with_db(self, db: Arc<ShardDb>) -> Self {
-        *self.db.lock().unwrap() = Some(db);
-        self
+    pub fn set_db(&mut self, db: Arc<ShardDb>) {
+        self.db = Some(db);
     }
 
-    /// Set a ShardDb for transparent spill-to-disk and demand-loading.
-    pub fn set_db(&self, db: Arc<ShardDb>) {
-        *self.db.lock().unwrap() = Some(db);
+    pub fn set_memory_limit(&mut self, max_bytes: usize) {
+        self.max_state_bytes = max_bytes;
     }
 
-    /// Set in-memory state capacity budget in bytes.
-    pub fn with_memory_limit(self, max_bytes: usize) -> Self {
-        self.max_state_bytes.store(max_bytes, Ordering::Relaxed);
-        self
+    pub fn set_limits(&mut self, max_groups: usize, max_bytes: usize) {
+        self.max_groups = max_groups;
+        self.max_bytes = max_bytes;
     }
 
-    /// Set in-memory state capacity budget in bytes dynamically.
-    pub fn set_memory_limit(&self, max_bytes: usize) {
-        self.max_state_bytes.store(max_bytes, Ordering::Relaxed);
+    pub fn set_persistence_mode(&mut self, mode: AggregatePersistenceMode) {
+        self.persistence_mode = mode;
     }
 
-    /// Number of in-memory cached groups.
+    pub fn persistence_mode(&self) -> AggregatePersistenceMode {
+        self.persistence_mode
+    }
+
     pub fn in_memory_groups(&self) -> usize {
-        self.state
-            .lock()
-            .expect("AggregateOp mutex poisoned")
-            .entry_count()
+        self.state.entry_count()
     }
 
-    /// Set consolidation limits dynamically.
-    pub fn set_limits(&self, max_groups: usize, max_bytes: usize) {
-        self.max_groups.store(max_groups, Ordering::Relaxed);
-        self.max_bytes.store(max_bytes, Ordering::Relaxed);
+    pub fn live_groups(&self) -> usize {
+        self.state.entry_count()
     }
 
-    /// Observable occupancy: distinct groups touched in the last epoch consolidation.
     pub fn consolidation_groups(&self) -> usize {
-        self.last_consolidation_groups.load(Ordering::Relaxed)
+        self.last_consolidation_groups
     }
 
-    /// Observable occupancy: estimated byte memory used in the last epoch consolidation.
     pub fn consolidation_bytes(&self) -> usize {
-        self.last_consolidation_bytes.load(Ordering::Relaxed)
+        self.last_consolidation_bytes
+    }
+
+    pub fn state_bytes(&self) -> u64 {
+        self.state.state_bytes()
+    }
+
+    /// Number of cold-key point lookups issued against `ShardDb` by this operator.
+    pub fn cold_key_reads(&self) -> u64 {
+        self.cold_key_reads
     }
 
     /// Mark the current dirty-key set durable after its caller's batch commits.
-    pub fn clear_dirty_keys(&self) {
-        let mut dirty = self
-            .dirty_keys
-            .lock()
-            .expect("AggregateOp dirty-key mutex poisoned");
-        let mut clean_lru = self
-            .clean_lru
-            .lock()
-            .expect("AggregateOp clean_lru mutex poisoned");
-        let mut state = self.state.lock().expect("AggregateOp mutex poisoned");
-
-        for &k in dirty.iter() {
-            if state.entries.contains_key(&k) {
-                clean_lru.push_back(k);
-                if clean_lru.len() > MAX_CLEAN_LRU_CAPACITY {
-                    clean_lru.pop_front();
+    pub fn clear_dirty_keys(&mut self) {
+        for &k in &self.dirty_keys {
+            self.legacy_keys.remove(&k);
+            if self.state.entries.contains_key(&k) {
+                self.clean_lru.push_back(k);
+                if self.clean_lru.len() > MAX_CLEAN_LRU_CAPACITY {
+                    self.clean_lru.pop_front();
                 }
             }
         }
-        dirty.clear();
+        self.dirty_keys.clear();
+        self.pending_mutations.clear();
+        self.uncommitted_undo.clear();
 
-        let limit = self.max_state_bytes.load(Ordering::Relaxed);
-        let has_db = self
-            .db
-            .lock()
-            .expect("AggregateOp db mutex poisoned")
-            .is_some();
-        if limit > 0 && has_db {
-            while state.state_bytes() as usize > limit && !clean_lru.is_empty() {
-                if let Some(cold_k) = clean_lru.pop_front() {
-                    state.entries.remove(&cold_k);
+        if self.max_state_bytes > 0 && self.db.is_some() {
+            while self.state.state_bytes() as usize > self.max_state_bytes
+                && !self.clean_lru.is_empty()
+            {
+                if let Some(cold_k) = self.clean_lru.pop_front() {
+                    self.state.entries.remove(&cold_k);
                 }
             }
         }
     }
 
-    /// Number of live groups (fill-level metric).
-    pub fn live_groups(&self) -> usize {
-        self.state
-            .lock()
-            .expect("AggregateOp mutex poisoned")
-            .entry_count()
+    /// Roll back all uncommitted in-memory state mutations since the last durable commit.
+    pub fn rollback_uncommitted(&mut self) {
+        for (k, prior) in self.uncommitted_undo.drain() {
+            match prior {
+                Some(val) => {
+                    self.state.entries.insert(k, val);
+                }
+                None => {
+                    self.state.entries.remove(&k);
+                }
+            }
+        }
+        self.dirty_keys.clear();
+        self.pending_mutations.clear();
+    }
+
+    /// Encode all uncommitted dirty-key mutations in deterministic sorted key order.
+    pub fn pending_state_mutations(&self) -> Vec<StateMutation> {
+        let mut keys: Vec<i64> = self.dirty_keys.iter().copied().collect();
+        keys.sort_unstable();
+        keys.into_iter()
+            .filter_map(|k| {
+                let pending = self.pending_mutations.get(&k).copied().or_else(|| {
+                    Some(match self.state.entries.get(&k).copied() {
+                        Some((sum, count)) => PendingKeyMutation::Put { sum, count },
+                        None => PendingKeyMutation::Delete,
+                    })
+                })?;
+                Some(encode_pending_mutation(
+                    self.op_id,
+                    k,
+                    pending,
+                    self.persistence_mode,
+                ))
+            })
+            .collect()
+    }
+
+    /// Append uncommitted dirty-key mutations (`Put`, `Merge`, or `Delete`) to `target`.
+    pub fn append_state_to_batch(&self, target: &mut WriteBatch) {
+        for mutation in self.pending_state_mutations() {
+            match mutation {
+                StateMutation::Put { key, value } => target.put(&key, &value),
+                StateMutation::Delete { key } => target.delete(&key),
+                StateMutation::Merge { key, operand, .. } => target.merge(&key, &operand),
+            }
+        }
     }
 
     /// Encode dirty state mutations as a `WriteBatch` for persistence.
-    ///
-    /// Persists only keys that changed (put) or were removed (delete) during the
-    /// current epoch, ensuring O(|Δ|) write amplification instead of O(|state|).
-    /// The caller (usually `ViewSinkOp` or group commit) merges this batch
-    /// into the epoch's group-commit `WriteBatch`.
     pub fn state_write_batch(&self) -> WriteBatch {
-        let state = self.state.lock().expect("AggregateOp mutex poisoned");
-        let dirty = self
-            .dirty_keys
-            .lock()
-            .expect("AggregateOp dirty_keys mutex poisoned");
         let mut wb = WriteBatch::new();
-        for &k in dirty.iter() {
-            let key = ShardKeyEncoder::encode(ShardPrefix::OpState, self.op_id.0, &k.to_be_bytes());
-            if let Some(&(sum, count)) = state.entries.get(&k) {
-                let mut value = [0u8; 16];
-                value[..8].copy_from_slice(&sum.to_be_bytes());
-                value[8..].copy_from_slice(&count.to_be_bytes());
-                wb.put(&key, &value);
-            } else {
-                wb.delete(&key);
-            }
-        }
+        self.append_state_to_batch(&mut wb);
         wb
     }
 
-    /// Restore an `AggregateOp` from a `ShardDb` (called at shard startup).
-    pub async fn load_from_storage(db: &ShardDb, op_id: OperatorId) -> Result<Self, OpError> {
-        let prefix = ShardKeyEncoder::operator_prefix(ShardPrefix::OpState, op_id.0);
-        let mut state = AggState::new();
-        let mut next_token: Option<bytes::Bytes> = None;
-        let mut clean_lru = VecDeque::new();
-
-        loop {
-            let page = db
-                .scan_prefix_page(&prefix, next_token.as_deref(), 1024, 1024 * 1024)
-                .await
-                .map_err(OpError::storage)?;
-
-            for (key, value) in &page.rows {
-                let (k, sum, count) = AggState::decode_persisted_entry(key, value, op_id, &prefix)?;
-                state.entries.insert(k, (sum, count));
-                clean_lru.push_back(k);
-                if clean_lru.len() > MAX_CLEAN_LRU_CAPACITY {
-                    clean_lru.pop_front();
-                }
-            }
-
-            if page.is_last_page {
-                break;
-            }
-            next_token = page.next_token;
-        }
-        let op = Self::with_state(op_id, state);
-        *op.db.lock().expect("AggregateOp db mutex poisoned") = Some(Arc::new(db.clone()));
-        *op.clean_lru
-            .lock()
-            .expect("AggregateOp clean_lru mutex poisoned") = clean_lru;
-        Ok(op)
-    }
-
-    /// Load persisted state from `db` into this already-constructed
-    /// instance in place (used by `GatewayHandler::recover_compiled_views`
-    /// to restore a recompiled view's arrangement after a process restart —
-    /// unlike `load_from_storage`, this keeps the same `Arc<AggregateOp>`
-    /// already installed in the pipeline rather than requiring the caller
-    /// to rebuild the pipeline around a freshly-returned instance).
-    pub async fn restore_in_place(&self, db: &ShardDb) -> Result<(), OpError> {
-        let prefix = ShardKeyEncoder::operator_prefix(ShardPrefix::OpState, self.op_id.0);
-        let mut state = AggState::new();
-        let mut next_token: Option<bytes::Bytes> = None;
-        let mut clean_lru = VecDeque::new();
-
-        loop {
-            let page = db
-                .scan_prefix_page(&prefix, next_token.as_deref(), 1024, 1024 * 1024)
-                .await
-                .map_err(OpError::storage)?;
-
-            for (key, value) in &page.rows {
-                let (k, sum, count) =
-                    AggState::decode_persisted_entry(key, value, self.op_id, &prefix)?;
-                state.entries.insert(k, (sum, count));
-                clean_lru.push_back(k);
-                if clean_lru.len() > MAX_CLEAN_LRU_CAPACITY {
-                    clean_lru.pop_front();
-                }
-            }
-
-            if page.is_last_page {
-                break;
-            }
-            next_token = page.next_token;
-        }
-
-        let limit = self.max_state_bytes.load(Ordering::Relaxed);
-        if limit > 0 {
-            while state.state_bytes() as usize > limit && !clean_lru.is_empty() {
-                if let Some(cold_k) = clean_lru.pop_front() {
-                    state.entries.remove(&cold_k);
-                }
-            }
-        }
-        *self.state.lock().expect("AggregateOp mutex poisoned") = state;
-        *self.db.lock().expect("AggregateOp db mutex poisoned") = Some(Arc::new(db.clone()));
-        *self
-            .clean_lru
-            .lock()
-            .expect("AggregateOp clean_lru mutex poisoned") = clean_lru;
-        self.clear_dirty_keys();
-        Ok(())
-    }
-
-    /// State bytes metric.
-    pub fn state_bytes(&self) -> u64 {
-        self.state.lock().unwrap().state_bytes()
-    }
-
-    /// Process one Z-set delta batch and return the output delta and delta-native state mutations.
-    pub fn process_delta_with_result(
-        &self,
+    /// Process one Z-set delta batch with zero mutex locking (`&mut self`).
+    pub fn process_delta_with_result_mut(
+        &mut self,
         delta: ArrowZSet,
     ) -> Result<crate::op::OperatorEpochResult, OpError> {
         let started_at = Instant::now();
@@ -894,9 +942,7 @@ impl AggregateOp {
         };
         let v_col = &v_col_owned;
 
-        let max_groups = self.max_groups.load(Ordering::Relaxed);
-        let max_bytes = self.max_bytes.load(Ordering::Relaxed);
-        let mut staged = StagedEpochAggregator::with_limits(max_groups, max_bytes);
+        let mut staged = StagedEpochAggregator::with_limits(self.max_groups, self.max_bytes);
         let n = delta.num_rows();
 
         for (row, &w) in delta.weights.iter().enumerate() {
@@ -911,65 +957,161 @@ impl AggregateOp {
             staged.ingest_delta(k, v, w)?;
         }
 
-        self.last_consolidation_groups
-            .store(staged.group_count(), Ordering::Relaxed);
-        self.last_consolidation_bytes
-            .store(staged.estimated_bytes(), Ordering::Relaxed);
+        self.last_consolidation_groups = staged.group_count();
+        self.last_consolidation_bytes = staged.estimated_bytes();
 
         struct GroupTransition {
             key: i64,
             old_state: Option<(i64, i64)>,
             new_state: Option<(i64, i64)>,
+            #[allow(dead_code)]
+            delta_sum: i128,
+            #[allow(dead_code)]
+            delta_count: i64,
             changed: bool,
+            blind_cold_merge: bool,
+            epoch_mutation: Option<PendingKeyMutation>,
+            combined_pending: Option<PendingKeyMutation>,
         }
 
-        let mut state = self.state.lock().expect("AggregateOp mutex poisoned");
         let mut transitions = Vec::with_capacity(staged.order.len());
-        let db_opt = self
-            .db
-            .lock()
-            .expect("AggregateOp db mutex poisoned")
-            .clone();
-        let current_dirty = self
-            .dirty_keys
-            .lock()
-            .expect("AggregateOp dirty-key mutex poisoned")
-            .clone();
-
-        let mut demand_loaded: HashMap<i64, (i64, i64)> = HashMap::new();
+        let mut demand_loaded: HashMap<i64, (i64, i64, bool)> = HashMap::new();
+        let mut cold_reads_this_epoch = 0u64;
 
         for &k in &staged.order {
             let (delta_sum, delta_count) = staged.entries[&k];
-            let mut old = state.entries.get(&k).copied();
+            let mut old = self.state.entries.get(&k).copied();
+            let mut is_legacy_key = self.legacy_keys.contains(&k);
 
-            if old.is_none() {
-                // If the key was deleted in the current uncommitted epoch, old is None
-                if !current_dirty.contains(&k) {
-                    if let Some(db) = &db_opt {
-                        let key_bytes = ShardKeyEncoder::encode(
-                            ShardPrefix::OpState,
-                            self.op_id.0,
-                            &k.to_be_bytes(),
-                        );
-                        let opt_bytes =
-                            crate::spill::block_on_future(db.get(&key_bytes)).map_err(|e| {
-                                OpError::storage_error(format!(
-                                    "AggregateOp demand load failed: {e}"
-                                ))
-                            })?;
-                        if let Some(bytes) = opt_bytes {
-                            if bytes.len() >= 16 {
-                                let sum = i64::from_be_bytes(bytes[..8].try_into().unwrap());
-                                let count = i64::from_be_bytes(bytes[8..16].try_into().unwrap());
-                                if count > 0 {
-                                    rockstream_types::metrics::inc_spill_faults_total();
-                                    old = Some((sum, count));
-                                    demand_loaded.insert(k, (sum, count));
-                                }
-                            }
+            if old.is_none()
+                && !self.dirty_keys.contains(&k)
+                && self.persistence_mode == AggregatePersistenceMode::BlindMerge
+                && self.db.is_some()
+            {
+                // Terminal storage-served view in BlindMerge mode: emit a consolidated
+                // SumCount/v1 merge operand directly to SlateDB WITHOUT reading the cold key.
+                if delta_sum == 0 && delta_count == 0 {
+                    transitions.push(GroupTransition {
+                        key: k,
+                        old_state: None,
+                        new_state: None,
+                        delta_sum,
+                        delta_count,
+                        changed: false,
+                        blind_cold_merge: true,
+                        epoch_mutation: None,
+                        combined_pending: None,
+                    });
+                    continue;
+                }
+                let delta_sum_i64 =
+                    checked_i128_to_i64(delta_sum).map_err(|_| OpError::aggregate_overflow(k))?;
+                // Validate ADR 0004 inverse / operand representability before emitting blind merge.
+                if delta_sum_i64 == i64::MIN || delta_count == i64::MIN {
+                    return Err(OpError::aggregate_overflow(k));
+                }
+                let epoch_mut = PendingKeyMutation::Merge {
+                    delta_sum: delta_sum_i64,
+                    delta_count,
+                };
+                transitions.push(GroupTransition {
+                    key: k,
+                    old_state: None,
+                    new_state: None,
+                    delta_sum,
+                    delta_count,
+                    changed: true,
+                    blind_cold_merge: true,
+                    epoch_mutation: Some(epoch_mut),
+                    combined_pending: Some(epoch_mut),
+                });
+                continue;
+            }
+
+            if old.is_none() && !self.dirty_keys.contains(&k) {
+                if let Some(db) = &self.db {
+                    let key_bytes = ShardKeyEncoder::encode(
+                        ShardPrefix::OpState,
+                        self.op_id.0,
+                        &k.to_be_bytes(),
+                    );
+                    cold_reads_this_epoch += 1;
+                    let opt_bytes =
+                        crate::spill::block_on_future(db.get(&key_bytes)).map_err(|e| {
+                            OpError::storage_error(format!("AggregateOp demand load failed: {e}"))
+                        })?;
+                    if let Some(bytes) = opt_bytes {
+                        if let Some((sum, count, legacy)) =
+                            decode_persisted_sum_count(&bytes, self.op_id)?
+                        {
+                            rockstream_types::metrics::inc_spill_faults_total();
+                            old = Some((sum, count));
+                            is_legacy_key = legacy;
+                            demand_loaded.insert(k, (sum, count, legacy));
                         }
                     }
                 }
+            } else if old.is_none()
+                && self.persistence_mode == AggregatePersistenceMode::BlindMerge
+                && matches!(
+                    self.pending_mutations.get(&k),
+                    Some(PendingKeyMutation::Merge { .. })
+                )
+            {
+                // Subsequent uncommitted blind-merge batch for the same cold key: consolidate in-epoch!
+                let Some(PendingKeyMutation::Merge {
+                    delta_sum: prev_sum,
+                    delta_count: prev_cnt,
+                }) = self.pending_mutations.get(&k).copied()
+                else {
+                    unreachable!();
+                };
+                if delta_sum == 0 && delta_count == 0 {
+                    transitions.push(GroupTransition {
+                        key: k,
+                        old_state: None,
+                        new_state: None,
+                        delta_sum,
+                        delta_count,
+                        changed: false,
+                        blind_cold_merge: true,
+                        epoch_mutation: None,
+                        combined_pending: Some(PendingKeyMutation::Merge {
+                            delta_sum: prev_sum,
+                            delta_count: prev_cnt,
+                        }),
+                    });
+                    continue;
+                }
+                let delta_sum_i64 =
+                    checked_i128_to_i64(delta_sum).map_err(|_| OpError::aggregate_overflow(k))?;
+                let combined_sum = checked_add_i64(prev_sum, delta_sum_i64)
+                    .map_err(|_| OpError::aggregate_overflow(k))?;
+                let combined_cnt = checked_add_i64(prev_cnt, delta_count)
+                    .map_err(|_| OpError::aggregate_overflow(k))?;
+                let combined_pending = if combined_sum == 0 && combined_cnt == 0 {
+                    None
+                } else {
+                    Some(PendingKeyMutation::Merge {
+                        delta_sum: combined_sum,
+                        delta_count: combined_cnt,
+                    })
+                };
+                transitions.push(GroupTransition {
+                    key: k,
+                    old_state: None,
+                    new_state: None,
+                    delta_sum,
+                    delta_count,
+                    changed: true,
+                    blind_cold_merge: true,
+                    epoch_mutation: Some(PendingKeyMutation::Merge {
+                        delta_sum: delta_sum_i64,
+                        delta_count,
+                    }),
+                    combined_pending,
+                });
+                continue;
             }
 
             let (old_sum, old_count) = old.unwrap_or((0, 0));
@@ -989,7 +1131,12 @@ impl AggregateOp {
                     key: k,
                     old_state,
                     new_state: old_state,
+                    delta_sum,
+                    delta_count,
                     changed: false,
+                    blind_cold_merge: false,
+                    epoch_mutation: None,
+                    combined_pending: self.pending_mutations.get(&k).copied(),
                 });
                 continue;
             }
@@ -1016,42 +1163,115 @@ impl AggregateOp {
                 }
             })?;
             let new_state = (new_count > 0).then_some(next);
-
             let changed = old_state != new_state;
+
+            let (epoch_mutation, combined_pending) = if !changed {
+                (None, self.pending_mutations.get(&k).copied())
+            } else {
+                let epoch_mut = match new_state {
+                    None => PendingKeyMutation::Delete,
+                    Some((ns, nc)) => {
+                        let merge_eligible = matches!(
+                            self.persistence_mode,
+                            AggregatePersistenceMode::MergeDelta
+                                | AggregatePersistenceMode::BlindMerge
+                        ) && old_state.is_some()
+                            && !is_legacy_key;
+                        if merge_eligible {
+                            if let Some(ds) =
+                                admits_sum_count_merge(old_sum, old_count, delta_sum, delta_count)
+                            {
+                                PendingKeyMutation::Merge {
+                                    delta_sum: ds,
+                                    delta_count,
+                                }
+                            } else {
+                                PendingKeyMutation::Put { sum: ns, count: nc }
+                            }
+                        } else {
+                            PendingKeyMutation::Put { sum: ns, count: nc }
+                        }
+                    }
+                };
+
+                let prev_pending = self.pending_mutations.get(&k).copied();
+                let combined = match (prev_pending, epoch_mut, new_state) {
+                    (_, PendingKeyMutation::Delete, _) => Some(PendingKeyMutation::Delete),
+                    (None, m, _) => Some(m),
+                    (Some(PendingKeyMutation::Put { .. }), _, Some((ns, nc))) => {
+                        Some(PendingKeyMutation::Put { sum: ns, count: nc })
+                    }
+                    (Some(PendingKeyMutation::Delete), _, Some((ns, nc))) => {
+                        Some(PendingKeyMutation::Put { sum: ns, count: nc })
+                    }
+                    (
+                        Some(PendingKeyMutation::Merge {
+                            delta_sum: p_ds,
+                            delta_count: p_dc,
+                        }),
+                        PendingKeyMutation::Merge {
+                            delta_sum: e_ds,
+                            delta_count: e_dc,
+                        },
+                        Some((ns, nc)),
+                    ) => {
+                        if let (Ok(c_ds), Ok(c_dc)) =
+                            (checked_add_i64(p_ds, e_ds), checked_add_i64(p_dc, e_dc))
+                        {
+                            if c_ds == 0 && c_dc == 0 {
+                                None
+                            } else {
+                                let base_sum = ns.checked_sub(c_ds);
+                                let base_cnt = nc.checked_sub(c_dc);
+                                if let (Some(bs), Some(bc)) = (base_sum, base_cnt) {
+                                    if admits_sum_count_merge(bs, bc, c_ds as i128, c_dc).is_some()
+                                    {
+                                        Some(PendingKeyMutation::Merge {
+                                            delta_sum: c_ds,
+                                            delta_count: c_dc,
+                                        })
+                                    } else {
+                                        Some(PendingKeyMutation::Put { sum: ns, count: nc })
+                                    }
+                                } else {
+                                    Some(PendingKeyMutation::Put { sum: ns, count: nc })
+                                }
+                            }
+                        } else {
+                            Some(PendingKeyMutation::Put { sum: ns, count: nc })
+                        }
+                    }
+                    (_, PendingKeyMutation::Put { sum, count }, _) => {
+                        Some(PendingKeyMutation::Put { sum, count })
+                    }
+                    (_, _, None) => Some(PendingKeyMutation::Delete),
+                };
+                (Some(epoch_mut), combined)
+            };
+
             transitions.push(GroupTransition {
                 key: k,
                 old_state,
                 new_state,
+                delta_sum,
+                delta_count,
                 changed,
+                blind_cold_merge: false,
+                epoch_mutation,
+                combined_pending,
             });
         }
 
-        // If we reached here, no overflow occurred! Commit changes atomically.
-        {
-            let mut clean_lru = self
-                .clean_lru
-                .lock()
-                .expect("AggregateOp clean_lru mutex poisoned");
-            for (dk, dv) in demand_loaded {
-                state.entries.insert(dk, dv);
-                clean_lru.push_back(dk);
-                if clean_lru.len() > MAX_CLEAN_LRU_CAPACITY {
-                    clean_lru.pop_front();
-                }
-            }
-        }
-
+        // Build the fallible output and mutation list BEFORE installing any planned state.
         let mut out_k: Vec<i64> = Vec::with_capacity(transitions.len() * 2);
         let mut out_sum: Vec<i64> = Vec::with_capacity(transitions.len() * 2);
         let mut out_count: Vec<i64> = Vec::with_capacity(transitions.len() * 2);
         let mut out_avg: Vec<f64> = Vec::with_capacity(transitions.len() * 2);
         let mut out_weights: Vec<i64> = Vec::with_capacity(transitions.len() * 2);
         for t in &transitions {
-            if !t.changed {
+            if !t.changed || t.blind_cold_merge {
                 continue;
             }
-
-            // Retract old aggregate row
             if let Some((old_sum, old_count)) = t.old_state {
                 let old_avg = avg_from_sum_count(old_sum, old_count).unwrap_or(0.0);
                 out_k.push(t.key);
@@ -1060,8 +1280,6 @@ impl AggregateOp {
                 out_avg.push(old_avg);
                 out_weights.push(-1);
             }
-
-            // Insert new aggregate row
             if let Some((new_sum, new_count)) = t.new_state {
                 let new_avg = avg_from_sum_count(new_sum, new_count).unwrap_or(0.0);
                 out_k.push(t.key);
@@ -1072,25 +1290,19 @@ impl AggregateOp {
             }
         }
 
-        let mut dirty_keys_vec: Vec<i64> = transitions
+        let mut mutation_entries: Vec<(i64, PendingKeyMutation)> = transitions
             .iter()
-            .filter(|transition| transition.changed)
-            .map(|transition| transition.key)
+            .filter_map(|t| t.epoch_mutation.map(|m| (t.key, m)))
             .collect();
-        dirty_keys_vec.sort_unstable();
-        let mut mutation_states: Vec<(i64, Option<(i64, i64)>)> = transitions
+        mutation_entries.sort_unstable_by_key(|(k, _)| *k);
+        let mutations: Vec<StateMutation> = mutation_entries
             .iter()
-            .filter(|transition| transition.changed)
-            .map(|transition| (transition.key, transition.new_state))
+            .map(|&(key, pending)| {
+                encode_pending_mutation(self.op_id, key, pending, self.persistence_mode)
+            })
             .collect();
-        mutation_states.sort_unstable_by_key(|(key, _)| *key);
-        let mutations = mutation_states
-            .iter()
-            .map(|&(key, new_state)| encode_state_mutation(self.op_id, key, new_state))
-            .collect::<Vec<_>>();
-        let logical_mutation_bytes = mutations.iter().map(|mutation| mutation.size_bytes()).sum();
+        let logical_mutation_bytes: usize = mutations.iter().map(StateMutation::size_bytes).sum();
 
-        // Build the fallible output before installing any planned state.
         let output_zset = if out_k.is_empty() {
             ArrowZSet::empty(output_schema())
         } else {
@@ -1105,52 +1317,71 @@ impl AggregateOp {
             ArrowZSet::try_new(data, out_weights)?
         };
 
-        for transition in &transitions {
-            if !transition.changed {
-                continue;
+        // Infallible commit of demand-loaded entries and planned transitions.
+        self.cold_key_reads = self.cold_key_reads.saturating_add(cold_reads_this_epoch);
+        for (dk, (ds, dc, is_legacy)) in demand_loaded {
+            self.state.entries.insert(dk, (ds, dc));
+            if is_legacy {
+                self.legacy_keys.insert(dk);
             }
-            if let Some(new_state) = transition.new_state {
-                state.entries.insert(transition.key, new_state);
-            } else {
-                state.entries.remove(&transition.key);
+            self.clean_lru.push_back(dk);
+            if self.clean_lru.len() > MAX_CLEAN_LRU_CAPACITY {
+                self.clean_lru.pop_front();
             }
         }
-        let state_bytes = state.state_bytes() as usize;
 
-        let mut dirty_guard = self
-            .dirty_keys
-            .lock()
-            .expect("AggregateOp dirty-key mutex poisoned");
-        dirty_guard.extend(dirty_keys_vec.iter().copied());
+        let mut dirty_count = 0usize;
+        for t in &transitions {
+            if !t.changed {
+                continue;
+            }
+            dirty_count += 1;
+            if !t.blind_cold_merge {
+                self.uncommitted_undo
+                    .entry(t.key)
+                    .or_insert_with(|| self.state.entries.get(&t.key).copied());
+                if let Some(new_state) = t.new_state {
+                    self.state.entries.insert(t.key, new_state);
+                } else {
+                    self.state.entries.remove(&t.key);
+                }
+            }
+            match t.combined_pending {
+                Some(pending) => {
+                    self.dirty_keys.insert(t.key);
+                    self.pending_mutations.insert(t.key, pending);
+                }
+                None => {
+                    self.dirty_keys.remove(&t.key);
+                    self.pending_mutations.remove(&t.key);
+                }
+            }
+        }
+        let state_bytes = self.state.state_bytes() as usize;
 
-        // Evict cold clean entries if over max_state_bytes
-        let limit = self.max_state_bytes.load(Ordering::Relaxed);
-        if limit > 0 && db_opt.is_some() {
-            let mut clean_lru = self
-                .clean_lru
-                .lock()
-                .expect("AggregateOp clean_lru mutex poisoned");
-            while state.state_bytes() as usize > limit && !clean_lru.is_empty() {
-                if let Some(cold_k) = clean_lru.pop_front() {
-                    if !dirty_guard.contains(&cold_k) {
-                        state.entries.remove(&cold_k);
+        // Evict cold clean entries if over max_state_bytes.
+        if self.max_state_bytes > 0 && self.db.is_some() {
+            while self.state.state_bytes() as usize > self.max_state_bytes
+                && !self.clean_lru.is_empty()
+            {
+                if let Some(cold_k) = self.clean_lru.pop_front() {
+                    if !self.dirty_keys.contains(&cold_k) {
+                        self.state.entries.remove(&cold_k);
                     }
                 }
             }
         }
 
-        drop(dirty_guard);
-        drop(state);
         debug!(
             op_id = self.op_id.0,
             input_rows = n,
             output_rows = output_zset.num_rows(),
-            dirty_keys = dirty_keys_vec.len(),
+            dirty_keys = dirty_count,
             "AggregateOp: processed delta"
         );
         let metric_key = rockstream_types::metrics::LawMetricKey {
-            law_id: rockstream_types::laws::weight_add::WEIGHT_ADD_ID,
-            law_name: "WeightAdd",
+            law_id: SUM_COUNT_ID,
+            law_name: "SumCount",
             law_version: 1,
             operator_id: Some(self.op_id),
         };
@@ -1168,7 +1399,7 @@ impl AggregateOp {
         let metrics = rockstream_types::state_mutation::OperatorEpochMetrics {
             input_records: n,
             output_records: output_zset.num_rows(),
-            dirty_keys: dirty_keys_vec.len(),
+            dirty_keys: dirty_count,
             state_mutations: mutations.len(),
             logical_mutation_bytes,
             full_state_entries_visited: 0,
@@ -1197,6 +1428,286 @@ impl AggregateOp {
             mutations,
             metrics,
         ))
+    }
+
+    /// Process delta and return only the output ZSet (zero locks).
+    pub fn process_delta_mut(&mut self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
+        self.process_delta_with_result_mut(delta)
+            .map(|res| res.output_delta)
+    }
+}
+
+/// Stateful incremental aggregate operator.
+///
+/// Input:  two Int64 columns `(k, v)`.
+/// Output: `(k, sum_v, count, avg_v)` — first three columns Int64, `avg_v` Float64.
+///
+/// Consolidates all mutable state into a single [`AggregateStateCore`]:
+/// single-owner shard actors invoke `process_delta_with_result_mut(&mut self)`
+/// (zero locks via `Mutex::get_mut`) or unwrap via `into_core()`, while legacy
+/// `&self` `Operator` callers acquire at most one uncontended lock.
+pub struct AggregateOp {
+    pub op_id: OperatorId,
+    core: Mutex<AggregateStateCore>,
+}
+
+impl AggregateOp {
+    /// Create a new aggregate operator with default consolidation limits and empty state.
+    pub fn new(op_id: OperatorId) -> Self {
+        Self::from_core(AggregateStateCore::new(op_id))
+    }
+
+    /// Create from pre-loaded state (used after loading from storage).
+    pub fn with_state(op_id: OperatorId, state: AggState) -> Self {
+        Self::from_core(AggregateStateCore::with_state(op_id, state))
+    }
+
+    /// Create with custom consolidation limits.
+    pub fn with_limits(op_id: OperatorId, max_groups: usize, max_bytes: usize) -> Self {
+        Self::from_core(AggregateStateCore::with_limits(
+            op_id, max_groups, max_bytes,
+        ))
+    }
+
+    /// Wrap an owned lock-free [`AggregateStateCore`].
+    pub fn from_core(core: AggregateStateCore) -> Self {
+        Self {
+            op_id: core.op_id,
+            core: Mutex::new(core),
+        }
+    }
+
+    /// Consume this wrapper and return the lock-free single-owner [`AggregateStateCore`].
+    pub fn into_core(self) -> AggregateStateCore {
+        self.core.into_inner().expect("AggregateOp mutex poisoned")
+    }
+
+    /// Configure persistence policy (`MergeDelta`, `BlindMerge`, or `PutDelete`).
+    pub fn with_persistence_mode(mut self, mode: AggregatePersistenceMode) -> Self {
+        self.core
+            .get_mut()
+            .expect("AggregateOp mutex poisoned")
+            .set_persistence_mode(mode);
+        self
+    }
+
+    /// Update persistence policy dynamically.
+    pub fn set_persistence_mode(&self, mode: AggregatePersistenceMode) {
+        self.core
+            .lock()
+            .expect("AggregateOp mutex poisoned")
+            .set_persistence_mode(mode);
+    }
+
+    /// Active persistence policy.
+    pub fn persistence_mode(&self) -> AggregatePersistenceMode {
+        self.core
+            .lock()
+            .expect("AggregateOp mutex poisoned")
+            .persistence_mode()
+    }
+
+    /// Attach a ShardDb for transparent spill-to-disk and demand-loading.
+    pub fn with_db(mut self, db: Arc<ShardDb>) -> Self {
+        self.core
+            .get_mut()
+            .expect("AggregateOp mutex poisoned")
+            .set_db(db);
+        self
+    }
+
+    /// Set a ShardDb for transparent spill-to-disk and demand-loading.
+    pub fn set_db(&self, db: Arc<ShardDb>) {
+        self.core
+            .lock()
+            .expect("AggregateOp mutex poisoned")
+            .set_db(db);
+    }
+
+    /// Set in-memory state capacity budget in bytes.
+    pub fn with_memory_limit(mut self, max_bytes: usize) -> Self {
+        self.core
+            .get_mut()
+            .expect("AggregateOp mutex poisoned")
+            .set_memory_limit(max_bytes);
+        self
+    }
+
+    /// Set in-memory state capacity budget in bytes dynamically.
+    pub fn set_memory_limit(&self, max_bytes: usize) {
+        self.core
+            .lock()
+            .expect("AggregateOp mutex poisoned")
+            .set_memory_limit(max_bytes);
+    }
+
+    /// Number of in-memory cached groups.
+    pub fn in_memory_groups(&self) -> usize {
+        self.core
+            .lock()
+            .expect("AggregateOp mutex poisoned")
+            .in_memory_groups()
+    }
+
+    /// Set consolidation limits dynamically.
+    pub fn set_limits(&self, max_groups: usize, max_bytes: usize) {
+        self.core
+            .lock()
+            .expect("AggregateOp mutex poisoned")
+            .set_limits(max_groups, max_bytes);
+    }
+
+    /// Observable occupancy: distinct groups touched in the last epoch consolidation.
+    pub fn consolidation_groups(&self) -> usize {
+        self.core
+            .lock()
+            .expect("AggregateOp mutex poisoned")
+            .consolidation_groups()
+    }
+
+    /// Observable occupancy: estimated byte memory used in the last epoch consolidation.
+    pub fn consolidation_bytes(&self) -> usize {
+        self.core
+            .lock()
+            .expect("AggregateOp mutex poisoned")
+            .consolidation_bytes()
+    }
+
+    /// Total cold-key reads issued against `ShardDb` by this aggregate operator.
+    pub fn cold_key_reads(&self) -> u64 {
+        self.core
+            .lock()
+            .expect("AggregateOp mutex poisoned")
+            .cold_key_reads()
+    }
+
+    /// Mark the current dirty-key set durable after its caller's batch commits.
+    pub fn clear_dirty_keys(&self) {
+        self.core
+            .lock()
+            .expect("AggregateOp mutex poisoned")
+            .clear_dirty_keys();
+    }
+
+    /// Roll back all uncommitted in-memory state mutations since the last durable commit.
+    pub fn rollback_uncommitted(&self) {
+        self.core
+            .lock()
+            .expect("AggregateOp mutex poisoned")
+            .rollback_uncommitted();
+    }
+
+    /// Number of live groups (fill-level metric).
+    pub fn live_groups(&self) -> usize {
+        self.core
+            .lock()
+            .expect("AggregateOp mutex poisoned")
+            .live_groups()
+    }
+
+    /// Encode dirty state mutations as a `WriteBatch` for persistence.
+    pub fn state_write_batch(&self) -> WriteBatch {
+        self.core
+            .lock()
+            .expect("AggregateOp mutex poisoned")
+            .state_write_batch()
+    }
+
+    /// Restore an `AggregateOp` from a `ShardDb` (called at shard startup).
+    pub async fn load_from_storage(db: &ShardDb, op_id: OperatorId) -> Result<Self, OpError> {
+        let op = Self::new(op_id);
+        op.restore_in_place(db).await?;
+        Ok(op)
+    }
+
+    /// Load persisted state from `db` into this already-constructed instance in place.
+    pub async fn restore_in_place(&self, db: &ShardDb) -> Result<(), OpError> {
+        let prefix = ShardKeyEncoder::operator_prefix(ShardPrefix::OpState, self.op_id.0);
+        let mut state = AggState::new();
+        let mut legacy_keys = HashSet::new();
+        let mut next_token: Option<bytes::Bytes> = None;
+        let mut clean_lru = VecDeque::new();
+
+        loop {
+            let page = db
+                .scan_prefix_page(&prefix, next_token.as_deref(), 1024, 1024 * 1024)
+                .await
+                .map_err(OpError::storage)?;
+
+            for (key, value) in &page.rows {
+                if let Some((k, sum, count, is_legacy)) =
+                    AggState::decode_persisted_entry_opt(key, value, self.op_id, &prefix)?
+                {
+                    state.entries.insert(k, (sum, count));
+                    if is_legacy {
+                        legacy_keys.insert(k);
+                    }
+                    clean_lru.push_back(k);
+                    if clean_lru.len() > MAX_CLEAN_LRU_CAPACITY {
+                        clean_lru.pop_front();
+                    }
+                }
+            }
+
+            if page.is_last_page {
+                break;
+            }
+            next_token = page.next_token;
+        }
+
+        let mut core = self.core.lock().expect("AggregateOp mutex poisoned");
+        let limit = core.max_state_bytes;
+        if limit > 0 {
+            while state.state_bytes() as usize > limit && !clean_lru.is_empty() {
+                if let Some(cold_k) = clean_lru.pop_front() {
+                    state.entries.remove(&cold_k);
+                }
+            }
+        }
+        core.state = state;
+        core.legacy_keys = legacy_keys;
+        core.db = Some(Arc::new(db.clone()));
+        core.clean_lru = clean_lru;
+        core.dirty_keys.clear();
+        core.pending_mutations.clear();
+        core.uncommitted_undo.clear();
+        Ok(())
+    }
+
+    /// State bytes metric.
+    pub fn state_bytes(&self) -> u64 {
+        self.core
+            .lock()
+            .expect("AggregateOp mutex poisoned")
+            .state_bytes()
+    }
+
+    /// Zero-lock single-owner execution (`&mut self`).
+    pub fn process_delta_with_result_mut(
+        &mut self,
+        delta: ArrowZSet,
+    ) -> Result<crate::op::OperatorEpochResult, OpError> {
+        self.core
+            .get_mut()
+            .expect("AggregateOp mutex poisoned")
+            .process_delta_with_result_mut(delta)
+    }
+
+    /// Zero-lock single-owner delta processing (`&mut self`).
+    pub fn process_delta_mut(&mut self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
+        self.process_delta_with_result_mut(delta)
+            .map(|res| res.output_delta)
+    }
+
+    /// Process one Z-set delta batch and return the output delta and delta-native state mutations.
+    pub fn process_delta_with_result(
+        &self,
+        delta: ArrowZSet,
+    ) -> Result<crate::op::OperatorEpochResult, OpError> {
+        self.core
+            .lock()
+            .expect("AggregateOp mutex poisoned")
+            .process_delta_with_result_mut(delta)
     }
 
     /// Process delta and return only the output ZSet.
@@ -1348,27 +1859,22 @@ impl BucketedAggregateOp {
             }
         }
 
-        for (&(group_key, _bucket), &(sum, count)) in local_partials.iter() {
-            if let Some((combined_sum, combined_count)) = local_combined.get_mut(&group_key) {
-                if *combined_count == 0 {
-                    *combined_sum = checked_add_i64(*combined_sum, sum)
-                        .map_err(|_| OpError::aggregate_overflow(group_key))?;
-                    *combined_count = checked_add_i64(*combined_count, count)
-                        .map_err(|_| OpError::aggregate_overflow(group_key))?;
-                    if *combined_count < 0 {
-                        return Err(OpError::invalid_multiplicity(group_key, *combined_count));
-                    }
-                }
-            } else {
-                let entry = local_combined.entry(group_key).or_insert((0, 0));
-                entry.0 = checked_add_i64(entry.0, sum)
-                    .map_err(|_| OpError::aggregate_overflow(group_key))?;
-                entry.1 = checked_add_i64(entry.1, count)
-                    .map_err(|_| OpError::aggregate_overflow(group_key))?;
-                if entry.1 < 0 {
-                    return Err(OpError::invalid_multiplicity(group_key, entry.1));
-                }
+        // Combined records are authoritative. Legacy partial-only records
+        // must reconstruct the sum of ALL buckets, independent of hash order.
+        let mut reconstructed: HashMap<i64, (i128, i128)> = HashMap::new();
+        for (&(group_key, _bucket), &(sum, count)) in &local_partials {
+            if !local_combined.contains_key(&group_key) {
+                let entry = reconstructed.entry(group_key).or_default();
+                entry.0 += i128::from(sum);
+                entry.1 += i128::from(count);
             }
+        }
+        for (group_key, (sum, count)) in reconstructed {
+            let sum =
+                checked_i128_to_i64(sum).map_err(|_| OpError::aggregate_overflow(group_key))?;
+            let count =
+                checked_i128_to_i64(count).map_err(|_| OpError::aggregate_overflow(group_key))?;
+            local_combined.insert(group_key, (sum, count));
         }
 
         let mut combined = self
@@ -1438,24 +1944,35 @@ impl Operator for BucketedAggregateOp {
             .downcast_ref::<Int64Array>()
             .ok_or_else(|| OpError::column_type_mismatch("Int64", "other"))?;
 
-        let mut consolidated: std::collections::HashMap<(i64, i64), i64> =
-            std::collections::HashMap::new();
-        let mut order: Vec<(i64, i64)> = Vec::new();
+        // Stage the full epoch before taking the state locks. Use the same
+        // checked single-owner kernel as AggregateOp for the authoritative result.
+        let mut staged = StagedEpochAggregator::new();
+        let mut bucket_deltas: HashMap<u16, (i128, i128)> = HashMap::new();
+        let mut sum_budget = 0u128;
+        let mut count_budget = 0u128;
         for (row, &w) in delta.weights.iter().enumerate() {
+            if w == 0 || k_col.is_null(row) || v_col.is_null(row) {
+                continue;
+            }
             let k = k_col.value(row);
             let v = v_col.value(row);
-            let entry = consolidated.entry((k, v)).or_insert_with(|| {
-                order.push((k, v));
-                0
-            });
-            *entry += w;
+            staged.ingest_delta(k, v, w)?;
+            if k == self.hot_key && self.bucket_count > 1 {
+                let contribution =
+                    checked_mul_i64(v, w).map_err(|_| OpError::aggregate_overflow(k))?;
+                sum_budget = sum_budget.saturating_add(u128::from(contribution.unsigned_abs()));
+                count_budget = count_budget.saturating_add(u128::from(w.unsigned_abs()));
+                let entry = bucket_deltas.entry(self.bucket_for(k, v)).or_default();
+                entry.0 += i128::from(contribution);
+                entry.1 += i128::from(w);
+            }
         }
 
-        let mut out_k: Vec<i64> = Vec::with_capacity(order.len() * 2);
-        let mut out_sum: Vec<i64> = Vec::with_capacity(order.len() * 2);
-        let mut out_count: Vec<i64> = Vec::with_capacity(order.len() * 2);
-        let mut out_avg: Vec<f64> = Vec::with_capacity(order.len() * 2);
-        let mut out_weights: Vec<i64> = Vec::with_capacity(order.len() * 2);
+        let mut out_k = Vec::with_capacity(staged.order.len() * 2);
+        let mut out_sum = Vec::with_capacity(staged.order.len() * 2);
+        let mut out_count = Vec::with_capacity(staged.order.len() * 2);
+        let mut out_avg = Vec::with_capacity(staged.order.len() * 2);
+        let mut out_weights = Vec::with_capacity(staged.order.len() * 2);
 
         let mut combined = self
             .combined
@@ -1465,49 +1982,38 @@ impl Operator for BucketedAggregateOp {
             .partials
             .lock()
             .expect("BucketedAggregateOp mutex poisoned");
+        let mut transitions = Vec::with_capacity(staged.order.len());
 
-        for (k, v) in order {
-            let w = consolidated[&(k, v)];
-            if w == 0 {
-                continue;
-            }
-
+        for &k in &staged.order {
+            let (delta_sum, delta_count) = staged.entries[&k];
             let (old_sum, old_count) = combined.get(&k).copied().unwrap_or((0, 0));
             let old_state = (old_count > 0).then_some((old_sum, old_count));
-
-            let contribution = checked_mul_i64(v, w).map_err(|_| OpError::aggregate_overflow(k))?;
-            let new_sum = checked_add_i64(old_sum, contribution)
+            let new_count = checked_add_i64(old_count, delta_count)
                 .map_err(|_| OpError::aggregate_overflow(k))?;
-            let new_count =
-                checked_add_i64(old_count, w).map_err(|_| OpError::aggregate_overflow(k))?;
             if new_count < 0 {
                 return Err(OpError::invalid_multiplicity(k, new_count));
             }
-
-            if k == self.hot_key && self.bucket_count > 1 {
-                let bucket = self.bucket_for(k, v);
-                let partial_key = (k, bucket);
-                let (partial_sum, partial_count) =
-                    partials.get(&partial_key).copied().unwrap_or((0, 0));
-                let next_partial_sum = checked_add_i64(partial_sum, contribution)
-                    .map_err(|_| OpError::aggregate_overflow(k))?;
-                let next_partial_count = checked_add_i64(partial_count, w)
-                    .map_err(|_| OpError::aggregate_overflow(k))?;
-                if next_partial_count != 0 {
-                    partials.insert(partial_key, (next_partial_sum, next_partial_count));
+            let next = rockstream_verified::aggregate::transition(
+                old_sum,
+                old_count,
+                delta_sum,
+                delta_count,
+            )
+            .ok_or_else(|| {
+                if new_count == 0 {
+                    OpError::invalid_literal(format!(
+                        "aggregate group {k} has zero count with nonzero sum"
+                    ))
                 } else {
-                    partials.remove(&partial_key);
+                    OpError::aggregate_overflow(k)
                 }
+            })?;
+            let new_state = (new_count > 0).then_some(next);
+            transitions.push((k, new_state));
+
+            if old_state == new_state {
+                continue;
             }
-
-            let new_state = if new_count > 0 {
-                combined.insert(k, (new_sum, new_count));
-                Some((new_sum, new_count))
-            } else {
-                combined.remove(&k);
-                None
-            };
-
             if let Some((old_sum, old_count)) = old_state {
                 out_k.push(k);
                 out_sum.push(old_sum);
@@ -1524,13 +2030,78 @@ impl Operator for BucketedAggregateOp {
             }
         }
 
+        // ADR 0004: include all existing partial operands and every input
+        // operand in the absolute-sum budget, not just the net epoch delta.
+        // If the budget fails, retain the single-owner result and discard the
+        // partial state. An existing unsplit group cannot be salted again
+        // without redistributing its input history; wait until it is empty.
+        let mut next_partials = HashMap::new();
+        if !bucket_deltas.is_empty() {
+            let mut previous = (0i128, 0i128);
+            for (&(key, bucket), &(sum, count)) in partials.iter() {
+                if key != self.hot_key {
+                    continue;
+                }
+                sum_budget = sum_budget.saturating_add(u128::from(sum.unsigned_abs()));
+                count_budget = count_budget.saturating_add(u128::from(count.unsigned_abs()));
+                previous.0 += i128::from(sum);
+                previous.1 += i128::from(count);
+                next_partials.insert(bucket, (i128::from(sum), i128::from(count)));
+            }
+            let (old_sum, old_count) = combined.get(&self.hot_key).copied().unwrap_or((0, 0));
+            let complete = previous == (i128::from(old_sum), i128::from(old_count));
+            let limit = i64::MAX as u128;
+            if complete && sum_budget <= limit && count_budget <= limit {
+                for (&bucket, &(sum, count)) in &bucket_deltas {
+                    let entry = next_partials.entry(bucket).or_default();
+                    entry.0 += sum;
+                    entry.1 += count;
+                }
+                if next_partials
+                    .values()
+                    .any(|&(sum, count)| count < 0 || (count == 0 && sum != 0))
+                {
+                    next_partials.clear();
+                }
+                next_partials.retain(|_, &mut (_, count)| count != 0);
+            } else {
+                next_partials.clear();
+            }
+        }
+
+        // Construct output before publishing any state, including on errors.
+        let data = RecordBatch::try_new(
+            output_schema(),
+            vec![
+                Arc::new(Int64Array::from(out_k)) as ArrayRef,
+                Arc::new(Int64Array::from(out_sum)) as ArrayRef,
+                Arc::new(Int64Array::from(out_count)) as ArrayRef,
+                Arc::new(Float64Array::from(out_avg)) as ArrayRef,
+            ],
+        )
+        .map_err(OpError::arrow)?;
+        let output_rows = data.num_rows();
+        for (k, state) in transitions {
+            if let Some(state) = state {
+                combined.insert(k, state);
+            } else {
+                combined.remove(&k);
+            }
+        }
+        if !bucket_deltas.is_empty() {
+            partials.retain(|&(key, _), _| key != self.hot_key);
+            for (bucket, (sum, count)) in next_partials {
+                // The absolute-sum admission above proves these casts exact.
+                partials.insert((self.hot_key, bucket), (sum as i64, count as i64));
+            }
+        }
         drop(partials);
         drop(combined);
 
         debug!(
             op_id = self.op_id.0,
             input_rows = delta.num_rows(),
-            output_rows = out_k.len(),
+            output_rows,
             hot_key = self.hot_key,
             bucket_count = self.bucket_count,
             "BucketedAggregateOp: processed delta"
@@ -1543,20 +2114,6 @@ impl Operator for BucketedAggregateOp {
             0,
         );
 
-        if out_k.is_empty() {
-            return Ok(ArrowZSet::empty(output_schema()));
-        }
-
-        let data = RecordBatch::try_new(
-            output_schema(),
-            vec![
-                Arc::new(Int64Array::from(out_k)) as ArrayRef,
-                Arc::new(Int64Array::from(out_sum)) as ArrayRef,
-                Arc::new(Int64Array::from(out_count)) as ArrayRef,
-                Arc::new(Float64Array::from(out_avg)) as ArrayRef,
-            ],
-        )
-        .map_err(OpError::arrow)?;
         Ok(ArrowZSet::new(data, out_weights))
     }
 }
@@ -1596,28 +2153,30 @@ pub async fn append_agg_state(
     op: &AggregateOp,
     target: &mut WriteBatch,
 ) -> Result<(), OpError> {
-    let mutations = {
-        let state = op.state.lock().expect("AggregateOp mutex poisoned");
-        let dirty_keys = op
-            .dirty_keys
-            .lock()
-            .expect("AggregateOp dirty-key mutex poisoned");
-        let mut keys = dirty_keys.iter().copied().collect::<Vec<_>>();
-        keys.sort_unstable();
-        state.encode_mutations_for_keys(op.op_id, &keys)
-    };
-    for mutation in mutations {
-        match mutation {
-            rockstream_types::state_mutation::StateMutation::Put { key, value } => {
-                target.put(&key, &value)
-            }
-            rockstream_types::state_mutation::StateMutation::Delete { key } => target.delete(&key),
-            rockstream_types::state_mutation::StateMutation::Merge { key, operand, .. } => {
-                target.merge(&key, &operand)
-            }
-        }
-    }
+    let core = op.core.lock().expect("AggregateOp mutex poisoned");
+    core.append_state_to_batch(target);
     Ok(())
+}
+
+/// Encode a `WeightAdd/v1` (`MergeTag::PNCounter`) merge mutation for Z-set weight
+/// arrangements admitted by ADR 0004 (checked i64 weight delta).
+pub fn encode_weight_add_merge_mutation(
+    op_id: OperatorId,
+    key_suffix: &[u8],
+    delta_weight: i64,
+) -> Result<StateMutation, OpError> {
+    if delta_weight == i64::MIN {
+        return Err(OpError::numeric_overflow(
+            "RS-1016: WeightAdd/v1 inverse/operand overflow for i64::MIN",
+        ));
+    }
+    let key = ShardKeyEncoder::encode(ShardPrefix::OpState, op_id.0, key_suffix);
+    Ok(StateMutation::Merge {
+        key,
+        law: rockstream_types::laws::weight_add::WEIGHT_ADD_ID,
+        law_version: rockstream_types::laws::weight_add::WEIGHT_ADD_VERSION,
+        operand: bytes::Bytes::from(MergeOperatorRegistry::encode_pn_counter(delta_weight)),
+    })
 }
 
 /// Persist aggregate state as one standalone batch for legacy callers.
@@ -1986,7 +2545,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "[RS-0001] Storage error: key encoding error: RS-3616: corrupted recovery record: aggregate value must be exactly 16 bytes; next_steps: check disk space and object store connectivity"
+            "[RS-0001] Storage error: key encoding error: RS-3616: corrupted recovery record: aggregate value must be 16 or 17 bytes; next_steps: check disk space and object store connectivity"
         );
     }
 
@@ -2038,6 +2597,77 @@ mod tests {
         op2.restore(&entries).unwrap();
         assert_eq!(op2.live_groups(), 2);
         assert_eq!(op2.live_partials(), 1);
+    }
+
+    #[test]
+    fn bucketed_restore_reconstructs_every_legacy_partial() {
+        let op_id = OperatorId(10);
+        let entries = vec![
+            (
+                bytes::Bytes::from(bucketed_partial_key(op_id, 1, 0)),
+                encode_bucketed_value(10, 1),
+            ),
+            (
+                bytes::Bytes::from(bucketed_partial_key(op_id, 1, 1)),
+                encode_bucketed_value(30, 2),
+            ),
+        ];
+        let op = BucketedAggregateOp::new(op_id, 1, 4);
+        op.restore_from_entries(&entries).unwrap();
+        let output = op.process_delta(make_batch(&[(1, 5, 1)])).unwrap();
+        assert_eq!(
+            extract_rows(&output),
+            vec![(1, 40, 3, 40.0 / 3.0, -1), (1, 45, 4, 11.25, 1)]
+        );
+    }
+
+    #[test]
+    fn bucketed_aggregate_recombines_once_per_epoch() {
+        let op = BucketedAggregateOp::new(OperatorId(10), 1, 4);
+        let output = op
+            .process_delta(make_batch(&[(1, 10, 1), (1, 20, 1), (1, 30, 1)]))
+            .unwrap();
+        assert_eq!(extract_rows(&output), vec![(1, 60, 3, 20.0, 1)]);
+        let output = op
+            .process_delta(make_batch(&[(1, 10, -1), (1, 40, 1)]))
+            .unwrap();
+        assert_eq!(
+            extract_rows(&output),
+            vec![(1, 60, 3, 20.0, -1), (1, 90, 3, 30.0, 1)]
+        );
+    }
+
+    #[test]
+    fn bucketed_aggregate_nonadmitted_epoch_falls_back_to_single_owner() {
+        let op = BucketedAggregateOp::new(OperatorId(10), 1, 4);
+        let output = op
+            .process_delta(make_batch(&[(1, i64::MAX, 1), (1, -i64::MAX, 1)]))
+            .unwrap();
+        assert_eq!(extract_rows(&output), vec![(1, 0, 2, 0.0, 1)]);
+        assert_eq!(op.live_partials(), 0);
+        let output = op.process_delta(make_batch(&[(1, 3, 1)])).unwrap();
+        assert_eq!(
+            extract_rows(&output),
+            vec![(1, 0, 2, 0.0, -1), (1, 3, 3, 1.0, 1)]
+        );
+        assert_eq!(op.live_partials(), 0);
+    }
+
+    #[test]
+    fn bucketed_aggregate_failed_epoch_does_not_install_any_transition() {
+        let op = BucketedAggregateOp::new(OperatorId(10), 1, 4);
+        op.process_delta(make_batch(&[(1, 2, 1), (2, i64::MAX, 1)]))
+            .unwrap();
+        assert!(matches!(
+            op.process_delta(make_batch(&[(1, 4, 1), (2, 1, 1)])),
+            Err(OpError::AggregateOverflow { group_key: 2, .. })
+        ));
+        assert_eq!(op.live_partials(), 1);
+        let output = op.process_delta(make_batch(&[(1, 4, 1)])).unwrap();
+        assert_eq!(
+            extract_rows(&output),
+            vec![(1, 2, 1, 2.0, -1), (1, 6, 2, 3.0, 1)]
+        );
     }
 
     #[test]

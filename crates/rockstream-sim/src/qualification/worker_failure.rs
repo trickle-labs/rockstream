@@ -224,11 +224,11 @@ pub fn validate(e: &WorkerRecoveryEvidence) -> Result<(), RecoveryFailure> {
         || e.after.checkpoint_history_entries != 5
         || staging(&e.before.sink_progress)
             != Some(
-                json!({"view":126,"columns":2,"topic":"worker-failure-output","snapshot_complete":true,"view_epoch":3,"transaction":3,
+                json!({"view":126,"columns":2,"topic":"worker-failure-output","snapshot_complete":true,"snapshot_chunk_offset":0,"snapshot_epoch":null,"change_chunk_offset":0,"view_epoch":3,"transaction":3,
             "pending":{"PreCommitted":{"staged_rows":1,"pending_handle":{"connector_id":126,"topic":"worker-failure-output","epoch":2,"payload":m["expected_sink"][2][1]}}}}),
             )
         || e.after.sink_progress
-            != json!({"view":126,"columns":2,"topic":"worker-failure-output","snapshot_complete":true,"view_epoch":5,"transaction":5,"pending":null})
+            != json!({"view":126,"columns":2,"topic":"worker-failure-output","snapshot_complete":true,"snapshot_chunk_offset":0,"snapshot_epoch":null,"change_chunk_offset":0,"view_epoch":5,"transaction":5,"pending":null})
     {
         return Err(ApplicationState);
     }
@@ -278,7 +278,7 @@ mod tests {
             relation: json!([[[{"Int64":2},{"Utf8":"b"}],1]]),
             in_flight_epochs: 0,
             checkpoint_history_entries: 3,
-            sink_progress: json!({"view":126,"columns":2,"topic":"worker-failure-output","snapshot_complete":true,"view_epoch":3,"transaction":3,"pending":{"PreCommitted":{"staged_rows":1,"pending_handle":pending_handle}}}),
+            sink_progress: json!({"view":126,"columns":2,"topic":"worker-failure-output","snapshot_complete":true,"snapshot_chunk_offset":0,"snapshot_epoch":null,"change_chunk_offset":0,"view_epoch":3,"transaction":3,"pending":{"PreCommitted":{"staged_rows":1,"pending_handle":pending_handle}}}),
         };
         let after = WorkerObservation {
             observed_at_ms: 1400,
@@ -291,7 +291,7 @@ mod tests {
             relation: m["expected_relation"].clone(),
             in_flight_epochs: 0,
             checkpoint_history_entries: 5,
-            sink_progress: json!({"view":126,"columns":2,"topic":"worker-failure-output","snapshot_complete":true,"view_epoch":5,"transaction":5,"pending":null}),
+            sink_progress: json!({"view":126,"columns":2,"topic":"worker-failure-output","snapshot_complete":true,"snapshot_chunk_offset":0,"snapshot_epoch":null,"change_chunk_offset":0,"view_epoch":5,"transaction":5,"pending":null}),
         };
         let mut detection = AuditEvent::now("control", "worker.disconnected", "worker-1");
         detection.timestamp_ms = 1100;
@@ -444,6 +444,12 @@ mod tests {
         assert_eq!(validate(&e), Err(RecoveryFailure::Identity));
         let mut e = fixture();
         e.after.sink_progress["pending"] = json!({"uncommitted":true});
+        assert_eq!(validate(&e), Err(RecoveryFailure::ApplicationState));
+        let mut e = fixture();
+        e.after.sink_progress["snapshot_chunk_offset"] = json!(1);
+        assert_eq!(validate(&e), Err(RecoveryFailure::ApplicationState));
+        let mut e = fixture();
+        e.after.sink_progress["change_chunk_offset"] = json!(1);
         assert_eq!(validate(&e), Err(RecoveryFailure::ApplicationState));
         let mut e = fixture();
         e.control_lease = e.before.lease.clone();

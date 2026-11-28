@@ -181,7 +181,7 @@ impl WorkerRegistration {
             capacity_headroom,
             location: WorkerLocation::default(),
             capabilities: WorkerCapabilities::default(),
-            protocol_range: SupportedVersionRange::v3_only(),
+            protocol_range: SupportedVersionRange::v4_only(),
             storage_format_range: SupportedStorageFormatRange::default(),
             registered_at_ms,
         }
@@ -295,6 +295,16 @@ pub enum ControlMessage {
     Execute {
         frame: crate::data_plane::RuntimeExchangeMessage,
     },
+    DispatchOwnedShuffle {
+        target: WorkerInfo,
+        frame: crate::data_plane::RuntimeExchangeMessage,
+    },
+    PrepareOwnedEpoch {
+        intent: crate::data_plane::OwnedEpochIntent,
+    },
+    FinishOwnedEpoch {
+        intent: crate::data_plane::OwnedEpochIntent,
+    },
     DeploymentReady {
         workload_id: crate::ids::WorkloadId,
         workers: Vec<crate::data_plane::WorkerExecutionStatus>,
@@ -303,8 +313,29 @@ pub enum ControlMessage {
         request_id: String,
         epoch: crate::timestamp::Epoch,
     },
+    InstallDirectEpochGrant {
+        grant: crate::direct_epoch::DirectEpochGrant,
+    },
+    RevokeDirectEpochGrants {
+        metadata: crate::direct_epoch::SourceEpochMetadata,
+        grant_id: Option<uuid::Uuid>,
+    },
+    DirectEpochAuthorized {
+        grant: crate::direct_epoch::DirectEpochGrant,
+        topology: crate::data_plane::WorkloadTopologySnapshot,
+    },
+    AdaptiveDiagnostics {
+        workload_id: crate::ids::WorkloadId,
+        events: Vec<serde_json::Value>,
+    },
     WorkloadSnapshot {
         snapshot: crate::data_plane::WorkloadSnapshot,
+    },
+    ReadWorkload {
+        version: u32,
+        request_id: String,
+        workload_id: crate::ids::WorkloadId,
+        shard_ids: Vec<ShardId>,
     },
     ReadOperatorStats {
         request_id: String,
@@ -343,6 +374,21 @@ pub enum ControlMessage {
     PrepareShardTransfer {
         operation_id: String,
         lease: ShardLease,
+    },
+    /// Verify a workload's durable anchor has no unfinished epoch after
+    /// control has frozen new admissions for an ownership handoff.
+    VerifyWorkloadIdle {
+        operation_id: String,
+        workload_id: crate::ids::WorkloadId,
+        anchor: ShardLease,
+    },
+    /// Read immutable shared-store ranges into the target cache without opening
+    /// a database writer or acquiring the donor's lease.
+    WarmShardCache {
+        operation_id: String,
+        lease: ShardLease,
+        /// (isolated cache identity/local path, shared object-store prefix).
+        storage_scopes: Vec<(String, String)>,
     },
     /// Create a durable SlateDB checkpoint for an idle shard.
     CreateShardCheckpoint {
@@ -445,6 +491,57 @@ pub enum ControlMessage {
         /// This node's current Raft term (`0` if Raft is not attached).
         term: u64,
     },
+    /// Response to [`WorkerMessage::DiscoverShards`]: active shard object-store
+    /// locations and published frontiers for stateless gateways and compactors.
+    ServingTopology {
+        /// Active shards with their object-store prefix and published frontier.
+        shards: Vec<ShardServingInfo>,
+        /// Minimum published cluster frontier across active shards, if known.
+        #[serde(default)]
+        cluster_frontier: Option<u64>,
+    },
+    /// Response to [`WorkerMessage::GetWorkloadTopology`]: versioned placement
+    /// table for direct Arrow IPC routing to shard owners.
+    WorkloadTopology {
+        snapshot: crate::data_plane::WorkloadTopologySnapshot,
+    },
+    /// Response to [`WorkerMessage::AcquireConnectorLease`] /
+    /// [`WorkerMessage::RenewConnectorLease`]: explicit single-owner connector lease.
+    ConnectorLeaseGranted {
+        lease: crate::data_plane::ConnectorLease,
+    },
+    /// Connector lease acquisition or renewal was denied because another
+    /// replica owns the connector or the fencing token is stale.
+    ConnectorLeaseDenied {
+        connector_id: crate::ids::ConnectorId,
+        current_owner: Option<String>,
+        code: String,
+        message: String,
+    },
+    /// Confirmation that a connector lease was released.
+    ConnectorLeaseReleased {
+        connector_id: crate::ids::ConnectorId,
+        released: bool,
+    },
+}
+
+/// Metadata describing an active shard's shared object-store location and
+/// published frontier for stateless read-serving gateways and compactors.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardServingInfo {
+    /// Shard identifier.
+    pub shard_id: ShardId,
+    /// Object-store key prefix for this shard (e.g., `"shards/0"`).
+    pub remote_prefix: String,
+    /// SlateDB database path inside the shard prefix (e.g., `"db"`).
+    pub db_path: String,
+    /// Worker currently holding the shard write lease.
+    pub worker_id: WorkerId,
+    /// Current monotonic lease token for the shard.
+    pub lease_token: crate::ids::LeaseToken,
+    /// Latest committed frontier epoch reported for this shard, if known.
+    #[serde(default)]
+    pub published_frontier: Option<u64>,
 }
 
 /// Wire-serializable mirror of `rockstream_control::raft::RaftRole`
@@ -827,6 +924,17 @@ pub const DATA_PLANE_DELEGATION_VERSION: u16 = 1;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkerMessage {
+    ReadAdaptiveDiagnostics {
+        workload_id: crate::ids::WorkloadId,
+    },
+    AuthorizeSourceEpoch {
+        metadata: crate::direct_epoch::SourceEpochMetadata,
+    },
+    DirectEpochGrantInstalled {
+        worker_id: WorkerId,
+        grant_id: uuid::Uuid,
+        accepted: bool,
+    },
     /// Actor-authorized gateway request over the internal data-plane transport.
     DelegatedDataPlane {
         version: u16,
@@ -835,6 +943,24 @@ pub enum WorkerMessage {
     },
     /// Initial registration request.
     Register(WorkerRegistration),
+    OwnedShuffleReady {
+        worker_id: WorkerId,
+    },
+    OwnedEpochRecoveryRequired {
+        worker_id: WorkerId,
+        workload_id: crate::ids::WorkloadId,
+        shard_id: ShardId,
+    },
+    OwnedEpochPrepared {
+        worker_id: WorkerId,
+        intent: crate::data_plane::OwnedEpochIntent,
+        error: Option<String>,
+    },
+    OwnedEpochFinished {
+        worker_id: WorkerId,
+        intent: crate::data_plane::OwnedEpochIntent,
+        error: Option<String>,
+    },
     DeployWorkload(crate::data_plane::DeploymentRequest),
     DeploymentReady {
         version: u32,
@@ -851,8 +977,26 @@ pub enum WorkerMessage {
         input_rows: u64,
         output_rows: u64,
     },
+    ExecutionFailed {
+        output: crate::data_plane::RuntimeOutputDelta,
+        message: String,
+    },
+    ShuffleDispatchFailed {
+        output: crate::data_plane::RuntimeOutputDelta,
+        message: String,
+    },
     ReadWorkload {
+        #[serde(default)]
+        version: u32,
         workload_id: crate::ids::WorkloadId,
+    },
+    WorkloadReadReport {
+        version: u32,
+        request_id: String,
+        workload_id: crate::ids::WorkloadId,
+        worker_id: WorkerId,
+        available: bool,
+        shards: Vec<crate::data_plane::ShardOutput>,
     },
     ReadOperatorStats {
         request_id: String,
@@ -929,6 +1073,26 @@ pub enum WorkerMessage {
         worker_id: WorkerId,
         samples: Vec<ShardLoadSample>,
     },
+    /// The current anchor reports a routing epoch only after its all-shard
+    /// commit journal has been durably finished. This is metadata, not row data.
+    RoutingEpochCommitted {
+        worker_id: WorkerId,
+        workload_id: crate::ids::WorkloadId,
+        anchor_shard_id: ShardId,
+        anchor_lease_token: crate::ids::LeaseToken,
+        epoch: u64,
+        generation: u64,
+        request_id: String,
+        input_digest: [u8; 32],
+        decision: serde_json::Value,
+        shard_leases: Vec<(ShardId, crate::ids::LeaseToken)>,
+    },
+    ShardHeatReport {
+        worker_id: WorkerId,
+        shard_id: ShardId,
+        lease_token: crate::ids::LeaseToken,
+        heat: crate::lease::LeaseHeatHint,
+    },
     /// Query this control node's current Raft leadership status (v0.45.2
     /// M7 S4). Any connected client (worker, ops tooling, or a test) may
     /// send this at any time without first registering; the control plane
@@ -964,6 +1128,40 @@ pub enum WorkerMessage {
     ResolveWorkloadSecretToken {
         workload_id: crate::ids::WorkloadId,
         secret_name: String,
+    },
+    /// Discover active shards, their shared object-store prefixes, and
+    /// published frontiers (used by stateless gateways and dedicated compactors).
+    DiscoverShards,
+    /// Deploy a workload with an explicit logical shard count decoupled from
+    /// the current healthy worker count.
+    DeployWorkloadSharded {
+        request: crate::data_plane::DeploymentRequest,
+        shard_count: usize,
+    },
+    /// Fetch the cached, versioned shard placement table for a workload so
+    /// gateways and connectors can stream Arrow IPC batches directly to shard
+    /// owners without routing row payloads through `ControlService`.
+    GetWorkloadTopology {
+        workload_id: crate::ids::WorkloadId,
+    },
+    /// Acquire an explicit single-owner lease for a source connector task.
+    AcquireConnectorLease {
+        connector_id: crate::ids::ConnectorId,
+        owner_id: String,
+        ttl_ms: u64,
+    },
+    /// Renew an active single-owner connector lease.
+    RenewConnectorLease {
+        connector_id: crate::ids::ConnectorId,
+        owner_id: String,
+        lease_token: crate::ids::LeaseToken,
+        ttl_ms: u64,
+    },
+    /// Release a held single-owner connector lease.
+    ReleaseConnectorLease {
+        connector_id: crate::ids::ConnectorId,
+        owner_id: String,
+        lease_token: crate::ids::LeaseToken,
     },
 }
 
@@ -1040,7 +1238,7 @@ mod tests {
     fn control_message_registered_roundtrip() {
         let msg = ControlMessage::Registered {
             worker_id: WorkerId(3),
-            protocol_version: ProtocolVersion::V3,
+            protocol_version: ProtocolVersion::V4,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let decoded: ControlMessage = serde_json::from_str(&json).unwrap();
@@ -1050,7 +1248,7 @@ mod tests {
                 protocol_version,
             } => {
                 assert_eq!(worker_id, WorkerId(3));
-                assert_eq!(protocol_version, ProtocolVersion::V3);
+                assert_eq!(protocol_version, ProtocolVersion::V4);
             }
             _ => panic!("unexpected message variant"),
         }

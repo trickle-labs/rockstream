@@ -23,6 +23,9 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 
+static RESERVED_ADDRS: std::sync::Mutex<Vec<(SocketAddr, TcpListener)>> =
+    std::sync::Mutex::new(Vec::new());
+
 #[path = "common/management_auth.rs"]
 mod management_auth;
 
@@ -42,7 +45,21 @@ impl Drop for RunningNode {
 
 fn free_addr() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("read ephemeral port")
+    let addr = listener.local_addr().expect("read ephemeral port");
+    RESERVED_ADDRS
+        .lock()
+        .expect("lock reserved test ports")
+        .push((addr, listener));
+    addr
+}
+
+fn release_addr(addr: SocketAddr) {
+    let mut reserved = RESERVED_ADDRS.lock().expect("lock reserved test ports");
+    let index = reserved
+        .iter()
+        .position(|(reserved, _)| *reserved == addr)
+        .expect("test address reservation");
+    drop(reserved.swap_remove(index));
 }
 
 fn start_embedded(
@@ -88,6 +105,10 @@ fn start_embedded(
         .get(&worker_id.unwrap_or(1))
         .expect("test PKI has the embedded worker identity");
     add_identity_tls_args(&mut command, certificate, key, pki);
+    release_addr(listen_addr);
+    if let Some(addr) = management_addr {
+        release_addr(addr);
+    }
     RunningNode(command.spawn().expect("start embedded role-all node"))
 }
 
@@ -113,6 +134,31 @@ async fn connect_gateway(addr: SocketAddr) -> Client {
             Err(error) => assert!(
                 Instant::now() < deadline,
                 "embedded gateway did not accept PostgreSQL connections: {error}"
+            ),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_backup_shard_ready(addr: SocketAddr) -> Client {
+    let client = connect_gateway(addr).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut last_error = None;
+    loop {
+        // Startup and peer registration can still be writing the catalog.
+        match tokio::time::timeout_at(
+            deadline,
+            client.simple_query(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
+            ),
+        )
+        .await
+        {
+            Ok(Ok(_)) => return client,
+            Ok(Err(error)) => last_error = Some(format!("{error:?}")),
+            Err(_) => panic!(
+                "embedded shard did not finish startup: {}",
+                last_error.as_deref().unwrap_or("readiness probe timed out")
             ),
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -457,6 +503,13 @@ fn assert_status_transcript(output: &Output, active_operations: u32, retained_op
     assert_eq!(status.nodes[0].source_version, status.source_version);
     let capacity_headroom = status.nodes[0].capacity_headroom;
     assert!((0.0..=1.0).contains(&capacity_headroom));
+    let worker_address = status.nodes[0].address.clone();
+    let address: std::net::SocketAddr = worker_address.parse().expect("worker address");
+    assert_eq!(
+        address.ip(),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    );
+    assert_ne!(address.port(), 0);
 
     status.observed_at = "<timestamp>".to_owned();
     status.source_version = "<source-revision>".to_owned();
@@ -473,7 +526,7 @@ fn assert_status_transcript(output: &Output, active_operations: u32, retained_op
             nodes: vec![ManagementNodeInfo {
                 node_id: 1,
                 role: "worker".to_owned(),
-                address: "127.0.0.1:0".to_owned(),
+                address: worker_address,
                 state: "active".to_owned(),
                 capacity_headroom,
                 host_id: String::new(),
@@ -513,6 +566,16 @@ async fn wait_for_backup_success(
     operation_id: &str,
     pki: &TestPki,
 ) -> ManagementOperationInfo {
+    wait_for_backup_success_with_recovery(binary, management, operation_id, pki, None).await
+}
+
+async fn wait_for_backup_success_with_recovery(
+    binary: &Path,
+    management: SocketAddr,
+    operation_id: &str,
+    pki: &TestPki,
+    recovered_checkpoint: Option<&str>,
+) -> ManagementOperationInfo {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let output = run_operation_show(binary, management, operation_id, pki);
@@ -539,6 +602,19 @@ async fn wait_for_backup_success(
                 expected_operation("running", "70%", &operation.phase)
             }
             "succeeded" => expected_operation("succeeded", "100%", "completed"),
+            // Only restart recovery may report this transient startup barrier.
+            // Other waiting reasons remain failures, and the original deadline
+            // and exact terminal-success assertions still apply.
+            "waiting" if recovered_checkpoint.is_some() => {
+                let phase = format!(
+                    "backup_checkpoint:{}",
+                    recovered_checkpoint.expect("recovered checkpoint")
+                );
+                let mut expected = expected_operation("waiting", "", &phase);
+                expected.error_code = "RS-3610".to_owned();
+                expected.next_steps = vec!["embedded shard startup is not complete".to_owned()];
+                expected
+            }
             "failed" | "cancelled" | "waiting" => {
                 let transcript = String::from_utf8_lossy(&output.stdout);
                 panic!("backup operation ended unexpectedly: {transcript}")
@@ -705,6 +781,8 @@ async fn release_management_backup_commits_and_restores_real_shard_data() {
             "GetShard",
             "ListOperations",
             "ListSecurityPrincipals",
+            "CreateServicePrincipal",
+            "DeleteSecurityPrincipal",
             "SetSecurityPrincipalGrants",
             "GetOperation",
             "GetConfigSummary",
@@ -916,7 +994,7 @@ async fn release_management_backup_idempotency_survives_role_all_restart() {
         None,
         &pki,
     );
-    let first_client = connect_gateway(first_listen).await;
+    let first_client = wait_for_backup_shard_ready(first_listen).await;
     let accepted =
         submit_backup_request(first_management, &destination, idempotency_key, &pki).await;
     assert_eq!(
@@ -926,7 +1004,7 @@ async fn release_management_backup_idempotency_survives_role_all_restart() {
     let operation_id = accepted.operation_id.clone();
     let mut first_management_client = management_client(first_management, &pki).await;
     let export_deadline = Instant::now() + Duration::from_secs(10);
-    loop {
+    let recovered_checkpoint = loop {
         let operation = first_management_client
             .get_operation(GetOperationRequest {
                 protocol_version: 1,
@@ -937,8 +1015,9 @@ async fn release_management_backup_idempotency_survives_role_all_restart() {
             .into_inner()
             .operation
             .expect("accepted backup operation record");
-        if operation.phase.starts_with("backup_exporting:") {
-            break;
+        if let Some(checkpoint) = operation.phase.strip_prefix("backup_exporting:") {
+            assert!(checkpoint.parse::<u64>().expect("numeric checkpoint ID") > 0);
+            break checkpoint.to_owned();
         }
         assert_ne!(
             operation.state, "succeeded",
@@ -949,7 +1028,7 @@ async fn release_management_backup_idempotency_survives_role_all_restart() {
             "backup did not enter export before hard kill: {operation:?}"
         );
         tokio::time::sleep(Duration::from_millis(1)).await;
-    }
+    };
     drop(first_management_client);
     drop(first_client);
     first_node
@@ -976,9 +1055,16 @@ async fn release_management_backup_idempotency_survives_role_all_restart() {
         None,
         &pki,
     );
-    let second_client = connect_gateway(second_listen).await;
+    let second_client = wait_for_backup_shard_ready(second_listen).await;
     wait_for_registered_worker(binary, second_management, 1, &pki).await;
-    let completed = wait_for_backup_success(binary, second_management, &operation_id, &pki).await;
+    let completed = wait_for_backup_success_with_recovery(
+        binary,
+        second_management,
+        &operation_id,
+        &pki,
+        Some(&recovered_checkpoint),
+    )
+    .await;
     assert_eq!(completed.state, "succeeded");
     drop(second_client);
     second_node
@@ -1002,7 +1088,7 @@ async fn release_management_backup_idempotency_survives_role_all_restart() {
         None,
         &pki,
     );
-    let third_client = connect_gateway(third_listen).await;
+    let third_client = wait_for_backup_shard_ready(third_listen).await;
     wait_for_registered_worker(binary, third_management, 1, &pki).await;
 
     let retried =
@@ -1081,10 +1167,12 @@ async fn release_management_backup_idempotency_is_atomic_across_processes() {
         "all",
         &[&destination, &different_destination],
     );
+    let first_listen = free_addr();
+    let second_listen = free_addr();
     let mut first_node = start_embedded(
         binary,
         &first_storage,
-        free_addr(),
+        first_listen,
         Some(first_management),
         Some(&shared_storage),
         Some(1),
@@ -1093,7 +1181,7 @@ async fn release_management_backup_idempotency_is_atomic_across_processes() {
     let mut second_node = start_embedded(
         binary,
         &second_storage,
-        free_addr(),
+        second_listen,
         Some(second_management),
         Some(&shared_storage),
         Some(2),
@@ -1101,6 +1189,8 @@ async fn release_management_backup_idempotency_is_atomic_across_processes() {
     );
     wait_for_management(first_management, &mut first_node, 1, &pki).await;
     wait_for_management(second_management, &mut second_node, 1, &pki).await;
+    let _first_gateway = wait_for_backup_shard_ready(first_listen).await;
+    let _second_gateway = wait_for_backup_shard_ready(second_listen).await;
 
     let (first, second) = tokio::join!(
         submit_backup_request(first_management, &destination, idempotency_key, &pki),
@@ -1161,16 +1251,18 @@ async fn release_management_backups_allocate_distinct_checkpoints_concurrently()
     );
     seed_backup_value(&storage, 0).await;
     let management = free_addr();
+    let listen_addr = free_addr();
     let mut node = start_embedded(
         binary,
         &storage,
-        free_addr(),
+        listen_addr,
         Some(management),
         None,
         None,
         &pki,
     );
     wait_for_management(management, &mut node, 1, &pki).await;
+    let _gateway = wait_for_backup_shard_ready(listen_addr).await;
     let (first, second) = tokio::join!(
         submit_backup_request(
             management,

@@ -14,6 +14,7 @@ pub enum Role {
     Gateway,
     Worker,
     Control,
+    Compactor,
 }
 
 /// Durable catalog layout used by offline security administration.
@@ -33,6 +34,7 @@ impl std::fmt::Display for Role {
                 Self::Gateway => "gateway",
                 Self::Worker => "worker",
                 Self::Control => "control",
+                Self::Compactor => "compactor",
             }
         )
     }
@@ -99,11 +101,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub storage_dir: Option<PathBuf>,
 
-    /// Principal presented to control-plane and catalog mutations.
+    /// Identity label used by legacy local CLI adapters; not the management API identity.
     #[arg(long, global = true, default_value = "rockstream")]
     pub identity_user: String,
 
-    /// RBAC role presented to control-plane and catalog mutations.
+    /// Legacy local role request; not an authenticated grant.
     #[arg(long, global = true, value_parser = ["viewer", "pipeline-owner", "admin"], default_value = "viewer")]
     pub identity_role: String,
 
@@ -229,11 +231,17 @@ pub enum Command {
         #[arg(long, value_enum, default_value_t = Role::All)]
         role: Role,
 
-        /// Control service URL (required for the worker and frontier roles).
+        /// Control service URL (required for the worker, frontier, and compactor roles).
         #[arg(long)]
         control: Option<String>,
 
-        /// Authentication mode. SCRAM requires an enabled durable login; OIDC and mTLS require their configuration. MD5 is rejected. Omitted uses `[auth].mode`.
+        /// Authentication mode. SCRAM requires an enabled durable login; OIDC requires an issuer,
+        /// audience, JWKS URL, and gateway TLS. OIDC accepts RS256 tokens up to 16 KiB and JWKS
+        /// responses up to 1 MiB and 100 keys. Key cache TTL is at most 60 seconds (honoring
+        /// shorter issuer lifetimes); fetches time out after 5 seconds and retry transient
+        /// transport, 429, or server failures once after 250 milliseconds. Expired keys are never
+        /// used. mTLS requires its gateway credentials; MD5 is rejected. Omitted uses
+        /// `[auth].mode`.
         #[arg(long, value_enum)]
         auth: Option<AuthMode>,
 
@@ -351,7 +359,7 @@ pub enum Command {
         #[command(subcommand)]
         command: ShardCommand,
     },
-    /// Checkpoint inspection commands.
+    /// Checkpoint commands (currently unavailable: no authenticated management endpoint).
     Checkpoint {
         #[command(subcommand)]
         command: CheckpointCommand,
@@ -367,12 +375,12 @@ pub enum Command {
         #[command(subcommand)]
         command: SchemaEvolutionCommand,
     },
-    /// Audit log inspection commands.
+    /// Local audit-history commands are unavailable; use authenticated `SHOW SECURITY AUDIT`.
     Audit {
         #[command(subcommand)]
         command: AuditCommand,
     },
-    /// Diagnostic support commands.
+    /// Generate actor-bound support artifacts through the authenticated management API.
     Support {
         #[command(subcommand)]
         command: SupportCommand,
@@ -790,7 +798,7 @@ pub enum SupportCommand {
         #[command(subcommand)]
         command: SupportArtifactCommand,
     },
-    /// Generate on-demand diagnostic support bundle.
+    /// Unavailable without authenticated support authorization; use `support artifact create`.
     Bundle {
         /// Optional view name filter.
         #[arg(long)]
@@ -802,7 +810,7 @@ pub enum SupportCommand {
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// Look up one runtime diagnostic and write its support bundle.
+    /// Unavailable without authenticated diagnostic authorization; use `support artifact create`.
     Diagnose {
         /// Look up the most recent occurrence for this catalog code.
         #[arg(long, conflicts_with = "correlation_id")]
@@ -859,13 +867,13 @@ pub enum SchemaEvolutionCommand {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum AuditCommand {
-    /// Tail recent audit log events.
+    /// Unavailable for local logs; use authenticated `SHOW SECURITY AUDIT`.
     Tail {
         /// Maximum events to return (max 1000).
         #[arg(long, default_value_t = 100)]
         max: usize,
     },
-    /// Query audit log events matching a filter.
+    /// Unavailable for local logs; use authenticated `SHOW SECURITY AUDIT`.
     Query {
         /// Substring filter for actor, action, or resource.
         #[arg(long)]
@@ -956,17 +964,17 @@ pub enum AdminCommand {
         #[command(subcommand)]
         command: RaftAdminCommand,
     },
-    /// Checkpoint administration and manual triggering.
+    /// Checkpoint administration (currently unavailable: no authenticated management endpoint).
     Checkpoint {
         #[command(subcommand)]
         command: CheckpointCommand,
     },
-    /// Point-in-time durable backup operations (create, inspect, verify).
+    /// Create backups through authenticated management; inspect or verify local backup files.
     Backup {
         #[command(subcommand)]
         command: BackupCommand,
     },
-    /// Restore a database backup into a clean or authorized destination.
+    /// Unavailable until the CLI exposes an authenticated backup-restore endpoint.
     Restore {
         /// Source backup directory or object-store URI.
         source: String,
@@ -1036,7 +1044,7 @@ pub enum OperationCommand {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum BackupCommand {
-    /// Create a full point-in-time backup.
+    /// Create a full point-in-time backup through authenticated management.
     Create {
         /// Destination directory or URI.
         destination: String,

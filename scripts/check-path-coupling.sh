@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # check-path-coupling.sh — DC.2 path-coupling gate (v0.22).
 #
-# Any change to a coordination crate or DESIGN.md must be accompanied by a
-# corresponding touch to formal/*.fizz or FIZZBEE_TEST_PLAN.md in the same
-# commit/PR. This prevents coordination-protocol changes from silently
-# drifting away from their formal models.
+# Any change to a coordination protocol in a coordination crate or DESIGN.md
+# must be accompanied by a corresponding touch to formal/*.fizz or
+# FIZZBEE_TEST_PLAN.md in the same commit/PR.
 #
 # Called by CI on every push and PR. Also callable locally.
 #
@@ -53,7 +52,7 @@ if [ -z "$changed_files" ]; then
     exit 0
 fi
 
-# Coordination crates and design doc — changes here require a model touch.
+# Coordination implementation sources and design doc — changes here require a model touch.
 # Data-plane behavior covered by focused checks does not need a FizzBee model.
 # Durable catalog reconstruction is specified in FIZZBEE_TEST_PLAN.md §3.6 and
 # checked by exact catalog recovery tests.
@@ -64,11 +63,74 @@ if [ -z "$changed_files" ]; then
     exit 0
 fi
 
+# Inline unit tests can live in coordination source files. Exclude only diffs
+# contained in a trailing #[cfg(test)] mod tests block on both sides.
+RANGE_BASE="${RANGE%%..*}"
+RANGE_HEAD="${RANGE##*..}"
+
+test_module_line() {
+    local revision="$1"
+    local file="$2"
+    git show "$revision:$file" 2>/dev/null | awk '
+        /^[[:space:]]*#\[cfg\(test\)\][[:space:]]*$/ {
+            cfg_line = NR
+            next
+        }
+        cfg_line && /^[[:space:]]*$/ { next }
+        cfg_line && /^[[:space:]]*mod[[:space:]]+tests[[:space:]]*\{/ {
+            test_line = cfg_line
+            cfg_line = 0
+            next
+        }
+        cfg_line { cfg_line = 0 }
+        test_line && NR > test_line && /^[^[:space:]]/ &&
+            $0 !~ /^}$/ && $0 !~ /^\/\// && $0 !~ /^\/\*/ && $0 !~ /^\*/ {
+            trailing_code = 1
+        }
+        END { if (test_line && !trailing_code) print test_line }
+    '
+}
+
+rust_test_only_change() {
+    local file="$1"
+    local base_line head_line hunks header old_start new_start
+    [[ "$file" == *.rs ]] || return 1
+    base_line=$(test_module_line "$RANGE_BASE" "$file")
+    head_line=$(test_module_line "$RANGE_HEAD" "$file")
+    [[ -n "$base_line" && -n "$head_line" ]] || return 1
+    hunks=$(git diff --unified=0 "$RANGE" -- "$file" | grep '^@@' || true)
+    [[ -n "$hunks" ]] || return 1
+
+    while IFS= read -r header; do
+        [[ "$header" =~ ^@@[[:space:]]-([0-9]+)(,[0-9]+)?[[:space:]]\+([0-9]+)(,[0-9]+)?[[:space:]]@@ ]] || return 1
+        old_start=${BASH_REMATCH[1]}
+        new_start=${BASH_REMATCH[3]}
+        [ "$old_start" -gt "$base_line" ] || return 1
+        [ "$new_start" -gt "$head_line" ] || return 1
+    done < <(printf '%s\n' "$hunks")
+}
+
+inline_test_files=""
+other_files=""
+while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    if rust_test_only_change "$file"; then
+        inline_test_files+="${file}"$'\n'
+    else
+        other_files+="${file}"$'\n'
+    fi
+done < <(printf '%s\n' "$changed_files")
+changed_files="${other_files%$'\n'}"
+if [ -z "$changed_files" ] && [ -n "$inline_test_files" ]; then
+    echo "check-path-coupling: only inline unit tests changed — OK."
+    exit 0
+fi
+
 COORDINATION_PATTERNS=(
-    "crates/rockstream-runtime/"
-    "crates/rockstream-control/"
-    "crates/rockstream-connectors/"
-    "crates/rockstream-storage/"
+    "crates/rockstream-runtime/src/"
+    "crates/rockstream-control/src/"
+    "crates/rockstream-connectors/src/"
+    "crates/rockstream-storage/src/"
     "DESIGN.md"
 )
 
@@ -87,7 +149,7 @@ for pattern in "${COORDINATION_PATTERNS[@]}"; do
 done
 
 if [ "$coordination_changed" -eq 0 ]; then
-    echo "check-path-coupling: no coordination-crate or DESIGN.md changes — OK."
+    echo "check-path-coupling: no coordination source or DESIGN.md changes — OK."
     exit 0
 fi
 
@@ -102,11 +164,11 @@ done
 
 if [ "$model_touched" -eq 0 ]; then
     echo ""
-    echo "PATH-COUPLING VIOLATION: coordination-crate or DESIGN.md changed without a"
+    echo "PATH-COUPLING VIOLATION: coordination source or DESIGN.md changed without a"
     echo "corresponding touch to formal/*.fizz or FIZZBEE_TEST_PLAN.md."
     echo ""
     echo "Changed coordination files:"
-    echo "$changed_files" | grep -E "^(crates/rockstream-(runtime|control|connectors|storage)/|DESIGN\.md)" || true
+    echo "$changed_files" | grep -E "^(crates/rockstream-(runtime|control|connectors|storage)/src/|DESIGN\.md)" || true
     echo ""
     echo "Fix: update the relevant FizzBee model and/or FIZZBEE_TEST_PLAN.md §3.6"
     echo "to reflect the protocol change before merging."

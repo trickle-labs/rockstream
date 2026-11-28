@@ -19,7 +19,7 @@ use rockstream_test_support::minio::{minio_object_store, start_minio, MINIO_PASS
 use rockstream_test_support::pki::TestPki;
 use rockstream_types::data_plane::WorkerExecutionStatus;
 use rockstream_types::ids::{ShardId, WorkerId, WorkloadId};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio_postgres::{Client, NoTls};
 
 #[path = "common/management_auth.rs"]
@@ -30,6 +30,15 @@ use management_auth::{
 };
 
 static PROCESS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct TestChild(Child);
+
+impl Drop for TestChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 
 struct Processes {
     control: Child,
@@ -191,6 +200,15 @@ fn assert_management_status_transcript(
             .iter()
             .find(|actual| actual.node_id == node.node_id)
             .expect("expected node is present in status");
+        if node.address == "127.0.0.1:0" {
+            let address: std::net::SocketAddr = actual.address.parse().expect("worker address");
+            assert_eq!(
+                address.ip(),
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+            );
+            assert_ne!(address.port(), 0);
+            node.address = actual.address.clone();
+        }
         assert!((0.0..=1.0).contains(&actual.capacity_headroom));
         node.capacity_headroom = actual.capacity_headroom;
         node.registered_at_ms = 0;
@@ -342,13 +360,6 @@ fn stable_name_id(namespace: &str, name: &str) -> u64 {
         .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
         })
-}
-
-fn stable_route(value: &str, shard_count: usize) -> usize {
-    value.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
-    }) as usize
-        % shard_count
 }
 
 async fn query_text_rows(client: &Client, sql: &str) -> Vec<Vec<String>> {
@@ -520,11 +531,6 @@ async fn run_cluster(worker_count: usize, kill_worker: bool) {
         .read_workload(workload_id)
         .await
         .unwrap();
-    let shard_base = workload_id.0.wrapping_mul(16);
-    let mut routed = vec![0_u64; worker_count];
-    for group in 0..values.len() {
-        routed[stable_route(&group.to_string(), worker_count)] += 1;
-    }
     let mut assigned_shards = BTreeMap::new();
     for status in &snapshot.workers {
         assert_eq!(status.shard_ids.len(), 1);
@@ -540,26 +546,33 @@ async fn run_cluster(worker_count: usize, kill_worker: bool) {
         assigned_shards.keys().copied().collect::<Vec<_>>(),
         (1..=worker_count as u64).map(WorkerId).collect::<Vec<_>>()
     );
+    let mut shard_ids: Vec<ShardId> = assigned_shards.values().copied().collect();
+    shard_ids.sort();
     assert_eq!(
-        assigned_shards
-            .values()
+        shard_ids
+            .iter()
             .copied()
-            .collect::<std::collections::BTreeSet<_>>(),
-        (0..worker_count)
-            .map(|index| ShardId(shard_base.wrapping_add(index as u64)))
-            .collect()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        worker_count
     );
+    let mut routed_by_shard = BTreeMap::<ShardId, u64>::new();
+    for group in 0..values.len() {
+        let bucket = rockstream_types::rendezvous::fnv1a_64(group.to_string().as_bytes()) % 4096;
+        let target = rockstream_types::rendezvous::rendezvous_hash(bucket, &shard_ids, 1).unwrap();
+        *routed_by_shard.entry(target).or_default() += 1;
+    }
     let expected_statuses = (1..=worker_count as u64)
         .map(|worker_id| {
             let worker_id = WorkerId(worker_id);
             let shard_id = assigned_shards[&worker_id];
-            let shard_index = shard_id.0.wrapping_sub(shard_base) as usize;
+            let expected_rows = routed_by_shard.get(&shard_id).copied().unwrap_or(0);
             WorkerExecutionStatus {
                 worker_id,
                 process_id: processes.workers[worker_id.0 as usize - 1].id(),
                 shard_ids: vec![shard_id],
-                input_rows: routed[shard_index],
-                output_rows: routed[shard_index],
+                input_rows: expected_rows,
+                output_rows: expected_rows,
                 frontier: 2,
                 ready: true,
             }
@@ -639,8 +652,16 @@ async fn run_cluster(worker_count: usize, kill_worker: bool) {
     }
 
     if kill_worker {
+        let worker1_shard = assigned_shards[&WorkerId(1)];
+        let worker2_shard = assigned_shards[&WorkerId(2)];
+        let worker2_rows = routed_by_shard.get(&worker2_shard).copied().unwrap_or(0);
         let dead_route = (0..16)
-            .find(|id| stable_route(&id.to_string(), worker_count) == 0)
+            .find(|id| {
+                let bucket =
+                    rockstream_types::rendezvous::fnv1a_64(id.to_string().as_bytes()) % 4096;
+                rockstream_types::rendezvous::rendezvous_hash(bucket, &shard_ids, 1)
+                    == Some(worker1_shard)
+            })
             .unwrap();
         processes.workers[0].kill().unwrap();
         processes.workers[0].wait().unwrap();
@@ -655,9 +676,9 @@ async fn run_cluster(worker_count: usize, kill_worker: bool) {
                 == vec![WorkerExecutionStatus {
                     worker_id: WorkerId(2),
                     process_id: processes.workers[1].id(),
-                    shard_ids: vec![ShardId(shard_base), ShardId(shard_base.wrapping_add(1))],
-                    input_rows: routed[1],
-                    output_rows: routed[1],
+                    shard_ids: shard_ids.clone(),
+                    input_rows: worker2_rows,
+                    output_rows: worker2_rows,
                     frontier: 2,
                     ready: true,
                 }]
@@ -698,6 +719,273 @@ async fn run_cluster(worker_count: usize, kill_worker: bool) {
             join_rows(&values)
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupted_dispatch_blocks_distributed_reads_after_gateway_restart() {
+    use rockstream_types::topology::{ControlMessage, WorkerMessage};
+
+    let _test_guard = PROCESS_TEST_LOCK.lock().await;
+    let root = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let control_addr = listener.local_addr().unwrap().to_string();
+    let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+    let control = tokio::spawn(async move {
+        let mut request_tx = Some(request_tx);
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut line = String::new();
+            BufReader::new(read).read_line(&mut line).await.unwrap();
+            match serde_json::from_str::<WorkerMessage>(&line).unwrap() {
+                WorkerMessage::DeployWorkload(request) => {
+                    let response = ControlMessage::DeploymentReady {
+                        workload_id: request.workload_id,
+                        workers: Vec::new(),
+                    };
+                    let wire = serde_json::to_string(&response).unwrap() + "\n";
+                    write.write_all(wire.as_bytes()).await.unwrap();
+                }
+                WorkerMessage::SubmitSourceDelta(request) => {
+                    request_tx.take().unwrap().send(request).unwrap();
+                    // This insecure development gateway has no actor assertion
+                    // and no direct workers. Interrupt its control fallback
+                    // before the gateway can learn the dispatch outcome.
+                    tokio::spawn(async move {
+                        let _pending_connection = write;
+                        std::future::pending::<()>().await;
+                    });
+                }
+                WorkerMessage::DiscoverShards => {
+                    // A stateless gateway now discovers shards at bootstrap.
+                    // This fixture intentionally has no serving replicas.
+                    let response = ControlMessage::ServingTopology {
+                        shards: Vec::new(),
+                        cluster_frontier: None,
+                    };
+                    let wire = serde_json::to_string(&response).unwrap() + "\n";
+                    write.write_all(wire.as_bytes()).await.unwrap();
+                }
+                WorkerMessage::GetWorkloadTopology { workload_id } => {
+                    // This mock fixture has no live workers; returning an empty
+                    // shard list selects the control fallback under test;
+                    // this mock never issues a direct epoch grant.
+                    let response = ControlMessage::WorkloadTopology {
+                        snapshot: rockstream_types::data_plane::WorkloadTopologySnapshot {
+                            topology_epoch: 1,
+                            workload_id,
+                            plan_json: String::new(),
+                            routing_columns: BTreeMap::new(),
+                            schemas: Vec::new(),
+                            shards: Vec::new(),
+                            workers: Vec::new(),
+                        },
+                    };
+                    let wire = serde_json::to_string(&response).unwrap() + "\n";
+                    write.write_all(wire.as_bytes()).await.unwrap();
+                }
+                other => panic!("unexpected request: {other:?}"),
+            }
+        }
+    });
+    let gateway_addr = free_addr();
+    let gateway_storage = root.path().join("gateway");
+    let start_gateway = || {
+        TestChild(spawn(&[
+            "start",
+            "--storage",
+            gateway_storage.to_str().unwrap(),
+            "--role",
+            "gateway",
+            "--allow-insecure-internal-dev",
+            "--control",
+            &control_addr,
+            "--listen",
+            &gateway_addr,
+        ]))
+    };
+    let mut gateway = start_gateway();
+    let client = connect_gateway(&gateway_addr).await;
+    execute(
+        &client,
+        "CREATE TABLE pending_items (id BIGINT PRIMARY KEY, value BIGINT NOT NULL)",
+    )
+    .await;
+    execute(&client, "CREATE MATERIALIZED VIEW pending_view AS SELECT id, SUM(value) AS total FROM pending_items GROUP BY id").await;
+    let insert = tokio::spawn(async move {
+        client
+            .simple_query("INSERT INTO pending_items VALUES (1, 10), (2, 20)")
+            .await
+    });
+    let request = tokio::time::timeout(Duration::from_secs(10), request_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        request.version,
+        rockstream_types::data_plane::DEPLOYMENT_DESCRIPTOR_VERSION
+    );
+    assert_eq!(request.epoch, 1);
+    // Check the exact original input before interrupting dispatch.
+    let expected = rockstream_types::data_plane::SourceDeltaRequest {
+        version: rockstream_types::data_plane::DEPLOYMENT_DESCRIPTOR_VERSION,
+        workload_id: request.workload_id,
+        request_id: request.request_id.clone(),
+        source: "pending_items".to_string(),
+        epoch: 1,
+        rows: vec![
+            rockstream_types::data_plane::RuntimeRow {
+                values_tsv: "1\t10".to_string(),
+                weight: 1,
+            },
+            rockstream_types::data_plane::RuntimeRow {
+                values_tsv: "2\t20".to_string(),
+                weight: 1,
+            },
+        ],
+    };
+    assert_eq!(request.source, expected.source);
+    assert_eq!(request.rows, expected.rows);
+    // Separately preserve the metadata-only authorization wire assertion.
+    let authorization =
+        rockstream_runtime::DataPlaneClient::source_authorization_request(&request).unwrap();
+    let WorkerMessage::AuthorizeSourceEpoch { metadata } = authorization else {
+        panic!("expected source epoch authorization metadata");
+    };
+    assert!(metadata.is_valid());
+    assert_eq!(
+        metadata,
+        rockstream_types::direct_epoch::SourceEpochMetadata::from_request(&expected).unwrap()
+    );
+    assert!(serde_json::to_value(&metadata)
+        .unwrap()
+        .get("rows")
+        .is_none());
+    gateway.0.kill().unwrap();
+    gateway.0.wait().unwrap();
+    assert!(insert.await.unwrap().is_err());
+    let _gateway = start_gateway();
+    let client = connect_gateway(&gateway_addr).await;
+    let error = client
+        .simple_query("SELECT * FROM pending_view")
+        .await
+        .unwrap_err();
+    let error = error.as_db_error().unwrap();
+    assert_eq!(error.code().code(), "XX000");
+    assert_eq!(error.message(), "[RS-2026] query.query_time_execution_failed: query-time execution failed: distributed source requires recovery; preserve source input and shard storage and contact the operator before retrying. next_steps: Simplify the query, validate referenced table/view schemas, or materialize the query into a view.");
+    control.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_dispatch_blocks_distributed_reads_after_gateway_restart() {
+    let _test_guard = PROCESS_TEST_LOCK.lock().await;
+    let root = tempfile::tempdir().unwrap();
+    let catalog = rockstream_control::TopologyCatalog::new();
+    let control = rockstream_control::ControlService::new(catalog.clone())
+        .with_shard_manager(ShardManager::new())
+        .with_insecure_dev_mode()
+        .start("127.0.0.1:0")
+        .await
+        .unwrap();
+    let control_addr = control.addr.to_string();
+    let gateway_addr = free_addr();
+    let worker_storage = root.path().join("worker");
+    let gateway_storage = root.path().join("gateway");
+    let mut worker = TestChild(spawn(&[
+        "start",
+        "--storage",
+        worker_storage.to_str().unwrap(),
+        "--role",
+        "worker",
+        "--allow-insecure-internal-dev",
+        "--control",
+        &control_addr,
+        "--worker-id",
+        "1",
+    ]));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while catalog.get(WorkerId(1)).is_none() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let start_gateway = || {
+        TestChild(spawn(&[
+            "start",
+            "--storage",
+            gateway_storage.to_str().unwrap(),
+            "--role",
+            "gateway",
+            "--allow-insecure-internal-dev",
+            "--control",
+            &control_addr,
+            "--listen",
+            &gateway_addr,
+        ]))
+    };
+    let mut gateway = start_gateway();
+    let client = connect_gateway(&gateway_addr).await;
+    execute(
+        &client,
+        "CREATE TABLE dispatch_items (id BIGINT PRIMARY KEY, value BIGINT NOT NULL)",
+    )
+    .await;
+    execute(&client, "CREATE MATERIALIZED VIEW dispatch_view AS SELECT id, SUM(value) AS total FROM dispatch_items GROUP BY id").await;
+    execute(&client, "INSERT INTO dispatch_items VALUES (3, 30)").await;
+    execute(&client, "INSERT INTO dispatch_items VALUES (4, 40)").await;
+    let error = client
+        .simple_query("SELECT * FROM dispatch_view")
+        .await
+        .unwrap_err();
+    let error = error.as_db_error().unwrap();
+    assert_eq!(error.code().code(), "XX000");
+    assert_eq!(error.message(), "[RS-2026] query.query_time_execution_failed: query-time execution failed: distributed view dispatch_view output is unavailable; contact the operator before relying on this result. next_steps: Simplify the query, validate referenced table/view schemas, or materialize the query into a view.");
+    worker.0.kill().unwrap();
+    worker.0.wait().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while catalog.get(WorkerId(1)).is_some() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let error = client
+        .simple_query("INSERT INTO dispatch_items VALUES (1, 10), (2, 20)")
+        .await
+        .unwrap_err();
+    let error = error.as_db_error().unwrap();
+    assert_eq!(error.code().code(), "XX000");
+    assert_eq!(error.message(), "[RS-2026] query.query_time_execution_failed: query-time execution failed: distributed view refresh dispatch_view: RS-0001: a routed shard owner has no active worker connection; Retry after the workload and workers are ready.; preserve source input and shard storage and contact the operator before retrying. next_steps: Simplify the query, validate referenced table/view schemas, or materialize the query into a view.");
+    let assert_pending = |error: tokio_postgres::Error| {
+        let error = error.as_db_error().unwrap();
+        assert_eq!(error.code().code(), "XX000");
+        assert_eq!(error.message(), "[RS-2026] query.query_time_execution_failed: query-time execution failed: distributed source requires recovery; preserve source input and shard storage and contact the operator before retrying. next_steps: Simplify the query, validate referenced table/view schemas, or materialize the query into a view.");
+    };
+    assert_pending(
+        client
+            .simple_query("SELECT * FROM dispatch_view")
+            .await
+            .unwrap_err(),
+    );
+    drop(client);
+    gateway.0.kill().unwrap();
+    gateway.0.wait().unwrap();
+    let _gateway = start_gateway();
+    let client = connect_gateway(&gateway_addr).await;
+    assert_pending(
+        client
+            .simple_query("SELECT * FROM dispatch_view")
+            .await
+            .unwrap_err(),
+    );
+    assert_pending(
+        client
+            .simple_query("INSERT INTO dispatch_items VALUES (5, 50)")
+            .await
+            .unwrap_err(),
+    );
+    control.shutdown();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -843,6 +1131,7 @@ async fn real_multi_process_management_status_is_an_exact_json_worker_lifecycle_
         }],
     );
     assert!(topology_revision(&one_worker) > topology_revision(&two_workers));
+    assert_eq!(one_worker.nodes[0].address, two_workers.nodes[1].address);
 }
 
 #[tokio::test]

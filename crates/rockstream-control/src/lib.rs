@@ -56,10 +56,11 @@ pub use checkpoint::{
 };
 pub use checkpoint_export::{
     CheckpointExportError, CheckpointExportOutcome, CheckpointExportService,
-    CheckpointRestoreOutcome, MAX_CHECKPOINT_EXPORT_OBJECTS_IN_FLIGHT,
-    MAX_CHECKPOINT_EXPORT_OBJECT_BYTES, MAX_CHECKPOINT_EXPORT_SCAN_WINDOW,
+    CheckpointRestoreOutcome, CHECKPOINT_EXPORT_STREAM_CHUNK_BYTES,
+    MAX_CHECKPOINT_EXPORT_OBJECTS_IN_FLIGHT, MAX_CHECKPOINT_EXPORT_OBJECT_BYTES,
+    MAX_CHECKPOINT_EXPORT_SCAN_WINDOW,
 };
-pub use checkpoint_store::CheckpointManifestStore;
+pub use checkpoint_store::{CheckpointManifestStore, GcPin, GcPinKind, GcPinStore};
 pub use freshness::{
     AdmissionMode, CheckpointMode, FreshnessAction, FreshnessBounds, FreshnessController,
     FreshnessObservation,
@@ -94,6 +95,8 @@ pub use rockstream_types::migration::MigrationProgress;
 pub use scheduler::{ShardAssignment, ShardScheduler};
 pub use secret_store::{
     SecretListing, SecretRotationOperationError, SecretStore, SecretStoreError,
+    SecretStoreMetricsSnapshot, MAX_KEK_ROTATION_STAGED_ENTRIES, MAX_KEK_ROTATION_STAGING_BYTES,
+    MAX_SECRET_STORE_WAITERS,
 };
 pub use service::{ControlService, ControlServiceHandle};
 pub use shard::{LeaseError, ShardManager, ShardManagerSnapshot, ShardPersistentStore};

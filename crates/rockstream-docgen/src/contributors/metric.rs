@@ -193,6 +193,23 @@ impl MetricContributor {
                 description: "Number of retained security audit records".to_string(),
             },
             MetricDescriptor {
+                name: "security_audit_transport_capacity".to_string(),
+                metric_type: "gauge".to_string(),
+                unit: "count".to_string(),
+                labels: vec![],
+                stability: "stable".to_string(),
+                description: "Maximum in-flight worker security audit acknowledgements".to_string(),
+            },
+            MetricDescriptor {
+                name: "security_audit_transport_pending".to_string(),
+                metric_type: "gauge".to_string(),
+                unit: "count".to_string(),
+                labels: vec![],
+                stability: "stable".to_string(),
+                description: "Worker security audit requests awaiting durable acknowledgement"
+                    .to_string(),
+            },
+            MetricDescriptor {
                 name: "storage_flush_latency_ms".to_string(),
                 metric_type: "histogram".to_string(),
                 unit: "ms".to_string(),

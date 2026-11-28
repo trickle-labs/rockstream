@@ -17,6 +17,10 @@ spec:
       labels:
         app.kubernetes.io/name: {{ .Chart.Name }}
         app.kubernetes.io/component: worker
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ .Values.worker.managementPort }}"
+        prometheus.io/path: "/metrics"
     spec:
       serviceAccountName: {{ .Values.serviceAccount.name }}
       securityContext:
@@ -33,6 +37,10 @@ spec:
             - "--listen=0.0.0.0:{{ .Values.worker.port }}"
             - "--metrics-addr=0.0.0.0:{{ .Values.worker.managementPort }}"
             - "--storage=/data"
+          {{- if .Values.objectStore.enabled }}
+          env:
+            {{- include "rockstream.objectStoreEnv" . | nindent 12 }}
+          {{- end }}
           ports:
             - name: dataplane-rpc
               containerPort: {{ .Values.worker.port }}

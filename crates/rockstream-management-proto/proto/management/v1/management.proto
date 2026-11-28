@@ -9,7 +9,10 @@ service ManagementService {
   rpc ListShards(ListShardsRequest) returns (ListShardsResponse);
   rpc GetShard(GetShardRequest) returns (GetShardResponse);
   rpc ListOperations(ListOperationsRequest) returns (ListOperationsResponse);
+  rpc ListSecurityAuditRecords(ListSecurityAuditRecordsRequest) returns (ListSecurityAuditRecordsResponse);
   rpc ListSecurityPrincipals(ListSecurityPrincipalsRequest) returns (ListSecurityPrincipalsResponse);
+  rpc CreateServicePrincipal(CreateServicePrincipalRequest) returns (CreateServicePrincipalResponse);
+  rpc DeleteSecurityPrincipal(DeleteSecurityPrincipalRequest) returns (DeleteSecurityPrincipalResponse);
   rpc SetSecurityPrincipalGrants(SetSecurityPrincipalGrantsRequest) returns (SetSecurityPrincipalGrantsResponse);
   rpc GetOperation(GetOperationRequest) returns (GetOperationResponse);
   rpc GetConfigSummary(GetConfigSummaryRequest) returns (GetConfigSummaryResponse);
@@ -113,6 +116,21 @@ message ListOperationsResponse {
   repeated Operation operations = 4;
   string next_page_token = 5;
 }
+message ListSecurityAuditRecordsRequest {
+  uint32 protocol_version = 1;
+  optional uint64 from_timestamp_ms = 2;
+  optional uint64 to_timestamp_ms = 3;
+  uint32 page_size = 4;
+  string page_token = 5;
+}
+message ListSecurityAuditRecordsResponse {
+  uint32 protocol_version = 1;
+  string observed_at = 2;
+  string source_version = 3;
+  // Each entry is JSON for one SecurityAuditRecord in its versioned record format.
+  repeated string records_json = 4;
+  string next_page_token = 5;
+}
 message GetOperationRequest { uint32 protocol_version = 1; string operation_id = 2; }
 message GetOperationResponse {
   uint32 protocol_version = 1;
@@ -152,6 +170,7 @@ message SecurityPrincipal {
   repeated SecurityPresetGrant preset_grants = 5;
   repeated SecurityActionGrant scoped_grants = 6;
   repeated SecurityActionGrant effective_permissions = 7;
+  repeated string service_ids = 8;
 }
 message SecurityPresetGrant {
   string preset = 1;
@@ -160,6 +179,32 @@ message SecurityPresetGrant {
 message SecurityActionGrant {
   string action = 1;
   string scope_json = 2;
+}
+message CreateServicePrincipalRequest {
+  uint32 protocol_version = 1;
+  uint64 principal_id = 2;
+  string display_name = 3;
+  string service_id = 4;
+  uint64 expected_grantor_revision = 5;
+  string idempotency_key = 6;
+  repeated SecurityActionGrant scoped_grants = 7;
+}
+message CreateServicePrincipalResponse {
+  uint32 protocol_version = 1;
+  SecurityPrincipal principal = 2;
+}
+message DeleteSecurityPrincipalRequest {
+  uint32 protocol_version = 1;
+  uint64 principal_id = 2;
+  uint64 expected_revision = 3;
+  uint64 expected_grantor_revision = 4;
+  string idempotency_key = 5;
+}
+message DeleteSecurityPrincipalResponse {
+  uint32 protocol_version = 1;
+  uint64 principal_id = 2;
+  uint64 deleted_revision = 3;
+  string operation_id = 4;
 }
 message SetSecurityPrincipalGrantsRequest {
   uint32 protocol_version = 1;

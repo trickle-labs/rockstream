@@ -120,14 +120,18 @@ fn worker_cpu_distribution_is_balanced() {
 }
 
 #[test]
-fn multi_worker_throughput_scaling_meets_binding_floors() {
+fn synthetic_reference_manifest_is_rejected_by_release_gate() {
     let mut candidate = CandidateIdentity::current();
     candidate.semantic_version = "1.0.0".to_string();
 
     let manifest = QualificationEvidenceManifest::reference_rc1_manifest(candidate);
     let gate = QualificationReleaseGate::new();
 
-    assert!(gate.evaluate_manifest(&manifest, None).is_ok());
+    let err = gate.evaluate_manifest(&manifest, None).unwrap_err();
+    assert!(matches!(
+        err,
+        rockstream_types::qualification::QualificationGateRejection::SyntheticFixtureRejected(_)
+    ));
 }
 
 #[test]

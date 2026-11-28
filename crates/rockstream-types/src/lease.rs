@@ -27,10 +27,49 @@ pub struct LeaseHeatHint {
     pub hot_sst_ids: Vec<String>,
     pub hot_block_ranges: Vec<(u64, u64)>,
     pub expected_read_rate: u64,
+    /// Object-associated immutable SST ranges. Legacy unassociated arrays are
+    /// retained for wire compatibility but are never used for prefetch I/O.
+    #[serde(default)]
+    pub blocks: Vec<SstBlockHeat>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SstBlockHeat {
+    pub storage_scope: String,
+    pub object_path: String,
+    pub start: u64,
+    pub end: u64,
+    pub observed_at_ms: u64,
+}
+
+impl SstBlockHeat {
+    pub fn is_valid(&self) -> bool {
+        !self.storage_scope.is_empty()
+            && self.storage_scope.len() <= 512
+            && self.object_path.len() <= 256
+            && self.object_path.starts_with("db/compacted/")
+            && self.object_path.ends_with(".sst")
+            && !self
+                .object_path
+                .split('/')
+                .any(|part| part == ".." || part.is_empty())
+            && self.object_path.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'-' | b'_')
+            })
+            && self
+                .end
+                .checked_sub(self.start)
+                .is_some_and(|bytes| bytes > 0 && bytes <= LeaseHeatHint::MAX_BLOCK_RANGE_BYTES)
+    }
 }
 
 impl LeaseHeatHint {
     pub const MAX_ENTRIES: usize = 64;
+    pub const MAX_KEY_PREFIX_BYTES: usize = 256;
+    pub const MAX_SST_ID_BYTES: usize = 128;
+    pub const MAX_BLOCK_RANGE_BYTES: u64 = 1024 * 1024;
+    pub const MAX_PREFETCH_BYTES: u64 = 4 * 1024 * 1024;
+    pub const MAX_AGE_MS: u64 = 60_000;
 
     /// Decay rate exponentially by epoch while retaining the useful locality hints.
     pub fn decay(&mut self, elapsed_epochs: u64, half_life_epochs: u64) {
@@ -43,9 +82,40 @@ impl LeaseHeatHint {
     }
 
     pub fn bounded(mut self) -> Self {
+        // Drop invalid entries instead of truncating an identifier into a
+        // different key. Hints are advisory and must never affect ownership.
+        self.hot_key_prefixes
+            .retain(|prefix| !prefix.is_empty() && prefix.len() <= Self::MAX_KEY_PREFIX_BYTES);
+        self.hot_sst_ids.retain(|id| {
+            !id.is_empty()
+                && id.len() <= Self::MAX_SST_ID_BYTES
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        });
         self.hot_key_prefixes.truncate(Self::MAX_ENTRIES);
         self.hot_sst_ids.truncate(Self::MAX_ENTRIES);
+        let mut remaining = Self::MAX_PREFETCH_BYTES;
+        self.hot_block_ranges.retain(|&(start, end)| {
+            let Some(bytes) = end.checked_sub(start) else {
+                return false;
+            };
+            if bytes == 0 || bytes > Self::MAX_BLOCK_RANGE_BYTES || bytes > remaining {
+                return false;
+            }
+            remaining -= bytes;
+            true
+        });
         self.hot_block_ranges.truncate(Self::MAX_ENTRIES);
+        let mut remaining = Self::MAX_PREFETCH_BYTES;
+        self.blocks.retain(|block| {
+            if !block.is_valid() || block.end - block.start > remaining {
+                return false;
+            }
+            remaining -= block.end - block.start;
+            true
+        });
+        self.blocks.truncate(Self::MAX_ENTRIES);
         self
     }
 }
@@ -113,6 +183,13 @@ impl ShardLease {
         }
     }
 
+    /// Compare the fenced ownership identity, ignoring non-authoritative heat.
+    pub fn same_owner(&self, other: &Self) -> bool {
+        self.shard_id == other.shard_id
+            && self.worker_id == other.worker_id
+            && self.lease_token == other.lease_token
+    }
+
     pub fn with_heat_hint(mut self, heat_hint: LeaseHeatHint) -> Self {
         self.heat_hint = heat_hint.bounded();
         self
@@ -151,6 +228,42 @@ mod tests {
         assert_eq!(lease.shard_id, back.shard_id);
         assert_eq!(lease.worker_id, back.worker_id);
         assert_eq!(lease.lease_token, back.lease_token);
+    }
+
+    #[test]
+    fn heat_hints_drop_malformed_entries_and_enforce_byte_budget() {
+        let max = LeaseHeatHint::MAX_BLOCK_RANGE_BYTES;
+        let hint = LeaseHeatHint {
+            hot_key_prefixes: vec![b"valid".to_vec(), vec![0; 257], vec![]],
+            hot_sst_ids: vec!["sst-7".to_owned(), "../invalid".to_owned(), "x".repeat(129)],
+            hot_block_ranges: vec![
+                (10, 9),
+                (1, 1),
+                (0, u64::MAX),
+                (0, max),
+                (max, max * 2),
+                (max * 2, max * 3),
+                (max * 3, max * 4),
+                (max * 4, max * 5),
+            ],
+            expected_read_rate: 100,
+            blocks: Vec::new(),
+        };
+        assert_eq!(
+            hint.bounded(),
+            LeaseHeatHint {
+                hot_key_prefixes: vec![b"valid".to_vec()],
+                hot_sst_ids: vec!["sst-7".to_owned()],
+                hot_block_ranges: vec![
+                    (0, max),
+                    (max, max * 2),
+                    (max * 2, max * 3),
+                    (max * 3, max * 4),
+                ],
+                expected_read_rate: 100,
+                blocks: Vec::new(),
+            }
+        );
     }
 
     #[test]

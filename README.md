@@ -235,7 +235,9 @@ rockstream start --role worker --control http://control:8000 --storage ./worker-
 ```
 
 Configuration, object-storage setup, authentication, and multi-node examples
-live in the [configuration reference](docs/reference/configuration.md) and
+live in the [5-minute quickstart](docs/quickstart-5min.md),
+[scale qualification program](benchmarks/scale-qualification/README.md),
+[configuration reference](docs/reference/configuration.md), and
 [operator guide](docs/operator.md).
 
 Useful diagnostics include:

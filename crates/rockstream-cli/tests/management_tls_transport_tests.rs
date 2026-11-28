@@ -646,6 +646,34 @@ async fn management_release_process_authenticates_and_authorizes_real_cli_reques
         String::from_utf8_lossy(&after_plaintext.stderr)
     );
 
+    let (worker_certificate, worker_key) = pki.worker_certs.get(&1).unwrap();
+    let worker_management = run_management_cli(
+        binary,
+        management_addr,
+        &pki,
+        worker_certificate,
+        worker_key,
+        None,
+        &["status"],
+    );
+    assert!(!worker_management.status.success());
+    assert_eq!(worker_management.stdout, b"");
+    let mut worker_error: CliErrorEnvelope =
+        serde_json::from_slice(&worker_management.stderr).unwrap();
+    assert_eq!(
+        worker_management.stderr,
+        format!("{}\n", serde_json::to_string_pretty(&worker_error).unwrap()).as_bytes()
+    );
+    worker_error.correlation_id.clear();
+    let mut expected_worker_error =
+        CliErrorEnvelope::from_cli_error(&rockstream_cli::CliError::new(
+            RS_0003,
+            "management GetClusterStatus failed: Unknown error: transport error",
+            "Check the management endpoint, protocol compatibility, and server logs.",
+        ));
+    expected_worker_error.correlation_id.clear();
+    assert_eq!(worker_error, expected_worker_error);
+
     let admin_status = run_management_cli(
         binary,
         management_addr,
@@ -690,6 +718,12 @@ async fn management_release_process_authenticates_and_authorizes_real_cli_reques
         node.registered_at_ms = 0;
         node.source_version = "<topology-version>".to_owned();
     }
+    let node_address = actual_status.nodes[0]
+        .address
+        .parse::<std::net::SocketAddr>()
+        .unwrap();
+    assert_eq!(node_address.ip(), std::net::Ipv4Addr::LOCALHOST);
+    assert_ne!(node_address.port(), 0);
     assert_eq!(
         actual_status,
         ManagementClusterStatusInfo {
@@ -995,6 +1029,36 @@ async fn management_release_process_authenticates_and_authorizes_real_cli_reques
         vec![unknown_failure.clone(), unknown_failure]
     );
 
+    let mut rejected_node_identity = audit
+        .iter()
+        .filter(|record| {
+            record.action == SecurityAuditClass::AuthenticationFailure
+                && record.actor == AuditIdentity::Unverified("worker:worker-1".to_owned())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(rejected_node_identity.len(), 1);
+    rejected_node_identity[0].event_id = "<event-id>".to_owned();
+    rejected_node_identity[0].timestamp_ms = 1;
+    assert_eq!(
+        rejected_node_identity,
+        vec![SecurityAuditRecord {
+            format_version: SECURITY_AUDIT_FORMAT_VERSION,
+            event_id: "<event-id>".to_owned(),
+            timestamp_ms: 1,
+            actor: AuditIdentity::Unverified("worker:worker-1".to_owned()),
+            target: AuditField::Known("management-api".to_owned()),
+            scope: AuditField::NotApplicable,
+            action: SecurityAuditClass::AuthenticationFailure,
+            outcome: SecurityAuditOutcome::Failure,
+            correlation: AuditCorrelation::Unknown,
+            operation_id: AuditField::NotApplicable,
+            policy_revision: AuditField::Unknown,
+            before_state: AuditField::NotApplicable,
+            after_state: AuditField::NotApplicable,
+        }]
+    );
+
     let mut denials = audit
         .iter()
         .filter(|record| {
@@ -1096,5 +1160,59 @@ async fn management_release_process_authenticates_and_authorizes_real_cli_reques
             before_state: AuditField::NotApplicable,
             after_state: AuditField::NotApplicable,
         }
+    );
+}
+
+#[tokio::test]
+async fn management_start_rejects_scram_only_administrator() {
+    let pki = TestPki::generate();
+    let principal = SecurityPrincipal {
+        format_version: SECURITY_PRINCIPAL_FORMAT_VERSION,
+        id: PrincipalId(1),
+        display_name: "SCRAM-only administrator".to_owned(),
+        enabled: true,
+        revision: 1,
+        login_methods: vec![LoginMethod::ScramSha256 {
+            username: "bootstrap-admin".to_owned(),
+            salt: vec![4; 16],
+            iterations: 4096,
+            stored_key: vec![5; 32],
+            server_key: vec![6; 32],
+        }],
+        preset_grants: [PermissionPreset::Administrator, PermissionPreset::Operator]
+            .into_iter()
+            .map(|preset| ScopedPresetGrant {
+                preset,
+                scope: PolicyScope::Cluster,
+            })
+            .collect(),
+        scoped_grants: Vec::new(),
+    };
+    let catalog = Arc::new(DurableCatalogStore::new(
+        Arc::new(InMemory::new()),
+        "scram-only-management-startup",
+    ));
+    catalog
+        .preprovision_first_administrator(principal, 1)
+        .await
+        .unwrap();
+    let service = ManagementService::new(
+        TopologyCatalog::new(),
+        ShardManager::new(),
+        ManagementOperationStore::new(Arc::new(InMemory::new())),
+        NodeConfig::default(),
+    )
+    .with_security_catalog(catalog as Arc<dyn CatalogStore>);
+    let tls = Arc::new(
+        rockstream_control::tls::TlsCertificateReloader::new(pki.control_tls_config()).unwrap(),
+    );
+
+    let error = match service.start("127.0.0.1:0", tls).await {
+        Ok(_) => panic!("SCRAM-only administrator must not start management"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.to_string(),
+        "RS-2405: management API requires a preprovisioned mTLS administrator"
     );
 }

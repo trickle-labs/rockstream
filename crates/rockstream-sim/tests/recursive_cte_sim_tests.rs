@@ -48,6 +48,7 @@ fn step_plan() -> PlanNode {
         input: Box::new(PlanNode::InnerJoin {
             left: Box::new(PlanNode::Exchange {
                 kind: rockstream_plan::ExchangeKind::Loopback,
+                partition_key: vec![],
                 child: Box::new(PlanNode::Source {
                     name: "reach".to_string(),
                 }),

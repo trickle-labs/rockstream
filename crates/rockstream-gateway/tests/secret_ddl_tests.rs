@@ -6,7 +6,7 @@ use std::sync::Arc;
 use rockstream_control::kek::EnvKekProvider;
 use rockstream_control::SecretStore;
 use rockstream_gateway::{
-    catalog_stubs::CatalogStubs,
+    catalog_stubs::{CatalogSinkEntry, CatalogStubs},
     view_reader::{ViewReadStrategy, ViewReader},
     GatewayError, GatewayServer,
 };
@@ -239,4 +239,73 @@ async fn legacy_source_and_sink_secret_names_migrate_before_gateway_use() {
         Some("secret://legacy_sink_password")
     );
     assert_eq!(sink.options["secret"], "secret://legacy_sink_password");
+}
+
+#[tokio::test]
+async fn kafka_sink_credentials_and_delivery_target_survive_catalog_recovery() {
+    let durable = Arc::new(DurableCatalogStore::new(
+        Arc::new(object_store::memory::InMemory::new()),
+        "kafka-sink-recovery",
+    ));
+    let catalog = CatalogStubs::new();
+    catalog.set_durable_store(durable.clone());
+    let entry = CatalogSinkEntry {
+        name: "orders_out".to_string(),
+        view: "orders_mv".to_string(),
+        format: "KAFKA".to_string(),
+        path: "broker:9092".to_string(),
+        snapshot_interval_epochs: None,
+        snapshot_interval_ms: None,
+        parquet_row_group_bytes: Some(1234),
+        format_version: Some(55),
+        partition_by: vec![],
+        catalog: "orders".to_string(),
+        secret_name: Some("secret://kafka_auth".to_string()),
+        security_protocol: Some("SASL_PLAINTEXT".to_string()),
+        secret_consumer: Some(PrincipalId(22)),
+        secret_namespace: Some("sales".to_string()),
+        last_snapshot_epoch: None,
+        state: "OK".to_string(),
+    };
+    assert!(catalog.add_sink_durable(entry).await.unwrap());
+
+    let stored = durable.list_sinks().await.unwrap();
+    assert_eq!(stored.len(), 1);
+    let stored = &stored[0];
+    assert_eq!(stored.sink_type, "KAFKA");
+    assert_eq!(stored.target, "broker:9092");
+    assert_eq!(
+        stored.options,
+        HashMap::from([
+            ("view".to_string(), "orders_mv".to_string()),
+            ("brokers".to_string(), "broker:9092".to_string()),
+            ("topic".to_string(), "orders".to_string()),
+            ("max_envelope_bytes".to_string(), "1234".to_string()),
+            (
+                "security.protocol".to_string(),
+                "SASL_PLAINTEXT".to_string()
+            ),
+            ("secret".to_string(), "secret://kafka_auth".to_string()),
+        ])
+    );
+
+    let recovered = CatalogStubs::new();
+    recovered.set_durable_store(durable);
+    recovered.sync_from_durable_store().await.unwrap();
+    let recovered = recovered.get_sink("orders_out").unwrap();
+    assert_eq!(recovered.view, "orders_mv");
+    assert_eq!(recovered.format, "KAFKA");
+    assert_eq!(recovered.path, "broker:9092");
+    assert_eq!(recovered.catalog, "orders");
+    assert_eq!(recovered.parquet_row_group_bytes, Some(1234));
+    assert_eq!(
+        recovered.secret_name.as_deref(),
+        Some("secret://kafka_auth")
+    );
+    assert_eq!(
+        recovered.security_protocol.as_deref(),
+        Some("SASL_PLAINTEXT")
+    );
+    assert_eq!(recovered.secret_consumer, Some(PrincipalId(22)));
+    assert_eq!(recovered.secret_namespace.as_deref(), Some("sales"));
 }

@@ -347,6 +347,28 @@ pub struct R1PersistenceCounters {
     pub full_state_entries_visited: u64,
 }
 
+/// Physical SlateDB / object-store I/O counters tracked separately from logical
+/// `StateMutation` bytes so benchmarks and tests report logical vs. physical write amplification.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PhysicalPersistenceCounters {
+    pub wal_bytes_written: u64,
+    pub sst_bytes_written: u64,
+    pub manifest_bytes_written: u64,
+    pub other_bytes_written: u64,
+    pub put_ops: u64,
+    pub get_ops: u64,
+    pub get_bytes: u64,
+}
+
+impl PhysicalPersistenceCounters {
+    pub const fn total_written_bytes(&self) -> u64 {
+        self.wal_bytes_written
+            .saturating_add(self.sst_bytes_written)
+            .saturating_add(self.manifest_bytes_written)
+            .saturating_add(self.other_bytes_written)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct R1ArrangementCounters {
     pub logical_trace_bytes: u64,
@@ -399,6 +421,7 @@ struct MetricRegistry {
     r1_execution: HashMap<R1ExecutionKey, R1ExecutionCounters>,
     compiled_join_views: [u64; 2],
     r1_persistence: HashMap<OperatorId, R1PersistenceCounters>,
+    physical_persistence: HashMap<String, PhysicalPersistenceCounters>,
     r1_arrangements: HashMap<ArrangementId, R1ArrangementCounters>,
     r1_workers: HashMap<WorkerId, R1WorkerActivity>,
     applied: HashMap<LawMetricKey, Counter>,
@@ -413,6 +436,12 @@ struct MetricRegistry {
     security_audit_retained_bytes: u64,
     security_audit_capacity_bytes: u64,
     security_audit_degraded: bool,
+    security_audit_transport_pending: u64,
+    security_audit_transport_capacity: u64,
+    support_artifact_retained_count: u64,
+    support_artifact_retained_bytes: u64,
+    support_artifact_capacity_count: u64,
+    support_artifact_capacity_bytes: u64,
 
     // SRE Observability metrics
     compaction_bytes_reclaimed: HashMap<u16, Counter>,
@@ -557,6 +586,7 @@ impl MetricRegistry {
             r1_execution: HashMap::new(),
             compiled_join_views: [0; 2],
             r1_persistence: HashMap::new(),
+            physical_persistence: HashMap::new(),
             r1_arrangements: HashMap::new(),
             r1_workers: HashMap::new(),
             applied: HashMap::new(),
@@ -568,6 +598,12 @@ impl MetricRegistry {
             security_audit_retained_bytes: 0,
             security_audit_capacity_bytes: 0,
             security_audit_degraded: false,
+            security_audit_transport_pending: 0,
+            security_audit_transport_capacity: 0,
+            support_artifact_retained_count: 0,
+            support_artifact_retained_bytes: 0,
+            support_artifact_capacity_count: 0,
+            support_artifact_capacity_bytes: 0,
             compaction_bytes_reclaimed: HashMap::new(),
             duplicate_dropped_total: HashMap::new(),
             tombstone_bytes: HashMap::new(),
@@ -710,6 +746,42 @@ pub fn r1_persistence_snapshot() -> Vec<(OperatorId, R1PersistenceCounters)> {
     with_registry(|reg| {
         let mut snapshot: Vec<_> = reg.r1_persistence.iter().map(|(k, v)| (*k, *v)).collect();
         snapshot.sort_by_key(|(operator_id, _)| *operator_id);
+        snapshot
+    })
+}
+
+pub fn record_physical_persistence(scope: &str, delta: PhysicalPersistenceCounters) {
+    with_registry(|reg| {
+        let entry = reg
+            .physical_persistence
+            .entry(scope.to_string())
+            .or_default();
+        entry.wal_bytes_written = entry
+            .wal_bytes_written
+            .saturating_add(delta.wal_bytes_written);
+        entry.sst_bytes_written = entry
+            .sst_bytes_written
+            .saturating_add(delta.sst_bytes_written);
+        entry.manifest_bytes_written = entry
+            .manifest_bytes_written
+            .saturating_add(delta.manifest_bytes_written);
+        entry.other_bytes_written = entry
+            .other_bytes_written
+            .saturating_add(delta.other_bytes_written);
+        entry.put_ops = entry.put_ops.saturating_add(delta.put_ops);
+        entry.get_ops = entry.get_ops.saturating_add(delta.get_ops);
+        entry.get_bytes = entry.get_bytes.saturating_add(delta.get_bytes);
+    });
+}
+
+pub fn physical_persistence_snapshot() -> Vec<(String, PhysicalPersistenceCounters)> {
+    with_registry(|reg| {
+        let mut snapshot: Vec<_> = reg
+            .physical_persistence
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        snapshot.sort_by(|(a, _), (b, _)| a.cmp(b));
         snapshot
     })
 }
@@ -1262,6 +1334,7 @@ pub fn reset_all() {
         reg.r1_execution.clear();
         reg.compiled_join_views = [0; 2];
         reg.r1_persistence.clear();
+        reg.physical_persistence.clear();
         reg.r1_arrangements.clear();
         reg.r1_workers.clear();
         reg.applied.clear();
@@ -1273,6 +1346,12 @@ pub fn reset_all() {
         reg.security_audit_retained_bytes = 0;
         reg.security_audit_capacity_bytes = 0;
         reg.security_audit_degraded = false;
+        reg.security_audit_transport_pending = 0;
+        reg.security_audit_transport_capacity = 0;
+        reg.support_artifact_retained_count = 0;
+        reg.support_artifact_retained_bytes = 0;
+        reg.support_artifact_capacity_count = 0;
+        reg.support_artifact_capacity_bytes = 0;
         reg.compaction_bytes_reclaimed.clear();
         reg.duplicate_dropped_total.clear();
         reg.tombstone_bytes.clear();
@@ -2573,12 +2652,41 @@ pub fn set_security_audit_storage_metrics(
     });
 }
 
+pub fn set_support_artifact_storage_metrics(
+    retained_count: u64,
+    retained_bytes: u64,
+    capacity_count: u64,
+    capacity_bytes: u64,
+) {
+    with_registry(|reg| {
+        reg.support_artifact_retained_count = retained_count;
+        reg.support_artifact_retained_bytes = retained_bytes;
+        reg.support_artifact_capacity_count = capacity_count;
+        reg.support_artifact_capacity_bytes = capacity_bytes;
+    });
+}
+
 pub fn set_security_audit_degraded(degraded: bool) {
     with_registry(|reg| reg.security_audit_degraded = degraded);
 }
 
+pub fn set_security_audit_transport_metrics(pending: u64, capacity: u64) {
+    with_registry(|reg| {
+        reg.security_audit_transport_pending = pending;
+        reg.security_audit_transport_capacity = capacity;
+    });
+}
+
 pub fn is_security_audit_degraded() -> bool {
     with_registry(|reg| reg.security_audit_degraded)
+}
+
+fn prometheus_label(value: &str) -> String {
+    crate::diagnostic::redact_secrets(value)
+        .replace("\\", "\\\\")
+        .replace("\"", "\\\"")
+        .replace("\n", "\\n")
+        .replace("\r", "\\n")
 }
 
 pub fn generate_prometheus_metrics() -> String {
@@ -2590,12 +2698,12 @@ pub fn generate_prometheus_metrics() -> String {
         out.push_str("# TYPE rockstream_build_info gauge\n");
         out.push_str(&format!(
             "rockstream_build_info{{version=\"{}\",commit_sha=\"{}\",build_timestamp=\"{}\",compiler_version=\"{}\",lockfile_digest=\"{}\",features=\"{}\"}} 1\n\n",
-            id.semantic_version,
-            id.commit_sha,
-            id.build_timestamp_rfc3339,
-            id.compiler_version,
-            id.lockfile_digest,
-            id.enabled_features.join(",")
+            prometheus_label(&id.semantic_version),
+            prometheus_label(&id.commit_sha),
+            prometheus_label(&id.build_timestamp_rfc3339),
+            prometheus_label(&id.compiler_version),
+            prometheus_label(&id.lockfile_digest),
+            prometheus_label(&id.enabled_features.join(","))
         ));
 
         out.push_str(
@@ -2626,6 +2734,43 @@ pub fn generate_prometheus_metrics() -> String {
             "security_audit_degraded {}\n\n",
             u8::from(reg.security_audit_degraded)
         ));
+        out.push_str("# HELP security_audit_transport_capacity Maximum in-flight worker security audit acknowledgements.\n");
+        out.push_str("# TYPE security_audit_transport_capacity gauge\n");
+        out.push_str(&format!(
+            "security_audit_transport_capacity {}\n",
+            reg.security_audit_transport_capacity
+        ));
+        out.push_str("# HELP security_audit_transport_pending Worker security audit requests awaiting durable acknowledgement.\n");
+        out.push_str("# TYPE security_audit_transport_pending gauge\n");
+        out.push_str(&format!(
+            "security_audit_transport_pending {}\n\n",
+            reg.security_audit_transport_pending
+        ));
+
+        out.push_str("# HELP support_artifact_retained_count Number of artifacts retained in the observed support-artifact ledger.\n");
+        out.push_str("# TYPE support_artifact_retained_count gauge\n");
+        out.push_str(&format!(
+            "support_artifact_retained_count {}\n",
+            reg.support_artifact_retained_count
+        ));
+        out.push_str("# HELP support_artifact_retained_bytes Payload bytes retained in the observed support-artifact ledger.\n");
+        out.push_str("# TYPE support_artifact_retained_bytes gauge\n");
+        out.push_str(&format!(
+            "support_artifact_retained_bytes {}\n",
+            reg.support_artifact_retained_bytes
+        ));
+        out.push_str("# HELP support_artifact_capacity_count Maximum retained support artifacts per deployment.\n");
+        out.push_str("# TYPE support_artifact_capacity_count gauge\n");
+        out.push_str(&format!(
+            "support_artifact_capacity_count {}\n",
+            reg.support_artifact_capacity_count
+        ));
+        out.push_str("# HELP support_artifact_capacity_bytes Maximum retained support-artifact payload bytes per deployment.\n");
+        out.push_str("# TYPE support_artifact_capacity_bytes gauge\n");
+        out.push_str(&format!(
+            "support_artifact_capacity_bytes {}\n\n",
+            reg.support_artifact_capacity_bytes
+        ));
 
         // 1. merge_law_applied_total
         out.push_str("# HELP merge_law_applied_total Counter tracking the number of times a merge law is evaluated on a state merge.\n");
@@ -2634,7 +2779,7 @@ pub fn generate_prometheus_metrics() -> String {
             out.push_str(&format!(
                 "merge_law_applied_total{{law_id=\"{}\",law_name=\"{}\",law_version=\"{}\"}} {}\n",
                 k.law_id.0,
-                k.law_name,
+                prometheus_label(k.law_name),
                 k.law_version,
                 c.get()
             ));
@@ -2648,7 +2793,7 @@ pub fn generate_prometheus_metrics() -> String {
             out.push_str(&format!(
                 "merge_law_fallback_total{{law_id=\"{}\",law_name=\"{}\",law_version=\"{}\"}} {}\n",
                 k.law_id.0,
-                k.law_name,
+                prometheus_label(k.law_name),
                 k.law_version,
                 c.get()
             ));
@@ -2709,7 +2854,7 @@ pub fn generate_prometheus_metrics() -> String {
         for (workload, c) in &reg.workload_memory_bytes {
             out.push_str(&format!(
                 "workload_memory_bytes{{workload_name=\"{}\"}} {}\n",
-                workload,
+                prometheus_label(workload),
                 c.get()
             ));
         }
@@ -2781,7 +2926,8 @@ pub fn generate_prometheus_metrics() -> String {
             };
             out.push_str(&format!(
                 "segment_cache_hit_ratio{{worker_id=\"{}\"}} {:.6}\n",
-                worker_id, ratio
+                prometheus_label(&worker_id),
+                ratio
             ));
         }
         out.push('\n');
@@ -2794,7 +2940,7 @@ pub fn generate_prometheus_metrics() -> String {
         for (worker_id, c) in &reg.segment_cache_bytes_used {
             out.push_str(&format!(
                 "segment_cache_bytes_used{{worker_id=\"{}\"}} {}\n",
-                worker_id,
+                prometheus_label(worker_id),
                 c.get()
             ));
         }
@@ -2806,7 +2952,8 @@ pub fn generate_prometheus_metrics() -> String {
         for (pipeline_id, bytes) in reg.pipeline_state_bytes.iter() {
             out.push_str(&format!(
                 "pipeline_state_bytes{{pipeline_id=\"{}\"}} {}\n",
-                pipeline_id, bytes
+                prometheus_label(pipeline_id),
+                bytes
             ));
         }
         let other = reg.pipeline_state_bytes_other.load(Ordering::Relaxed);
@@ -2832,7 +2979,7 @@ pub fn generate_prometheus_metrics() -> String {
         for (view_name, c) in &reg.freshness_lag_ms {
             out.push_str(&format!(
                 "freshness_lag_ms{{view_name=\"{}\"}} {}\n",
-                view_name,
+                prometheus_label(view_name),
                 c.get()
             ));
         }
@@ -2865,7 +3012,7 @@ pub fn generate_prometheus_metrics() -> String {
         for (mode, c) in &reg.session_staleness_exceeded_total {
             out.push_str(&format!(
                 "session_staleness_exceeded_total{{mode=\"{}\"}} {}\n",
-                mode,
+                prometheus_label(mode),
                 c.get()
             ));
         }
@@ -2876,7 +3023,7 @@ pub fn generate_prometheus_metrics() -> String {
         for (mode, c) in &reg.session_frontier_age_ms {
             out.push_str(&format!(
                 "session_frontier_age_ms{{mode=\"{}\"}} {}\n",
-                mode,
+                prometheus_label(mode),
                 c.get()
             ));
         }
@@ -2887,7 +3034,7 @@ pub fn generate_prometheus_metrics() -> String {
         for (target, c) in &reg.shard_bloom_filter_bytes_used {
             out.push_str(&format!(
                 "shard_bloom_filter_bytes_used{{target=\"{}\"}} {}\n",
-                target,
+                prometheus_label(target),
                 c.get()
             ));
         }
@@ -2950,7 +3097,7 @@ pub fn generate_prometheus_metrics() -> String {
             for s in &stall_snapshots {
                 out.push_str(&format!(
                     "rockstream_operator_frontier_epoch{{view_name=\"{}\",op_id=\"{}\",shard_id=\"{}\"}} {}\n",
-                    s.view_name, s.op_id.0, s.shard_id, s.frontier_epoch
+                    prometheus_label(&s.view_name), s.op_id.0, s.shard_id, s.frontier_epoch
                 ));
             }
             out.push('\n');
@@ -2961,7 +3108,7 @@ pub fn generate_prometheus_metrics() -> String {
                 if s.is_slowest_input {
                     out.push_str(&format!(
                         "rockstream_pipeline_slowest_input_epoch{{view_name=\"{}\",op_id=\"{}\",shard_id=\"{}\"}} {}\n",
-                        s.view_name, s.op_id.0, s.shard_id, s.frontier_epoch
+                        prometheus_label(&s.view_name), s.op_id.0, s.shard_id, s.frontier_epoch
                     ));
                 }
             }
@@ -2972,7 +3119,7 @@ pub fn generate_prometheus_metrics() -> String {
             for s in &stall_snapshots {
                 out.push_str(&format!(
                     "rockstream_pipeline_holding_back_frontier{{view_name=\"{}\",op_id=\"{}\",shard_id=\"{}\"}} {}\n",
-                    s.view_name, s.op_id.0, s.shard_id, if s.is_holding_back_commit { 1 } else { 0 }
+                    prometheus_label(&s.view_name), s.op_id.0, s.shard_id, if s.is_holding_back_commit { 1 } else { 0 }
                 ));
             }
             out.push('\n');
@@ -3096,7 +3243,8 @@ pub fn generate_prometheus_metrics() -> String {
         for (view_name, lag) in &reg.view_stage_lags {
             out.push_str(&format!(
                 "view_freshness_lag_source_ms{{view_name=\"{}\"}} {}\n",
-                view_name, lag.source_lag_ms
+                prometheus_label(view_name),
+                lag.source_lag_ms
             ));
         }
         out.push('\n');
@@ -3106,7 +3254,8 @@ pub fn generate_prometheus_metrics() -> String {
         for (view_name, lag) in &reg.view_stage_lags {
             out.push_str(&format!(
                 "view_freshness_lag_decode_ms{{view_name=\"{}\"}} {}\n",
-                view_name, lag.decode_lag_ms
+                prometheus_label(view_name),
+                lag.decode_lag_ms
             ));
         }
         out.push('\n');
@@ -3116,7 +3265,8 @@ pub fn generate_prometheus_metrics() -> String {
         for (view_name, lag) in &reg.view_stage_lags {
             out.push_str(&format!(
                 "view_freshness_lag_compute_ms{{view_name=\"{}\"}} {}\n",
-                view_name, lag.compute_lag_ms
+                prometheus_label(view_name),
+                lag.compute_lag_ms
             ));
         }
         out.push('\n');
@@ -3126,7 +3276,8 @@ pub fn generate_prometheus_metrics() -> String {
         for (view_name, lag) in &reg.view_stage_lags {
             out.push_str(&format!(
                 "view_freshness_lag_checkpoint_alignment_ms{{view_name=\"{}\"}} {}\n",
-                view_name, lag.alignment_lag_ms
+                prometheus_label(view_name),
+                lag.alignment_lag_ms
             ));
         }
         out.push('\n');
@@ -3136,7 +3287,8 @@ pub fn generate_prometheus_metrics() -> String {
         for (view_name, lag) in &reg.view_stage_lags {
             out.push_str(&format!(
                 "view_freshness_lag_sink_commit_ms{{view_name=\"{}\"}} {}\n",
-                view_name, lag.sink_lag_ms
+                prometheus_label(view_name),
+                lag.sink_lag_ms
             ));
         }
         out.push('\n');
@@ -3146,7 +3298,8 @@ pub fn generate_prometheus_metrics() -> String {
         for (view_name, lag) in &reg.view_stage_lags {
             out.push_str(&format!(
                 "view_freshness_lag_spill_ms{{view_name=\"{}\"}} {}\n",
-                view_name, lag.spill_lag_ms
+                prometheus_label(view_name),
+                lag.spill_lag_ms
             ));
         }
         out.push('\n');
@@ -3156,7 +3309,8 @@ pub fn generate_prometheus_metrics() -> String {
         for (view_name, lag) in &reg.view_stage_lags {
             out.push_str(&format!(
                 "view_freshness_lag_storage_pressure_ms{{view_name=\"{}\"}} {}\n",
-                view_name, lag.storage_pressure_ms
+                prometheus_label(view_name),
+                lag.storage_pressure_ms
             ));
         }
         out.push('\n');
@@ -3166,7 +3320,8 @@ pub fn generate_prometheus_metrics() -> String {
         for (view_name, lag) in &reg.view_stage_lags {
             out.push_str(&format!(
                 "view_freshness_lag_end_to_end_ms{{view_name=\"{}\"}} {}\n",
-                view_name, lag.total_lag_ms
+                prometheus_label(view_name),
+                lag.total_lag_ms
             ));
         }
         out.push('\n');
@@ -3439,7 +3594,9 @@ pub fn generate_prometheus_metrics() -> String {
         for ((source, format), (rows, _)) in &ingest {
             out.push_str(&format!(
                 "rockstream_ingest_rows_total{{source=\"{}\",format=\"{}\"}} {}\n",
-                source, format, rows
+                prometheus_label(source),
+                prometheus_label(format),
+                rows
             ));
         }
         if reg.ingest_rows_other > 0 {
@@ -3455,7 +3612,9 @@ pub fn generate_prometheus_metrics() -> String {
         for ((source, format), (_, bytes)) in &ingest {
             out.push_str(&format!(
                 "rockstream_ingest_bytes_total{{source=\"{}\",format=\"{}\"}} {}\n",
-                source, format, bytes
+                prometheus_label(source),
+                prometheus_label(format),
+                bytes
             ));
         }
         if reg.ingest_bytes_other > 0 {
@@ -3473,7 +3632,9 @@ pub fn generate_prometheus_metrics() -> String {
         for ((view, operator), rows) in &exec {
             out.push_str(&format!(
                 "rockstream_execution_rows_total{{view=\"{}\",operator=\"{}\"}} {}\n",
-                view, operator, rows
+                prometheus_label(view),
+                prometheus_label(operator),
+                rows
             ));
         }
         if reg.execution_rows_other > 0 {
@@ -3491,7 +3652,9 @@ pub fn generate_prometheus_metrics() -> String {
         for ((workload, phase), duration) in &epochs {
             out.push_str(&format!(
                 "rockstream_epoch_duration_seconds{{workload=\"{}\",phase=\"{}\"}} {}\n",
-                workload, phase, duration
+                prometheus_label(workload),
+                prometheus_label(phase),
+                duration
             ));
         }
         if let Some(dur) = reg.epoch_durations_other {
@@ -3506,7 +3669,8 @@ pub fn generate_prometheus_metrics() -> String {
         for (view, lag) in &lags {
             out.push_str(&format!(
                 "rockstream_frontier_lag_seconds{{view=\"{}\"}} {}\n",
-                view, lag
+                prometheus_label(view),
+                lag
             ));
         }
         if let Some(lag) = reg.frontier_lags_other {
@@ -3524,7 +3688,9 @@ pub fn generate_prometheus_metrics() -> String {
         for ((view, backend), bytes) in &state_bytes {
             out.push_str(&format!(
                 "rockstream_state_bytes{{view=\"{}\",backend=\"{}\"}} {}\n",
-                view, backend, bytes
+                prometheus_label(view),
+                prometheus_label(backend),
+                bytes
             ));
         }
         if let Some(b) = reg.view_state_bytes_other {
@@ -3542,7 +3708,9 @@ pub fn generate_prometheus_metrics() -> String {
         for ((worker, category), bytes) in &mem_bytes {
             out.push_str(&format!(
                 "rockstream_memory_bytes{{worker=\"{}\",category=\"{}\"}} {}\n",
-                worker, category, bytes
+                prometheus_label(worker),
+                prometheus_label(category),
+                bytes
             ));
         }
         if let Some(b) = reg.worker_memory_bytes_other {
@@ -3562,7 +3730,9 @@ pub fn generate_prometheus_metrics() -> String {
         for ((sender, receiver), bytes) in &ex_bytes {
             out.push_str(&format!(
                 "rockstream_exchange_bytes_total{{sender=\"{}\",receiver=\"{}\"}} {}\n",
-                sender, receiver, bytes
+                prometheus_label(sender),
+                prometheus_label(receiver),
+                bytes
             ));
         }
         if reg.exchange_bytes_other > 0 {
@@ -3579,7 +3749,9 @@ pub fn generate_prometheus_metrics() -> String {
         for ((worker, channel), ratio) in &ex_bp {
             out.push_str(&format!(
                 "rockstream_exchange_backpressure{{worker=\"{}\",channel=\"{}\"}} {}\n",
-                worker, channel, ratio
+                prometheus_label(worker),
+                prometheus_label(channel),
+                ratio
             ));
         }
         if let Some(r) = reg.exchange_backpressure_other {
@@ -3594,7 +3766,9 @@ pub fn generate_prometheus_metrics() -> String {
         for ((shard, tier), duration) in &cp_dur {
             out.push_str(&format!(
                 "rockstream_checkpoint_duration_seconds{{shard=\"{}\",tier=\"{}\"}} {}\n",
-                shard, tier, duration
+                prometheus_label(shard),
+                prometheus_label(tier),
+                duration
             ));
         }
         if let Some(d) = reg.checkpoint_duration_other {
@@ -3611,7 +3785,8 @@ pub fn generate_prometheus_metrics() -> String {
         for (migration_id, rows) in &mig_rows {
             out.push_str(&format!(
                 "rockstream_migration_rows_copied_total{{migration_id=\"{}\"}} {}\n",
-                migration_id, rows
+                prometheus_label(migration_id),
+                rows
             ));
         }
         if reg.migration_rows_other > 0 {
@@ -3631,7 +3806,9 @@ pub fn generate_prometheus_metrics() -> String {
         for ((source, partition), records) in &conn_lag {
             out.push_str(&format!(
                 "rockstream_connector_lag_records{{source=\"{}\",partition=\"{}\"}} {}\n",
-                source, partition, records
+                prometheus_label(source),
+                prometheus_label(partition),
+                records
             ));
         }
         if let Some(l) = reg.connector_lag_other {
@@ -3646,7 +3823,8 @@ pub fn generate_prometheus_metrics() -> String {
         for (code, count) in &diag_err {
             out.push_str(&format!(
                 "rockstream_errors_total{{code=\"{}\"}} {}\n",
-                code, count
+                prometheus_label(code),
+                count
             ));
         }
         if reg.diagnostic_errors_other > 0 {
@@ -4169,12 +4347,45 @@ mod tests {
     }
 
     #[test]
+    fn prometheus_labels_redact_secrets_and_escape_control_characters() {
+        let _g = TEST_LOCK.lock().unwrap();
+        reset_all();
+
+        let view_name = "token=metric-fixture-secret\nview\"name\\tail";
+        record_operator_frontier(view_name, OperatorId(7), 2, 42, true);
+        set_frontier_lag_seconds(view_name, 1.5);
+        let metrics = generate_prometheus_metrics();
+        let lines: Vec<_> = metrics
+            .lines()
+            .filter(|line| {
+                line.starts_with("rockstream_operator_frontier_epoch{")
+                    || line.starts_with("rockstream_pipeline_slowest_input_epoch{")
+                    || line.starts_with("rockstream_pipeline_holding_back_frontier{")
+                    || line.starts_with("rockstream_frontier_lag_seconds{")
+            })
+            .collect();
+
+        assert_eq!(
+            lines,
+            vec![
+                r#"rockstream_operator_frontier_epoch{view_name="token=[REDACTED]\nview\"name\\tail",op_id="7",shard_id="2"} 42"#,
+                r#"rockstream_pipeline_slowest_input_epoch{view_name="token=[REDACTED]\nview\"name\\tail",op_id="7",shard_id="2"} 42"#,
+                r#"rockstream_pipeline_holding_back_frontier{view_name="token=[REDACTED]\nview\"name\\tail",op_id="7",shard_id="2"} 0"#,
+                r#"rockstream_frontier_lag_seconds{view="token=[REDACTED]\nview\"name\\tail"} 1.5"#,
+            ]
+        );
+        assert!(!metrics.contains("metric-fixture-secret"));
+        reset_all();
+    }
+
+    #[test]
     fn security_audit_storage_metrics_are_exported_exactly() {
         let _g = TEST_LOCK.lock().unwrap();
         reset_all();
 
         set_security_audit_storage_metrics(7, 2048, 4096);
         set_security_audit_degraded(true);
+        set_security_audit_transport_metrics(2, 32);
         let prometheus = generate_prometheus_metrics();
         let lines: Vec<_> = prometheus
             .lines()
@@ -4200,9 +4411,52 @@ mod tests {
                 "# HELP security_audit_degraded Whether required security audit writes are failing.",
                 "# TYPE security_audit_degraded gauge",
                 "security_audit_degraded 1",
+                "# HELP security_audit_transport_capacity Maximum in-flight worker security audit acknowledgements.",
+                "# TYPE security_audit_transport_capacity gauge",
+                "security_audit_transport_capacity 32",
+                "# HELP security_audit_transport_pending Worker security audit requests awaiting durable acknowledgement.",
+                "# TYPE security_audit_transport_pending gauge",
+                "security_audit_transport_pending 2",
             ]
         );
         assert!(is_security_audit_degraded());
+
+        reset_all();
+    }
+
+    #[test]
+    fn support_artifact_storage_metrics_are_exported_exactly() {
+        let _g = TEST_LOCK.lock().unwrap();
+        reset_all();
+
+        set_support_artifact_storage_metrics(3, 4096, 2048, 100 * 1024 * 1024);
+        let prometheus = generate_prometheus_metrics();
+        let lines: Vec<_> = prometheus
+            .lines()
+            .filter(|line| {
+                line.starts_with("# HELP support_artifact_")
+                    || line.starts_with("# TYPE support_artifact_")
+                    || line.starts_with("support_artifact_")
+            })
+            .collect();
+
+        assert_eq!(
+            lines,
+            vec![
+                "# HELP support_artifact_retained_count Number of artifacts retained in the observed support-artifact ledger.",
+                "# TYPE support_artifact_retained_count gauge",
+                "support_artifact_retained_count 3",
+                "# HELP support_artifact_retained_bytes Payload bytes retained in the observed support-artifact ledger.",
+                "# TYPE support_artifact_retained_bytes gauge",
+                "support_artifact_retained_bytes 4096",
+                "# HELP support_artifact_capacity_count Maximum retained support artifacts per deployment.",
+                "# TYPE support_artifact_capacity_count gauge",
+                "support_artifact_capacity_count 2048",
+                "# HELP support_artifact_capacity_bytes Maximum retained support-artifact payload bytes per deployment.",
+                "# TYPE support_artifact_capacity_bytes gauge",
+                "support_artifact_capacity_bytes 104857600",
+            ]
+        );
 
         reset_all();
     }

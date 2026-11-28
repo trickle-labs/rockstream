@@ -22,6 +22,7 @@ slatedb = { workspace = true }
 slatedb-common = "0.16"
 moka = { version = "0.12.15", features = ["future"] }
 object_store = { workspace = true }
+parking_lot = { workspace = true }
 thiserror = { workspace = true }
 crc32fast = { workspace = true }
 tokio = { workspace = true }
